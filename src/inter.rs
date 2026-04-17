@@ -15,7 +15,7 @@
 //! Skipped MBs (`not_coded == 1`) copy the corresponding 16×16 region from
 //! the reference frame verbatim, with MV(0,0).
 
-use oxideav_core::{Error, Result};
+use oxideav_core::Result;
 
 use crate::bitreader::BitReader;
 use crate::block::{
@@ -678,9 +678,30 @@ fn decode_one_intra_block_p(
     grid: &mut PredGrid,
 ) -> Result<()> {
     if !use_intra_dc_vlc {
-        return Err(Error::unsupported(
-            "mpeg4 P-VOP intra MB: plain-13-bit DC path not yet implemented",
-        ));
+        // Plain 8-bit raw DC path (used when `intra_dc_vlc_thr` and the
+        // current quant say so). Mirrors `mb.rs::plain_dc_block`.
+        let raw = br.read_u32(8)? as i32;
+        let (_pred_pel, dir) = predict_dc_p(block_idx, mb_x, mb_y, grid);
+        let scale = dc_scaler(block_idx, quant) as i32;
+
+        let mut coeffs = [0i32; 64];
+        let scan = choose_scan(ac_pred, dir);
+        if coded {
+            decode_intra_ac(br, &mut coeffs, scan)?;
+        }
+        coeffs[0] = raw * scale;
+
+        let mut out = [0i32; 64];
+        reconstruct_intra_block(&mut coeffs, vol, quant, &mut out)?;
+
+        let nbr = block_neighbour_mut_p(grid, block_idx, mb_x, mb_y);
+        nbr.dc = coeffs[0];
+        nbr.quant = quant as u8;
+        nbr.is_intra = true;
+        record_ac_prediction_cache(&coeffs, nbr);
+
+        write_intra_block(pic, block_idx, mb_x, mb_y, &out);
+        return Ok(());
     }
     let dc_diff = decode_intra_dc_diff(br, block_idx)?;
     let (predicted_dc_pel, dc_pred_dir) = predict_dc_p(block_idx, mb_x, mb_y, grid);
