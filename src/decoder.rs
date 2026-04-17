@@ -114,6 +114,16 @@ impl Mpeg4VideoDecoder {
                     let Some(vol) = self.vol.clone() else {
                         return Err(Error::invalid("mpeg4: VOP before VOL"));
                     };
+                    if vol.data_partitioned {
+                        return Err(Error::unsupported(
+                            "mpeg4 data-partitioned VOL: follow-up",
+                        ));
+                    }
+                    if vol.interlaced {
+                        return Err(Error::unsupported(
+                            "mpeg4 interlaced field coding: follow-up",
+                        ));
+                    }
                     let mut br = BitReader::new(payload);
                     let vop = parse_vop(&mut br, &vol)?;
                     self.handle_vop(&vol, &vop, &mut br)?;
