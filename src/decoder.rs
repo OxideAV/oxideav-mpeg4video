@@ -133,9 +133,15 @@ impl Mpeg4VideoDecoder {
         br: &mut BitReader<'_>,
     ) -> Result<()> {
         if !vop.vop_coded {
-            // "Not coded" VOP — repeat the previous frame as a placeholder.
-            // For a simple decoder we just don't emit anything; downstream
-            // can hold the previous frame.
+            // "Not coded" VOP (§6.2.5): the decoder must re-emit the previous
+            // reference frame at the new pts. The reference itself is not
+            // modified — the next coded VOP still predicts from the last
+            // coded picture.
+            if let Some(reference) = self.prev_ref.as_ref() {
+                let frame =
+                    pic_to_video_frame(vol, reference, self.pending_pts, self.pending_tb);
+                self.ready_frames.push_back(frame);
+            }
             return Ok(());
         }
         match vop.vop_coding_type {
