@@ -1,6 +1,6 @@
 //! Linear-scan VLC decoder shared by the Annex B tables.
 //!
-//! Mirrors the structure used in `oxideav-mpeg1video::vlc` — the tables are
+//! Mirrors the structure used in `oxideav-mpeg12video::vlc` — the tables are
 //! small enough that a walk per symbol is perfectly fast for textbook-grade
 //! decode and keeps each entry obvious to audit against the spec.
 

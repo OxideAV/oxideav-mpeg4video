@@ -2,7 +2,7 @@
 //!
 //! MPEG-4 Part 2 stores fields MSB-first within each byte; start codes are
 //! byte-aligned `0x000001XX` markers identical in structure to MPEG-1 / MPEG-2
-//! video. The reader mirrors `oxideav-mpeg1video`'s layout so the two crates
+//! video. The reader mirrors `oxideav-mpeg12video`'s layout so the two crates
 //! can share mental models.
 
 use oxideav_core::{Error, Result};

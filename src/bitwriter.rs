@@ -1,7 +1,7 @@
 //! MSB-first bit writer for MPEG-4 Part 2 video bitstreams.
 //!
 //! Mirrors the layout assumed by the matching `BitReader`: bits are packed
-//! MSB-first within each byte. Layout copied from `oxideav-mpeg1video`'s
+//! MSB-first within each byte. Layout copied from `oxideav-mpeg12video`'s
 //! `BitWriter` so the two crates share mental models.
 
 /// MSB-first bit writer.
