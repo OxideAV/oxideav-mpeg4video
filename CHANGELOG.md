@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/OxideAV/oxideav-mpeg4video/compare/v0.0.5...v0.0.6) - 2026-04-19
+
+### Other
+
+- bump oxideav-codec to 0.0.5
+- bump oxideav-core to 0.0.6
+- claim AVI FourCCs via the new CodecTag registry
+
 ## [0.0.4](https://github.com/OxideAV/oxideav-mpeg4video/compare/v0.0.3...v0.0.4) - 2026-04-18
 
 ### Other
