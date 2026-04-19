@@ -361,7 +361,11 @@ impl Decoder for Mpeg4VideoDecoder {
         // an MS stream has no such prefix anywhere. If we don't find
         // one, refuse the packet with a clear dispatch hint.
         if !self.format_verified {
-            if !crate::probe_is_mpeg4_part2(&packet.data) {
+            // Use crate::has_start_code on the raw bytes rather than the
+            // ProbeContext-based probe_is_mpeg4_part2 — at decode time
+            // we already know which codec the demuxer picked, we just
+            // want to verify the bitstream isn't a mislabel.
+            if !crate::has_packet_start_code(&packet.data) {
                 return Err(Error::unsupported(
                     "mpeg4video: packet has no MPEG-4 Part 2 start code — \
                      bitstream is likely MS-MPEG4 (DIV3 / MP43 / …). \
