@@ -384,7 +384,15 @@ pub fn decode_p_mb(
     if !is_intra {
         let f_code = vop.vop_fcode_forward.max(1);
         if four_mv {
+            motion.four_mv = true;
             for blk in 0..4 {
+                // Flush the already-decoded blocks of the CURRENT MB into
+                // the grid before predicting this one — blocks 1/2/3 may
+                // reference block 0/1/2 of the same MB as a predictor
+                // (§7.6.2 fig 7-6). Without this, later blocks would
+                // read the stale zero-initialised grid entry and predict
+                // from (0,0) instead of the just-decoded neighbour.
+                mv_grid.set(mb_x, mb_y, motion);
                 let (px, py) = predict_mv_full(
                     mv_grid,
                     mb_x,
@@ -398,7 +406,6 @@ pub fn decode_p_mb(
                 let mvy = decode_mv_component(br, f_code, py)?;
                 motion.mv[blk] = (mvx, mvy);
             }
-            motion.four_mv = true;
             mv_grid.set(mb_x, mb_y, motion);
         } else {
             let (px, py) = predict_mv_full(
