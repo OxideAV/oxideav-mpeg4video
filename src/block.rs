@@ -9,7 +9,7 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::bitreader::BitReader;
+use crate::bits_ext::BitReaderExt;
 use crate::headers::vol::{
     VideoObjectLayer, ALTERNATE_HORIZONTAL_SCAN, ALTERNATE_VERTICAL_SCAN, ZIGZAG,
 };
@@ -18,6 +18,7 @@ use crate::iq::{
     dequantise_intra_mpeg4,
 };
 use crate::tables::{dc_size, tcoef, vlc};
+use oxideav_core::bits::BitReader;
 
 /// The direction that the DC predictor used — `Left` picks from the left
 /// neighbour, `Top` from the top neighbour (§7.4.3.1). The AC predictor reuses

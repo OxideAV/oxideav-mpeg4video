@@ -25,7 +25,6 @@ use oxideav_core::{
     VideoFrame,
 };
 
-use crate::bitreader::BitReader;
 use crate::headers::vol::{parse_vol, VideoObjectLayer};
 use crate::headers::vop::{parse_vop, VideoObjectPlane, VopCodingType};
 use crate::headers::vos::{parse_visual_object, parse_vos, VisualObject, VisualObjectSequence};
@@ -37,6 +36,7 @@ use crate::start_codes::{
     VIDEO_SESSION_ERROR_CODE, VISUAL_OBJECT_START_CODE, VOP_START_CODE, VOS_END_CODE,
     VOS_START_CODE,
 };
+use oxideav_core::bits::BitReader;
 
 /// Factory for the registry.
 pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
@@ -115,9 +115,7 @@ impl Mpeg4VideoDecoder {
                         return Err(Error::invalid("mpeg4: VOP before VOL"));
                     };
                     if vol.data_partitioned {
-                        return Err(Error::unsupported(
-                            "mpeg4 data-partitioned VOL: follow-up",
-                        ));
+                        return Err(Error::unsupported("mpeg4 data-partitioned VOL: follow-up"));
                     }
                     if vol.interlaced {
                         return Err(Error::unsupported(
@@ -148,8 +146,7 @@ impl Mpeg4VideoDecoder {
             // modified — the next coded VOP still predicts from the last
             // coded picture.
             if let Some(reference) = self.prev_ref.as_ref() {
-                let frame =
-                    pic_to_video_frame(vol, reference, self.pending_pts, self.pending_tb);
+                let frame = pic_to_video_frame(vol, reference, self.pending_pts, self.pending_tb);
                 self.ready_frames.push_back(frame);
             }
             return Ok(());

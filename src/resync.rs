@@ -30,9 +30,10 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::bitreader::BitReader;
+use crate::bits_ext::BitReaderExt;
 use crate::headers::vol::VideoObjectLayer;
 use crate::headers::vop::{VideoObjectPlane, VopCodingType};
+use oxideav_core::bits::BitReader;
 
 /// First 16 bits of a stuffed resync-marker, indexed by `bits_count & 7`
 /// of the decoder's position before the stuffing.
@@ -155,12 +156,12 @@ pub fn try_consume_resync_marker_after(
         return Ok(ResyncResult::None);
     }
 
-    // Tentatively read mb_num + quant via save/restore.
-    let saved = br.save();
+    // Tentatively read mb_num + quant via Copy-based checkpoint.
+    let saved = *br;
     br.consume(marker_total as u32)?;
     let mb_bits = mb_num_bits(mb_count);
     if (br.bits_remaining() as u32) < mb_bits + vol.quant_precision as u32 + 1 {
-        br.restore(saved);
+        *br = saved;
         return Ok(ResyncResult::None);
     }
     let mb_num = br.read_u32(mb_bits)?;
@@ -171,7 +172,7 @@ pub fn try_consume_resync_marker_after(
     // The marker can legitimately say `mb_num == current_mb_after` (we're
     // sitting right at the new packet boundary), but never strictly less.
     if mb_num == 0 || mb_num >= mb_count || mb_num < current_mb_after || new_quant == 0 {
-        br.restore(saved);
+        *br = saved;
         return Ok(ResyncResult::None);
     }
 

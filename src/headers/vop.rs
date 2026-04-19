@@ -2,8 +2,9 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::bitreader::BitReader;
+use crate::bits_ext::BitReaderExt;
 use crate::headers::vol::{ShapeType, VideoObjectLayer};
+use oxideav_core::bits::BitReader;
 
 /// `vop_coding_type` field.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

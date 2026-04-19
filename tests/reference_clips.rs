@@ -15,8 +15,8 @@
 
 use std::path::Path;
 
+use oxideav_core::bits::BitReader;
 use oxideav_mpeg4video::{
-    bitreader::BitReader,
     decoder::codec_parameters_from_vol,
     headers::{
         vol::parse_vol,

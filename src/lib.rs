@@ -30,8 +30,7 @@
 #![allow(clippy::needless_range_loop)]
 #![allow(clippy::too_many_arguments)]
 
-pub mod bitreader;
-pub mod bitwriter;
+pub mod bits_ext;
 pub mod block;
 pub mod decoder;
 pub mod encoder;

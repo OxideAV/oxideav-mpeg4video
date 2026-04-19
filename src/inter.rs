@@ -17,7 +17,6 @@
 
 use oxideav_core::Result;
 
-use crate::bitreader::BitReader;
 use crate::block::{
     apply_ac_prediction, choose_dc_predictor, choose_scan, clip_to_u8, decode_inter_ac,
     decode_intra_ac, decode_intra_dc_diff, reconstruct_inter_block, reconstruct_intra_block,
@@ -29,6 +28,7 @@ use crate::iq::{dc_scaler, INTRA_DC_VLC_THR_TABLE};
 use crate::mb::{IVopPicture, PredGrid};
 use crate::mc::{luma_mv_to_chroma, predict_block};
 use crate::tables::{cbpy, mcbpc, mv as mv_tab, vlc};
+use oxideav_core::bits::BitReader;
 
 /// Same `dquant` table as the intra path.
 const DQUANT_DELTA: [i32; 4] = [-1, -2, 1, 2];

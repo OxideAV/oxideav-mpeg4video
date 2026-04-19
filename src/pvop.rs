@@ -40,13 +40,13 @@
 
 use oxideav_core::Result;
 
-use crate::bitwriter::BitWriter;
 use crate::encoder::{block_pel_position, fdct8x8};
 use crate::headers::vol::ZIGZAG;
 use crate::inter::{MbMotion, MvGrid};
 use crate::mb::IVopPicture;
 use crate::mc::{luma_mv_to_chroma, predict_block};
 use crate::tables::{mv as mv_tab, tcoef};
+use oxideav_core::bits::BitWriter;
 
 /// Default integer-pel search range (in integer pels). The encoder keeps the
 /// half-pel MV within `±2 * MAX_SEARCH_INT` — comfortably inside the
@@ -865,8 +865,8 @@ mod tests {
 
     #[test]
     fn mv_component_zero_roundtrip() {
-        use crate::bitreader::BitReader;
         use crate::inter::decode_mv_component;
+        use oxideav_core::bits::BitReader;
         let mut bw = BitWriter::new();
         write_mv_component(&mut bw, 0, 1);
         let mut data = bw.finish();
@@ -878,8 +878,8 @@ mod tests {
 
     #[test]
     fn mv_component_small_positive_roundtrip() {
-        use crate::bitreader::BitReader;
         use crate::inter::decode_mv_component;
+        use oxideav_core::bits::BitReader;
         for d in [1i32, -1, 3, -3, 7, -7, 15, -16, 31, -32] {
             let mut bw = BitWriter::new();
             write_mv_component(&mut bw, d, 1);

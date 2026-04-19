@@ -44,7 +44,6 @@ use oxideav_core::{
     TimeBase, VideoFrame,
 };
 
-use crate::bitwriter::BitWriter;
 use crate::block::{choose_dc_predictor, BlockNeighbour};
 use crate::headers::vol::ZIGZAG;
 use crate::iq::{dc_scaler, Y_DC_SCALE_TABLE};
@@ -52,6 +51,7 @@ use crate::mb::{IVopPicture, PredGrid};
 use crate::pvop::encode_p_vop_body;
 use crate::start_codes::{VISUAL_OBJECT_START_CODE, VOP_START_CODE, VOS_END_CODE, VOS_START_CODE};
 use crate::tables::tcoef;
+use oxideav_core::bits::BitWriter;
 
 // -------------------------------------------------------------------------
 // Public factory + Encoder impl
@@ -1063,8 +1063,8 @@ mod tests {
     #[test]
     fn dc_size_round_trip_luma() {
         // For a few representative diff values, encode+decode and compare.
-        use crate::bitreader::BitReader;
         use crate::block::decode_intra_dc_diff;
+        use oxideav_core::bits::BitReader;
         for &diff in &[0i32, 1, -1, 5, -5, 127, -127, 2047, -2047] {
             let mut bw = BitWriter::new();
             write_intra_dc_diff(&mut bw, 0, diff);
@@ -1079,8 +1079,8 @@ mod tests {
 
     #[test]
     fn dc_size_round_trip_chroma() {
-        use crate::bitreader::BitReader;
         use crate::block::decode_intra_dc_diff;
+        use oxideav_core::bits::BitReader;
         for &diff in &[0i32, 3, -3, 200, -200, 1000, -1000] {
             let mut bw = BitWriter::new();
             write_intra_dc_diff(&mut bw, 4, diff);

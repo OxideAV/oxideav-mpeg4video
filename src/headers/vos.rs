@@ -2,7 +2,7 @@
 
 use oxideav_core::Result;
 
-use crate::bitreader::BitReader;
+use oxideav_core::bits::BitReader;
 
 /// Parsed Visual Object Sequence header. The VOS payload is a single byte that
 /// carries `profile_and_level_indication` — a numeric id covering both profile

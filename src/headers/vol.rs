@@ -6,7 +6,8 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::bitreader::BitReader;
+use crate::bits_ext::BitReaderExt;
+use oxideav_core::bits::BitReader;
 
 /// `aspect_ratio_info` — Table 6-12.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

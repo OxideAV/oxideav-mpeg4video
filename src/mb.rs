@@ -19,7 +19,6 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::bitreader::BitReader;
 use crate::block::{
     apply_ac_prediction, choose_dc_predictor, choose_scan, clip_to_u8, decode_intra_ac,
     decode_intra_dc_diff, reconstruct_intra_block, record_ac_prediction_cache, BlockNeighbour,
@@ -29,6 +28,7 @@ use crate::headers::vol::VideoObjectLayer;
 use crate::headers::vop::VideoObjectPlane;
 use crate::iq::{dc_scaler, INTRA_DC_VLC_THR_TABLE};
 use crate::tables::{cbpy, mcbpc, vlc};
+use oxideav_core::bits::BitReader;
 
 /// Signed `dquant` adjustment — Table 6-20 / 7-3. 2-bit field indexing
 /// `[-1, -2, 1, 2]` for the four codes `0, 1, 2, 3`.
