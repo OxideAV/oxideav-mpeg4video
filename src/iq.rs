@@ -46,18 +46,7 @@ pub fn dequantise_intra_h263(coeffs: &mut [i32; 64], quant: u32) -> Result<()> {
     }
     let q = quant as i32;
     let q_plus = if q & 1 == 1 { q } else { q - 1 };
-    for i in 1..64 {
-        let l = coeffs[i];
-        if l == 0 {
-            continue;
-        }
-        let abs = l.abs();
-        let mut val = 2 * q * abs + q_plus;
-        if l < 0 {
-            val = -val;
-        }
-        coeffs[i] = val.clamp(-2048, 2047);
-    }
+    crate::simd::dequant_h263(coeffs, q, q_plus, 1);
     Ok(())
 }
 
@@ -111,18 +100,7 @@ pub fn dequantise_inter_h263(coeffs: &mut [i32; 64], quant: u32) -> Result<()> {
     }
     let q = quant as i32;
     let q_plus = if q & 1 == 1 { q } else { q - 1 };
-    for i in 0..64 {
-        let l = coeffs[i];
-        if l == 0 {
-            continue;
-        }
-        let abs = l.abs();
-        let mut val = 2 * q * abs + q_plus;
-        if l < 0 {
-            val = -val;
-        }
-        coeffs[i] = val.clamp(-2048, 2047);
-    }
+    crate::simd::dequant_h263(coeffs, q, q_plus, 0);
     Ok(())
 }
 

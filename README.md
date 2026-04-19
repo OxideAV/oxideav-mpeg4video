@@ -91,6 +91,57 @@ Out of scope for the encoder:
 - Interlace, scalability, data partitioning, reversible VLCs.
 - MPEG-4 matrix quant (`mpeg_quant = 1`).
 
+## Performance
+
+Hot paths go through the `simd` module (mirrors the `oxideav-vorbis`
+layout) with three implementations:
+
+- `scalar` — reference + test oracle, always compiled.
+- `chunked` — stable-Rust default. Fixed-size `[f32; 8]` / `[i32; 8]`
+  / `[u8; 8]` tiles that LLVM auto-vectorises to AVX2 / NEON / SSE on
+  release builds.
+- `portable` — `std::simd` (`f32x8` / `i32x8`) behind the `nightly`
+  feature flag.
+
+Kernels wrapped: `idct8x8` / `fdct8x8`, `dequant_h263`,
+`clip_block_to_u8`, `add_residual_clip_block`, `copy_block_u8`,
+`copy_mb_luma`, `copy_mb_chroma`. Bit-exact-vs-scalar tests live in
+`src/simd/mod.rs`.
+
+Motion compensation has an interior-only fast path that skips
+per-pixel edge-replication clamping when the block footprint is in
+bounds — the common case for typical encoders.
+
+### Benchmarks
+
+Four criterion suites under `benches/`:
+
+- `idct_bench` — IDCT and FDCT, 1000 blocks per iteration.
+- `dequant_bench` — H.263 dequantisation at sparse / medium / dense
+  coefficient density, plus residual-add+clip.
+- `mc_bench` — 8×8 and 16×16 half-pel motion compensation across the
+  four sub-pel positions, plus the skipped-MB copy.
+- `frame_bench` — end-to-end encode one I-VOP, decode one I-VOP,
+  decode an IPP GOP (256×256).
+
+Measured on `-C target-cpu=x86-64-v3` (AVX2 + FMA):
+
+| kernel                             | before | after | Δ    |
+|------------------------------------|-------:|------:|-----:|
+| `predict_block 16×16 int`          | 222 µs |  28 µs | -87% |
+| `predict_block 8×8 half_hv`        | 117 µs |  47 µs | -60% |
+| `predict_block 8×8 half_h`         | 104 µs |  40 µs | -61% |
+| `dequant_h263` dense               |  52 µs |  25 µs | -52% |
+| `add_residual_clip_block`          |  24 µs |  21 µs | -10% |
+
+IDCT and FDCT are unchanged — the scalar form is already well
+vectorised by LLVM at `x86-64-v3` and above; the kernels exist for
+portability to profiles where auto-vectorisation is weaker. Per-block
+times are dominated by motion compensation, so the interior fast-path
+win is what matters end-to-end.
+
+Run: `cargo bench -p oxideav-mpeg4video`.
+
 ## Quick use
 
 ```rust

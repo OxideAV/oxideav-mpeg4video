@@ -38,17 +38,32 @@ pub fn predict_block(
     let src_x = blk_px + int_x;
     let src_y = blk_py + int_y;
 
+    // §7.6.2.1 half-pel filter — bilinear with rounding offset 1 normally,
+    // 0 when `rounding` is set (vop_rounding_type=1).
+    let round = if rounding { 0 } else { 1 };
+    let round2 = if rounding { 1 } else { 2 };
+
+    // Fast path: the block (plus the 1-pel half-pel tap right/below) lies
+    // entirely inside the reference plane, so no edge-replication clamp
+    // is ever triggered. This is overwhelmingly the common case for
+    // typical encoders: MVs stay inside the picture and only the rare
+    // edge-adjacent MB needs the clamped walk.
+    let tap_x = if hx { 1 } else { 0 };
+    let tap_y = if hy { 1 } else { 0 };
+    if src_x >= 0 && src_y >= 0 && src_x + n + tap_x <= ref_w && src_y + n + tap_y <= ref_h {
+        predict_block_interior(
+            ref_plane, ref_stride, src_x as usize, src_y as usize, hx, hy, n as usize, round,
+            round2, dst, dst_stride,
+        );
+        return;
+    }
+
     // Clamp helpers — replicate edges (unrestricted MV domain §7.6.4).
     let sample = |x: i32, y: i32| -> u32 {
         let xc = x.clamp(0, ref_w - 1) as usize;
         let yc = y.clamp(0, ref_h - 1) as usize;
         ref_plane[yc * ref_stride + xc] as u32
     };
-
-    // §7.6.2.1 half-pel filter — bilinear with rounding offset 1 normally,
-    // 0 when `rounding` is set (vop_rounding_type=1).
-    let round = if rounding { 0 } else { 1 };
-    let round2 = if rounding { 1 } else { 2 };
 
     for j in 0..n {
         for i in 0..n {
@@ -73,6 +88,76 @@ pub fn predict_block(
                 }
             };
             dst[(j as usize) * dst_stride + (i as usize)] = v as u8;
+        }
+    }
+}
+
+/// Interior-only half-pel predictor: whole footprint guaranteed in
+/// bounds, so no per-pel clamping. The three sub-pel branches unroll
+/// into straight memory reads + add/shifts that the auto-vectoriser
+/// lowers to `vpmovzxbw` / `vpaddw` / `vpsrlw` sequences.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn predict_block_interior(
+    ref_plane: &[u8],
+    ref_stride: usize,
+    src_x: usize,
+    src_y: usize,
+    hx: bool,
+    hy: bool,
+    n: usize,
+    round: u32,
+    round2: u32,
+    dst: &mut [u8],
+    dst_stride: usize,
+) {
+    match (hx, hy) {
+        (false, false) => {
+            // Straight integer-pel copy.
+            for j in 0..n {
+                let s = (src_y + j) * ref_stride + src_x;
+                let d = j * dst_stride;
+                dst[d..d + n].copy_from_slice(&ref_plane[s..s + n]);
+            }
+        }
+        (true, false) => {
+            for j in 0..n {
+                let s = (src_y + j) * ref_stride + src_x;
+                let a = &ref_plane[s..s + n];
+                let b = &ref_plane[s + 1..s + 1 + n];
+                let d = j * dst_stride;
+                for i in 0..n {
+                    dst[d + i] = ((a[i] as u32 + b[i] as u32 + round) >> 1) as u8;
+                }
+            }
+        }
+        (false, true) => {
+            for j in 0..n {
+                let s0 = (src_y + j) * ref_stride + src_x;
+                let s1 = (src_y + j + 1) * ref_stride + src_x;
+                let a = &ref_plane[s0..s0 + n];
+                let b = &ref_plane[s1..s1 + n];
+                let d = j * dst_stride;
+                for i in 0..n {
+                    dst[d + i] = ((a[i] as u32 + b[i] as u32 + round) >> 1) as u8;
+                }
+            }
+        }
+        (true, true) => {
+            for j in 0..n {
+                let s0 = (src_y + j) * ref_stride + src_x;
+                let s1 = (src_y + j + 1) * ref_stride + src_x;
+                let a = &ref_plane[s0..s0 + n];
+                let b = &ref_plane[s0 + 1..s0 + 1 + n];
+                let c = &ref_plane[s1..s1 + n];
+                let e = &ref_plane[s1 + 1..s1 + 1 + n];
+                let d = j * dst_stride;
+                for i in 0..n {
+                    dst[d + i] =
+                        ((a[i] as u32 + b[i] as u32 + c[i] as u32 + e[i] as u32 + round2) >> 2)
+                            as u8;
+                }
+            }
         }
     }
 }

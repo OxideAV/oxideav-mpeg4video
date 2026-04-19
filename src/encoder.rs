@@ -993,47 +993,11 @@ fn quantise_ac_intra_h263(coef: i32, q: i32) -> i32 {
 /// applied as a matrix on the left (rows). Using the same `idct8x8` for the
 /// forward transform via an explicit transpose path gives a self-inverse
 /// transform under the same f32 cosine table.
+///
+/// Dispatches to the compile-time selected kernel in [`crate::simd`].
+#[inline]
 pub fn fdct8x8(block: &mut [f32; 64]) {
-    use std::f32::consts::PI;
-    use std::sync::OnceLock;
-
-    static T: OnceLock<[[f32; 8]; 8]> = OnceLock::new();
-    let cos = T.get_or_init(|| {
-        let mut t = [[0.0f32; 8]; 8];
-        for k in 0..8 {
-            let c_k = if k == 0 {
-                (1.0_f32 / 2.0_f32).sqrt()
-            } else {
-                1.0
-            };
-            for n in 0..8 {
-                t[k][n] = 0.5 * c_k * ((2 * n + 1) as f32 * k as f32 * PI / 16.0).cos();
-            }
-        }
-        t
-    });
-
-    let mut tmp = [0.0f32; 64];
-    // Row-wise forward: tmp[y][k] = Σn t[k][n] * block[y][n]
-    for y in 0..8 {
-        for k in 0..8 {
-            let mut s = 0.0f32;
-            for n in 0..8 {
-                s += cos[k][n] * block[y * 8 + n];
-            }
-            tmp[y * 8 + k] = s;
-        }
-    }
-    // Column-wise.
-    for x in 0..8 {
-        for k in 0..8 {
-            let mut s = 0.0f32;
-            for n in 0..8 {
-                s += cos[k][n] * tmp[n * 8 + x];
-            }
-            block[k * 8 + x] = s;
-        }
-    }
+    crate::simd::fdct8x8(block);
 }
 
 #[cfg(test)]

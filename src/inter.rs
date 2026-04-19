@@ -18,7 +18,7 @@
 use oxideav_core::Result;
 
 use crate::block::{
-    apply_ac_prediction, choose_dc_predictor, choose_scan, clip_to_u8, decode_inter_ac,
+    apply_ac_prediction, choose_dc_predictor, choose_scan, decode_inter_ac,
     decode_intra_ac, decode_intra_dc_diff, reconstruct_inter_block, reconstruct_intra_block,
     record_ac_prediction_cache, BlockNeighbour, PredDir,
 };
@@ -481,26 +481,16 @@ pub fn decode_p_mb(
 
         // Decode residual if coded; otherwise zero.
         let mut residual = [0i32; 64];
+        let dst_off = (blk_py as usize) * pic.y_stride + (blk_px as usize);
         if luma_coded[blk] {
             decode_inter_ac(br, &mut residual, &crate::headers::vol::ZIGZAG)?;
             let mut out = [0i32; 64];
             reconstruct_inter_block(&mut residual, vol, quant, &mut out)?;
-            // Add predictor + residual, clip.
-            for j in 0..8 {
-                for i in 0..8 {
-                    let v = pred_buf[j * 8 + i] as i32 + out[j * 8 + i];
-                    pic.y[(blk_py as usize + j) * pic.y_stride + (blk_px as usize + i)] =
-                        clip_to_u8(v);
-                }
-            }
+            crate::simd::add_residual_clip_block(
+                &pred_buf, &out, &mut pic.y, dst_off, pic.y_stride,
+            );
         } else {
-            // No residual: just the predictor.
-            for j in 0..8 {
-                for i in 0..8 {
-                    pic.y[(blk_py as usize + j) * pic.y_stride + (blk_px as usize + i)] =
-                        pred_buf[j * 8 + i];
-                }
-            }
+            crate::simd::copy_block_u8(&pred_buf, &mut pic.y, dst_off, pic.y_stride);
         }
     }
 
@@ -541,34 +531,21 @@ pub fn decode_p_mb(
         );
         let coded = chroma_coded[plane_idx];
         let mut residual = [0i32; 64];
+        let dst_off = (blk_py as usize) * pic.c_stride + (blk_px as usize);
+        let dst_plane = if plane_idx == 0 {
+            &mut pic.cb
+        } else {
+            &mut pic.cr
+        };
         if coded {
             decode_inter_ac(br, &mut residual, &crate::headers::vol::ZIGZAG)?;
             let mut out = [0i32; 64];
             reconstruct_inter_block(&mut residual, vol, quant, &mut out)?;
-            let dst_plane = if plane_idx == 0 {
-                &mut pic.cb
-            } else {
-                &mut pic.cr
-            };
-            for j in 0..8 {
-                for i in 0..8 {
-                    let v = pred_buf[j * 8 + i] as i32 + out[j * 8 + i];
-                    dst_plane[(blk_py as usize + j) * pic.c_stride + (blk_px as usize + i)] =
-                        clip_to_u8(v);
-                }
-            }
+            crate::simd::add_residual_clip_block(
+                &pred_buf, &out, dst_plane, dst_off, pic.c_stride,
+            );
         } else {
-            let dst_plane = if plane_idx == 0 {
-                &mut pic.cb
-            } else {
-                &mut pic.cr
-            };
-            for j in 0..8 {
-                for i in 0..8 {
-                    dst_plane[(blk_py as usize + j) * pic.c_stride + (blk_px as usize + i)] =
-                        pred_buf[j * 8 + i];
-                }
-            }
+            crate::simd::copy_block_u8(&pred_buf, dst_plane, dst_off, pic.c_stride);
         }
     }
 
@@ -582,22 +559,32 @@ pub fn decode_p_mb(
 fn copy_skipped_mb(pic: &mut IVopPicture, reference: &IVopPicture, mb_x: usize, mb_y: usize) {
     let px = mb_x * 16;
     let py = mb_y * 16;
-    for j in 0..16 {
-        for i in 0..16 {
-            pic.y[(py + j) * pic.y_stride + (px + i)] =
-                reference.y[(py + j) * reference.y_stride + (px + i)];
-        }
-    }
+    crate::simd::copy_mb_luma(
+        &reference.y,
+        py * reference.y_stride + px,
+        reference.y_stride,
+        &mut pic.y,
+        py * pic.y_stride + px,
+        pic.y_stride,
+    );
     let cx = mb_x * 8;
     let cy = mb_y * 8;
-    for j in 0..8 {
-        for i in 0..8 {
-            pic.cb[(cy + j) * pic.c_stride + (cx + i)] =
-                reference.cb[(cy + j) * reference.c_stride + (cx + i)];
-            pic.cr[(cy + j) * pic.c_stride + (cx + i)] =
-                reference.cr[(cy + j) * reference.c_stride + (cx + i)];
-        }
-    }
+    crate::simd::copy_mb_chroma(
+        &reference.cb,
+        cy * reference.c_stride + cx,
+        reference.c_stride,
+        &mut pic.cb,
+        cy * pic.c_stride + cx,
+        pic.c_stride,
+    );
+    crate::simd::copy_mb_chroma(
+        &reference.cr,
+        cy * reference.c_stride + cx,
+        reference.c_stride,
+        &mut pic.cr,
+        cy * pic.c_stride + cx,
+        pic.c_stride,
+    );
 }
 
 /// Reset the AC/DC prediction slots for one MB (used when an inter or
@@ -865,9 +852,5 @@ fn write_intra_block(
         5 => (pic.cr.as_mut_slice(), pic.c_stride, mb_x * 8, mb_y * 8),
         _ => unreachable!(),
     };
-    for dy in 0..8 {
-        for dx in 0..8 {
-            plane[(py + dy) * stride + (px + dx)] = clip_to_u8(out[dy * 8 + dx]);
-        }
-    }
+    crate::simd::clip_block_to_u8(out, plane, py * stride + px, stride);
 }

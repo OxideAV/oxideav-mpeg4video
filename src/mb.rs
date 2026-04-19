@@ -20,7 +20,7 @@
 use oxideav_core::{Error, Result};
 
 use crate::block::{
-    apply_ac_prediction, choose_dc_predictor, choose_scan, clip_to_u8, decode_intra_ac,
+    apply_ac_prediction, choose_dc_predictor, choose_scan, decode_intra_ac,
     decode_intra_dc_diff, reconstruct_intra_block, record_ac_prediction_cache, BlockNeighbour,
     PredDir,
 };
@@ -465,10 +465,5 @@ fn write_block_to_picture(
         5 => (pic.cr.as_mut_slice(), pic.c_stride, mb_x * 8, mb_y * 8),
         _ => unreachable!(),
     };
-    for dy in 0..8 {
-        for dx in 0..8 {
-            let s = out[dy * 8 + dx];
-            plane[(py + dy) * stride + (px + dx)] = clip_to_u8(s);
-        }
-    }
+    crate::simd::clip_block_to_u8(out, plane, py * stride + px, stride);
 }

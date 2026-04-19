@@ -29,6 +29,7 @@
 
 #![allow(clippy::needless_range_loop)]
 #![allow(clippy::too_many_arguments)]
+#![cfg_attr(feature = "nightly", feature(portable_simd))]
 
 pub mod bits_ext;
 pub mod block;
@@ -41,6 +42,7 @@ pub mod mb;
 pub mod mc;
 pub mod pvop;
 pub mod resync;
+pub mod simd;
 pub mod start_codes;
 pub mod tables;
 

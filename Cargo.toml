@@ -13,6 +13,33 @@ homepage = "https://github.com/OxideAV/oxideav-mpeg4video"
 keywords = ["multimedia", "video", "mpeg4", "codec", "pure-rust"]
 categories = ["multimedia::encoding", "multimedia::video"]
 
+[features]
+default = []
+# Enables `#![feature(portable_simd)]` and the `std::simd` code paths
+# in `src/simd/portable.rs`. Requires a nightly toolchain. The default
+# build relies on chunked fixed-size arrays that LLVM auto-vectorises
+# reliably on stable.
+nightly = []
+
 [dependencies]
 oxideav-core = "0.1"
 oxideav-codec = "0.1"
+
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "idct_bench"
+harness = false
+
+[[bench]]
+name = "dequant_bench"
+harness = false
+
+[[bench]]
+name = "mc_bench"
+harness = false
+
+[[bench]]
+name = "frame_bench"
+harness = false
