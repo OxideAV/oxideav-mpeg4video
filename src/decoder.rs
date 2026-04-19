@@ -56,6 +56,12 @@ pub struct Mpeg4VideoDecoder {
     /// Last decoded reference picture — used as `prev_ref` for the next
     /// P-VOP. Refreshed by each I-VOP and each P-VOP.
     prev_ref: Option<IVopPicture>,
+    /// First-packet sniff: catches the mislabel case where a container
+    /// tagged the stream as MPEG-4 Part 2 (XVID / DX50 / …) but the
+    /// bytes are actually an MS-MPEG4 bitstream. `None` until the
+    /// first `send_packet`, then cached so we only pay the scan once
+    /// per stream.
+    format_verified: bool,
 }
 
 impl Mpeg4VideoDecoder {
@@ -71,6 +77,7 @@ impl Mpeg4VideoDecoder {
             pending_tb: TimeBase::new(1, 90_000),
             eof: false,
             prev_ref: None,
+            format_verified: false,
         }
     }
 
@@ -346,6 +353,23 @@ impl Decoder for Mpeg4VideoDecoder {
     }
 
     fn send_packet(&mut self, packet: &Packet) -> Result<()> {
+        // Sniff the first packet to catch the mislabel case — a
+        // container tagged the stream as MPEG-4 Part 2 (XVID / DX50 /
+        // DIVX / …) but the bytes are actually MS-MPEG4 (DIV3-style).
+        // An ISO stream MUST start with a `0x000001` start code prefix
+        // somewhere in its first couple of KB (VOS / VOL / VOP / GOV);
+        // an MS stream has no such prefix anywhere. If we don't find
+        // one, refuse the packet with a clear dispatch hint.
+        if !self.format_verified {
+            if !crate::probe_is_mpeg4_part2(&packet.data) {
+                return Err(Error::unsupported(
+                    "mpeg4video: packet has no MPEG-4 Part 2 start code — \
+                     bitstream is likely MS-MPEG4 (DIV3 / MP43 / …). \
+                     Dispatch to oxideav-msmpeg4 instead.",
+                ));
+            }
+            self.format_verified = true;
+        }
         self.pending_pts = packet.pts;
         self.pending_tb = packet.time_base;
         self.buffer.extend_from_slice(&packet.data);
@@ -393,4 +417,84 @@ pub fn codec_parameters_from_vol(vol: &VideoObjectLayer) -> CodecParameters {
         params.frame_rate = Some(Rational::new(num, den));
     }
     params
+}
+
+#[cfg(test)]
+mod decoder_tests {
+    use super::*;
+    use oxideav_core::{CodecId, Packet, TimeBase};
+
+    /// The send_packet sniff rejects a stream whose first packet has no
+    /// 0x000001 start-code prefix — i.e. an MS-MPEG4 bitstream that was
+    /// mislabelled as MPEG-4 Part 2 by the container (typical AVI
+    /// FourCC mismatch: file stamped `XVID` but payload is DIV3-style).
+    #[test]
+    fn send_packet_rejects_msmpeg4_bitstream() {
+        let mut dec = Mpeg4VideoDecoder::new(CodecId::new(crate::CODEC_ID_STR));
+        // MS-MPEG4v3 picture header opens with `1` bit + quant — no
+        // 0x000001 start-code sequence anywhere.
+        let pkt = Packet::new(
+            0,
+            TimeBase::new(1, 90_000),
+            vec![0x85, 0x3F, 0xD4, 0x80, 0x00, 0xA2, 0x10, 0xFF],
+        );
+        let err = dec.send_packet(&pkt).expect_err("expected Unsupported");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no MPEG-4 Part 2 start code"),
+            "error should mention missing start code, got: {msg}",
+        );
+        assert!(
+            msg.to_lowercase().contains("msmpeg4"),
+            "error should dispatch to msmpeg4, got: {msg}",
+        );
+    }
+
+    /// A genuine MPEG-4 Part 2 elementary stream (starts with VOS start
+    /// code 0x000001B0) passes the sniff and reaches the normal parse
+    /// path — which will likely error further in (we're not feeding a
+    /// valid VOL here) but crucially NOT with the mislabel message.
+    #[test]
+    fn send_packet_accepts_iso_bitstream() {
+        let mut dec = Mpeg4VideoDecoder::new(CodecId::new(crate::CODEC_ID_STR));
+        // Visual Object Sequence start code with trailing junk.
+        let pkt = Packet::new(
+            0,
+            TimeBase::new(1, 90_000),
+            vec![0x00, 0x00, 0x01, 0xB0, 0x01, 0x00, 0x00, 0x01, 0xB5],
+        );
+        // The sniff must pass — further parsing may or may not
+        // succeed, but the mislabel-error must not fire.
+        let result = dec.send_packet(&pkt);
+        if let Err(e) = &result {
+            assert!(
+                !e.to_string().contains("no MPEG-4 Part 2 start code"),
+                "ISO bitstream wrongly rejected as mislabelled: {e}",
+            );
+        }
+    }
+
+    /// After the first successful sniff, format_verified stays `true`
+    /// and subsequent packets (even fragmented ones that don't
+    /// contain start codes in isolation) are accepted.
+    #[test]
+    fn sniff_only_runs_on_first_packet() {
+        let mut dec = Mpeg4VideoDecoder::new(CodecId::new(crate::CODEC_ID_STR));
+        let first = Packet::new(
+            0,
+            TimeBase::new(1, 90_000),
+            vec![0x00, 0x00, 0x01, 0xB0, 0x01],
+        );
+        let _ = dec.send_packet(&first);
+        // Second packet is coded-data continuation — no start code. Must
+        // not be flagged as mislabelled.
+        let second = Packet::new(0, TimeBase::new(1, 90_000), vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        let result = dec.send_packet(&second);
+        if let Err(e) = &result {
+            assert!(
+                !e.to_string().contains("no MPEG-4 Part 2 start code"),
+                "sniff wrongly re-ran on second packet: {e}",
+            );
+        }
+    }
 }
