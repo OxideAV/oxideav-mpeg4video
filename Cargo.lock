@@ -4,9 +4,9 @@ version = 3
 
 [[package]]
 name = "oxideav-codec"
-version = "0.0.4"
+version = "0.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "594f4f2bbd636179604dbf3d70612c07e8701c947a3cc42ede061d4c42fc8382"
+checksum = "1074db2188b3b41befb69ab1eea2ebc53480d320513afdff615384345e0d2076"
 dependencies = [
  "oxideav-core",
 ]
