@@ -4,6 +4,7 @@
 //! session. Placeholder modules are provided for the tables the follow-up
 //! (P/B-frame + motion compensation) will need, so the layout is stable.
 
+pub mod bvop;
 pub mod cbpy;
 pub mod dc_size;
 pub mod mcbpc;
