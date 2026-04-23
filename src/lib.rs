@@ -32,6 +32,7 @@
 
 pub mod bits_ext;
 pub mod block;
+pub mod bvop;
 pub mod decoder;
 pub mod encoder;
 pub mod headers;

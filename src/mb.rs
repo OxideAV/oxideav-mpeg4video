@@ -36,6 +36,7 @@ const DQUANT_DELTA: [i32; 4] = [-1, -2, 1, 2];
 
 /// Reconstructed I-VOP: three pel planes (Y, Cb, Cr) sized to the MB-aligned
 /// image. Planes are stride-packed (stride == width for each plane).
+#[derive(Clone)]
 pub struct IVopPicture {
     pub width: usize,
     pub height: usize,

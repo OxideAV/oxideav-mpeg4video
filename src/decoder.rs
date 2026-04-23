@@ -24,6 +24,7 @@ use oxideav_core::{
     VideoFrame,
 };
 
+use crate::bvop::{decode_b_mb, trb_trd, BMvGrid};
 use crate::headers::vol::{parse_vol, VideoObjectLayer};
 use crate::headers::vop::{parse_vop, VideoObjectPlane, VopCodingType};
 use crate::headers::vos::{parse_visual_object, parse_vos, VisualObject, VisualObjectSequence};
@@ -52,9 +53,28 @@ pub struct Mpeg4VideoDecoder {
     pending_pts: Option<i64>,
     pending_tb: TimeBase,
     eof: bool,
-    /// Last decoded reference picture — used as `prev_ref` for the next
-    /// P-VOP. Refreshed by each I-VOP and each P-VOP.
+    /// Forward reference picture — the last I/P VOP to be decoded. Used
+    /// as the "past" reference for both the next P-VOP and any B-VOPs
+    /// between two references.
     prev_ref: Option<IVopPicture>,
+    /// Backward reference — the P-VOP that was decoded AFTER `prev_ref`
+    /// in decode order. B-VOPs between them pull bidirectional samples
+    /// from this picture. When a B-VOP is decoded, `prev_ref` stays put
+    /// and `next_ref` stays put until the next I/P-VOP arrives, at which
+    /// point `prev_ref` is replaced by `next_ref` and `next_ref` by the
+    /// newly decoded picture.
+    next_ref: Option<IVopPicture>,
+    /// MV grid from `next_ref`, needed for B-VOP direct-mode co-location.
+    next_ref_mv_grid: Option<MvGrid>,
+    /// Absolute time (in VOP time-increment ticks accumulated across
+    /// modulo_time_base seconds) of `prev_ref` and `next_ref`. Used to
+    /// compute TRB/TRD for direct mode.
+    prev_ref_time: i64,
+    next_ref_time: i64,
+    /// Running second counter — sum of all `modulo_time_base` bits since
+    /// the start of the stream. Multiplied by `vop_time_increment_resolution`
+    /// to form the absolute tick count for each VOP.
+    absolute_base_seconds: i64,
     /// First-packet sniff: catches the mislabel case where a container
     /// tagged the stream as MPEG-4 Part 2 (XVID / DX50 / …) but the
     /// bytes are actually an MS-MPEG4 bitstream. `None` until the
@@ -76,8 +96,21 @@ impl Mpeg4VideoDecoder {
             pending_tb: TimeBase::new(1, 90_000),
             eof: false,
             prev_ref: None,
+            next_ref: None,
+            next_ref_mv_grid: None,
+            prev_ref_time: 0,
+            next_ref_time: 0,
+            absolute_base_seconds: 0,
             format_verified: false,
         }
+    }
+
+    /// Absolute tick-count for a VOP given its header. Uses the stored
+    /// `absolute_base_seconds` + any new `modulo_time_base` ticks.
+    fn vop_absolute_time(&mut self, vol: &VideoObjectLayer, vop: &VideoObjectPlane) -> i64 {
+        self.absolute_base_seconds += vop.modulo_time_base as i64;
+        let res = vol.vop_time_increment_resolution as i64;
+        self.absolute_base_seconds * res + vop.vop_time_increment as i64
     }
 
     pub fn vol(&self) -> Option<&VideoObjectLayer> {
@@ -147,11 +180,11 @@ impl Mpeg4VideoDecoder {
         br: &mut BitReader<'_>,
     ) -> Result<()> {
         if !vop.vop_coded {
-            // "Not coded" VOP (§6.2.5): the decoder must re-emit the previous
-            // reference frame at the new pts. The reference itself is not
-            // modified — the next coded VOP still predicts from the last
-            // coded picture.
-            if let Some(reference) = self.prev_ref.as_ref() {
+            // "Not coded" VOP (§6.2.5): the decoder must re-emit the most
+            // recently decoded picture at the new pts. The reference itself
+            // is not modified — the next coded VOP still predicts from the
+            // last coded picture.
+            if let Some(reference) = self.next_ref.as_ref().or(self.prev_ref.as_ref()) {
                 let frame = pic_to_video_frame(vol, reference, self.pending_pts, self.pending_tb);
                 self.ready_frames.push_back(frame);
             }
@@ -161,25 +194,68 @@ impl Mpeg4VideoDecoder {
             VopCodingType::I => {
                 let pic = decode_ivop_pic(vol, vop, br)?;
                 let frame = pic_to_video_frame(vol, &pic, self.pending_pts, self.pending_tb);
-                self.prev_ref = Some(pic);
+                let cur_time = self.vop_absolute_time(vol, vop);
+                // I-VOP promotes the existing `next_ref` into `prev_ref`, then
+                // becomes the new backward reference. B-VOPs following in
+                // decode order will look at this new pair.
+                self.rotate_refs(pic, None, cur_time);
                 self.ready_frames.push_back(frame);
                 Ok(())
             }
             VopCodingType::P => {
-                let Some(reference) = self.prev_ref.as_ref() else {
+                let Some(reference) = self.prev_ref.as_ref().or(self.next_ref.as_ref()) else {
                     return Err(Error::invalid("mpeg4 P-VOP: no reference frame yet"));
                 };
-                let pic = decode_pvop_pic(vol, vop, br, reference)?;
+                // When we already have a `next_ref`, use IT as the prev — the
+                // P-VOP in decode order is always predicted off the most
+                // recently decoded I/P. We clone the picture to avoid holding
+                // a borrow while we call `decode_pvop_pic` and later mutate
+                // `self.prev_ref`.
+                let ref_pic = match self.next_ref.as_ref() {
+                    Some(r) => r.clone(),
+                    None => reference.clone(),
+                };
+                let (pic, mv_grid) = decode_pvop_pic_with_grid(vol, vop, br, &ref_pic)?;
                 let frame = pic_to_video_frame(vol, &pic, self.pending_pts, self.pending_tb);
-                self.prev_ref = Some(pic);
+                let cur_time = self.vop_absolute_time(vol, vop);
+                self.rotate_refs(pic, Some(mv_grid), cur_time);
                 self.ready_frames.push_back(frame);
                 Ok(())
             }
-            VopCodingType::B => Err(Error::unsupported(
-                "mpeg4 B frames: follow-up (bidirectional MC)",
-            )),
+            VopCodingType::B => {
+                let Some(prev) = self.prev_ref.as_ref() else {
+                    return Err(Error::invalid("mpeg4 B-VOP: missing forward reference"));
+                };
+                let Some(next) = self.next_ref.as_ref() else {
+                    return Err(Error::invalid("mpeg4 B-VOP: missing backward reference"));
+                };
+                let prev = prev.clone();
+                let next = next.clone();
+                let co_grid = self.next_ref_mv_grid.clone();
+                let cur_time = self.vop_absolute_time(vol, vop);
+                let (trb, trd) = trb_trd(self.prev_ref_time, cur_time, self.next_ref_time);
+                let pic = decode_bvop_pic(vol, vop, br, &prev, &next, co_grid.as_ref(), trb, trd)?;
+                let frame = pic_to_video_frame(vol, &pic, self.pending_pts, self.pending_tb);
+                // B-VOPs never become references.
+                self.ready_frames.push_back(frame);
+                Ok(())
+            }
             VopCodingType::S => Err(Error::unsupported("mpeg4 S-VOP (sprite): out of scope")),
         }
+    }
+
+    /// Rotate the reference-pair: move the current `next_ref` into
+    /// `prev_ref`, and install the newly decoded I/P picture as the new
+    /// `next_ref`. Tracks timestamps in parallel.
+    fn rotate_refs(&mut self, pic: IVopPicture, mv_grid: Option<MvGrid>, cur_time: i64) {
+        if let Some(old_next) = self.next_ref.take() {
+            self.prev_ref = Some(old_next);
+            self.prev_ref_time = self.next_ref_time;
+            self.next_ref_mv_grid = None;
+        }
+        self.next_ref = Some(pic);
+        self.next_ref_mv_grid = mv_grid;
+        self.next_ref_time = cur_time;
     }
 }
 
@@ -279,6 +355,137 @@ pub fn decode_pvop_pic(
                 // Reset prediction state across packet boundaries.
                 pred_grid = PredGrid::new(mb_w, mb_h);
                 mv_grid = MvGrid::new(mb_w, mb_h);
+                if new_quant != 0 {
+                    quant = new_quant;
+                }
+                mb_idx = mb_num;
+                slice_first_mb = ((mb_idx as usize) % mb_w, (mb_idx as usize) / mb_w);
+            }
+        }
+    }
+    Ok(pic)
+}
+
+/// Variant of `decode_pvop_pic` that also returns the fully populated MV
+/// grid — B-VOPs need access to the co-located P-VOP MVs for direct-mode
+/// scaling.
+pub fn decode_pvop_pic_with_grid(
+    vol: &VideoObjectLayer,
+    vop: &VideoObjectPlane,
+    br: &mut BitReader<'_>,
+    reference: &IVopPicture,
+) -> Result<(IVopPicture, MvGrid)> {
+    let mb_w = vol.mb_width() as usize;
+    let mb_h = vol.mb_height() as usize;
+    let mut pic = IVopPicture::new(vol.width as usize, vol.height as usize);
+    let mut pred_grid = PredGrid::new(mb_w, mb_h);
+    let mut mv_grid = MvGrid::new(mb_w, mb_h);
+
+    let mb_total = (mb_w * mb_h) as u32;
+    let mut quant = vop.vop_quant;
+    let mut mb_idx: u32 = 0;
+    let mut slice_first_mb = (0usize, 0usize);
+    while (mb_idx as usize) < mb_w * mb_h {
+        let mb_x = (mb_idx as usize) % mb_w;
+        let mb_y = (mb_idx as usize) / mb_w;
+        quant = decode_p_mb(
+            br,
+            mb_x,
+            mb_y,
+            quant,
+            vol,
+            vop,
+            &mut pic,
+            &mut pred_grid,
+            &mut mv_grid,
+            reference,
+            slice_first_mb,
+        )
+        .map_err(|e| {
+            oxideav_core::Error::invalid(format!("mpeg4 P-VOP MB ({mb_x},{mb_y}): {e}"))
+        })?;
+        mb_idx += 1;
+        if (mb_idx as usize) >= mb_w * mb_h {
+            break;
+        }
+        match try_consume_resync_marker_after(br, vol, vop, mb_total, mb_idx)? {
+            ResyncResult::None => {}
+            ResyncResult::Resync { mb_num, new_quant } => {
+                if mb_num < mb_idx || mb_num >= mb_total {
+                    return Err(Error::invalid(format!(
+                        "mpeg4 P-VOP: resync mb_num={mb_num} not at or after current={mb_idx}"
+                    )));
+                }
+                pred_grid = PredGrid::new(mb_w, mb_h);
+                mv_grid = MvGrid::new(mb_w, mb_h);
+                if new_quant != 0 {
+                    quant = new_quant;
+                }
+                mb_idx = mb_num;
+                slice_first_mb = ((mb_idx as usize) % mb_w, (mb_idx as usize) / mb_w);
+            }
+        }
+    }
+    Ok((pic, mv_grid))
+}
+
+/// Decode a B-VOP relative to `prev_ref` (forward) and `next_ref`
+/// (backward). Returns the reconstructed picture.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_bvop_pic(
+    vol: &VideoObjectLayer,
+    vop: &VideoObjectPlane,
+    br: &mut BitReader<'_>,
+    prev_ref: &IVopPicture,
+    next_ref: &IVopPicture,
+    co_mv_grid: Option<&MvGrid>,
+    trb: i32,
+    trd: i32,
+) -> Result<IVopPicture> {
+    let mb_w = vol.mb_width() as usize;
+    let mb_h = vol.mb_height() as usize;
+    let mut pic = IVopPicture::new(vol.width as usize, vol.height as usize);
+    let mut bmv_grid = BMvGrid::new(mb_w, mb_h);
+
+    let mb_total = (mb_w * mb_h) as u32;
+    let mut quant = vop.vop_quant;
+    let mut mb_idx: u32 = 0;
+    let mut slice_first_mb = (0usize, 0usize);
+    while (mb_idx as usize) < mb_w * mb_h {
+        let mb_x = (mb_idx as usize) % mb_w;
+        let mb_y = (mb_idx as usize) / mb_w;
+        quant = decode_b_mb(
+            br,
+            mb_x,
+            mb_y,
+            quant,
+            vol,
+            vop,
+            &mut pic,
+            &mut bmv_grid,
+            prev_ref,
+            next_ref,
+            co_mv_grid,
+            trb,
+            trd,
+            slice_first_mb,
+        )
+        .map_err(|e| {
+            oxideav_core::Error::invalid(format!("mpeg4 B-VOP MB ({mb_x},{mb_y}): {e}"))
+        })?;
+        mb_idx += 1;
+        if (mb_idx as usize) >= mb_w * mb_h {
+            break;
+        }
+        match try_consume_resync_marker_after(br, vol, vop, mb_total, mb_idx)? {
+            ResyncResult::None => {}
+            ResyncResult::Resync { mb_num, new_quant } => {
+                if mb_num < mb_idx || mb_num >= mb_total {
+                    return Err(Error::invalid(format!(
+                        "mpeg4 B-VOP: resync mb_num={mb_num} not at or after current={mb_idx}"
+                    )));
+                }
+                bmv_grid = BMvGrid::new(mb_w, mb_h);
                 if new_quant != 0 {
                     quant = new_quant;
                 }
@@ -406,6 +613,11 @@ impl Decoder for Mpeg4VideoDecoder {
         self.pending_pts = None;
         self.eof = false;
         self.prev_ref = None;
+        self.next_ref = None;
+        self.next_ref_mv_grid = None;
+        self.prev_ref_time = 0;
+        self.next_ref_time = 0;
+        self.absolute_base_seconds = 0;
         Ok(())
     }
 }
