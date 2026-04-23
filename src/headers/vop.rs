@@ -132,7 +132,16 @@ pub fn parse_vop(br: &mut BitReader<'_>, vol: &VideoObjectLayer) -> Result<Video
     let intra_dc_vlc_thr = br.read_u32(3)? as u8;
 
     // VOP-level interlaced fields (§6.2.5). Present only when the VOL
-    // advertises `interlaced == 1`.
+    // advertises `interlaced == 1`. Note: per the ISO 14496-2 committee
+    // draft the VOP-level `interlaced` flag appears unconditionally in
+    // the VOP header for non-binary-only shapes; in practice every
+    // conforming encoder we've parsed gates it by the VOL flag, so the
+    // progressive-stream test suite is unaffected either way. We gate
+    // on `vol.interlaced` — that's the robust path for the XVID / FFmpeg
+    // encoders that emit `interlaced == 0` in the VOL when the stream
+    // is progressive. The follow-up interlaced MB decoder will also
+    // need `vol.interlaced` to know whether to emit
+    // `interlaced_information()` at the MB layer.
     let (interlaced, top_field_first, alternate_vertical_scan) = if vol.interlaced {
         let il = br.read_u1()? == 1;
         if il {

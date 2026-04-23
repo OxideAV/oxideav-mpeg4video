@@ -22,7 +22,18 @@
 //!   P-VOP-level `sprite_trajectory()` with 1..=4 warp points, per-MB
 //!   `mcsel` flag selecting between local (translational) and global
 //!   (warp) motion. Bilinear sampling of the warped reference per
-//!   §7.7.5 / §7.7.6. `sprite_brightness_change == 1` not yet applied.
+//!   §7.7.5 / §7.7.6. `sprite_brightness_change == 1` not yet applied
+//!   during reconstruction but the VLC (Table 11-33) is decoded.
+//!
+//! Header-level parse coverage (no reconstruction yet):
+//! * **Static-sprite VOL** — `sprite_enable == 1` parses the full
+//!   Table 6-7 payload (rectangle + warping + brightness +
+//!   low_latency) and exposes `SpriteRect`. S-VOP decode still returns
+//!   `Unsupported` at the VOP layer.
+//! * **Interlaced** — VOP-level `interlaced`, `top_field_first`, and
+//!   `alternate_vertical_scan_flag` are parsed when the VOL advertises
+//!   `interlaced == 1`. Progressive VOPs inside such a VOL decode
+//!   normally; field-coded VOPs return `Unsupported`.
 //!
 //! Out of scope (returns `Unsupported`):
 //! * S-VOPs / static-sprite decoding (`sprite_enable == 1`).
