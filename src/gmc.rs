@@ -632,6 +632,7 @@ mod tests {
             sprite_warping_accuracy: accuracy,
             sprite_brightness_change: false,
             low_latency_sprite_enable: false,
+            sprite_rect: None,
             not_8_bit: false,
             quant_precision: 5,
             bits_per_pixel: 8,

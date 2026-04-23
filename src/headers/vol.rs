@@ -37,6 +37,20 @@ pub enum ChromaFormat {
     Reserved(u8),
 }
 
+/// Static-sprite canvas rectangle (Table 6-7). Present in the VOL only
+/// when `sprite_enable == 1`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SpriteRect {
+    /// Sprite canvas width in luma pels.
+    pub width: u32,
+    /// Sprite canvas height in luma pels.
+    pub height: u32,
+    /// Sprite canvas left coordinate (signed 13-bit).
+    pub left: i32,
+    /// Sprite canvas top coordinate (signed 13-bit).
+    pub top: i32,
+}
+
 /// Parsed Video Object Layer header. Only the subset of fields this decoder
 /// consumes or exposes is stored — unparsed optional sub-blocks (scalability,
 /// sprite VOPs, complexity-estimation) are read-then-discarded.
@@ -92,6 +106,11 @@ pub struct VideoObjectLayer {
     /// `low_latency_sprite_enable`. Only meaningful for static-sprite
     /// mode (`sprite_enable == 1`); GMC uses regular P-VOPs.
     pub low_latency_sprite_enable: bool,
+    /// Static-sprite rectangle — `(width, height, left, top)` of the
+    /// sprite canvas as advertised by the VOL when `sprite_enable == 1`.
+    /// All four values are 13-bit unsigned / signed integers per Table
+    /// 6-7. `None` for `sprite_enable != 1`.
+    pub sprite_rect: Option<SpriteRect>,
     pub not_8_bit: bool,
     pub quant_precision: u8,
     pub bits_per_pixel: u8,
@@ -153,6 +172,18 @@ fn bits_needed(max_value: u32) -> u32 {
         return 1;
     }
     32 - max_value.leading_zeros()
+}
+
+/// Read a signed 13-bit two's-complement integer from the bitstream.
+/// Used for `sprite_left` / `sprite_top` (Table 6-7).
+fn read_signed_13(br: &mut BitReader<'_>) -> Result<i32> {
+    let raw = br.read_u32(13)? as i32;
+    // Sign-extend: bit 12 is the sign bit.
+    Ok(if raw & (1 << 12) != 0 {
+        raw - (1 << 13)
+    } else {
+        raw
+    })
 }
 
 fn parse_aspect_ratio(br: &mut BitReader<'_>) -> Result<AspectRatioInfo> {
@@ -290,18 +321,38 @@ pub fn parse_vol(br: &mut BitReader<'_>) -> Result<VideoObjectLayer> {
     let mut no_of_sprite_warping_points = 0u8;
     let mut sprite_warping_accuracy = 0u8;
     let mut sprite_brightness_change = false;
-    let low_latency_sprite_enable = false;
+    let mut low_latency_sprite_enable = false;
+    let mut sprite_rect = None;
     match sprite_enable {
         0 => { /* no sprite */ }
         1 => {
-            // Static sprite — not yet decoded. We do NOT consume the
-            // fields here; the caller will see `Unsupported`, which is
-            // the same outcome the pre-GMC implementation produced. If
-            // the decoder ever grows an S-VOP path we'll parse these in
-            // full at that time.
-            return Err(Error::unsupported(
-                "mpeg4 static-sprite VOLs (S-VOP path): follow-up",
-            ));
+            // Static sprite (§6.2.3 + Table 6-7). Parse the canvas
+            // rectangle + trajectory/accuracy/brightness fields so the
+            // VOL structure is fully exposed to consumers. The S-VOP
+            // decode path itself is rejected downstream.
+            let sprite_width = br.read_u32(13)?;
+            br.read_marker()?;
+            let sprite_height = br.read_u32(13)?;
+            br.read_marker()?;
+            let sprite_left = read_signed_13(br)?;
+            br.read_marker()?;
+            let sprite_top = read_signed_13(br)?;
+            br.read_marker()?;
+            sprite_rect = Some(SpriteRect {
+                width: sprite_width,
+                height: sprite_height,
+                left: sprite_left,
+                top: sprite_top,
+            });
+            no_of_sprite_warping_points = br.read_u32(6)? as u8;
+            if no_of_sprite_warping_points > 4 {
+                return Err(Error::invalid(format!(
+                    "mpeg4 static-sprite VOL: no_of_sprite_warping_points={no_of_sprite_warping_points} > 4"
+                )));
+            }
+            sprite_warping_accuracy = br.read_u32(2)? as u8;
+            sprite_brightness_change = br.read_u1()? == 1;
+            low_latency_sprite_enable = br.read_u1()? == 1;
         }
         2 => {
             // GMC-enabled — VOL carries only the trajectory-related
@@ -410,6 +461,7 @@ pub fn parse_vol(br: &mut BitReader<'_>) -> Result<VideoObjectLayer> {
         sprite_warping_accuracy,
         sprite_brightness_change,
         low_latency_sprite_enable,
+        sprite_rect,
         not_8_bit,
         quant_precision,
         bits_per_pixel,
@@ -549,14 +601,80 @@ mod tests {
     }
 
     #[test]
-    fn vol_parse_rejects_sprite_enable_1() {
-        // sprite_enable = 1 = static sprite (S-VOP path): not yet
-        // supported; parser must return Unsupported early so the
-        // rest of the VOL is not consumed speculatively.
-        let bytes = build_vol_bytes(1, 2);
+    fn vol_parse_accepts_sprite_enable_1() {
+        // sprite_enable = 1 = static sprite. The VOL parser now
+        // consumes the full sprite-rectangle + warping fields so
+        // downstream consumers see the whole VOL structure; actual
+        // S-VOP decode is still rejected at the decoder layer.
+        let bytes = build_vol_bytes_static_sprite(1, 2);
         let mut br = BitReader::new(&bytes);
-        let err = parse_vol(&mut br).unwrap_err();
-        assert!(err.to_string().contains("static-sprite"));
+        let vol = parse_vol(&mut br).expect("static-sprite VOL must parse");
+        assert_eq!(vol.sprite_enable, 1);
+        let rect = vol.sprite_rect.expect("sprite_rect populated");
+        // Test helper writes width=256, height=128, left=0, top=0.
+        assert_eq!(rect.width, 256);
+        assert_eq!(rect.height, 128);
+        assert_eq!(rect.left, 0);
+        assert_eq!(rect.top, 0);
+        assert_eq!(vol.no_of_sprite_warping_points, 1);
+        assert!(vol.low_latency_sprite_enable);
+    }
+
+    /// Build a VOL with `sprite_enable = 1` and a static-sprite
+    /// rectangle. Separate from `build_vol_bytes_ex` since the sprite
+    /// payload differs between sprite_enable=1 (rectangle + warping +
+    /// brightness + low_latency) and sprite_enable=2 (warping +
+    /// brightness only).
+    fn build_vol_bytes_static_sprite(warping_points: u8, verid: u8) -> Vec<u8> {
+        let mut bw = BitWriter::new();
+        bw.write_bits(0, 1); // random_accessible_vol
+        bw.write_bits(1, 8); // video_object_type_indication
+        bw.write_bits(1, 1); // is_object_layer_identifier
+        bw.write_bits(verid as u32, 4);
+        bw.write_bits(0, 3); // priority
+        bw.write_bits(1, 4); // aspect_ratio_info = square
+        bw.write_bits(0, 1); // vol_control_parameters
+        bw.write_bits(0, 2); // shape = rectangular
+        bw.write_bits(1, 1); // marker
+        bw.write_bits(30, 16); // vop_time_increment_resolution
+        bw.write_bits(1, 1); // marker
+        bw.write_bits(0, 1); // fixed_vop_rate
+        bw.write_bits(1, 1); // marker
+        bw.write_bits(32, 13); // width
+        bw.write_bits(1, 1); // marker
+        bw.write_bits(32, 13); // height
+        bw.write_bits(1, 1); // marker
+        bw.write_bits(0, 1); // interlaced
+        bw.write_bits(1, 1); // obmc_disable
+        // sprite_enable — 2 bits (verid != 1). Value 1 = static sprite.
+        bw.write_bits(1, 2);
+        // Static-sprite rectangle: width, height, left (signed), top (signed).
+        bw.write_bits(256, 13);
+        bw.write_bits(1, 1);
+        bw.write_bits(128, 13);
+        bw.write_bits(1, 1);
+        bw.write_bits(0, 13);
+        bw.write_bits(1, 1);
+        bw.write_bits(0, 13);
+        bw.write_bits(1, 1);
+        bw.write_bits(warping_points as u32, 6);
+        bw.write_bits(1, 2); // sprite_warping_accuracy = 1/4-pel
+        bw.write_bits(0, 1); // sprite_brightness_change
+        bw.write_bits(1, 1); // low_latency_sprite_enable
+        bw.write_bits(0, 1); // not_8_bit
+        bw.write_bits(0, 1); // mpeg_quant
+        if verid != 1 {
+            bw.write_bits(0, 1); // quarter_sample
+        }
+        bw.write_bits(1, 1); // complexity_estimation_disable
+        bw.write_bits(1, 1); // resync_marker_disable
+        bw.write_bits(0, 1); // data_partitioned
+        if verid != 1 {
+            bw.write_bits(0, 1); // newpred_enable
+            bw.write_bits(0, 1); // reduced_resolution_vop_enable
+        }
+        bw.write_bits(0, 1); // scalability
+        bw.finish()
     }
 
     #[test]

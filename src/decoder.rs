@@ -194,6 +194,17 @@ impl Mpeg4VideoDecoder {
         vop: &VideoObjectPlane,
         br: &mut BitReader<'_>,
     ) -> Result<()> {
+        // Static-sprite VOLs (`sprite_enable == 1`) carry an initial
+        // I-VOP that represents the entire sprite canvas (potentially
+        // bigger than the VOP rectangle), then a stream of S-VOPs that
+        // re-use the sprite via trajectory + optional piece updates.
+        // Neither the canvas-I-VOP sizing nor the S-VOP reconstruction
+        // path is implemented yet — reject cleanly at the VOP layer.
+        if vol.sprite_enable == 1 {
+            return Err(Error::unsupported(
+                "mpeg4 static-sprite (sprite_enable=1) VOP decode: follow-up",
+            ));
+        }
         if !vop.vop_coded {
             // "Not coded" VOP (§6.2.5): the decoder must re-emit the most
             // recently decoded picture at the new pts. The reference itself
