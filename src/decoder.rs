@@ -164,13 +164,20 @@ impl Mpeg4VideoDecoder {
                     if vol.data_partitioned {
                         return Err(Error::unsupported("mpeg4 data-partitioned VOL: follow-up"));
                     }
-                    if vol.interlaced {
-                        return Err(Error::unsupported(
-                            "mpeg4 interlaced field coding: follow-up",
-                        ));
-                    }
                     let mut br = BitReader::new(payload);
                     let vop = parse_vop(&mut br, &vol)?;
+                    // Interlaced streams parse cleanly through the header
+                    // layer, but field-coded MBs (dct_type / field_prediction)
+                    // aren't reconstructed yet — reject at the VOP layer
+                    // rather than at the VOL so progressive VOPs inside an
+                    // `interlaced == 1` VOL still decode. Per §6.2.5 the
+                    // VOL flag is permissive: it marks the VOL as "may
+                    // contain interlaced VOPs", not as a required mode.
+                    if vop.interlaced && vop.vop_coded {
+                        return Err(Error::unsupported(
+                            "mpeg4 interlaced field coding (VOP-level): follow-up",
+                        ));
+                    }
                     self.handle_vop(&vol, &vop, &mut br)?;
                 }
                 _ => {

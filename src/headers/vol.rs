@@ -315,11 +315,10 @@ pub fn parse_vol(br: &mut BitReader<'_>) -> Result<VideoObjectLayer> {
             }
             sprite_warping_accuracy = br.read_u32(2)? as u8;
             sprite_brightness_change = br.read_u1()? == 1;
-            if sprite_brightness_change {
-                return Err(Error::unsupported(
-                    "mpeg4 GMC sprite_brightness_change: follow-up",
-                ));
-            }
+            // `sprite_brightness_change == 1` is now permitted. When a
+            // GMC P-VOP carries this flag the VOP header includes a
+            // `brightness_change_factor()` VLC (§6.2.5.6 / Table 11-33);
+            // the factor is applied during warp-sample reconstruction.
         }
         _ => {
             return Err(Error::invalid(format!(
@@ -491,6 +490,17 @@ mod tests {
     /// Helper: build a minimal VOL payload with the given sprite_enable
     /// and verid so we can exercise the GMC-path branches.
     fn build_vol_bytes(sprite_enable: u8, verid: u8) -> Vec<u8> {
+        build_vol_bytes_ex(sprite_enable, verid, false, false)
+    }
+
+    /// Extended helper: additionally toggles `sprite_brightness_change`
+    /// and VOL-level `interlaced` so we can exercise the new parse paths.
+    fn build_vol_bytes_ex(
+        sprite_enable: u8,
+        verid: u8,
+        brightness: bool,
+        interlaced: bool,
+    ) -> Vec<u8> {
         let mut bw = BitWriter::new();
         bw.write_bits(0, 1); // random_accessible_vol
         bw.write_bits(1, 8); // video_object_type_indication = 1
@@ -509,7 +519,7 @@ mod tests {
         bw.write_bits(1, 1); // marker
         bw.write_bits(32, 13); // height
         bw.write_bits(1, 1); // marker
-        bw.write_bits(0, 1); // interlaced
+        bw.write_bits(if interlaced { 1 } else { 0 }, 1); // interlaced
         bw.write_bits(1, 1); // obmc_disable
         // sprite_enable — 1 bit in verid==1, 2 bits otherwise.
         if verid == 1 {
@@ -520,7 +530,7 @@ mod tests {
         if sprite_enable == 2 {
             bw.write_bits(2, 6); // no_of_sprite_warping_points = 2
             bw.write_bits(1, 2); // sprite_warping_accuracy = 1/4-pel
-            bw.write_bits(0, 1); // sprite_brightness_change = 0
+            bw.write_bits(if brightness { 1 } else { 0 }, 1); // sprite_brightness_change
         }
         bw.write_bits(0, 1); // not_8_bit
         bw.write_bits(0, 1); // mpeg_quant
@@ -560,6 +570,29 @@ mod tests {
         assert_eq!(vol.no_of_sprite_warping_points, 2);
         assert_eq!(vol.sprite_warping_accuracy, 1);
         assert!(!vol.sprite_brightness_change);
+    }
+
+    #[test]
+    fn vol_parse_accepts_sprite_brightness_change() {
+        // Previously any sprite_enable=2 stream with sprite_brightness_change=1
+        // was rejected as unsupported. After the brightness_change_factor
+        // VLC landed, the VOL parser simply records the flag and leaves
+        // application to the VOP-level / warp-reconstruction code.
+        let bytes = build_vol_bytes_ex(2, 2, true, false);
+        let mut br = BitReader::new(&bytes);
+        let vol = parse_vol(&mut br).expect("sprite_brightness_change=1 must parse");
+        assert!(vol.sprite_brightness_change);
+        assert_eq!(vol.sprite_enable, 2);
+    }
+
+    #[test]
+    fn vol_parse_accepts_interlaced_flag() {
+        // VOL-level interlaced=1 must parse cleanly (decoder-level rejection
+        // of field-coded MBs happens at the VOP layer, not the VOL).
+        let bytes = build_vol_bytes_ex(0, 2, false, true);
+        let mut br = BitReader::new(&bytes);
+        let vol = parse_vol(&mut br).expect("interlaced VOL must parse");
+        assert!(vol.interlaced);
     }
 
     #[test]

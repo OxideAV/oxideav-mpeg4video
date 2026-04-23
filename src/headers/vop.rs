@@ -41,6 +41,22 @@ pub struct VideoObjectPlane {
     /// `sprite_enable == 2` (GMC) and this VOP is a P-VOP with
     /// `no_of_sprite_warping_points > 0`. `None` otherwise.
     pub sprite_trajectory: Option<SpriteTrajectory>,
+    /// VOP-level interlaced flag (§6.2.5). Only present when the VOL
+    /// advertises `interlaced == 1`. When set, the VOP may contain
+    /// interlaced (field-coded) macroblocks alongside progressive ones.
+    pub interlaced: bool,
+    /// `top_field_first` — only meaningful when `interlaced == true`.
+    /// 1 = the top field is displayed first, 0 = bottom field first.
+    pub top_field_first: bool,
+    /// `alternate_vertical_scan_flag` — only meaningful when
+    /// `interlaced == true`. When set, interlaced intra blocks use the
+    /// alternate-vertical scan (Table 7-3c) instead of zigzag.
+    pub alternate_vertical_scan: bool,
+    /// Brightness-change factor decoded when the VOL advertises
+    /// `sprite_brightness_change == 1` AND this VOP is an S-VOP. The
+    /// value is in 1/100ths; sample reconstruction multiplies by
+    /// `(factor * 0.01 + 1)`. 0 when absent.
+    pub brightness_change_factor: i32,
 }
 
 /// Parse the VOP header that follows a 0x000001B6 start code.
@@ -88,6 +104,10 @@ pub fn parse_vop(br: &mut BitReader<'_>, vol: &VideoObjectLayer) -> Result<Video
             width: vol.width,
             height: vol.height,
             sprite_trajectory: None,
+            interlaced: false,
+            top_field_first: false,
+            alternate_vertical_scan: false,
+            brightness_change_factor: 0,
         });
     }
 
@@ -110,6 +130,21 @@ pub fn parse_vop(br: &mut BitReader<'_>, vol: &VideoObjectLayer) -> Result<Video
 
     // intra_dc_vlc_thr — 3 bits.
     let intra_dc_vlc_thr = br.read_u32(3)? as u8;
+
+    // VOP-level interlaced fields (§6.2.5). Present only when the VOL
+    // advertises `interlaced == 1`.
+    let (interlaced, top_field_first, alternate_vertical_scan) = if vol.interlaced {
+        let il = br.read_u1()? == 1;
+        if il {
+            let tff = br.read_u1()? == 1;
+            let avs = br.read_u1()? == 1;
+            (il, tff, avs)
+        } else {
+            (false, false, false)
+        }
+    } else {
+        (false, false, false)
+    };
 
     // vop_quant — quant_precision bits (default 5).
     let vop_quant = br.read_u32(vol.quant_precision as u32)?;
@@ -154,5 +189,9 @@ pub fn parse_vop(br: &mut BitReader<'_>, vol: &VideoObjectLayer) -> Result<Video
         width: vol.width,
         height: vol.height,
         sprite_trajectory,
+        interlaced,
+        top_field_first,
+        alternate_vertical_scan,
+        brightness_change_factor: 0,
     })
 }

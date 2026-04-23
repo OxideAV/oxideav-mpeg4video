@@ -124,6 +124,72 @@ pub struct SpriteTrajectory {
     // dv[i] pair in the bitstream; we consume and ignore it.
 }
 
+/// Decode `brightness_change_factor()` (§6.2.6 / Table 11-33). Returns
+/// the signed factor value in 1/100th of a multiplicative unit (the
+/// sample reconstruction applies `Y * (factor * 0.01 + 1)` per §7.7.6).
+///
+/// VLC layout (Table 11-33):
+///   `0`    -> size 5, range -16..-1, 1..16       (FLC 5 bits)
+///   `10`   -> size 6, range -48..-17, 17..48     (FLC 6 bits)
+///   `110`  -> size 7, range -112..-49, 49..112   (FLC 7 bits)
+///   `1110` -> size 9, range 113..624             (FLC 9 bits, sign implied positive)
+///   `1111` -> size 10, range 625..1648           (FLC 10 bits, sign implied positive)
+///
+/// For size 5..=7 the FLC is an `i(size)`-style signed two's-complement
+/// code with the MSB being the sign bit (1 = positive). Size 9 and 10
+/// entries are always positive magnitudes added to a base offset.
+pub fn decode_brightness_change_factor(br: &mut BitReader<'_>) -> Result<i32> {
+    let bit0 = br.read_u1()?;
+    if bit0 == 0 {
+        // "0" -> size 5, FLC 5 bits, signed (MSB sign-bit style).
+        let flc = br.read_u32(5)? as i32;
+        // MSB of flc is the sign: 1 -> positive, 0 -> negative.
+        let val = if flc & 0b10000 != 0 {
+            // Positive: value = (flc & 0x0F) + 1 -> range 1..=16.
+            (flc & 0x0F) + 1
+        } else {
+            // Negative: value = -((flc & 0x0F) + 1) -> range -16..=-1.
+            -((flc & 0x0F) + 1)
+        };
+        return Ok(val);
+    }
+    let bit1 = br.read_u1()?;
+    if bit1 == 0 {
+        // "10" -> size 6, FLC 6 bits, signed.
+        let flc = br.read_u32(6)? as i32;
+        let val = if flc & 0b100000 != 0 {
+            // Positive range 17..=48.
+            (flc & 0x1F) + 17
+        } else {
+            // Negative range -48..=-17.
+            -((flc & 0x1F) + 17)
+        };
+        return Ok(val);
+    }
+    let bit2 = br.read_u1()?;
+    if bit2 == 0 {
+        // "110" -> size 7, FLC 7 bits, signed.
+        let flc = br.read_u32(7)? as i32;
+        let val = if flc & 0b1000000 != 0 {
+            // Positive range 49..=112.
+            (flc & 0x3F) + 49
+        } else {
+            // Negative range -112..=-49.
+            -((flc & 0x3F) + 49)
+        };
+        return Ok(val);
+    }
+    let bit3 = br.read_u1()?;
+    if bit3 == 0 {
+        // "1110" -> size 9 magnitude, positive, range 113..=624.
+        let flc = br.read_u32(9)? as i32;
+        return Ok(113 + flc);
+    }
+    // "1111" -> size 10 magnitude, positive, range 625..=1648.
+    let flc = br.read_u32(10)? as i32;
+    Ok(625 + flc)
+}
+
 /// Parse `sprite_trajectory()` (§6.2.6): `no_of_sprite_warping_points`
 /// pairs of `(du[i], dv[i])` magnitudes, each trailed by a marker bit
 /// that separates the two components and guards against start-code
@@ -675,6 +741,67 @@ mod tests {
         let mut br = BitReader::new(&data);
         let v = decode_warping_mv(&mut br).unwrap();
         assert_eq!(v, 4);
+    }
+
+    #[test]
+    fn brightness_change_factor_small_values() {
+        // Size-5 entry "0" + FLC 5 bits.
+        // Positive +1: "0" prefix, FLC MSB=1, lower 4 bits = 0000 -> value = 0+1 = 1.
+        // Bits: "0 10000" = 010000 00 -> 0x40.
+        let data = [0b0_10000_00u8, 0xFF];
+        let mut br = BitReader::new(&data);
+        let v = decode_brightness_change_factor(&mut br).unwrap();
+        assert_eq!(v, 1);
+
+        // Positive +16: FLC MSB=1, lower 4 bits = 1111 -> value = 15+1 = 16.
+        // Bits: "0 11111" = 011111 00.
+        let data = [0b0_11111_00u8, 0xFF];
+        let mut br = BitReader::new(&data);
+        let v = decode_brightness_change_factor(&mut br).unwrap();
+        assert_eq!(v, 16);
+
+        // Negative -1: FLC MSB=0, lower 4 bits = 0000 -> value = -(0+1) = -1.
+        // Bits: "0 00000" = 000000 00.
+        let data = [0b0_00000_00u8, 0xFF];
+        let mut br = BitReader::new(&data);
+        let v = decode_brightness_change_factor(&mut br).unwrap();
+        assert_eq!(v, -1);
+    }
+
+    #[test]
+    fn brightness_change_factor_medium_values() {
+        // Size-6 entry "10" + FLC 6 bits.
+        // Positive +17 is smallest of range: FLC MSB=1, lower 5 = 00000 -> 0+17 = 17.
+        // Bits: "10 100000" = 10100000 -> 0xA0.
+        let data = [0b10_100000u8, 0xFF];
+        let mut br = BitReader::new(&data);
+        let v = decode_brightness_change_factor(&mut br).unwrap();
+        assert_eq!(v, 17);
+
+        // Negative -17: FLC MSB=0, lower 5 = 00000 -> -(0+17) = -17.
+        // Bits: "10 000000" = 10000000 -> 0x80.
+        let data = [0b10_000000u8, 0xFF];
+        let mut br = BitReader::new(&data);
+        let v = decode_brightness_change_factor(&mut br).unwrap();
+        assert_eq!(v, -17);
+    }
+
+    #[test]
+    fn brightness_change_factor_large_values() {
+        // Size-9 entry "1110" + 9-bit FLC magnitude added to 113.
+        // Value 113: "1110" + 000000000 -> bits 1110 0000 0000 0 -> pad: 11100000 00000000 = 0xE0 0x00.
+        let data = [0b1110_0000u8, 0b0000_0000u8, 0xFF];
+        let mut br = BitReader::new(&data);
+        let v = decode_brightness_change_factor(&mut br).unwrap();
+        assert_eq!(v, 113);
+
+        // Size-10 entry "1111" + 10-bit FLC magnitude added to 625.
+        // Value 625: "1111" + 0000000000 -> bits 1111 0000 0000 00 pad.
+        // 14 bits: 11110000 00000000 -> 0xF0 0x00.
+        let data = [0b1111_0000u8, 0b0000_0000u8, 0xFF];
+        let mut br = BitReader::new(&data);
+        let v = decode_brightness_change_factor(&mut br).unwrap();
+        assert_eq!(v, 625);
     }
 
     #[test]

@@ -339,6 +339,10 @@ mod tests {
             width: 64,
             height: 64,
             sprite_trajectory: None,
+            interlaced: false,
+            top_field_first: false,
+            alternate_vertical_scan: false,
+            brightness_change_factor: 0,
         }
     }
 }
