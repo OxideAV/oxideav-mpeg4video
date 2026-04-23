@@ -11,8 +11,12 @@
 //! * Holds one reference picture (`prev_ref`) — refreshed by each I-VOP and
 //!   each newly-reconstructed P-VOP.
 //!
+//! * **Decodes B-VOPs** — direct / forward / backward / interpolated
+//!   modes, co-located MV scaling (TRB/TRD), dual-reference forward+
+//!   backward motion compensation.
+//!
 //! Out of scope (returns `Error::Unsupported`):
-//! * B-VOPs, S-VOPs (sprites), GMC.
+//! * S-VOPs (sprites), GMC.
 //! * Interlaced field coding, scalability, data partitioning.
 
 use std::collections::VecDeque;

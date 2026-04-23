@@ -15,8 +15,10 @@
 //! * One reference frame held in the decoder; refreshed by each
 //!   I-VOP/P-VOP.
 //!
+//! * **B-VOP** decode — bidirectional prediction with Direct / Forward /
+//!   Backward / Interpolated modes and co-located MV scaling (§7.6.5).
+//!
 //! Out of scope (returns `Unsupported`):
-//! * B-VOPs (bidirectional prediction).
 //! * S-VOPs (sprites), GMC.
 //! * Interlaced field coding, scalability, data partitioning, reversible
 //!   VLCs.
