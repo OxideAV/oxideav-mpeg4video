@@ -338,6 +338,7 @@ mod tests {
             vop_fcode_backward: 0,
             width: 64,
             height: 64,
+            sprite_trajectory: None,
         }
     }
 }

@@ -29,6 +29,7 @@ use oxideav_core::{
 };
 
 use crate::bvop::{decode_b_mb, trb_trd, BMvGrid};
+use crate::gmc::WarpParams;
 use crate::headers::vol::{parse_vol, VideoObjectLayer};
 use crate::headers::vop::{parse_vop, VideoObjectPlane, VopCodingType};
 use crate::headers::vos::{parse_visual_object, parse_vos, VisualObject, VisualObjectSequence};
@@ -321,6 +322,11 @@ pub fn decode_pvop_pic(
     let mut pred_grid = PredGrid::new(mb_w, mb_h);
     let mut mv_grid = MvGrid::new(mb_w, mb_h);
 
+    let warp = vop
+        .sprite_trajectory
+        .as_ref()
+        .map(|t| WarpParams::from_trajectory(t, vol));
+
     let mb_total = (mb_w * mb_h) as u32;
     let mut quant = vop.vop_quant;
     let mut mb_idx: u32 = 0;
@@ -340,6 +346,7 @@ pub fn decode_pvop_pic(
             &mut mv_grid,
             reference,
             slice_first_mb,
+            warp.as_ref(),
         )
         .map_err(|e| {
             oxideav_core::Error::invalid(format!("mpeg4 P-VOP MB ({mb_x},{mb_y}): {e}"))
@@ -385,6 +392,11 @@ pub fn decode_pvop_pic_with_grid(
     let mut pred_grid = PredGrid::new(mb_w, mb_h);
     let mut mv_grid = MvGrid::new(mb_w, mb_h);
 
+    let warp = vop
+        .sprite_trajectory
+        .as_ref()
+        .map(|t| WarpParams::from_trajectory(t, vol));
+
     let mb_total = (mb_w * mb_h) as u32;
     let mut quant = vop.vop_quant;
     let mut mb_idx: u32 = 0;
@@ -404,6 +416,7 @@ pub fn decode_pvop_pic_with_grid(
             &mut mv_grid,
             reference,
             slice_first_mb,
+            warp.as_ref(),
         )
         .map_err(|e| {
             oxideav_core::Error::invalid(format!("mpeg4 P-VOP MB ({mb_x},{mb_y}): {e}"))

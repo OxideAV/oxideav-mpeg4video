@@ -3,6 +3,7 @@
 use oxideav_core::{Error, Result};
 
 use crate::bits_ext::BitReaderExt;
+use crate::gmc::{decode_sprite_trajectory, SpriteTrajectory};
 use crate::headers::vol::{ShapeType, VideoObjectLayer};
 use oxideav_core::bits::BitReader;
 
@@ -36,6 +37,10 @@ pub struct VideoObjectPlane {
     /// caller still receives the values here.
     pub width: u32,
     pub height: u32,
+    /// GMC sprite trajectory — present only when the VOL advertises
+    /// `sprite_enable == 2` (GMC) and this VOP is a P-VOP with
+    /// `no_of_sprite_warping_points > 0`. `None` otherwise.
+    pub sprite_trajectory: Option<SpriteTrajectory>,
 }
 
 /// Parse the VOP header that follows a 0x000001B6 start code.
@@ -82,6 +87,7 @@ pub fn parse_vop(br: &mut BitReader<'_>, vol: &VideoObjectLayer) -> Result<Video
             vop_fcode_backward: 0,
             width: vol.width,
             height: vol.height,
+            sprite_trajectory: None,
         });
     }
 
@@ -121,6 +127,20 @@ pub fn parse_vop(br: &mut BitReader<'_>, vol: &VideoObjectLayer) -> Result<Video
         fcode_bwd = br.read_u32(3)? as u8;
     }
 
+    // GMC trajectory (§7.7.4 amendment). When the VOL uses
+    // `sprite_enable == 2` and the current VOP is a P-VOP, the next
+    // `no_of_sprite_warping_points` trajectory pairs follow the fcode
+    // field and precede the MB-layer. S-VOPs carry the same trajectory
+    // but we don't decode S-VOPs yet.
+    let sprite_trajectory =
+        if vol.sprite_enable == 2 && vop_coding_type == VopCodingType::P
+            && vol.no_of_sprite_warping_points > 0
+        {
+            Some(decode_sprite_trajectory(br, vol)?)
+        } else {
+            None
+        };
+
     Ok(VideoObjectPlane {
         vop_coding_type,
         modulo_time_base,
@@ -133,5 +153,6 @@ pub fn parse_vop(br: &mut BitReader<'_>, vol: &VideoObjectLayer) -> Result<Video
         vop_fcode_backward: fcode_bwd,
         width: vol.width,
         height: vol.height,
+        sprite_trajectory,
     })
 }

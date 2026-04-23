@@ -22,6 +22,7 @@ use crate::block::{
     decode_intra_ac, decode_intra_dc_diff, reconstruct_inter_block, reconstruct_intra_block,
     record_ac_prediction_cache, BlockNeighbour, PredDir,
 };
+use crate::gmc::{warp_predict_chroma_block, warp_predict_luma_block, WarpParams};
 use crate::headers::vol::VideoObjectLayer;
 use crate::headers::vop::VideoObjectPlane;
 use crate::iq::{dc_scaler, INTRA_DC_VLC_THR_TABLE};
@@ -314,6 +315,11 @@ pub fn predict_mv(
 ///
 /// `slice_first_mb` is the (mb_x, mb_y) of the first MB in the current
 /// video packet. Used for first-slice-line MV prediction (§7.6.2).
+///
+/// `warp` carries the precomputed per-VOP global-motion transform when
+/// `vol.sprite_enable == 2` — in that case single-MV inter MBs read
+/// an extra `mcsel` bit; `mcsel == 1` MBs skip local MV decode and
+/// take their prediction from `warp_predict_*_block`.
 #[allow(clippy::too_many_arguments)]
 pub fn decode_p_mb(
     br: &mut BitReader<'_>,
@@ -327,6 +333,7 @@ pub fn decode_p_mb(
     mv_grid: &mut MvGrid,
     reference: &IVopPicture,
     slice_first_mb: (usize, usize),
+    warp: Option<&WarpParams>,
 ) -> Result<u32> {
     // 1. not_coded — 1-bit flag (§6.3.5).
     let not_coded = br.read_u1()? == 1;
@@ -373,7 +380,22 @@ pub fn decode_p_mb(
         quant = new_q.clamp(1, 31) as u32;
     }
 
-    // 6. Motion vectors (skip for intra MBs).
+    // 5b. GMC `mcsel` flag (§7.7 amendment). Present only when the VOL
+    // advertises `sprite_enable == 2` AND the MB type is Inter / InterQ
+    // (single-MV). The bit signals that the MB should be reconstructed
+    // by warping the reference through the global transform rather than
+    // by translational MC. `mcsel == 1` macroblocks omit the local MV
+    // component pair from the bitstream. 4MV and Intra MBs never carry
+    // mcsel.
+    let gmc_mb = if vol.sprite_enable == 2
+        && matches!(mb_type, mcbpc::PMbType::Inter | mcbpc::PMbType::InterQ)
+    {
+        br.read_u1()? == 1
+    } else {
+        false
+    };
+
+    // 6. Motion vectors (skip for intra MBs and for GMC-coded MBs).
     let mut motion = MbMotion::default();
     let four_mv = matches!(
         mb_type,
@@ -381,7 +403,13 @@ pub fn decode_p_mb(
     );
     let is_intra = matches!(mb_type, mcbpc::PMbType::Intra | mcbpc::PMbType::IntraQ);
 
-    if !is_intra {
+    if is_intra {
+        // Intra MB carries (0,0) as future neighbour predictor.
+        mv_grid.set(mb_x, mb_y, MbMotion::default());
+    } else if gmc_mb {
+        // GMC MB — no MV in bitstream. MV predictor neighbours see (0,0).
+        mv_grid.set(mb_x, mb_y, MbMotion::default());
+    } else {
         let f_code = vop.vop_fcode_forward.max(1);
         if four_mv {
             motion.four_mv = true;
@@ -423,9 +451,6 @@ pub fn decode_p_mb(
             motion.four_mv = false;
             mv_grid.set(mb_x, mb_y, motion);
         }
-    } else {
-        // Intra MB carries (0,0) as future neighbour predictor.
-        mv_grid.set(mb_x, mb_y, MbMotion::default());
     }
 
     // 7. Texture: per-block luma + chroma decode.
@@ -462,9 +487,24 @@ pub fn decode_p_mb(
         let blk_px = (mb_x * 16 + sub_x) as i32;
         let blk_py = (mb_y * 16 + sub_y) as i32;
 
-        // Build prediction block. Luma uses the VOL-wide pel precision.
+        // Build prediction block. Three paths:
+        //   * GMC — inverse-map through the global warp.
+        //   * QPel translational — 8-tap + bilinear (§7.6.2.2).
+        //   * Half-pel translational — bilinear (§7.6.2.1).
         let mut pred_buf = [0u8; 64];
-        if vol.quarter_sample {
+        if gmc_mb {
+            let warp = warp.expect("GMC MB but no warp params");
+            warp_predict_luma_block(
+                warp,
+                &reference.y,
+                reference.y_stride,
+                blk_px,
+                blk_py,
+                8,
+                &mut pred_buf,
+                8,
+            );
+        } else if vol.quarter_sample {
             predict_block_qpel(
                 &reference.y,
                 reference.y_stride,
@@ -538,20 +578,34 @@ pub fn decode_p_mb(
         let blk_px = (mb_x * 8) as i32;
         let blk_py = (mb_y * 8) as i32;
         let mut pred_buf = [0u8; 64];
-        predict_block(
-            ref_plane,
-            ref_stride,
-            ref_stride as i32,
-            (ref_plane.len() / ref_stride) as i32,
-            blk_px,
-            blk_py,
-            cmx,
-            cmy,
-            8,
-            vop.rounding_type,
-            &mut pred_buf,
-            8,
-        );
+        if gmc_mb {
+            let warp = warp.expect("GMC chroma MB but no warp params");
+            warp_predict_chroma_block(
+                warp,
+                ref_plane,
+                ref_stride,
+                blk_px,
+                blk_py,
+                8,
+                &mut pred_buf,
+                8,
+            );
+        } else {
+            predict_block(
+                ref_plane,
+                ref_stride,
+                ref_stride as i32,
+                (ref_plane.len() / ref_stride) as i32,
+                blk_px,
+                blk_py,
+                cmx,
+                cmy,
+                8,
+                vop.rounding_type,
+                &mut pred_buf,
+                8,
+            );
+        }
         let coded = chroma_coded[plane_idx];
         let mut residual = [0i32; 64];
         let dst_off = (blk_py as usize) * pic.c_stride + (blk_px as usize);

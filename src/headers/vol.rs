@@ -476,6 +476,7 @@ impl VideoObjectLayer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oxideav_core::bits::BitWriter;
 
     #[test]
     fn bits_needed_basic() {
@@ -485,5 +486,88 @@ mod tests {
         assert_eq!(bits_needed(9), 4);
         assert_eq!(bits_needed(15), 4);
         assert_eq!(bits_needed(16), 5);
+    }
+
+    /// Helper: build a minimal VOL payload with the given sprite_enable
+    /// and verid so we can exercise the GMC-path branches.
+    fn build_vol_bytes(sprite_enable: u8, verid: u8) -> Vec<u8> {
+        let mut bw = BitWriter::new();
+        bw.write_bits(0, 1); // random_accessible_vol
+        bw.write_bits(1, 8); // video_object_type_indication = 1
+        bw.write_bits(1, 1); // is_object_layer_identifier
+        bw.write_bits(verid as u32, 4); // verid
+        bw.write_bits(0, 3); // priority
+        bw.write_bits(1, 4); // aspect_ratio_info = square
+        bw.write_bits(0, 1); // vol_control_parameters
+        bw.write_bits(0, 2); // shape = rectangular
+        bw.write_bits(1, 1); // marker
+        bw.write_bits(30, 16); // vop_time_increment_resolution
+        bw.write_bits(1, 1); // marker
+        bw.write_bits(0, 1); // fixed_vop_rate
+        bw.write_bits(1, 1); // marker
+        bw.write_bits(32, 13); // width
+        bw.write_bits(1, 1); // marker
+        bw.write_bits(32, 13); // height
+        bw.write_bits(1, 1); // marker
+        bw.write_bits(0, 1); // interlaced
+        bw.write_bits(1, 1); // obmc_disable
+        // sprite_enable — 1 bit in verid==1, 2 bits otherwise.
+        if verid == 1 {
+            bw.write_bits(sprite_enable as u32, 1);
+        } else {
+            bw.write_bits(sprite_enable as u32, 2);
+        }
+        if sprite_enable == 2 {
+            bw.write_bits(2, 6); // no_of_sprite_warping_points = 2
+            bw.write_bits(1, 2); // sprite_warping_accuracy = 1/4-pel
+            bw.write_bits(0, 1); // sprite_brightness_change = 0
+        }
+        bw.write_bits(0, 1); // not_8_bit
+        bw.write_bits(0, 1); // mpeg_quant
+        if verid != 1 {
+            bw.write_bits(0, 1); // quarter_sample
+        }
+        bw.write_bits(1, 1); // complexity_estimation_disable
+        bw.write_bits(1, 1); // resync_marker_disable
+        bw.write_bits(0, 1); // data_partitioned
+        if verid != 1 {
+            bw.write_bits(0, 1); // newpred_enable
+            bw.write_bits(0, 1); // reduced_resolution_vop_enable
+        }
+        bw.write_bits(0, 1); // scalability
+        bw.finish()
+    }
+
+    #[test]
+    fn vol_parse_rejects_sprite_enable_1() {
+        // sprite_enable = 1 = static sprite (S-VOP path): not yet
+        // supported; parser must return Unsupported early so the
+        // rest of the VOL is not consumed speculatively.
+        let bytes = build_vol_bytes(1, 2);
+        let mut br = BitReader::new(&bytes);
+        let err = parse_vol(&mut br).unwrap_err();
+        assert!(err.to_string().contains("static-sprite"));
+    }
+
+    #[test]
+    fn vol_parse_accepts_sprite_enable_2_gmc() {
+        // sprite_enable = 2 = GMC. Parser must succeed and expose
+        // the warping-point count + accuracy.
+        let bytes = build_vol_bytes(2, 2);
+        let mut br = BitReader::new(&bytes);
+        let vol = parse_vol(&mut br).expect("GMC VOL must parse");
+        assert_eq!(vol.sprite_enable, 2);
+        assert_eq!(vol.no_of_sprite_warping_points, 2);
+        assert_eq!(vol.sprite_warping_accuracy, 1);
+        assert!(!vol.sprite_brightness_change);
+    }
+
+    #[test]
+    fn vol_parse_rejects_reserved_sprite_enable_3() {
+        // sprite_enable = 3 is reserved — parser must flag invalid.
+        let bytes = build_vol_bytes(3, 2);
+        let mut br = BitReader::new(&bytes);
+        let err = parse_vol(&mut br).unwrap_err();
+        assert!(err.to_string().contains("reserved sprite_enable=3"));
     }
 }
