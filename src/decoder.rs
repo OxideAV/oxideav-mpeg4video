@@ -7,7 +7,10 @@
 //! * **Decodes I-VOPs** — full intra path (DC+AC VLCs, AC/DC prediction,
 //!   H.263 + MPEG-4 dequantisation, IDCT).
 //! * **Decodes P-VOPs** — half-pel motion compensation, 1MV / 4MV modes,
-//!   inter texture decode, MV-median prediction, and skipped MBs.
+//!   inter texture decode, MV-median prediction, and skipped MBs. GMC
+//!   (global motion) supported when VOL advertises `sprite_enable == 2`:
+//!   per-VOP sprite_trajectory() decoded, per-MB mcsel flag picks
+//!   between local MV + warp paths.
 //! * Holds one reference picture (`prev_ref`) — refreshed by each I-VOP and
 //!   each newly-reconstructed P-VOP.
 //!
@@ -16,7 +19,7 @@
 //!   backward motion compensation.
 //!
 //! Out of scope (returns `Error::Unsupported`):
-//! * S-VOPs (sprites), GMC.
+//! * S-VOPs (`sprite_enable == 1`) — static-sprite/mosaic decoding.
 //! * Interlaced field coding, scalability, data partitioning.
 
 use std::collections::VecDeque;

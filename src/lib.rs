@@ -18,8 +18,14 @@
 //! * **B-VOP** decode — bidirectional prediction with Direct / Forward /
 //!   Backward / Interpolated modes and co-located MV scaling (§7.6.5).
 //!
+//! * **GMC (Global Motion Compensation)** — VOL `sprite_enable == 2`,
+//!   P-VOP-level `sprite_trajectory()` with 1..=4 warp points, per-MB
+//!   `mcsel` flag selecting between local (translational) and global
+//!   (warp) motion. Bilinear sampling of the warped reference per
+//!   §7.7.5 / §7.7.6. `sprite_brightness_change == 1` not yet applied.
+//!
 //! Out of scope (returns `Unsupported`):
-//! * S-VOPs (sprites), GMC.
+//! * S-VOPs / static-sprite decoding (`sprite_enable == 1`).
 //! * Interlaced field coding, scalability, data partitioning, reversible
 //!   VLCs.
 //! * MPEG-4 Studio / AVC Simple profiles.
