@@ -3,10 +3,11 @@
 //! Half-pel resolution with bilinear filter, optional unrestricted-MV
 //! domain (UMV — clamped to picture boundaries via edge replication).
 //!
-//! Quarter-pel motion (§7.6.2.2) is NOT enabled in this build because the
-//! VOL parser currently rejects `quarter_sample == 1` up front. When
-//! quarter-pel arrives in a follow-up the chroma and luma filters here will
-//! need to switch to the 8-tap interpolator for the half-pel sub-positions.
+//! Quarter-pel motion (§7.6.2.2) — 8-tap filter for the half-sample
+//! positions, then bilinear averaging to reach quarter-sample positions.
+//! Selected by the VOL `quarter_sample` flag; chroma remains on the
+//! half-pel grid regardless (chroma MV is derived from the luma MV via
+//! `luma_qmv_to_chroma` when QPel is active).
 
 /// Predict an `n × n` block from `ref_plane` into `dst`. `mv_x_half` and
 /// `mv_y_half` are in half-pel units relative to the block's natural
@@ -189,6 +190,222 @@ pub fn luma_mv_to_chroma(luma_mv_half: i32) -> i32 {
     int_part * 2 + half_bit
 }
 
+/// Quarter-pel 8-tap filter coefficients (§7.6.2.2).
+///
+/// The MPEG-4 QPel design first builds a half-sample grid using an 8-tap
+/// symmetric filter, then derives the quarter-sample positions by bilinear
+/// averaging between the integer / half / integer pair that straddles the
+/// target.
+///
+/// Coefficients: `{ -1, 3, -6, 20, 20, -6, 3, -1 } / 32`, rounded.
+/// Symmetric around the midpoint between samples 3 and 4. Uncopyrightable
+/// spec table — matches ISO 14496-2 §7.6.2.2.
+const QPEL_TAPS: [i32; 8] = [-1, 3, -6, 20, 20, -6, 3, -1];
+
+/// Apply the 8-tap QPel filter to 8 samples centred between indices 3 and 4.
+/// The result is rounded, clipped to `[0, 255]`, and returned as `u8`.
+#[inline]
+fn qpel_filter8(s: [i32; 8], rounding: bool) -> u8 {
+    let mut acc = 0i32;
+    for i in 0..8 {
+        acc += QPEL_TAPS[i] * s[i];
+    }
+    // §7.6.2.2 rounding — `round=16` (/32 nearest) when rounding flag is
+    // clear; `round=15` (floor) when set. Divisor is 32.
+    let round = if rounding { 15 } else { 16 };
+    let v = (acc + round) >> 5;
+    v.clamp(0, 255) as u8
+}
+
+/// Read a sample with edge-replication clamp.
+#[inline]
+fn clamp_sample(ref_plane: &[u8], ref_stride: usize, ref_w: i32, ref_h: i32, x: i32, y: i32) -> i32 {
+    let xc = x.clamp(0, ref_w - 1) as usize;
+    let yc = y.clamp(0, ref_h - 1) as usize;
+    ref_plane[yc * ref_stride + xc] as i32
+}
+
+/// Predict an `n × n` block using quarter-pel motion (§7.6.2.2).
+///
+/// `mv_x_q` and `mv_y_q` are in quarter-pel units. The luma MV for QPel
+/// blocks is decoded directly on the quarter-pel grid; this helper runs
+/// the 8-tap filter along the sub-pel axis (or axes) then bilinearly
+/// mixes to reach the true quarter-sample position when needed.
+#[allow(clippy::too_many_arguments)]
+pub fn predict_block_qpel(
+    ref_plane: &[u8],
+    ref_stride: usize,
+    ref_w: i32,
+    ref_h: i32,
+    blk_px: i32,
+    blk_py: i32,
+    mv_x_q: i32,
+    mv_y_q: i32,
+    n: i32,
+    rounding: bool,
+    dst: &mut [u8],
+    dst_stride: usize,
+) {
+    let int_x = mv_x_q >> 2;
+    let int_y = mv_y_q >> 2;
+    let sx = mv_x_q & 3;
+    let sy = mv_y_q & 3;
+
+    let src_x = blk_px + int_x;
+    let src_y = blk_py + int_y;
+
+    // Pure integer sample (0/4, 0/4) — straight copy.
+    if sx == 0 && sy == 0 {
+        for j in 0..n as usize {
+            for i in 0..n as usize {
+                let v = clamp_sample(
+                    ref_plane,
+                    ref_stride,
+                    ref_w,
+                    ref_h,
+                    src_x + i as i32,
+                    src_y + j as i32,
+                ) as u8;
+                dst[j * dst_stride + i] = v;
+            }
+        }
+        return;
+    }
+
+    // Strategy (§7.6.2.2):
+    //
+    //   (a) For a pure half-sample position in a single axis (sx=2, sy=0 or
+    //       sx=0, sy=2) apply the 8-tap filter along that axis.
+    //   (b) For the double-half position (sx=2, sy=2) filter horizontally
+    //       then vertically (or vice versa — spec yields identical results
+    //       after rounding).
+    //   (c) Quarter-sample positions (sx or sy in {1,3}) bilinearly average
+    //       the adjacent integer and half samples.
+    //
+    // We implement this compactly by first building a 16-bit "half-grid"
+    // plane covering the block footprint plus the filter taps, then
+    // bilinearly mixing for the final quarter offset.
+
+    // Local fn: build one row's worth of horizontally-filtered half samples.
+    let hh = |x: i32, y: i32| -> u8 {
+        let samples: [i32; 8] = core::array::from_fn(|i| {
+            clamp_sample(ref_plane, ref_stride, ref_w, ref_h, x + i as i32 - 3, y)
+        });
+        qpel_filter8(samples, rounding)
+    };
+    // Local fn: vertically-filtered half sample (integer x).
+    let hv = |x: i32, y: i32| -> u8 {
+        let samples: [i32; 8] = core::array::from_fn(|j| {
+            clamp_sample(ref_plane, ref_stride, ref_w, ref_h, x, y + j as i32 - 3)
+        });
+        qpel_filter8(samples, rounding)
+    };
+    // Local fn: diagonal half-sample (filter horizontally into a row
+    // buffer, then vertically through that).
+    let hd = |x: i32, y: i32| -> u8 {
+        // Vertical filter over 8 rows of horizontally-filtered halves.
+        let rows: [i32; 8] = core::array::from_fn(|j| hh(x, y + j as i32 - 3) as i32);
+        qpel_filter8(rows, rounding)
+    };
+
+    // Integer sample from the reference.
+    let int_s = |x: i32, y: i32| -> u8 {
+        clamp_sample(ref_plane, ref_stride, ref_w, ref_h, x, y) as u8
+    };
+
+    // Pick the two "anchor" samplers and the mixing weights per sub-pel.
+    // We compute sample at position (px, py) where px, py are measured in
+    // quarter-pels relative to the block's integer origin. Positions are
+    // derived from `(src_x, src_y, sx, sy)`.
+    //
+    // Quarter-pel interpolation rules (§7.6.2.2):
+    //   (sx=1): mix integer-x and half-x, bilinear average.
+    //   (sx=3): mix half-x and integer-(x+1), bilinear average.
+    //   Similarly for sy.
+    //   (sx=1, sy=1): average int(x,y) with hd(x,y).
+    //   …four combinations in total when both sx and sy are odd.
+    //
+    // We encode the rules as a table of two source selectors and
+    // coordinate offsets.
+
+    enum Src {
+        Int,
+        Hh,
+        Hv,
+        Hd,
+    }
+
+    // Map (sx, sy) to up to two (source, dx, dy) contributors.
+    // dx/dy are integer offsets (0 or 1) relative to (src_x, src_y).
+    // A single contributor → straight half-sample filter.
+    // Two contributors → bilinear mix (rounded to nearest per spec).
+    let contribs: &[(Src, i32, i32)] = match (sx, sy) {
+        (2, 0) => &[(Src::Hh, 0, 0)],
+        (0, 2) => &[(Src::Hv, 0, 0)],
+        (2, 2) => &[(Src::Hd, 0, 0)],
+        (1, 0) => &[(Src::Int, 0, 0), (Src::Hh, 0, 0)],
+        (3, 0) => &[(Src::Hh, 0, 0), (Src::Int, 1, 0)],
+        (0, 1) => &[(Src::Int, 0, 0), (Src::Hv, 0, 0)],
+        (0, 3) => &[(Src::Hv, 0, 0), (Src::Int, 0, 1)],
+        (1, 1) => &[(Src::Int, 0, 0), (Src::Hd, 0, 0)],
+        (3, 1) => &[(Src::Int, 1, 0), (Src::Hd, 0, 0)],
+        (1, 3) => &[(Src::Int, 0, 1), (Src::Hd, 0, 0)],
+        (3, 3) => &[(Src::Int, 1, 1), (Src::Hd, 0, 0)],
+        (2, 1) => &[(Src::Hh, 0, 0), (Src::Hd, 0, 0)],
+        (2, 3) => &[(Src::Hd, 0, 0), (Src::Hh, 0, 1)],
+        (1, 2) => &[(Src::Hv, 0, 0), (Src::Hd, 0, 0)],
+        (3, 2) => &[(Src::Hd, 0, 0), (Src::Hv, 1, 0)],
+        _ => unreachable!("quarter-pel sub-position out of 0..=3"),
+    };
+
+    let round = if rounding { 0 } else { 1 };
+    for j in 0..n {
+        for i in 0..n {
+            let x = src_x + i;
+            let y = src_y + j;
+            let sample = |c: &(Src, i32, i32)| -> u32 {
+                let xx = x + c.1;
+                let yy = y + c.2;
+                (match c.0 {
+                    Src::Int => int_s(xx, yy),
+                    Src::Hh => hh(xx, yy),
+                    Src::Hv => hv(xx, yy),
+                    Src::Hd => hd(xx, yy),
+                }) as u32
+            };
+            let v = if contribs.len() == 1 {
+                sample(&contribs[0])
+            } else {
+                let a = sample(&contribs[0]);
+                let b = sample(&contribs[1]);
+                (a + b + round) >> 1
+            };
+            dst[(j as usize) * dst_stride + (i as usize)] = v as u8;
+        }
+    }
+}
+
+/// Chroma MV derivation when the luma MV is expressed in quarter-pel
+/// units (§7.6.2.2). The chroma MV lives on the half-pel grid.
+///
+///   chroma_int_offset = luma_qmv >> 3                  (signed floor)
+///   chroma_half_bit   = `table_q[luma_qmv & 7]`
+///   chroma_mv_half    = chroma_int_offset * 2 + chroma_half_bit
+///
+/// The lookup table per §7.6.2.2 eq. (107):
+///
+///   rem (0..=7): 0, 1, 1, 1, 1, 1, 1, 2
+///
+/// Negative `luma_qmv` inherits the floor / remainder behaviour of the
+/// signed arithmetic shift + AND(7) on a two's-complement integer.
+pub fn luma_qmv_to_chroma(luma_qmv: i32) -> i32 {
+    // Table from ISO 14496-2 §7.6.2.2 eq. (107).
+    const Q_TABLE: [i32; 8] = [0, 1, 1, 1, 1, 1, 1, 2];
+    let int_part = luma_qmv >> 3;
+    let rem = (luma_qmv & 7) as usize;
+    int_part * 2 + Q_TABLE[rem]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,6 +444,68 @@ mod tests {
         predict_block(&refp, 4, 4, 4, 0, 0, 1, 1, 1, true, &mut dst2, 1);
         // (0+1+1+1+1)/4 = 4/4 = 1 (rounding on -> +1 offset)
         assert_eq!(dst2[0], 1);
+    }
+
+    #[test]
+    fn qpel_integer_copy_equals_bilinear_integer() {
+        // Integer QPel MV matches the integer half-pel MV path byte-for-byte.
+        let refp: [u8; 64] = core::array::from_fn(|i| (i * 3) as u8);
+        let mut a = [0u8; 16];
+        let mut b = [0u8; 16];
+        // MV (4, 0) q = 1 int pel to the right
+        predict_block_qpel(&refp, 8, 8, 8, 0, 0, 4, 0, 4, false, &mut a, 4);
+        predict_block(&refp, 8, 8, 8, 0, 0, 2, 0, 4, false, &mut b, 4);
+        assert_eq!(a, b, "QPel int-pel path should match half-pel int-pel path");
+    }
+
+    #[test]
+    fn qpel_half_h_symmetric_gradient() {
+        // 8-tap filter is symmetric around its centre — for a linear ramp,
+        // the half-sample output equals the bilinear average of the adjacent
+        // integer samples (within rounding).
+        let refp: [u8; 64] = core::array::from_fn(|i| ((i % 8) * 30) as u8);
+        let mut q = [0u8; 4];
+        // sx=2 — pure horizontal half at offset (2/4, 0/4).
+        predict_block_qpel(&refp, 8, 8, 8, 3, 3, 2, 0, 2, false, &mut q, 2);
+        // Ramp is `x * 30` on each row. Half-sample at pixel 3.5 should be
+        // approximately 3.5*30 = 105. The 8-tap filter rounds to nearest.
+        assert!((q[0] as i32 - 105).abs() <= 1, "half-pel ramp gave {}", q[0]);
+    }
+
+    #[test]
+    fn qpel_rounding_flag_reduces_offset() {
+        // With rounding=true (vop_rounding_type=1) the filter rounds to
+        // floor instead of nearest → output is ≤ the rounding=false output.
+        let refp: [u8; 64] = core::array::from_fn(|i| (i as u8).wrapping_mul(5));
+        let mut a = [0u8; 4];
+        let mut b = [0u8; 4];
+        predict_block_qpel(&refp, 8, 8, 8, 3, 3, 1, 0, 2, false, &mut a, 2);
+        predict_block_qpel(&refp, 8, 8, 8, 3, 3, 1, 0, 2, true, &mut b, 2);
+        // Each b[i] <= a[i] since rounding-on uses floor.
+        for (av, bv) in a.iter().zip(b.iter()) {
+            assert!(
+                bv <= av,
+                "rounding-on output {bv} should be ≤ rounding-off output {av}"
+            );
+        }
+    }
+
+    #[test]
+    fn luma_qmv_to_chroma_table() {
+        // Positive remainders per spec table.
+        assert_eq!(luma_qmv_to_chroma(0), 0);
+        assert_eq!(luma_qmv_to_chroma(1), 1);
+        assert_eq!(luma_qmv_to_chroma(2), 1);
+        assert_eq!(luma_qmv_to_chroma(3), 1);
+        assert_eq!(luma_qmv_to_chroma(4), 1);
+        assert_eq!(luma_qmv_to_chroma(5), 1);
+        assert_eq!(luma_qmv_to_chroma(6), 1);
+        assert_eq!(luma_qmv_to_chroma(7), 2);
+        assert_eq!(luma_qmv_to_chroma(8), 2);
+        // Symmetry around zero — the arithmetic shift floors negatives:
+        //   -1 >> 3 = -1,  -1 & 7 = 7 → -1*2 + 2 = 0.
+        assert_eq!(luma_qmv_to_chroma(-1), 0);
+        assert_eq!(luma_qmv_to_chroma(-8), -2);
     }
 
     #[test]
