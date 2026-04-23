@@ -282,13 +282,7 @@ pub fn parse_vol(br: &mut BitReader<'_>) -> Result<VideoObjectLayer> {
     // quarter_sample was added in verid>=2 (MPEG-4 Part 2 / 2000 corrigendum).
     // verid==1 streams never carry this bit.
     let quarter_sample = if verid != 1 {
-        let v = br.read_u1()? == 1;
-        if v {
-            return Err(Error::unsupported(
-                "mpeg4 quarter-pel motion: follow-up (out of scope)",
-            ));
-        }
-        v
+        br.read_u1()? == 1
     } else {
         false
     };

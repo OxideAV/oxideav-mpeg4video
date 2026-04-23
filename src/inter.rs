@@ -26,7 +26,7 @@ use crate::headers::vol::VideoObjectLayer;
 use crate::headers::vop::VideoObjectPlane;
 use crate::iq::{dc_scaler, INTRA_DC_VLC_THR_TABLE};
 use crate::mb::{IVopPicture, PredGrid};
-use crate::mc::{luma_mv_to_chroma, predict_block};
+use crate::mc::{luma_mv_to_chroma, luma_qmv_to_chroma, predict_block, predict_block_qpel};
 use crate::tables::{cbpy, mcbpc, mv as mv_tab, vlc};
 use oxideav_core::bits::BitReader;
 
@@ -462,22 +462,39 @@ pub fn decode_p_mb(
         let blk_px = (mb_x * 16 + sub_x) as i32;
         let blk_py = (mb_y * 16 + sub_y) as i32;
 
-        // Build prediction block.
+        // Build prediction block. Luma uses the VOL-wide pel precision.
         let mut pred_buf = [0u8; 64];
-        predict_block(
-            &reference.y,
-            reference.y_stride,
-            reference.y_stride as i32,
-            (reference.y.len() / reference.y_stride) as i32,
-            blk_px,
-            blk_py,
-            mvx,
-            mvy,
-            8,
-            vop.rounding_type,
-            &mut pred_buf,
-            8,
-        );
+        if vol.quarter_sample {
+            predict_block_qpel(
+                &reference.y,
+                reference.y_stride,
+                reference.y_stride as i32,
+                (reference.y.len() / reference.y_stride) as i32,
+                blk_px,
+                blk_py,
+                mvx,
+                mvy,
+                8,
+                vop.rounding_type,
+                &mut pred_buf,
+                8,
+            );
+        } else {
+            predict_block(
+                &reference.y,
+                reference.y_stride,
+                reference.y_stride as i32,
+                (reference.y.len() / reference.y_stride) as i32,
+                blk_px,
+                blk_py,
+                mvx,
+                mvy,
+                8,
+                vop.rounding_type,
+                &mut pred_buf,
+                8,
+            );
+        }
 
         // Decode residual if coded; otherwise zero.
         let mut residual = [0i32; 64];
@@ -495,16 +512,22 @@ pub fn decode_p_mb(
     }
 
     // Chroma. For 1MV mode use the single MV scaled to chroma; for 4MV mode
-    // use the average of the 4 luma MVs scaled.
+    // use the average of the 4 luma MVs scaled. Chroma always lives on the
+    // half-pel grid — when luma is QPel we first reduce each luma component
+    // through `luma_qmv_to_chroma` (§7.6.2.2) instead of `luma_mv_to_chroma`.
+    let to_chroma = |v: i32| -> i32 {
+        if vol.quarter_sample {
+            luma_qmv_to_chroma(v)
+        } else {
+            luma_mv_to_chroma(v)
+        }
+    };
     let (cmx, cmy) = if four_mv {
         let sx: i32 = motion.mv.iter().map(|(x, _)| *x).sum();
         let sy: i32 = motion.mv.iter().map(|(_, y)| *y).sum();
-        (luma_mv_to_chroma(sx / 4), luma_mv_to_chroma(sy / 4))
+        (to_chroma(sx / 4), to_chroma(sy / 4))
     } else {
-        (
-            luma_mv_to_chroma(motion.mv[0].0),
-            luma_mv_to_chroma(motion.mv[0].1),
-        )
+        (to_chroma(motion.mv[0].0), to_chroma(motion.mv[0].1))
     };
     for plane_idx in 0..2 {
         let (ref_plane, ref_stride) = if plane_idx == 0 {

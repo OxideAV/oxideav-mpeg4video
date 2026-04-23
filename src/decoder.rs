@@ -13,7 +13,6 @@
 //!
 //! Out of scope (returns `Error::Unsupported`):
 //! * B-VOPs, S-VOPs (sprites), GMC.
-//! * Quarter-pel motion (`quarter_sample` rejected at VOL parse time).
 //! * Interlaced field coding, scalability, data partitioning.
 
 use std::collections::VecDeque;
