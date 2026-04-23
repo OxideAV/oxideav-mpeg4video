@@ -70,7 +70,28 @@ pub struct VideoObjectLayer {
     pub height: u32,
     pub interlaced: bool,
     pub obmc_disable: bool,
+    /// `sprite_enable` — 1 bit when `verid == 1`, 2 bits otherwise.
+    /// Canonical values (ISO 14496-2 + amendments):
+    ///   0 = no sprite (default).
+    ///   1 = static sprite (requires S-VOPs — not yet decoded).
+    ///   2 = GMC (global motion compensation for P-VOPs).
+    ///   3 = reserved.
     pub sprite_enable: u8,
+    /// GMC / sprite trajectory: number of warp points (0..=4).
+    /// 0 = identity, 1 = translation, 2/3 = affine, 4 = perspective.
+    /// Present only when `sprite_enable` is 1 or 2.
+    pub no_of_sprite_warping_points: u8,
+    /// `sprite_warping_accuracy` (Table 6-8): 0 = 1/2-pel, 1 = 1/4-pel,
+    /// 2 = 1/8-pel, 3 = 1/16-pel. Present only when `sprite_enable` is
+    /// 1 or 2.
+    pub sprite_warping_accuracy: u8,
+    /// `sprite_brightness_change`. Rejected by the decoder when true —
+    /// we parse but do not apply the brightness delta (trivially rare
+    /// in practice; every GMC bitstream we've seen keeps it cleared).
+    pub sprite_brightness_change: bool,
+    /// `low_latency_sprite_enable`. Only meaningful for static-sprite
+    /// mode (`sprite_enable == 1`); GMC uses regular P-VOPs.
+    pub low_latency_sprite_enable: bool,
     pub not_8_bit: bool,
     pub quant_precision: u8,
     pub bits_per_pixel: u8,
@@ -254,10 +275,57 @@ pub fn parse_vol(br: &mut BitReader<'_>) -> Result<VideoObjectLayer> {
     } else {
         br.read_u32(2)? as u8
     };
-    if sprite_enable != 0 {
-        return Err(Error::unsupported(
-            "mpeg4 sprite / GMC VOPs: follow-up (out of scope)",
-        ));
+    // Sprite-specific VOL fields. Bitstream layout per ISO/IEC 14496-2
+    // §6.2.3 + amendment 1 (GMC):
+    //   if (sprite_enable == 1 || sprite_enable == 2) {
+    //       if (sprite_enable == 1) {  /* static sprite rectangle */
+    //           sprite_width(13), marker, sprite_height(13), marker,
+    //           sprite_left(13), marker, sprite_top(13), marker;
+    //       }
+    //       no_of_sprite_warping_points(6);
+    //       sprite_warping_accuracy(2);
+    //       sprite_brightness_change(1);
+    //       if (sprite_enable == 1) low_latency_sprite_enable(1);
+    //   }
+    let mut no_of_sprite_warping_points = 0u8;
+    let mut sprite_warping_accuracy = 0u8;
+    let mut sprite_brightness_change = false;
+    let low_latency_sprite_enable = false;
+    match sprite_enable {
+        0 => { /* no sprite */ }
+        1 => {
+            // Static sprite — not yet decoded. We do NOT consume the
+            // fields here; the caller will see `Unsupported`, which is
+            // the same outcome the pre-GMC implementation produced. If
+            // the decoder ever grows an S-VOP path we'll parse these in
+            // full at that time.
+            return Err(Error::unsupported(
+                "mpeg4 static-sprite VOLs (S-VOP path): follow-up",
+            ));
+        }
+        2 => {
+            // GMC-enabled — VOL carries only the trajectory-related
+            // fields; no static-sprite rectangle. Validated: values
+            // > 4 for the warp count are invalid per Table 6-7.
+            no_of_sprite_warping_points = br.read_u32(6)? as u8;
+            if no_of_sprite_warping_points > 4 {
+                return Err(Error::invalid(format!(
+                    "mpeg4 GMC VOL: no_of_sprite_warping_points={no_of_sprite_warping_points} > 4"
+                )));
+            }
+            sprite_warping_accuracy = br.read_u32(2)? as u8;
+            sprite_brightness_change = br.read_u1()? == 1;
+            if sprite_brightness_change {
+                return Err(Error::unsupported(
+                    "mpeg4 GMC sprite_brightness_change: follow-up",
+                ));
+            }
+        }
+        _ => {
+            return Err(Error::invalid(format!(
+                "mpeg4 VOL: reserved sprite_enable={sprite_enable}"
+            )));
+        }
     }
 
     let not_8_bit = br.read_u1()? == 1;
@@ -339,6 +407,10 @@ pub fn parse_vol(br: &mut BitReader<'_>) -> Result<VideoObjectLayer> {
         interlaced,
         obmc_disable,
         sprite_enable,
+        no_of_sprite_warping_points,
+        sprite_warping_accuracy,
+        sprite_brightness_change,
+        low_latency_sprite_enable,
         not_8_bit,
         quant_precision,
         bits_per_pixel,

@@ -37,6 +37,7 @@ pub mod block;
 pub mod bvop;
 pub mod decoder;
 pub mod encoder;
+pub mod gmc;
 pub mod headers;
 pub mod inter;
 pub mod iq;
