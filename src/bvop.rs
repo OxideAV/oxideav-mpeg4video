@@ -70,7 +70,7 @@ pub struct BMbMotion {
 
 impl BMbMotion {
     /// Construct from a single 16x16 forward/backward pair.
-    fn uni(fwd: (i32, i32), bwd: (i32, i32), mode: BMode) -> Self {
+    pub fn uni(fwd: (i32, i32), bwd: (i32, i32), mode: BMode) -> Self {
         Self {
             fwd,
             bwd,

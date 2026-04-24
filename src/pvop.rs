@@ -114,6 +114,26 @@ pub fn encode_p_vop_body(
     f_code_fwd: u8,
     rounding_type: bool,
 ) -> Result<IVopPicture> {
+    let (pic, _mv_grid) =
+        encode_p_vop_body_with_grid(bw, v, reference, vop_quant, f_code_fwd, rounding_type)?;
+    Ok(pic)
+}
+
+/// Variant of [`encode_p_vop_body`] that also returns the P-VOP's MV grid.
+///
+/// The B-VOP encoder consults this grid for:
+/// * `co_located_not_coded` inheritance (§7.5.9.5.4) — skipping B-MBs
+///   whose co-located P-MB was not coded.
+/// * Direct-mode co-located MV scaling (§7.5.9.5) — the forward/backward
+///   MVs of direct-mode B-MBs are derived from the P-MB's MV.
+pub fn encode_p_vop_body_with_grid(
+    bw: &mut BitWriter,
+    v: &oxideav_core::VideoFrame,
+    reference: &IVopPicture,
+    vop_quant: u32,
+    f_code_fwd: u8,
+    rounding_type: bool,
+) -> Result<(IVopPicture, MvGrid)> {
     let width = v.width as usize;
     let height = v.height as usize;
     let mb_w = width.div_ceil(16);
@@ -136,17 +156,18 @@ pub fn encode_p_vop_body(
             emit_p_mb(bw, &mb, mb_x, mb_y, &mv_grid, f_code_fwd);
             // Stash reconstructed samples into `pic`.
             write_recon_to_pic(&mut pic, &mb, mb_x, mb_y);
-            // Update MV predictor grid.
+            // Update MV predictor grid. Record `not_coded` so B-VOP
+            // encode can inherit the skip flag per §7.5.9.5.4.
             let motion = MbMotion {
                 mv: [mb.mv_half; 4],
                 four_mv: false,
-                not_coded: false,
+                not_coded: mb.skipped,
             };
             mv_grid.set(mb_x, mb_y, motion);
         }
     }
 
-    Ok(pic)
+    Ok((pic, mv_grid))
 }
 
 fn write_recon_to_pic(pic: &mut IVopPicture, mb: &PMbEncoding, mb_x: usize, mb_y: usize) {
@@ -410,7 +431,7 @@ fn sad_halfpel(
 // Block prediction + residual/quant round-trip
 // -------------------------------------------------------------------------
 
-fn predict_luma_mb(
+pub(crate) fn predict_luma_mb(
     reference: &IVopPicture,
     mb_x: usize,
     mb_y: usize,
@@ -448,7 +469,7 @@ fn predict_luma_mb(
     }
 }
 
-fn predict_chroma_block(
+pub(crate) fn predict_chroma_block(
     ref_plane: &[u8],
     ref_stride: usize,
     mb_x: usize,
@@ -476,7 +497,7 @@ fn predict_chroma_block(
     );
 }
 
-fn load_luma_mb(v: &oxideav_core::VideoFrame, mb_x: usize, mb_y: usize) -> [u8; 256] {
+pub(crate) fn load_luma_mb(v: &oxideav_core::VideoFrame, mb_x: usize, mb_y: usize) -> [u8; 256] {
     let mut out = [0u8; 256];
     let w = v.width as usize;
     let h = v.height as usize;
@@ -491,7 +512,7 @@ fn load_luma_mb(v: &oxideav_core::VideoFrame, mb_x: usize, mb_y: usize) -> [u8; 
     out
 }
 
-fn load_chroma_block(
+pub(crate) fn load_chroma_block(
     v: &oxideav_core::VideoFrame,
     plane_idx: usize,
     mb_x: usize,
@@ -555,7 +576,11 @@ fn read_pred_block(mb_pred: &[u8; 256], stride: usize, sub_x: usize, sub_y: usiz
 /// dequantise + IDCT + clip to reconstruct. Returns `(ac_levels, recon)`.
 /// `ac_levels` has 64 entries (natural order). `recon` is the sample block
 /// ready to copy back into the picture buffer.
-fn encode_inter_block(src: &[u8; 64], pred: &[u8; 64], quant: u32) -> ([i32; 64], [u8; 64]) {
+pub(crate) fn encode_inter_block(
+    src: &[u8; 64],
+    pred: &[u8; 64],
+    quant: u32,
+) -> ([i32; 64], [u8; 64]) {
     // Residual.
     let mut res = [0f32; 64];
     for i in 0..64 {
@@ -696,7 +721,7 @@ fn emit_p_mb(
 }
 
 /// Fold a signed MVD into the `[-range, range-1]` range by ±2*range.
-fn wrap_mvd(mvd: i32, range: i32) -> i32 {
+pub(crate) fn wrap_mvd(mvd: i32, range: i32) -> i32 {
     let mut v = mvd;
     if v < -range {
         v += 2 * range;
@@ -746,7 +771,7 @@ fn write_cbpy(bw: &mut BitWriter, cbpy: u8) {
 /// Write one motion-vector component per §7.6.3.
 ///
 /// MVD `diff` is in half-pel units and already wrapped into `[-32*f, 32*f-1]`.
-fn write_mv_component(bw: &mut BitWriter, diff: i32, f_code: u8) {
+pub(crate) fn write_mv_component(bw: &mut BitWriter, diff: i32, f_code: u8) {
     let r_size = (f_code.saturating_sub(1)) as u32;
     let f = 1i32 << r_size;
     // |motion_code| and residual derivation (§7.6.3):
@@ -787,7 +812,7 @@ fn mv_tab_row(mag: usize) -> (u8, u32) {
 
 /// Walk `block` in zigzag order, emitting one inter tcoef symbol per non-zero
 /// coefficient. Unlike the intra path, inter tcoef starts at scan index 0.
-fn write_inter_ac(bw: &mut BitWriter, block: &[i32; 64]) {
+pub(crate) fn write_inter_ac(bw: &mut BitWriter, block: &[i32; 64]) {
     // Find the last non-zero AC in scan order (zigzag).
     let mut last_nz: Option<usize> = None;
     for i in 0..64 {

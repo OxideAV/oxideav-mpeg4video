@@ -45,10 +45,13 @@ use oxideav_core::{
 };
 
 use crate::block::{choose_dc_predictor, BlockNeighbour};
+use crate::bvop::trb_trd;
+use crate::bvop_enc::encode_b_vop_body;
 use crate::headers::vol::ZIGZAG;
+use crate::inter::MvGrid;
 use crate::iq::{dc_scaler, Y_DC_SCALE_TABLE};
 use crate::mb::{IVopPicture, PredGrid};
-use crate::pvop::encode_p_vop_body;
+use crate::pvop::encode_p_vop_body_with_grid;
 use crate::start_codes::{VISUAL_OBJECT_START_CODE, VOP_START_CODE, VOS_END_CODE, VOS_START_CODE};
 use crate::tables::tcoef;
 use oxideav_core::bits::BitWriter;
@@ -70,6 +73,10 @@ pub const DEFAULT_GOP_SIZE: u32 = 16;
 /// smallest range `[-32, 31]` half-pels which is plenty for the encoder's
 /// tiny diamond search (bounded at ±7 integer pels). The decoder accepts 1-7.
 pub const DEFAULT_F_CODE_FWD: u8 = 1;
+
+/// Default number of B-frames between reference pictures. 0 disables the
+/// B-VOP path entirely (I + P only, matching pre-round-8 behaviour).
+pub const DEFAULT_MAX_B_FRAMES: u32 = 0;
 
 /// Encoder factory used by `register()`.
 pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
@@ -108,6 +115,14 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
 
     let time_base = TimeBase::new(frame_rate.den, frame_rate.num);
 
+    // Options — currently only the `bf` (max B-frames) knob. Default 0
+    // matches the pre-round-8 encoder (I + P only).
+    let max_b_frames = params
+        .options
+        .get("bf")
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(DEFAULT_MAX_B_FRAMES);
+
     Ok(Box::new(Mpeg4VideoEncoder {
         output_params,
         width,
@@ -117,12 +132,17 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         vop_quant: DEFAULT_VOP_QUANT,
         gop_size: DEFAULT_GOP_SIZE,
         f_code_fwd: DEFAULT_F_CODE_FWD,
+        max_b_frames,
         pending: VecDeque::new(),
+        b_queue: VecDeque::new(),
         eof: false,
         finalised: false,
         headers_emitted: false,
+        display_index: 0,
         vop_count: 0,
         reference: None,
+        reference_grid: None,
+        reference_time: 0,
         rounding_type: false,
     }))
 }
@@ -136,14 +156,26 @@ struct Mpeg4VideoEncoder {
     vop_quant: u32,
     gop_size: u32,
     f_code_fwd: u8,
+    /// Max consecutive B-VOPs between two reference pictures. 0 = no B-VOPs.
+    max_b_frames: u32,
     pending: VecDeque<Packet>,
+    /// Display-order B-frame queue — flushed on the next I/P encode.
+    b_queue: VecDeque<VideoFrame>,
     eof: bool,
     finalised: bool,
     headers_emitted: bool,
+    /// Display-order index of the next incoming frame. Used to decide
+    /// I/P vs B for each frame given the GOP cadence + `max_b_frames`.
+    display_index: u32,
+    /// Decode-order VOP count — used as the `vop_time_increment` field.
     vop_count: u32,
-    /// Reconstructed previous picture — used as the MC reference for the
-    /// next P-VOP. Refreshed by every I-VOP and every P-VOP.
+    /// Reconstructed previous I/P picture — used as the forward reference
+    /// for subsequent P-VOPs and B-VOPs. Refreshed by every I/P encode.
     reference: Option<IVopPicture>,
+    /// MV grid of `reference` — used by B-VOPs for co-located inheritance.
+    reference_grid: Option<MvGrid>,
+    /// Absolute display time (in display-index units) of `reference`.
+    reference_time: i64,
     /// `vop_rounding_type` to emit on the next P-VOP. Per FFmpeg convention
     /// we toggle this between P-VOPs (starts at 0 after an I-VOP, alternates
     /// afterwards) — it matches the half-pel rounding inside `mc.rs`.
@@ -178,72 +210,46 @@ impl Encoder for Mpeg4VideoEncoder {
             return Err(Error::invalid("mpeg4 encoder: expected 3 planes"));
         }
 
-        // Decide I-VOP vs P-VOP: first frame and every gop_size-th frame are
-        // I-VOPs. If the reference frame is missing (e.g. on error we reset),
-        // force an I-VOP too.
-        let is_keyframe = self.vop_count % self.gop_size == 0 || self.reference.is_none();
-
-        let mut bw = BitWriter::with_capacity(8192);
-        if !self.headers_emitted {
-            write_vos_vo_vol(
-                &mut bw,
-                self.width,
-                self.height,
-                self.frame_rate,
-                self.vop_quant,
-            );
-            self.headers_emitted = true;
-        }
-
-        if is_keyframe {
-            write_i_vop_header(&mut bw, self.vop_count, self.vop_quant);
-            let pic = encode_i_vop_body_and_reconstruct(&mut bw, v, self.vop_quant)?;
-            self.reference = Some(pic);
-            // Reset rounding_type on I-VOP (spec §7.6.2.1).
-            self.rounding_type = false;
+        if self.max_b_frames == 0 {
+            // Legacy path: I + P only. Emit each incoming frame directly.
+            self.emit_i_or_p(v)?;
         } else {
-            let reference = self
-                .reference
-                .as_ref()
-                .expect("P-VOP path requires a reference picture");
-            write_p_vop_header(
-                &mut bw,
-                self.vop_count,
-                self.vop_quant,
-                self.rounding_type,
-                self.f_code_fwd,
-            );
-            let pic = encode_p_vop_body(
-                &mut bw,
-                v,
-                reference,
-                self.vop_quant,
-                self.f_code_fwd,
-                self.rounding_type,
-            )?;
-            self.reference = Some(pic);
-            // Keep rounding_type = 0 for all P-VOPs (default). The spec
-            // permits alternating but our encoder's reconstruction uses the
-            // same flag so no drift accumulates on the decoder side that
-            // honours our value.
+            // B-frame path. We classify each incoming display-order frame
+            // as a reference (I/P) or a B. Reference positions are at
+            // `display_index % (bf + 1) == 0` (and every `gop_size`-th is
+            // an I). B frames are buffered until the next reference
+            // arrives — at that point we encode the reference (which
+            // becomes the new backward ref), then encode each buffered
+            // B using (forward_ref, backward_ref).
+            let bf = self.max_b_frames;
+            let is_reference_position = self.display_index % (bf + 1) == 0;
+            if is_reference_position {
+                self.flush_as_reference(v)?;
+            } else {
+                // Buffer for later.
+                self.b_queue.push_back(v.clone());
+            }
         }
-        // Byte-align the VOP body so the next start code (or VOS_END) is
-        // immediately byte-aligned. Spec §6.3.5 / FFmpeg's encoder pad.
-        bw.align_to_byte_zero();
-
-        let bytes = bw.finish();
-        let mut pkt = Packet::new(0, self.time_base, bytes);
-        pkt.pts = v.pts;
-        pkt.dts = v.pts;
-        pkt.flags.keyframe = is_keyframe;
-        self.pending.push_back(pkt);
-        self.vop_count += 1;
+        self.display_index += 1;
         Ok(())
     }
 
     fn receive_packet(&mut self) -> Result<Packet> {
         if let Some(p) = self.pending.pop_front() {
             return Ok(p);
+        }
+        if self.eof && !self.b_queue.is_empty() {
+            // EOF flush: any trailing B-frames lose their backward
+            // reference — re-encode them as P-VOPs against the current
+            // forward reference. This keeps the stream parseable and
+            // loses only a small amount of compression on the tail.
+            let queued: Vec<VideoFrame> = self.b_queue.drain(..).collect();
+            for v in queued {
+                self.emit_p_using_forward_ref(&v)?;
+            }
+            if let Some(p) = self.pending.pop_front() {
+                return Ok(p);
+            }
         }
         if self.eof && !self.finalised {
             self.finalised = true;
@@ -267,6 +273,239 @@ impl Encoder for Mpeg4VideoEncoder {
     }
 }
 
+impl Mpeg4VideoEncoder {
+    /// Legacy I + P emit path (no B-frames).
+    fn emit_i_or_p(&mut self, v: &VideoFrame) -> Result<()> {
+        let is_keyframe = self.vop_count % self.gop_size == 0 || self.reference.is_none();
+        let mut bw = BitWriter::with_capacity(8192);
+        if !self.headers_emitted {
+            write_vos_vo_vol(
+                &mut bw,
+                self.width,
+                self.height,
+                self.frame_rate,
+                self.vop_quant,
+                self.max_b_frames > 0,
+            );
+            self.headers_emitted = true;
+        }
+        // Display time in VOL time-base ticks = original frame pts.
+        let time_inc = display_time_inc(v, self.display_index);
+        if is_keyframe {
+            write_i_vop_header(&mut bw, time_inc, self.vop_quant);
+            let pic = encode_i_vop_body_and_reconstruct(&mut bw, v, self.vop_quant)?;
+            self.reference = Some(pic);
+            self.reference_grid = None;
+            self.reference_time = time_inc as i64;
+            self.rounding_type = false;
+        } else {
+            let reference = self
+                .reference
+                .as_ref()
+                .expect("P-VOP path requires a reference picture");
+            write_p_vop_header(
+                &mut bw,
+                time_inc,
+                self.vop_quant,
+                self.rounding_type,
+                self.f_code_fwd,
+            );
+            let (pic, grid) = encode_p_vop_body_with_grid(
+                &mut bw,
+                v,
+                reference,
+                self.vop_quant,
+                self.f_code_fwd,
+                self.rounding_type,
+            )?;
+            self.reference = Some(pic);
+            self.reference_grid = Some(grid);
+            self.reference_time = time_inc as i64;
+        }
+        bw.align_to_byte_zero();
+        let bytes = bw.finish();
+        let mut pkt = Packet::new(0, self.time_base, bytes);
+        pkt.pts = v.pts;
+        pkt.dts = v.pts;
+        pkt.flags.keyframe = is_keyframe;
+        self.pending.push_back(pkt);
+        self.vop_count += 1;
+        Ok(())
+    }
+
+    /// B-frame emit path — the current frame is a reference (I or P). We
+    /// encode and push it first (decode order places the reference before
+    /// the B frames that point at it), then drain the `b_queue` and emit
+    /// each buffered B against (prev_forward_ref, this-new-ref).
+    fn flush_as_reference(&mut self, v: &VideoFrame) -> Result<()> {
+        // Save the previous forward reference before overwriting it.
+        let prev_forward_ref = self.reference.clone();
+        let prev_forward_time = self.reference_time;
+
+        let is_keyframe = self.vop_count % self.gop_size == 0 || self.reference.is_none();
+
+        let mut bw = BitWriter::with_capacity(8192);
+        if !self.headers_emitted {
+            write_vos_vo_vol(
+                &mut bw,
+                self.width,
+                self.height,
+                self.frame_rate,
+                self.vop_quant,
+                self.max_b_frames > 0,
+            );
+            self.headers_emitted = true;
+        }
+
+        let time_inc = display_time_inc(v, self.display_index);
+        if is_keyframe {
+            write_i_vop_header(&mut bw, time_inc, self.vop_quant);
+            let pic = encode_i_vop_body_and_reconstruct(&mut bw, v, self.vop_quant)?;
+            self.reference = Some(pic);
+            self.reference_grid = None; // I-VOPs have no MV grid.
+            self.reference_time = time_inc as i64;
+            self.rounding_type = false;
+        } else {
+            let reference = prev_forward_ref
+                .as_ref()
+                .expect("P-VOP path requires a reference picture");
+            write_p_vop_header(
+                &mut bw,
+                time_inc,
+                self.vop_quant,
+                self.rounding_type,
+                self.f_code_fwd,
+            );
+            let (pic, grid) = encode_p_vop_body_with_grid(
+                &mut bw,
+                v,
+                reference,
+                self.vop_quant,
+                self.f_code_fwd,
+                self.rounding_type,
+            )?;
+            self.reference = Some(pic);
+            self.reference_grid = Some(grid);
+            self.reference_time = time_inc as i64;
+        }
+        bw.align_to_byte_zero();
+        let bytes = bw.finish();
+        let mut pkt = Packet::new(0, self.time_base, bytes);
+        pkt.pts = v.pts;
+        pkt.dts = v.pts;
+        pkt.flags.keyframe = is_keyframe;
+        self.pending.push_back(pkt);
+        self.vop_count += 1;
+
+        // Now emit each buffered B-VOP against (prev_forward_ref,
+        // new_backward_ref).
+        let bs: Vec<VideoFrame> = self.b_queue.drain(..).collect();
+        if !bs.is_empty() {
+            // For B-VOPs, we need both a forward (past) and backward
+            // (future) reference. At this point `self.reference` is the
+            // NEW backward ref; `prev_forward_ref` is the past ref.
+            // If there's no prev_forward_ref (e.g. this is the first
+            // reference in the stream), fall back to treating each
+            // buffered B as a stand-alone P — they can't B-code.
+            if let Some(prev_forward) = prev_forward_ref {
+                let next_backward = self
+                    .reference
+                    .as_ref()
+                    .expect("backward reference set by this function")
+                    .clone();
+                let next_backward_grid = self.reference_grid.clone();
+                let cur_ref_time = self.reference_time;
+                for b_frame in &bs {
+                    self.emit_b_vop(
+                        b_frame,
+                        &prev_forward,
+                        &next_backward,
+                        next_backward_grid.as_ref(),
+                        prev_forward_time,
+                        cur_ref_time,
+                    )?;
+                }
+            } else {
+                for b_frame in &bs {
+                    self.emit_p_using_forward_ref(b_frame)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Emit one B-VOP packet. Uses `prev_forward` as the past reference
+    /// and `next_backward` (with optional MV grid) as the future
+    /// reference. `trb / trd` are derived from the display times.
+    fn emit_b_vop(
+        &mut self,
+        v: &VideoFrame,
+        prev_forward: &IVopPicture,
+        next_backward: &IVopPicture,
+        next_backward_grid: Option<&MvGrid>,
+        prev_time: i64,
+        next_time: i64,
+    ) -> Result<()> {
+        // Fallback display index = current display_index - 1 - queue size.
+        let fallback = (self.display_index as i64).saturating_sub(1);
+        let time_inc_u = v
+            .pts
+            .map(|p| p.max(0) as u32)
+            .unwrap_or(fallback.max(0) as u32);
+        let cur_time = time_inc_u as i64;
+        let (trb, trd) = trb_trd(prev_time, cur_time, next_time);
+        let mut bw = BitWriter::with_capacity(8192);
+        write_b_vop_header(
+            &mut bw,
+            time_inc_u,
+            self.vop_quant,
+            self.f_code_fwd,
+            self.f_code_fwd,
+        );
+
+        // Co-located grid: `next_backward`'s MV grid. An I-VOP has no
+        // MV grid (`next_backward_grid = None`) — `encode_b_vop_body`
+        // treats every MB as implicitly not-coded in that case, but we
+        // have none right now (B-VOPs only appear after the first P).
+        // Make a zero-MV grid if missing so our encoder has a grid to
+        // query; that still emits a full body (no implicit skips).
+        let mb_w = (self.width as usize).div_ceil(16);
+        let mb_h = (self.height as usize).div_ceil(16);
+        let fallback_grid = MvGrid::new(mb_w, mb_h);
+        let grid = next_backward_grid.unwrap_or(&fallback_grid);
+
+        encode_b_vop_body(
+            &mut bw,
+            v,
+            prev_forward,
+            next_backward,
+            grid,
+            self.vop_quant,
+            self.f_code_fwd,
+            self.f_code_fwd,
+            trb,
+            trd,
+        )?;
+        bw.align_to_byte_zero();
+        let bytes = bw.finish();
+        let mut pkt = Packet::new(0, self.time_base, bytes);
+        pkt.pts = v.pts;
+        pkt.dts = v.pts;
+        pkt.flags.keyframe = false;
+        self.pending.push_back(pkt);
+        self.vop_count += 1;
+        Ok(())
+    }
+
+    /// Fallback: emit a single frame as a P-VOP against the current
+    /// forward reference. Used when a B-frame can't be coded (no
+    /// backward ref) — e.g. trailing B-frames at EOF or when the first
+    /// reference hasn't been emitted yet.
+    fn emit_p_using_forward_ref(&mut self, v: &VideoFrame) -> Result<()> {
+        self.emit_i_or_p(v)
+    }
+}
+
 // -------------------------------------------------------------------------
 // Start-code + header emission
 // -------------------------------------------------------------------------
@@ -274,6 +513,14 @@ impl Encoder for Mpeg4VideoEncoder {
 fn write_start_code(bw: &mut BitWriter, code: u8) {
     bw.align_to_byte_zero();
     bw.write_bytes(&[0x00, 0x00, 0x01, code]);
+}
+
+/// Compute the display-order time-increment to stamp into a VOP header.
+/// Uses the frame's own PTS when available, else the monotonic
+/// `display_index` counter. Wrapping to a u32 is safe for our tests —
+/// the VTI field masks against 24 in the header writer.
+fn display_time_inc(v: &VideoFrame, fallback: u32) -> u32 {
+    v.pts.map(|p| p.max(0) as u32).unwrap_or(fallback)
 }
 
 /// Compute the smallest number of bits required to hold `max_value`. Mirrors
@@ -293,11 +540,22 @@ fn bits_needed(max_value: u32) -> u32 {
 /// happily consumes. Layer geometry is encoded at the picture's natural
 /// resolution; the `frame_rate` is encoded as
 /// `vop_time_increment_resolution = num`, `fixed_vop_time_increment = den`.
-fn write_vos_vo_vol(bw: &mut BitWriter, width: u32, height: u32, frame_rate: Rational, _q: u32) {
+fn write_vos_vo_vol(
+    bw: &mut BitWriter,
+    width: u32,
+    height: u32,
+    frame_rate: Rational,
+    _q: u32,
+    enable_b_vops: bool,
+) {
     // VOS.
     write_start_code(bw, VOS_START_CODE);
-    // profile_and_level_indication = 0x01 — Simple Profile @ Level 1.
-    bw.write_bits(0x01, 8);
+    // profile_and_level_indication — ASP Level 1 (`0xF1`) when B-VOPs are
+    // used (matches ffmpeg's own -bf 2 output), Simple Profile Level 1
+    // (`0x01`) otherwise. ASP is required for B-VOPs; Simple Profile
+    // explicitly forbids them (§Annex N).
+    let pli = if enable_b_vops { 0xF1 } else { 0x01 };
+    bw.write_bits(pli, 8);
 
     // Visual Object.
     write_start_code(bw, VISUAL_OBJECT_START_CODE);
@@ -313,12 +571,18 @@ fn write_vos_vo_vol(bw: &mut BitWriter, width: u32, height: u32, frame_rate: Rat
     // Video Object Layer — id 0x20.
     write_start_code(bw, 0x20);
     bw.write_bits(0, 1); // random_accessible_vol = 0
-    bw.write_bits(1, 8); // video_object_type_indication = 1 (Simple)
+                         // video_object_type_indication — Main (4) when B-VOPs are on, Simple
+                         // (1) otherwise. Main explicitly permits B-VOPs.
+    let vot_indication = if enable_b_vops { 4 } else { 1 };
+    bw.write_bits(vot_indication, 8);
     bw.write_bits(0, 1); // is_object_layer_identifier = 0
     bw.write_bits(1, 4); // aspect_ratio_info = 1 (square)
     bw.write_bits(1, 1); // vol_control_parameters = 1
     bw.write_bits(1, 2); // chroma_format = 1 (4:2:0)
-    bw.write_bits(1, 1); // low_delay = 1
+                         // low_delay — must be 0 when B-VOPs are in the stream, so the decoder
+                         // knows to enable its reorder queue. 1 otherwise (no reorder needed).
+    let low_delay = if enable_b_vops { 0 } else { 1 };
+    bw.write_bits(low_delay, 1);
     bw.write_bits(0, 1); // vbv_parameters = 0
     bw.write_bits(0, 2); // video_object_layer_shape = 0 (Rectangular)
     bw.write_bits(1, 1); // marker
@@ -389,6 +653,32 @@ fn write_i_vop_header(bw: &mut BitWriter, time_inc: u32, vop_quant: u32) {
     bw.write_bits(0, 3);
     bw.write_bits(vop_quant, 5);
     // No fcode for I-VOP.
+}
+
+/// Emit the VOP header for a B-VOP (§6.2.5, vop_coding_type == 2). Mirrors
+/// `write_p_vop_header` plus the extra `vop_fcode_backward` field. No
+/// `vop_rounding_type` for B-VOPs (inherited from the enclosing P context).
+fn write_b_vop_header(
+    bw: &mut BitWriter,
+    time_inc: u32,
+    vop_quant: u32,
+    f_code_fwd: u8,
+    f_code_bwd: u8,
+) {
+    write_start_code(bw, VOP_START_CODE);
+    bw.write_bits(0b10, 2); // vop_coding_type = 10 (B)
+    bw.write_bits(0, 1); // modulo_time_base = `0` terminator
+    bw.write_bits(1, 1); // marker
+    let vti_bits = bits_needed(23).max(1);
+    bw.write_bits(time_inc % 24, vti_bits);
+    bw.write_bits(1, 1); // marker
+
+    bw.write_bits(1, 1); // vop_coded = 1
+                         // (No vop_rounding_type for B — see §6.2.5.)
+    bw.write_bits(0, 3); // intra_dc_vlc_thr = 0
+    bw.write_bits(vop_quant, 5);
+    bw.write_bits(f_code_fwd as u32, 3); // vop_fcode_forward
+    bw.write_bits(f_code_bwd as u32, 3); // vop_fcode_backward
 }
 
 /// Emit the VOP header for a P-VOP. Field layout mirrors `write_i_vop_header`
