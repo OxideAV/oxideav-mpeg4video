@@ -115,6 +115,7 @@ fn decode_bvop_clip_matches_ffmpeg() {
     let mut total_pixels = 0usize;
     let mut sum_sq_diff: u64 = 0;
     let mut max_diff_overall = 0i32;
+    let mut n_high_psnr = 0usize;
 
     loop {
         let frame = match dec.receive_frame() {
@@ -132,12 +133,10 @@ fn decode_bvop_clip_matches_ffmpeg() {
         ours.extend_from_slice(&frame.planes[0].data);
         ours.extend_from_slice(&frame.planes[1].data);
         ours.extend_from_slice(&frame.planes[2].data);
-        // Display-order index: with `-bf 2`, decode order differs from
-        // display order (I P B B P B B …). We don't yet reorder; compare
-        // against the ffmpeg reference at the SAME decode-order index —
-        // this is what ffmpeg's raw `-f rawvideo` output is too (display
-        // order), so it's only an approximation. Still useful as a sanity
-        // check on overall energy.
+        // With the decode-order → display-order reorder buffer wired up
+        // (`held_ref_frame` in the decoder), the N-th emitted frame
+        // corresponds to display-order index N. ffmpeg's raw-video
+        // muxer also writes display order, so we compare 1:1.
         let ref_off = frames_decoded * frame_size;
         if ref_off + frame_size > reference.len() {
             break;
@@ -168,6 +167,9 @@ fn decode_bvop_clip_matches_ffmpeg() {
         total_pixels += frame_size;
         sum_sq_diff += sq;
         max_diff_overall = max_diff_overall.max(max_diff);
+        if psnr >= 50.0 {
+            n_high_psnr += 1;
+        }
         frames_decoded += 1;
     }
 
@@ -185,16 +187,30 @@ fn decode_bvop_clip_matches_ffmpeg() {
     eprintln!(
         "bvop overall: {frames_decoded} frames; pixel match {pct:.2}%; PSNR {psnr:.2} dB; max diff {max_diff_overall}"
     );
-    // We can't yet enforce a display-order PSNR target because decode and
-    // display order diverge with B-VOPs — the asserted threshold here is
-    // a SANITY bound: everything should at least parse without panics and
-    // produce well-formed pixel data (mean Y within normal range, no
-    // wildly corrupted values).
-    //
-    // Once the decoder gains frame reordering, this threshold should
-    // tighten to PSNR >= 35 dB against the display-order reference.
+    // With decode-order → display-order reorder in place, at least the
+    // I-VOP and any P-VOPs the decoder gets to reconstruct should land
+    // at their correct display-order positions and match the ffmpeg
+    // reference almost bit-exactly (~67 dB for the frames we've
+    // observed). We require at least two such >=50 dB frames as a
+    // direct assertion that reorder is wired correctly — I/P-VOPs that
+    // were not reordered against would drop to the low 30s / high 20s
+    // against a display-order reference.
     assert!(
-        pct >= 25.0 || psnr >= 15.0,
-        "bvop clip decode produced essentially garbage: pct={pct:.2}% psnr={psnr:.2}"
+        n_high_psnr >= 2,
+        "reorder check failed: expected >=2 high-PSNR frames \
+         (I/P-VOPs at their display-order position), got {n_high_psnr}. \
+         frames={frames_decoded} overall_psnr={psnr:.2}"
+    );
+    // Overall PSNR target: the B-VOP decode itself is still missing
+    // interlaced B-MBs, 4MV direct mode, and quarter-pel MC, so
+    // per-B-VOP PSNR sits in the 28-33 dB band. That drags the overall
+    // number below 35 dB. The threshold tightens again once those
+    // B-VOP paths land; for now the reorder correctness is covered by
+    // the high-PSNR frame count above, and the overall number is a
+    // floor that rules out accidental regressions (was ~31 dB before
+    // reorder, ~33 dB after).
+    assert!(
+        psnr >= 28.0,
+        "bvop clip overall PSNR fell below reorder-era floor: {psnr:.2} dB"
     );
 }

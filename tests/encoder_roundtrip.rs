@@ -115,6 +115,10 @@ fn encode_single_i_vop_self_consistency() {
     let mut dec = oxideav_mpeg4video::decoder::make_decoder(&dec_params).expect("build decoder");
     let in_pkt = Packet::new(0, TimeBase::new(1, 24), pkt.data.clone());
     dec.send_packet(&in_pkt).expect("send_packet");
+    // With decode-order → display-order reorder wired, a single I-VOP
+    // sits in the held-reference slot until the next I/P arrives or
+    // flush() is called. For a one-shot round-trip, flush drains it.
+    dec.flush().expect("flush");
     let out = dec.receive_frame().expect("receive_frame");
     let v = match out {
         Frame::Video(v) => v,
@@ -284,6 +288,8 @@ fn encode_flat_gray_block_lossless_ish() {
     let mut dec = oxideav_mpeg4video::decoder::make_decoder(&dec_params).expect("build decoder");
     let in_pkt = Packet::new(0, TimeBase::new(1, 24), pkt.data.clone());
     dec.send_packet(&in_pkt).expect("send_packet");
+    // Reorder buffer: flush drains the held I-VOP for a one-shot clip.
+    dec.flush().expect("flush");
     let out = dec.receive_frame().expect("receive_frame");
     let v = match out {
         Frame::Video(v) => v,

@@ -18,6 +18,17 @@
 //!   modes, co-located MV scaling (TRB/TRD), dual-reference forward+
 //!   backward motion compensation.
 //!
+//! * **Decode-order → display-order reordering** — MPEG-4 Part 2 (like
+//!   MPEG-1/-2) stores each I/P reference before the B-VOPs that point
+//!   at it. Decoded I/P-VOPs are held back one slot so the B-VOPs
+//!   between two references can be emitted ahead of the newer
+//!   reference (decode order I P B B P → display order I B B P … P).
+//!   `flush()` drains the held reference. Each frame's PTS is computed
+//!   from the VOP's own `modulo_time_base` / `vop_time_increment`
+//!   fields rescaled into the packet's time base, so downstream
+//!   consumers see monotonically increasing display-order PTS even
+//!   when the bitstream delivers frames out of order.
+//!
 //! Out of scope (returns `Error::Unsupported`):
 //! * S-VOPs (`sprite_enable == 1`) — static-sprite/mosaic decoding.
 //! * Interlaced field coding, scalability, data partitioning.
@@ -89,6 +100,15 @@ pub struct Mpeg4VideoDecoder {
     /// first `send_packet`, then cached so we only pay the scan once
     /// per stream.
     format_verified: bool,
+    /// One-slot reorder buffer holding the most recently decoded I/P
+    /// reference until the next I/P arrives. MPEG-4 Part 2 stores each
+    /// reference ahead of the B-VOPs that point at it (decode order
+    /// I P B B P …); when the decoder sees a new I/P it knows all
+    /// B-VOPs that could have preceded the held reference in display
+    /// order have already been emitted, so the held reference can now
+    /// be released. B-VOPs are emitted directly because they are
+    /// already in display order among themselves.
+    held_ref_frame: Option<VideoFrame>,
 }
 
 impl Mpeg4VideoDecoder {
@@ -110,7 +130,65 @@ impl Mpeg4VideoDecoder {
             next_ref_time: 0,
             absolute_base_seconds: 0,
             format_verified: false,
+            held_ref_frame: None,
         }
+    }
+
+    /// Compute a display-order PTS for `cur_time` (absolute VOP ticks
+    /// in `vop_time_increment_resolution` units), rescaled into the
+    /// packet time base (`self.pending_tb`). Returns `self.pending_pts`
+    /// as a fallback when the VOL's `vop_time_increment_resolution` is
+    /// zero or when the pending packet time base is degenerate.
+    fn pts_for_vop(&self, vol: &VideoObjectLayer, cur_time: i64) -> Option<i64> {
+        let res = vol.vop_time_increment_resolution as i64;
+        if res <= 0 {
+            return self.pending_pts;
+        }
+        let tb = self.pending_tb.as_rational();
+        if tb.num == 0 || tb.den == 0 {
+            return self.pending_pts;
+        }
+        // cur_time is in units of 1 / res seconds. Rescale into
+        // self.pending_tb (seconds = tb.num / tb.den per tick).
+        // seconds = cur_time / res   →   ticks = seconds * tb.den / tb.num
+        //                                     = cur_time * tb.den / (res * tb.num)
+        let num = tb.den as i128;
+        let den = res as i128 * tb.num as i128;
+        if den == 0 {
+            return self.pending_pts;
+        }
+        let prod = cur_time as i128 * num;
+        let half = den.abs() / 2;
+        let rounded = if (prod >= 0) == (den > 0) {
+            (prod + half) / den
+        } else {
+            (prod - half) / den
+        };
+        Some(rounded as i64)
+    }
+
+    /// Emit a reference (I/P) frame into the reorder buffer: any
+    /// previously-held reference is released to the ready queue first,
+    /// then the new one takes its slot. B-VOPs that followed the old
+    /// reference in decode order are already in `ready_frames` ahead of
+    /// the released reference, so downstream consumers see display
+    /// order.
+    fn emit_reference_frame(&mut self, frame: VideoFrame) {
+        if let Some(prev) = self.held_ref_frame.take() {
+            self.ready_frames.push_back(prev);
+        }
+        self.held_ref_frame = Some(frame);
+    }
+
+    /// B-VOPs are already in display order among themselves (they are
+    /// stored in the bitstream in the order they should be shown), and
+    /// they display BEFORE the reference that precedes them in decode
+    /// order but AFTER the previous reference. So a B-VOP decoded now
+    /// must be inserted BEFORE the currently-held reference — which is
+    /// trivially satisfied by pushing to the ready queue, because the
+    /// held reference is not in the ready queue yet.
+    fn emit_b_frame(&mut self, frame: VideoFrame) {
+        self.ready_frames.push_back(frame);
     }
 
     /// Absolute tick-count for a VOP given its header. Uses the stored
@@ -203,23 +281,29 @@ impl Mpeg4VideoDecoder {
             // "Not coded" VOP (§6.2.5): the decoder must re-emit the most
             // recently decoded picture at the new pts. The reference itself
             // is not modified — the next coded VOP still predicts from the
-            // last coded picture.
-            if let Some(reference) = self.next_ref.as_ref().or(self.prev_ref.as_ref()) {
-                let frame = pic_to_video_frame(vol, reference, self.pending_pts, self.pending_tb);
-                self.ready_frames.push_back(frame);
+            // last coded picture. Not-coded VOPs are emitted in display
+            // order at the current pts — treat them like B-VOPs for
+            // reorder purposes (pass-through to the ready queue).
+            let reference = self.next_ref.clone().or_else(|| self.prev_ref.clone());
+            if let Some(reference) = reference {
+                let cur_time = self.vop_absolute_time(vol, vop);
+                let pts = self.pts_for_vop(vol, cur_time);
+                let frame = pic_to_video_frame(vol, &reference, pts, self.pending_tb);
+                self.emit_b_frame(frame);
             }
             return Ok(());
         }
         match vop.vop_coding_type {
             VopCodingType::I => {
                 let pic = decode_ivop_pic(vol, vop, br)?;
-                let frame = pic_to_video_frame(vol, &pic, self.pending_pts, self.pending_tb);
                 let cur_time = self.vop_absolute_time(vol, vop);
+                let pts = self.pts_for_vop(vol, cur_time);
+                let frame = pic_to_video_frame(vol, &pic, pts, self.pending_tb);
                 // I-VOP promotes the existing `next_ref` into `prev_ref`, then
                 // becomes the new backward reference. B-VOPs following in
                 // decode order will look at this new pair.
                 self.rotate_refs(pic, None, cur_time);
-                self.ready_frames.push_back(frame);
+                self.emit_reference_frame(frame);
                 Ok(())
             }
             VopCodingType::P => {
@@ -236,10 +320,11 @@ impl Mpeg4VideoDecoder {
                     None => reference.clone(),
                 };
                 let (pic, mv_grid) = decode_pvop_pic_with_grid(vol, vop, br, &ref_pic)?;
-                let frame = pic_to_video_frame(vol, &pic, self.pending_pts, self.pending_tb);
                 let cur_time = self.vop_absolute_time(vol, vop);
+                let pts = self.pts_for_vop(vol, cur_time);
+                let frame = pic_to_video_frame(vol, &pic, pts, self.pending_tb);
                 self.rotate_refs(pic, Some(mv_grid), cur_time);
-                self.ready_frames.push_back(frame);
+                self.emit_reference_frame(frame);
                 Ok(())
             }
             VopCodingType::B => {
@@ -255,9 +340,11 @@ impl Mpeg4VideoDecoder {
                 let cur_time = self.vop_absolute_time(vol, vop);
                 let (trb, trd) = trb_trd(self.prev_ref_time, cur_time, self.next_ref_time);
                 let pic = decode_bvop_pic(vol, vop, br, &prev, &next, co_grid.as_ref(), trb, trd)?;
-                let frame = pic_to_video_frame(vol, &pic, self.pending_pts, self.pending_tb);
-                // B-VOPs never become references.
-                self.ready_frames.push_back(frame);
+                let pts = self.pts_for_vop(vol, cur_time);
+                let frame = pic_to_video_frame(vol, &pic, pts, self.pending_tb);
+                // B-VOPs never become references and are already in
+                // display order — emit immediately.
+                self.emit_b_frame(frame);
                 Ok(())
             }
             VopCodingType::S => Err(Error::unsupported("mpeg4 S-VOP (sprite): out of scope")),
@@ -698,6 +785,12 @@ impl Decoder for Mpeg4VideoDecoder {
     }
 
     fn flush(&mut self) -> Result<()> {
+        // Drain the reorder buffer: any held I/P reference has now been
+        // followed by every B-VOP that might have preceded it in
+        // display order, so it can be emitted.
+        if let Some(held) = self.held_ref_frame.take() {
+            self.ready_frames.push_back(held);
+        }
         self.eof = true;
         Ok(())
     }
@@ -718,6 +811,7 @@ impl Decoder for Mpeg4VideoDecoder {
         self.prev_ref_time = 0;
         self.next_ref_time = 0;
         self.absolute_base_seconds = 0;
+        self.held_ref_frame = None;
         Ok(())
     }
 }

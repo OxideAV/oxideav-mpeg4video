@@ -18,6 +18,15 @@
 //! * **B-VOP** decode — bidirectional prediction with Direct / Forward /
 //!   Backward / Interpolated modes and co-located MV scaling (§7.6.5).
 //!
+//! * **Decode-order → display-order reorder** — one-slot reorder buffer
+//!   inside the decoder holds each I/P reference until the next I/P
+//!   arrives, so B-VOPs decoded between two references are released
+//!   into the ready queue AHEAD of the newer reference. `flush()`
+//!   drains the held reference at end-of-stream. Per-VOP display PTS is
+//!   synthesised from the bitstream's `modulo_time_base` /
+//!   `vop_time_increment` + VOL `vop_time_increment_resolution` and
+//!   rescaled into the packet time base.
+//!
 //! * **GMC (Global Motion Compensation)** — VOL `sprite_enable == 2`,
 //!   P-VOP-level `sprite_trajectory()` with 1..=4 warp points, per-MB
 //!   `mcsel` flag selecting between local (translational) and global
