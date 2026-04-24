@@ -1,18 +1,22 @@
-//! B-VOP (bidirectional) decode — ISO/IEC 14496-2 §7.6.5.
+//! B-VOP (bidirectional) decode — ISO/IEC 14496-2:2004 §7.6.8–§7.6.9.
 //!
-//! Per-MB flow:
-//! 1. `modb` VLC (Table B-16). If skipped, the MB inherits direct-mode
+//! Per-MB flow (spec syntax §6.2.7 / semantics §6.3.5):
+//! 1. `modb` VLC (Table B.3). If skipped ('1'), the MB inherits direct-mode
 //!    prediction with zero MVD — emit co-located P-VOP reference region.
-//! 2. `mbtype` VLC (Table B-18) — Direct / Forward / Backward / Interpolated.
-//! 3. If MODB=="00", `cbpb` (6 bits, one per block — Y0..Y3, Cb, Cr).
-//! 4. MVs:
+//! 2. `mbtype` VLC (Table B.4) — Direct / Forward / Backward / Interpolated.
+//!    (present only when `modb != '1'`)
+//! 3. If MODB=="00", `cbpb` (6 bits for 4:2:0 — one per block, Y0..Y3 Cb Cr).
+//! 4. `dbquant` VLC (Table 6-33) — present only when `mb_type != '1'` AND
+//!    `cbpb != 0`. Codes: `0`→0, `10`→-2, `11`→+2. This is a B-VOP-specific
+//!    quantiser-delta VLC — **not** the P-VOP 2-bit `dquant` (Table 6-32).
+//! 5. MVs:
 //!    * Direct mode — scales the co-located P-VOP MV by (TRB/TRD) and adds
 //!      an optional small delta `mvd_b` (single MV pair).
 //!    * Forward mode — decodes `mvd_forward` via the standard MV VLC.
 //!    * Backward mode — decodes `mvd_backward`.
 //!    * Interpolated — decodes both `mvd_forward` and `mvd_backward`.
-//! 5. Texture residual per coded block.
-//! 6. Motion compensation: forward-only, backward-only, or average of the
+//! 6. Texture residual per coded block.
+//! 7. Motion compensation: forward-only, backward-only, or average of the
 //!    two predictions, plus optional residual add.
 //!
 //! Frame types in this decoder's two-reference model:
@@ -235,16 +239,14 @@ pub fn decode_b_mb(
     // `not_coded == 1`, the B-VOP MB is NOT coded in the bitstream (no
     // MODB read). It is reconstructed as forward mode with the zero MV.
     //
-    // When the backward reference is an I-VOP there is no MV grid to
-    // query — the committee-draft does not explicitly cover this case.
-    // Empirically (observed in ffmpeg-encoded bitstreams), the encoder
-    // treats I-VOP-backed-reference B-VOPs as if `co_located_not_coded == 1`
-    // for every MB — the B-VOP body carries only resync markers and
-    // bitstream-absent MBs. We mirror that behaviour: `None` grid means
-    // "all MBs implicitly skipped from the bitstream".
+    // Per 2004 spec §6.3.5: "co_located_not_coded ... is set to 1 when
+    // the current VOP is a B-VOP, the future reference VOP is a P-VOP,
+    // and the co-located macroblock in the future reference VOP is
+    // skipped". When the backward reference is an I-VOP the flag is
+    // unset (0) — every MB carries MODB bits in the bitstream.
     let co_located_not_coded = co_mv_grid
         .map(|g| g.get(mb_x, mb_y).not_coded)
-        .unwrap_or(true);
+        .unwrap_or(false);
     if co_located_not_coded {
         bmv_grid.set(mb_x, mb_y, BMbMotion::uni((0, 0), (0, 0), BMode::Forward));
         reconstruct_b_mb(
@@ -305,21 +307,35 @@ pub fn decode_b_mb(
         0
     };
 
-    // 4. dquant — per spec: "if (mb_type != '1' && cbpb != 0) dquant". That
-    //    is, dquant is present for non-direct modes whenever any residual
-    //    block is coded. The 2-bit dquant table maps 00→-1, 01→-2, 10→+1,
-    //    11→+2 (Table 6-17).
+    // 4. dbquant — per 2004 spec §6.3.5 / Table 6-33: "if (mb_type != '1'
+    //    && cbpb != 0) dbquant". B-VOPs use `dbquant` (a 1-or-2-bit VLC),
+    //    NOT the P-VOP 2-bit `dquant`:
+    //
+    //        dbquant code  value
+    //             0          0
+    //            10         -2
+    //            11         +2
+    //
+    //    The quantiser is then clipped to [1, 2^quant_precision - 1]. An
+    //    earlier version of this decoder used the P-VOP 2-bit dquant table
+    //    here, which desynced every non-direct B-MB whenever the encoder
+    //    emitted `dbquant = 0` (the "no change" single-bit code). The
+    //    `Round 9` fix switches to the proper VLC (see Table 6-33 in the
+    //    2004 final edition).
     if mbtype != bvop_tab::MBTYPE_DIRECT && cbpb != 0 {
-        let dquant_code = br.read_u32(2)? as i32;
-        let delta = match dquant_code {
-            0b00 => -1,
-            0b01 => -2,
-            0b10 => 1,
-            0b11 => 2,
-            _ => unreachable!(),
+        let first = br.read_u1()?;
+        let delta = if first == 0 {
+            0
+        } else {
+            let second = br.read_u1()?;
+            if second == 0 {
+                -2
+            } else {
+                2
+            }
         };
-        let q = (quant as i32 + delta).clamp(1, 31) as u32;
-        quant = q;
+        let q_limit = (1u32 << vol.quant_precision).saturating_sub(1).max(1);
+        quant = (quant as i32 + delta).clamp(1, q_limit as i32) as u32;
     }
 
     // 4b. Interlaced information (§6.2.7 / §6.2.7.3). Present only when

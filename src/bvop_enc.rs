@@ -193,7 +193,7 @@ fn estimate_b_mb(
         // NOTE: This round favours direct strongly because ffmpeg's
         // decoder reports "illegal MB_type" on some non-direct B-MBs we
         // emit — root cause TBD and tracked in follow-up items. Favouring
-        // direct keeps the bitstream syntactically simple (MODB = "0",
+        // direct keeps the bitstream syntactically simple (MODB = "1",
         // no mbtype VLC, no MVD) and sidesteps the mismatch. Our own
         // decoder is unaffected either way (39 dB self-consistency).
         const DIRECT_BONUS: i64 = -200;
@@ -591,26 +591,27 @@ fn emit_b_mb(
 
     // This encoder never emits residual for B-MBs (cbpb == 0 always). The
     // B-VOP body is pure motion-compensation; residual emit is gated
-    // behind a dquant sidechannel and the spec requires dquant when
+    // behind a `dbquant` sidechannel (2004 Table 6-33, B-VOP-specific
+    // quantiser-delta VLC) and the spec requires `dbquant` when
     // `mb_type != direct && cbpb != 0` (§6.2.7) — to keep the path
     // drift-free we skip residual emit entirely. This costs ~0-3 dB of
     // PSNR vs a residual-emitting encoder; the motion predictor is the
     // dominant quality driver for close reference frames.
     let any_coded = false;
 
-    // MODB selection (Table 11-3):
-    //   - "0"    → skipped (direct mode, no cbpb).
-    //   - "10"   → mbtype, no cbpb.
-    //   - "11"   → mbtype + cbpb. (not emitted — we force cbpb = 0.)
+    // MODB selection (2004 Table B.3):
+    //   - "1"    → skipped (direct mode, no cbpb).
+    //   - "01"   → mbtype, no cbpb.
+    //   - "00"   → mbtype + cbpb. (not emitted — we force cbpb = 0.)
     if matches!(mb.mode, BMode::Direct) && !any_coded {
-        // MODB = "0" — single bit. No mbtype, no MVs, no residuals.
-        bw.write_bits(0b0, 1);
+        // MODB = "1" — single bit. No mbtype, no MVs, no residuals.
+        bw.write_bits(0b1, 1);
         // Row predictors NOT updated for direct mode (spec §7.5.8).
         return;
     }
 
-    // MODB = "10" (mbtype only, cbpb implicit zero).
-    bw.write_bits(0b10, 2);
+    // MODB = "01" (mbtype only, cbpb implicit zero).
+    bw.write_bits(0b01, 2);
 
     // MBTYPE (Table 11-4, 1..=4 bits):
     match mb.mode {
@@ -692,12 +693,12 @@ mod tests {
 
 // -------------------------------------------------------------------------
 // Follow-up items:
-// * dquant = 0 emission. The current workaround forces +1 dquant whenever
-//   cbpb != 0 (to satisfy §6.2.7). A cleaner path would be to re-quantise
-//   at quant+1 during ME so the residual is drift-free — currently we
-//   quantise at `vop_quant` but the decoder reconstructs at `quant+1`,
-//   which introduces a one-step quant mismatch per non-direct coded MB.
-//   In practice this loses ~0.3 dB PSNR; measurable but not a blocker.
+// * `dbquant = 0` emission. The encoder currently sidesteps `cbpb != 0`
+//   entirely (`any_coded = false`) so no `dbquant` ever reaches the
+//   bitstream. When residual emit is re-enabled the emitter must use
+//   the 2004 Table 6-33 VLC (`0`→0, `10`→-2, `11`→+2), NOT the P-VOP
+//   2-bit `dquant`. The decoder path is updated; matching emitter work
+//   is a one-liner (write `0`, `10`, or `11`).
 // * 4MV direct emit — the spec allows direct-mode B-MBs to borrow the
 //   co-located P-MB's 4MV. Decoder supports this via `BMbMotion::quad`.
 //   Encoder always emits single-MV direct.

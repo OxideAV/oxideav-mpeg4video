@@ -649,12 +649,15 @@ pub fn decode_bvop_pic(
                 while mb_idx < mb_num {
                     let mb_x = (mb_idx as usize) % mb_w;
                     let mb_y = (mb_idx as usize) / mb_w;
-                    // `None` grid (backward ref is an I-VOP) treats every
-                    // MB as implicitly not-coded — matches decode_b_mb's
-                    // convention above.
+                    // The encoder inserted a resync marker that jumps
+                    // past `mb_idx..mb_num`. Those MBs were not in the
+                    // bitstream — either because they were implicitly
+                    // skipped (co_located_not_coded) or because the
+                    // encoder chose not to code them (decoder fills with
+                    // a reconstruction). See §6.3.5.2.
                     let co_not_coded = co_mv_grid
                         .map(|g| g.get(mb_x, mb_y).not_coded)
-                        .unwrap_or(true);
+                        .unwrap_or(false);
                     // Both paths reconstruct the block without consuming
                     // bits from the bitstream.
                     if co_not_coded {

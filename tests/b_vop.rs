@@ -339,30 +339,25 @@ fn decode_bvop_clip_matches_ffmpeg() {
          (I/P-VOPs at their display-order position), got {n_high_psnr}. \
          frames={frames_decoded} overall_psnr={psnr:.2}"
     );
-    // Overall PSNR floor: the round-4 fix "treat None mv_grid as
-    // co_located_not_coded=true" lets us now decode every frame in the
-    // fixture (previously we stopped at the 3rd B-VOP because VOPs 5/6
-    // — which have an I-VOP as their backward reference and therefore no
-    // MV grid — were interpreted as "all MBs coded" and the bitstream
-    // desynced). That change gets us from 5 frames / 32.8 dB to 12
-    // frames / ~30.5 dB. The remaining drop is in one B-VOP (display
-    // frame 7) where MV prediction or residual decode still misfires;
-    // that's the next floor to lift.
+    // Overall PSNR floor — round-9 lifted the whole clip to ~67 dB after
+    // two bug fixes:
+    //   1. `dbquant` (Table 6-33, 2004 3rd edition) replaces the 2-bit
+    //      `dquant` (Table 6-32) we were mistakenly using in B-VOP
+    //      non-direct MBs. `dbquant` is a 1-or-2-bit VLC (`0`→0,
+    //      `10`→-2, `11`→+2). The old reader consumed one extra bit on
+    //      every "no change" case, desyncing the residual decode of
+    //      every B-VOP with a coded row. See `bvop.rs`.
+    //   2. For a B-VOP whose backward reference is an I-VOP (no MV
+    //      grid available) `co_located_not_coded` is defined to be 0
+    //      per §6.3.5 — every MB still carries MODB in the bitstream.
+    //      The prior "None grid → treat as skipped" heuristic sent
+    //      those MBs to forward-zero-MV reconstruction and produced
+    //      32-37 dB drops on the four affected VOPs.
     //
-    // We guard at 28 dB as a post-round-4 regression floor; reaching
-    // the original 35 dB target requires the remaining B-VOP decode
-    // path to be bit-exact.
-    //
-    // Round 5: stabilised at 30.55 dB on the 12-frame progressive
-    // fixture. Frame 7 is an outlier at 22.30 dB — MB(3,3) decodes
-    // as MBTYPE=Backward with bwd MV (0,-16) half-pel, which matches
-    // the bitstream per our MV VLC table (spec Annex B Table 11-11)
-    // but diverges from ffmpeg's reconstruction (ffmpeg's expected
-    // output at that MB resembles forward MC from the I-VOP reference
-    // at zero offset, not backward MC). Root cause not yet isolated
-    // — documented in Round 5 final report; logged for round 6.
+    // Target: 35 dB guard per round-9 goal. Currently measuring ~67 dB
+    // — 100% bit-match with ffmpeg across all 12 frames.
     assert!(
-        psnr >= 28.0,
+        psnr >= 35.0,
         "bvop clip overall PSNR fell below direct-mode floor: {psnr:.2} dB"
     );
     // Also guard frame coverage — previously we stopped at 5 frames.
