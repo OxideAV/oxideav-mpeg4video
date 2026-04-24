@@ -31,7 +31,7 @@ use oxideav_core::{
     VideoFrame,
 };
 
-use crate::bvop::{decode_b_mb, trb_trd, BMvGrid};
+use crate::bvop::{decode_b_mb, trb_trd, BMvGrid, BRowPred};
 use crate::gmc::WarpParams;
 use crate::headers::vol::{parse_vol, VideoObjectLayer};
 use crate::headers::vop::{parse_vop, VideoObjectPlane, VopCodingType};
@@ -378,9 +378,10 @@ pub fn decode_pvop_pic(
                         "mpeg4 P-VOP: resync mb_num={mb_num} not at or after current={mb_idx}"
                     )));
                 }
-                // Reset prediction state across packet boundaries.
+                // Reset intra-prediction state across packet boundaries.
+                // Keep the MV grid so previously-decoded `not_coded` flags
+                // survive (needed by downstream B-VOP decode).
                 pred_grid = PredGrid::new(mb_w, mb_h);
-                mv_grid = MvGrid::new(mb_w, mb_h);
                 if new_quant != 0 {
                     quant = new_quant;
                 }
@@ -448,8 +449,12 @@ pub fn decode_pvop_pic_with_grid(
                         "mpeg4 P-VOP: resync mb_num={mb_num} not at or after current={mb_idx}"
                     )));
                 }
+                // Reset prediction STATE (intra AC/DC predictors) — but keep
+                // the MV grid intact: the slice_first_mb gate in
+                // predict_mv_full already prevents cross-slice prediction,
+                // and downstream B-VOP decode needs to see the per-MB
+                // `not_coded` flags recorded for previously-decoded MBs.
                 pred_grid = PredGrid::new(mb_w, mb_h);
-                mv_grid = MvGrid::new(mb_w, mb_h);
                 if new_quant != 0 {
                     quant = new_quant;
                 }
@@ -483,9 +488,21 @@ pub fn decode_bvop_pic(
     let mut quant = vop.vop_quant;
     let mut mb_idx: u32 = 0;
     let mut slice_first_mb = (0usize, 0usize);
+    let mut row_pred = BRowPred::default();
+    let mut cur_row: usize = 0;
     while (mb_idx as usize) < mb_w * mb_h {
         let mb_x = (mb_idx as usize) % mb_w;
         let mb_y = (mb_idx as usize) / mb_w;
+        // §7.5.8 — forward/backward predictors reset to zero at the start
+        // of each macroblock row.
+        if mb_y != cur_row || mb_x == 0 {
+            if mb_y != cur_row {
+                cur_row = mb_y;
+            }
+            if mb_x == 0 {
+                row_pred.reset();
+            }
+        }
         quant = decode_b_mb(
             br,
             mb_x,
@@ -495,6 +512,7 @@ pub fn decode_bvop_pic(
             vop,
             &mut pic,
             &mut bmv_grid,
+            &mut row_pred,
             prev_ref,
             next_ref,
             co_mv_grid,
@@ -517,7 +535,57 @@ pub fn decode_bvop_pic(
                         "mpeg4 B-VOP: resync mb_num={mb_num} not at or after current={mb_idx}"
                     )));
                 }
+                // Any MBs between `mb_idx` and `mb_num` that we're jumping
+                // over must have been implicit-skips — the resync marker
+                // wouldn't have fit if the encoder had emitted any bits for
+                // them. Reconstruct each as forward-mode zero-MV (§6.2.7).
+                while mb_idx < mb_num {
+                    let mb_x = (mb_idx as usize) % mb_w;
+                    let mb_y = (mb_idx as usize) / mb_w;
+                    let co_not_coded = co_mv_grid
+                        .map(|g| g.get(mb_x, mb_y).not_coded)
+                        .unwrap_or(false);
+                    // Both paths reconstruct the block without consuming
+                    // bits from the bitstream.
+                    if co_not_coded {
+                        // Implicit forward-zero-MV.
+                        crate::bvop::reconstruct_b_mb_public(
+                            &mut pic,
+                            prev_ref,
+                            next_ref,
+                            mb_x,
+                            mb_y,
+                            (0, 0),
+                            (0, 0),
+                            crate::bvop::BMode::Forward,
+                            vol,
+                            vop,
+                            None,
+                        );
+                    } else {
+                        // Fallback direct-mode skip using co-located MV.
+                        let co_mv = co_mv_grid
+                            .map(|g| g.get(mb_x, mb_y).mv[0])
+                            .unwrap_or((0, 0));
+                        let (fwd, bwd) = crate::bvop::direct_mode_mvs(co_mv, trb, trd, (0, 0));
+                        crate::bvop::reconstruct_b_mb_public(
+                            &mut pic,
+                            prev_ref,
+                            next_ref,
+                            mb_x,
+                            mb_y,
+                            fwd,
+                            bwd,
+                            crate::bvop::BMode::Skipped,
+                            vol,
+                            vop,
+                            None,
+                        );
+                    }
+                    mb_idx += 1;
+                }
                 bmv_grid = BMvGrid::new(mb_w, mb_h);
+                row_pred.reset();
                 if new_quant != 0 {
                     quant = new_quant;
                 }

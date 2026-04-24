@@ -44,6 +44,12 @@ pub struct MbMotion {
     pub mv: [(i32, i32); 4],
     /// True when the MB used 4MV mode (one MV per luma block).
     pub four_mv: bool,
+    /// `not_coded == 1` — the P-VOP MB was skipped. Used downstream by
+    /// B-VOP decode: per §6.2.7, a B-MB whose co-located P-MB has
+    /// `co_located_not_coded == 1` is entirely skipped from the
+    /// bitstream (no MODB read) and reconstructed as forward mode with
+    /// zero MV.
+    pub not_coded: bool,
 }
 
 /// Motion-vector predictor grid: per macroblock, an array of 4 MVs (one per
@@ -345,8 +351,17 @@ pub fn decode_p_mb(
         // reference at the same position with MV(0,0).
         copy_skipped_mb(pic, reference, mb_x, mb_y);
         // Reset MV predictor grid — skipped MBs contribute (0,0) to future
-        // MVs (§7.6.7).
-        mv_grid.set(mb_x, mb_y, MbMotion::default());
+        // MVs (§7.6.7). Mark `not_coded` so B-VOPs following in decode
+        // order can detect the `co_located_not_coded == 1` condition
+        // (§6.2.7) and skip the MB entirely from the bitstream.
+        mv_grid.set(
+            mb_x,
+            mb_y,
+            MbMotion {
+                not_coded: true,
+                ..MbMotion::default()
+            },
+        );
         // Reset prediction grid (no intra info).
         reset_pred_grid_mb(pred_grid, mb_x, mb_y);
         return Ok(quant_in);

@@ -140,6 +140,7 @@ pub fn encode_p_vop_body(
             let motion = MbMotion {
                 mv: [mb.mv_half; 4],
                 four_mv: false,
+                not_coded: false,
             };
             mv_grid.set(mb_x, mb_y, motion);
         }
