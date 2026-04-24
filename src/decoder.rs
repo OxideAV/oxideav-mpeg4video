@@ -629,9 +629,12 @@ pub fn decode_bvop_pic(
                 while mb_idx < mb_num {
                     let mb_x = (mb_idx as usize) % mb_w;
                     let mb_y = (mb_idx as usize) / mb_w;
+                    // `None` grid (backward ref is an I-VOP) treats every
+                    // MB as implicitly not-coded — matches decode_b_mb's
+                    // convention above.
                     let co_not_coded = co_mv_grid
                         .map(|g| g.get(mb_x, mb_y).not_coded)
-                        .unwrap_or(false);
+                        .unwrap_or(true);
                     // Both paths reconstruct the block without consuming
                     // bits from the bitstream.
                     if co_not_coded {

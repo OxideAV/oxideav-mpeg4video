@@ -234,9 +234,17 @@ pub fn decode_b_mb(
     // §6.2.7 / §7.5.9.5.4 — if the co-located P-VOP MB has
     // `not_coded == 1`, the B-VOP MB is NOT coded in the bitstream (no
     // MODB read). It is reconstructed as forward mode with the zero MV.
+    //
+    // When the backward reference is an I-VOP there is no MV grid to
+    // query — the committee-draft does not explicitly cover this case.
+    // Empirically (observed in ffmpeg-encoded bitstreams), the encoder
+    // treats I-VOP-backed-reference B-VOPs as if `co_located_not_coded == 1`
+    // for every MB — the B-VOP body carries only resync markers and
+    // bitstream-absent MBs. We mirror that behaviour: `None` grid means
+    // "all MBs implicitly skipped from the bitstream".
     let co_located_not_coded = co_mv_grid
         .map(|g| g.get(mb_x, mb_y).not_coded)
-        .unwrap_or(false);
+        .unwrap_or(true);
     if co_located_not_coded {
         bmv_grid.set(
             mb_x,

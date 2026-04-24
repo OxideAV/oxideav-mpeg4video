@@ -234,18 +234,26 @@ fn decode_bvop_clip_matches_ffmpeg() {
          (I/P-VOPs at their display-order position), got {n_high_psnr}. \
          frames={frames_decoded} overall_psnr={psnr:.2}"
     );
-    // Overall PSNR floor: 4MV direct mode (§7.5.9.5.2) is wired up but
-    // this particular fixture (testsrc pattern) does not produce 4MV
-    // P-MBs at ffmpeg's default `-bf 2 -qscale:v 5` settings, so the
-    // observed ceiling is still governed by interlaced B-MBs and
-    // quarter-pel MC in B-VOPs. The `decode_bvop_4mv_clip_runs` test
-    // above exercises the 4MV direct path on a mandelbrot fixture.
+    // Overall PSNR floor: the round-4 fix "treat None mv_grid as
+    // co_located_not_coded=true" lets us now decode every frame in the
+    // fixture (previously we stopped at the 3rd B-VOP because VOPs 5/6
+    // — which have an I-VOP as their backward reference and therefore no
+    // MV grid — were interpreted as "all MBs coded" and the bitstream
+    // desynced). That change gets us from 5 frames / 32.8 dB to 12
+    // frames / ~30.5 dB. The remaining drop is in one B-VOP (display
+    // frame 7) where MV prediction or residual decode still misfires;
+    // that's the next floor to lift.
     //
-    // Current measured overall: ~32.8 dB. We guard at 32 dB as a
-    // regression floor; the 35 dB target requires the remaining two
-    // B-VOP paths (interlaced + quarter-pel) to land.
+    // We guard at 28 dB as a post-round-4 regression floor; reaching
+    // the original 35 dB target requires the remaining B-VOP decode
+    // path to be bit-exact.
     assert!(
-        psnr >= 32.0,
+        psnr >= 28.0,
         "bvop clip overall PSNR fell below direct-mode floor: {psnr:.2} dB"
+    );
+    // Also guard frame coverage — previously we stopped at 5 frames.
+    assert!(
+        frames_decoded >= 10,
+        "bvop clip frame coverage regressed: got {frames_decoded}"
     );
 }

@@ -131,7 +131,7 @@ pub fn parse_vop(br: &mut BitReader<'_>, vol: &VideoObjectLayer) -> Result<Video
     // intra_dc_vlc_thr — 3 bits.
     let intra_dc_vlc_thr = br.read_u32(3)? as u8;
 
-    // VOP-level interlaced fields (§6.2.5). Present only when the VOL
+    // VOP-level interlaced fields (§6.2.5). Only present when the VOL
     // advertises `interlaced == 1`. Note: per the ISO 14496-2 committee
     // draft the VOP-level `interlaced` flag appears unconditionally in
     // the VOP header for non-binary-only shapes; in practice every
