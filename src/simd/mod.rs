@@ -117,12 +117,7 @@ pub fn add_residual_clip_block(
 
 /// Copy an 8×8 `u8` block into a row-strided destination.
 #[inline]
-pub fn copy_block_u8(
-    src: &[u8; 64],
-    dst: &mut [u8],
-    dst_off: usize,
-    stride: usize,
-) {
+pub fn copy_block_u8(src: &[u8; 64], dst: &mut [u8], dst_off: usize, stride: usize) {
     #[cfg(feature = "nightly")]
     {
         portable::copy_block_u8(src, dst, dst_off, stride);

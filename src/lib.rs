@@ -272,4 +272,3 @@ mod lib_tests {
         assert!(reg.resolve_tag_ref(&c).is_none());
     }
 }
-

@@ -86,8 +86,9 @@ fn bench_dequant(c: &mut Criterion) {
 
 fn bench_add_residual(c: &mut Criterion) {
     let n = 1000usize;
-    let preds: Vec<[u8; 64]> =
-        (0..n).map(|i| std::array::from_fn(|k| ((i + k) as u8).wrapping_mul(3))).collect();
+    let preds: Vec<[u8; 64]> = (0..n)
+        .map(|i| std::array::from_fn(|k| ((i + k) as u8).wrapping_mul(3)))
+        .collect();
     let residuals: Vec<[i32; 64]> = (0..n)
         .map(|i| std::array::from_fn(|k| ((i as i32) * 5 + (k as i32) * 3) - 150))
         .collect();

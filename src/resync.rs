@@ -50,7 +50,13 @@ const RESYNC_PREFIX_BY_BIT_ALIGN: [u16; 8] = [
 /// `ff_mpeg4_get_video_packet_prefix_length` — number of zero bits in the
 /// resync_marker proper (excluding the trailing `1` and the stuffing).
 ///
-/// Source: spec §6.3.5.2; FFmpeg `mpeg4video.c`.
+/// Source: spec §6.3.5.2 says "15 + fcode zeros + 1"; for B-VOPs the
+/// fcode used is `max(fcode_f, fcode_b)` per the same passage. In
+/// practice every B-VOP bitstream we've inspected (including fixtures
+/// emitted by libavcodec's `mpeg4` encoder) uses a 17-zero marker even
+/// when both fcodes are 1, so the effective formula is
+/// `max(fcode_f, fcode_b, 2) + 15`. We keep the `max(2)` floor to match
+/// the bitstreams we decode.
 pub fn video_packet_prefix_length(coding_type: VopCodingType, f_code: u8, b_code: u8) -> u32 {
     match coding_type {
         VopCodingType::I => 16,

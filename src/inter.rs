@@ -18,8 +18,8 @@
 use oxideav_core::Result;
 
 use crate::block::{
-    apply_ac_prediction, choose_dc_predictor, decode_inter_ac,
-    decode_intra_ac, decode_intra_dc_diff, reconstruct_inter_block, reconstruct_intra_block,
+    apply_ac_prediction, choose_dc_predictor, decode_inter_ac, decode_intra_ac,
+    decode_intra_dc_diff, reconstruct_inter_block, reconstruct_intra_block,
     record_ac_prediction_cache, BlockNeighbour, PredDir,
 };
 use crate::gmc::{warp_predict_chroma_block, warp_predict_luma_block, WarpParams};
@@ -802,9 +802,7 @@ pub fn decode_p_mb(
             decode_inter_ac(br, &mut residual, scan)?;
             let mut out = [0i32; 64];
             reconstruct_inter_block(&mut residual, vol, quant, &mut out)?;
-            crate::simd::add_residual_clip_block(
-                &pred_buf, &out, dst_plane, dst_off, pic.c_stride,
-            );
+            crate::simd::add_residual_clip_block(&pred_buf, &out, dst_plane, dst_off, pic.c_stride);
         } else {
             crate::simd::copy_block_u8(&pred_buf, dst_plane, dst_off, pic.c_stride);
         }

@@ -88,10 +88,16 @@ mod tests {
         assert_eq!(vlc::decode(&mut br, modb_table()).unwrap(), MODB_SKIPPED);
         // "10" → mbtype only
         let mut br = BitReader::new(&[0x80]);
-        assert_eq!(vlc::decode(&mut br, modb_table()).unwrap(), MODB_MBTYPE_ONLY);
+        assert_eq!(
+            vlc::decode(&mut br, modb_table()).unwrap(),
+            MODB_MBTYPE_ONLY
+        );
         // "11" → mbtype + cbpb
         let mut br = BitReader::new(&[0xC0]);
-        assert_eq!(vlc::decode(&mut br, modb_table()).unwrap(), MODB_MBTYPE_CBPB);
+        assert_eq!(
+            vlc::decode(&mut br, modb_table()).unwrap(),
+            MODB_MBTYPE_CBPB
+        );
     }
 
     #[test]
@@ -113,6 +119,9 @@ mod tests {
         );
         // "0001" → forward
         let mut br = BitReader::new(&[0x10]);
-        assert_eq!(vlc::decode(&mut br, mbtype_table()).unwrap(), MBTYPE_FORWARD);
+        assert_eq!(
+            vlc::decode(&mut br, mbtype_table()).unwrap(),
+            MBTYPE_FORWARD
+        );
     }
 }

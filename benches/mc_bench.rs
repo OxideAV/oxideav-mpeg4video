@@ -29,7 +29,12 @@ fn mk_ref_plane() -> Vec<u8> {
 
 fn bench_predict(c: &mut Criterion) {
     let refp = mk_ref_plane();
-    let subpel_positions = [(0, 0, "int"), (1, 0, "half_h"), (0, 1, "half_v"), (1, 1, "half_hv")];
+    let subpel_positions = [
+        (0, 0, "int"),
+        (1, 0, "half_h"),
+        (0, 1, "half_v"),
+        (1, 1, "half_hv"),
+    ];
     let block_sizes = [(8, "8x8"), (16, "16x16")];
 
     for (n, name) in block_sizes {

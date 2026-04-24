@@ -573,7 +573,7 @@ mod tests {
         bw.write_bits(1, 1); // marker
         bw.write_bits(if interlaced { 1 } else { 0 }, 1); // interlaced
         bw.write_bits(1, 1); // obmc_disable
-        // sprite_enable — 1 bit in verid==1, 2 bits otherwise.
+                             // sprite_enable — 1 bit in verid==1, 2 bits otherwise.
         if verid == 1 {
             bw.write_bits(sprite_enable as u32, 1);
         } else {
@@ -646,7 +646,7 @@ mod tests {
         bw.write_bits(1, 1); // marker
         bw.write_bits(0, 1); // interlaced
         bw.write_bits(1, 1); // obmc_disable
-        // sprite_enable — 2 bits (verid != 1). Value 1 = static sprite.
+                             // sprite_enable — 2 bits (verid != 1). Value 1 = static sprite.
         bw.write_bits(1, 2);
         // Static-sprite rectangle: width, height, left (signed), top (signed).
         bw.write_bits(256, 13);

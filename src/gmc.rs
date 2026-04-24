@@ -48,12 +48,12 @@ const MAX_DMV_LENGTH: u32 = 14;
 ///
 /// Bit layout:
 ///   * Length prefix (§11.1.6):
-///       "00"                                -> length 0, no FLC (value 0)
-///       "010" .. "110"                      -> length 1..5
-///       "111" then further unary            -> length 6..14
+///     "00"                                -> length 0, no FLC (value 0)
+///     "010" .. "110"                      -> length 1..5
+///     "111" then further unary            -> length 6..14
 ///   * FLC (length bits):
-///       MSB == 1 -> positive: value == FLC
-///       MSB == 0 -> negative: value == FLC + 1 - (1 << length)
+///     MSB == 1 -> positive: value == FLC
+///     MSB == 0 -> negative: value == FLC + 1 - (1 << length)
 pub fn decode_warping_mv(br: &mut BitReader<'_>) -> Result<i32> {
     // Try 2-bit prefix first.
     let bit0 = br.read_u1()?;
@@ -85,9 +85,7 @@ pub fn decode_warping_mv(br: &mut BitReader<'_>) -> Result<i32> {
         }
         extra_ones += 1;
         if extra_ones > (MAX_DMV_LENGTH - 6) {
-            return Err(Error::invalid(
-                "mpeg4 GMC: dmv_length runaway past 14 bits",
-            ));
+            return Err(Error::invalid("mpeg4 GMC: dmv_length runaway past 14 bits"));
         }
     }
     let length = 6 + extra_ones;
@@ -267,7 +265,12 @@ impl WarpParams {
         //   (i1, j1) = (W, 0)
         //   (i2, j2) = (0, H)
         //   (i3, j3) = (W, H)
-        let i = [(0.0f64, 0.0), (w as f64, 0.0), (0.0, h as f64), (w as f64, h as f64)];
+        let i = [
+            (0.0f64, 0.0),
+            (w as f64, 0.0),
+            (0.0, h as f64),
+            (w as f64, h as f64),
+        ];
 
         // Cumulative sums: du'[k] = Σ_{m<=k} du[m].
         let mut cum_du = [0i32; 4];
@@ -339,11 +342,9 @@ impl WarpParams {
             let wf = w as f64;
             let hf = h as f64;
 
-            pg = ((i0p - i1p - i2p + i3p) * (j2p - j3p)
-                - (i2p - i3p) * (j0p - j1p - j2p + j3p))
+            pg = ((i0p - i1p - i2p + i3p) * (j2p - j3p) - (i2p - i3p) * (j0p - j1p - j2p + j3p))
                 * hf;
-            ph = ((i1p - i3p) * (j0p - j1p - j2p + j3p)
-                - (i0p - i1p - i2p + i3p) * (j1p - j3p))
+            ph = ((i1p - i3p) * (j0p - j1p - j2p + j3p) - (i0p - i1p - i2p + i3p) * (j1p - j3p))
                 * wf;
             let big_d = (i1p - i3p) * (j2p - j3p) - (i2p - i3p) * (j1p - j3p);
             d_wh = big_d * wf * hf;
@@ -410,7 +411,7 @@ impl WarpParams {
                 let wf = self.w as f64;
                 let big_i = i_f; // (i - i0) since i0 == 0 for rectangular
                 let big_j = j_f; // (j - j0)
-                // 2-point conformal rotation/scaling in (dx, dy) = (i1'-i0', j1'-j0')/W.
+                                 // 2-point conformal rotation/scaling in (dx, dy) = (i1'-i0', j1'-j0')/W.
                 let dx = (i1p - i0p) / wf;
                 let dy = (j1p - j0p) / wf;
                 // The rotation matrix [[dx, -dy], [dy, dx]] acts on (I, J):
@@ -594,8 +595,7 @@ fn warp_sample(
     let y01 = sample(x_int + 1, y_int);
     let y10 = sample(x_int, y_int + 1);
     let y11 = sample(x_int + 1, y_int + 1);
-    let val = ((s - rj) * ((s - ri) * y00 + ri * y01) + rj * ((s - ri) * y10 + ri * y11))
-        / (s * s);
+    let val = ((s - rj) * ((s - ri) * y00 + ri * y01) + rj * ((s - ri) * y10 + ri * y11)) / (s * s);
     val.round().clamp(0.0, 255.0) as u8
 }
 
@@ -688,7 +688,7 @@ mod tests {
         // A 1-point warp with an exact integer shift should return the
         // shifted reference pel.
         let vol = mk_vol(8, 8, 1, 0); // s=2 (half-pel)
-        // du=4, dv=0: i0' = (s/2)(2*0 + 4) = 4, so shift = i0'/s = 2 pel.
+                                      // du=4, dv=0: i0' = (s/2)(2*0 + 4) = 4, so shift = i0'/s = 2 pel.
         let mut t = SpriteTrajectory {
             points: 1,
             ..Default::default()
@@ -749,21 +749,21 @@ mod tests {
         // Size-5 entry "0" + FLC 5 bits.
         // Positive +1: "0" prefix, FLC MSB=1, lower 4 bits = 0000 -> value = 0+1 = 1.
         // Bits: "0 10000" = 010000 00 -> 0x40.
-        let data = [0b0_10000_00u8, 0xFF];
+        let data = [0b0100_0000_u8, 0xFF];
         let mut br = BitReader::new(&data);
         let v = decode_brightness_change_factor(&mut br).unwrap();
         assert_eq!(v, 1);
 
         // Positive +16: FLC MSB=1, lower 4 bits = 1111 -> value = 15+1 = 16.
         // Bits: "0 11111" = 011111 00.
-        let data = [0b0_11111_00u8, 0xFF];
+        let data = [0b0111_1100_u8, 0xFF];
         let mut br = BitReader::new(&data);
         let v = decode_brightness_change_factor(&mut br).unwrap();
         assert_eq!(v, 16);
 
         // Negative -1: FLC MSB=0, lower 4 bits = 0000 -> value = -(0+1) = -1.
         // Bits: "0 00000" = 000000 00.
-        let data = [0b0_00000_00u8, 0xFF];
+        let data = [0b0000_0000_u8, 0xFF];
         let mut br = BitReader::new(&data);
         let v = decode_brightness_change_factor(&mut br).unwrap();
         assert_eq!(v, -1);

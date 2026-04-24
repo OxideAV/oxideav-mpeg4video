@@ -576,8 +576,7 @@ fn parse_interlaced_vol_and_first_vop() {
     assert_eq!(vol.height, 480);
 
     // First VOP.
-    let (vop_pos, _) =
-        find_start_code(&data, |c| c == VOP_START_CODE).expect("at least one VOP");
+    let (vop_pos, _) = find_start_code(&data, |c| c == VOP_START_CODE).expect("at least one VOP");
     let vop_end = start_codes::iter_start_codes(&data[vop_pos + 4..])
         .next()
         .map(|(p, _)| vop_pos + 4 + p)
@@ -688,9 +687,6 @@ fn parse_gmc_clip_vol() {
     );
     eprintln!(
         "GMC VOL: warping_points={} accuracy={} brightness_change={}",
-        vol.no_of_sprite_warping_points,
-        vol.sprite_warping_accuracy,
-        vol.sprite_brightness_change
+        vol.no_of_sprite_warping_points, vol.sprite_warping_accuracy, vol.sprite_brightness_change
     );
 }
-

@@ -687,12 +687,8 @@ pub fn decode_bvop_pic(
                             }
                             None => ([(0, 0); 4], false),
                         };
-                        let (fwd4, bwd4) = crate::bvop::direct_mode_mvs_4(
-                            co_mvs4,
-                            trb,
-                            trd,
-                            (0, 0),
-                        );
+                        let (fwd4, bwd4) =
+                            crate::bvop::direct_mode_mvs_4(co_mvs4, trb, trd, (0, 0));
                         if was_4mv {
                             crate::bvop::reconstruct_b_mb_public_4mv(
                                 &mut pic,

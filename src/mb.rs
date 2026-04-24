@@ -20,9 +20,8 @@
 use oxideav_core::{Error, Result};
 
 use crate::block::{
-    apply_ac_prediction, choose_dc_predictor, decode_intra_ac,
-    decode_intra_dc_diff, reconstruct_intra_block, record_ac_prediction_cache, BlockNeighbour,
-    PredDir,
+    apply_ac_prediction, choose_dc_predictor, decode_intra_ac, decode_intra_dc_diff,
+    reconstruct_intra_block, record_ac_prediction_cache, BlockNeighbour, PredDir,
 };
 use crate::headers::vol::VideoObjectLayer;
 use crate::headers::vop::VideoObjectPlane;

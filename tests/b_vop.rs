@@ -147,19 +147,20 @@ fn decode_bvop_qpel_clip_runs() {
 }
 
 /// Interlaced (+ilme+ildct) B-VOP fixture — exercises the B-VOP MB-layer
-/// `interlaced_information()` parse. Fixture:
+/// `interlaced_information()` parse AND the field-sample MC path in
+/// `reconstruct_b_mb` (§7.6.2.2). Fixture:
 ///   ffmpeg -y -f lavfi -i "testsrc=size=64x64:rate=10:duration=1.2" \
 ///       -c:v mpeg4 -flags +ilme+ildct -g 6 -bf 2 -qscale:v 5 -an \
 ///       -f m4v /tmp/m4v_bvop_il.es
+///   ffmpeg -y -i /tmp/m4v_bvop_il.es -f rawvideo -pix_fmt yuv420p \
+///       /tmp/m4v_bvop_il.yuv
 ///
-/// This test is a no-panic smoke: it runs the bitstream through the
-/// decoder and asserts the call graph does not panic or diverge. Many
-/// interlaced paths (field-predicted MC in particular) are still
-/// follow-up work; the test just locks in that the B-VOP MB parser
-/// consumes the `interlaced_information()` bits before hitting MVs.
+/// When the reference YUV is available we assert a minimum PSNR floor
+/// to guard against regressions in the field-MC path. Otherwise the
+/// test is a no-panic smoke.
 #[test]
 fn decode_bvop_interlaced_clip_runs() {
-    use oxideav_core::{CodecId, CodecParameters, Packet, TimeBase};
+    use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
 
     let Some(bitstream) = read_fixture("/tmp/m4v_bvop_il.es") else {
         return;
@@ -169,17 +170,54 @@ fn decode_bvop_interlaced_clip_runs() {
     let packet = Packet::new(0, TimeBase::new(1, 90_000), bitstream);
     let _ = dec.send_packet(&packet);
     let _ = dec.flush();
-    // Drain the ready queue; we only require decode_send_packet to
-    // not panic. Silent `Err(NeedMore)` is fine — the test asserts
-    // the parser stays well-defined on interlaced bitstreams.
+
+    let reference = std::fs::read("/tmp/m4v_bvop_il.yuv").ok();
+    let frame_size = 64 * 64 * 3 / 2;
     let mut n = 0;
-    while let Ok(_f) = dec.receive_frame() {
+    let mut total_psnr_accum: f64 = 0.0;
+    let mut frames_with_ref = 0;
+    loop {
+        let frame = match dec.receive_frame() {
+            Ok(Frame::Video(vf)) => vf,
+            Ok(_) => break,
+            Err(_) => break,
+        };
+        if let Some(ref_buf) = reference.as_ref() {
+            let ref_off = n * frame_size;
+            if ref_off + frame_size <= ref_buf.len() {
+                let mut ours = Vec::with_capacity(frame_size);
+                ours.extend_from_slice(&frame.planes[0].data);
+                ours.extend_from_slice(&frame.planes[1].data);
+                ours.extend_from_slice(&frame.planes[2].data);
+                let mut sq: u64 = 0;
+                for i in 0..frame_size {
+                    let d = (ours[i] as i32) - (ref_buf[ref_off + i] as i32);
+                    sq += (d * d) as u64;
+                }
+                let mse = sq as f64 / frame_size as f64;
+                let psnr = if mse > 0.0 {
+                    10.0 * (255.0_f64 * 255.0 / mse).log10()
+                } else {
+                    100.0
+                };
+                eprintln!("interlaced frame {n}: PSNR {psnr:.2} dB");
+                total_psnr_accum += psnr;
+                frames_with_ref += 1;
+            }
+        }
         n += 1;
         if n > 64 {
             break;
         }
     }
-    eprintln!("interlaced bvop clip: decoded {n} frames (no panic)");
+    eprintln!(
+        "interlaced bvop clip: decoded {n} frames (no panic); avg PSNR over {frames_with_ref} frames: {:.2}",
+        if frames_with_ref > 0 {
+            total_psnr_accum / frames_with_ref as f64
+        } else {
+            0.0
+        }
+    );
 }
 
 /// Full-pipeline B-VOP decode — feed the full elementary stream into the

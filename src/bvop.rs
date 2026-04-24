@@ -246,11 +246,7 @@ pub fn decode_b_mb(
         .map(|g| g.get(mb_x, mb_y).not_coded)
         .unwrap_or(true);
     if co_located_not_coded {
-        bmv_grid.set(
-            mb_x,
-            mb_y,
-            BMbMotion::uni((0, 0), (0, 0), BMode::Forward),
-        );
+        bmv_grid.set(mb_x, mb_y, BMbMotion::uni((0, 0), (0, 0), BMode::Forward));
         reconstruct_b_mb(
             pic,
             prev_ref,
@@ -262,6 +258,7 @@ pub fn decode_b_mb(
             BMode::Forward,
             vol,
             vop,
+            None,
             None,
         );
         return Ok(quant);
@@ -291,6 +288,7 @@ pub fn decode_b_mb(
             BMode::Skipped,
             vol,
             vop,
+            None,
             None,
         );
         return Ok(quant);
@@ -460,10 +458,23 @@ pub fn decode_b_mb(
             )))
         }
     };
-    // Both `field_mvs_*` are currently threaded into `reconstruct_b_mb` via
-    // the field-MC path below. For the non-interlaced fixture they stay
-    // `None` and the existing frame-MV path is used verbatim.
-    let _field_mvs = (field_mvs_fwd, field_mvs_bwd);
+    // Field-prediction MC — build the per-MB `FieldMc` descriptor with
+    // the just-captured top/bottom field MVs + the reference-field flags
+    // carried in `il_info`. `reconstruct_b_mb` dispatches into the
+    // `field_predict_luma_mb` / `field_predict_chroma_mb` helpers when
+    // this is `Some`. For the progressive path it stays `None`.
+    let field_mc = if field_pred {
+        Some(FieldMc {
+            fwd: field_mvs_fwd,
+            bwd: field_mvs_bwd,
+            fwd_top_ref: il_info.forward_top_field_ref,
+            fwd_bot_ref: il_info.forward_bottom_field_ref,
+            bwd_top_ref: il_info.backward_top_field_ref,
+            bwd_bot_ref: il_info.backward_bottom_field_ref,
+        })
+    } else {
+        None
+    };
 
     let entry = if is_4mv_direct {
         BMbMotion::quad(fwd4, bwd4, mode)
@@ -516,8 +527,7 @@ pub fn decode_b_mb(
             };
             for r in 0..8 {
                 for c in 0..8 {
-                    residual_blocks[blk][r * 8 + c] =
-                        frame_mb[(sub_y + r) * 16 + (sub_x + c)];
+                    residual_blocks[blk][r * 8 + c] = frame_mb[(sub_y + r) * 16 + (sub_x + c)];
                 }
             }
         }
@@ -535,6 +545,7 @@ pub fn decode_b_mb(
         vol,
         vop,
         Some(&residual_blocks),
+        field_mc,
     );
 
     Ok(quant)
@@ -579,7 +590,18 @@ pub fn reconstruct_b_mb_public_4mv(
     residual_blocks: Option<&[[i32; 64]; 6]>,
 ) {
     reconstruct_b_mb(
-        pic, prev_ref, next_ref, mb_x, mb_y, fwd4, bwd4, mode, vol, vop, residual_blocks,
+        pic,
+        prev_ref,
+        next_ref,
+        mb_x,
+        mb_y,
+        fwd4,
+        bwd4,
+        mode,
+        vol,
+        vop,
+        residual_blocks,
+        None,
     );
 }
 
@@ -614,7 +636,27 @@ pub fn reconstruct_b_mb_public(
         vol,
         vop,
         residual_blocks,
+        None,
     );
+}
+
+/// Optional field MVs for a field-predicted B-MB. When `Some`, the
+/// luma + chroma MC fall through to the `field_predict_luma_mb` /
+/// `field_predict_chroma_mb` helpers instead of the frame-level
+/// `predict_block` path. `fwd` carries `[top, bottom]` field MVs for
+/// the forward reference; `bwd` is the backward counterpart.
+///
+/// `top_field_ref` / `bot_field_ref` flags come from the MB's
+/// `interlaced_information()` — they pick which field of the reference
+/// each half of the MB samples from.
+#[derive(Clone, Copy, Debug, Default)]
+struct FieldMc {
+    fwd: Option<[(i32, i32); 2]>,
+    bwd: Option<[(i32, i32); 2]>,
+    fwd_top_ref: bool,
+    fwd_bot_ref: bool,
+    bwd_top_ref: bool,
+    bwd_bot_ref: bool,
 }
 
 /// Combine forward + backward predictions according to `mode`, add
@@ -625,6 +667,10 @@ pub fn reconstruct_b_mb_public(
 /// `fwd4`/`bwd4` carry one MV per luma 8x8 block in raster order. In
 /// all modes except 4MV direct the four entries are equal (the caller
 /// fills them by replication).
+///
+/// `field_mc` drives the optional field-sample path (§7.6.2.2). When
+/// provided, the MB is sampled strip-by-strip from alternating fields
+/// in the reference instead of the frame-level predictor.
 #[allow(clippy::too_many_arguments)]
 fn reconstruct_b_mb(
     pic: &mut IVopPicture,
@@ -638,7 +684,24 @@ fn reconstruct_b_mb(
     vol: &VideoObjectLayer,
     vop: &VideoObjectPlane,
     residual_blocks: Option<&[[i32; 64]; 6]>,
+    field_mc: Option<FieldMc>,
 ) {
+    // Field-predicted path: sample 16x16 luma + 8x8 chroma MB buffers
+    // from alternating reference fields, then add residual + clip.
+    if let Some(fm) = field_mc.filter(|f| f.fwd.is_some() || f.bwd.is_some()) {
+        return reconstruct_b_mb_field(
+            pic,
+            prev_ref,
+            next_ref,
+            mb_x,
+            mb_y,
+            mode,
+            vol,
+            vop,
+            residual_blocks,
+            fm,
+        );
+    }
     // Per §7.5.9.5.3: for direct mode, luma MC runs on 8x8 blocks using
     // the per-block MVs (fwd4/bwd4). For non-direct modes each of fwd4
     // holds the same 16x16 MV across all 4 entries, so the same 8x8
@@ -806,6 +869,209 @@ fn reconstruct_b_mb(
     }
 }
 
+/// Field-sample reconstruction path for B-MBs (§7.6.2.2). Samples the
+/// 16x16 luma + 8x8 chroma MBs from alternating reference fields using
+/// the top + bottom field MVs captured during parse, applies residuals,
+/// and writes into `pic`.
+///
+/// Chroma field MVs are derived by `Div2Round` (`luma_mv_to_chroma`)
+/// from the luma field MVs — §7.6.2.2 specifies the same reduction
+/// table as for frame MC.
+#[allow(clippy::too_many_arguments)]
+fn reconstruct_b_mb_field(
+    pic: &mut IVopPicture,
+    prev_ref: &IVopPicture,
+    next_ref: &IVopPicture,
+    mb_x: usize,
+    mb_y: usize,
+    mode: BMode,
+    vol: &VideoObjectLayer,
+    vop: &VideoObjectPlane,
+    residual_blocks: Option<&[[i32; 64]; 6]>,
+    fm: FieldMc,
+) {
+    let use_fwd = matches!(mode, BMode::Forward | BMode::Interpolated);
+    let use_bwd = matches!(mode, BMode::Backward | BMode::Interpolated);
+    let mb_px = (mb_x * 16) as i32;
+    let mb_py = (mb_y * 16) as i32;
+
+    // --- Luma 16x16 predictor ---
+    let ref_h = prev_ref.y.len() / prev_ref.y_stride;
+    let ref_h_next = next_ref.y.len() / next_ref.y_stride;
+    let mut pred_fwd = [0u8; 256];
+    let mut pred_bwd = [0u8; 256];
+    if use_fwd {
+        if let Some([t, b]) = fm.fwd {
+            crate::interlaced::field_predict_luma_mb(
+                &prev_ref.y,
+                prev_ref.y_stride,
+                ref_h,
+                mb_px,
+                mb_py,
+                t,
+                b,
+                fm.fwd_top_ref,
+                fm.fwd_bot_ref,
+                vop.rounding_type,
+                &mut pred_fwd,
+            );
+        }
+    }
+    if use_bwd {
+        if let Some([t, b]) = fm.bwd {
+            crate::interlaced::field_predict_luma_mb(
+                &next_ref.y,
+                next_ref.y_stride,
+                ref_h_next,
+                mb_px,
+                mb_py,
+                t,
+                b,
+                fm.bwd_top_ref,
+                fm.bwd_bot_ref,
+                vop.rounding_type,
+                &mut pred_bwd,
+            );
+        }
+    }
+    let mut combined_luma = [0u8; 256];
+    match mode {
+        BMode::Forward => combined_luma.copy_from_slice(&pred_fwd),
+        BMode::Backward => combined_luma.copy_from_slice(&pred_bwd),
+        BMode::Interpolated | BMode::Direct | BMode::Skipped => {
+            for i in 0..256 {
+                combined_luma[i] = ((pred_fwd[i] as u16 + pred_bwd[i] as u16 + 1) >> 1) as u8;
+            }
+        }
+    }
+    // Write luma into pic.y, per-block with residual.
+    for blk in 0..4 {
+        let (sub_x, sub_y) = match blk {
+            0 => (0usize, 0usize),
+            1 => (8, 0),
+            2 => (0, 8),
+            3 => (8, 8),
+            _ => unreachable!(),
+        };
+        let dst_off = (mb_py as usize + sub_y) * pic.y_stride + (mb_px as usize + sub_x);
+        // Gather the 8x8 predictor block from the 16x16 combined buffer.
+        let mut pblk = [0u8; 64];
+        for r in 0..8 {
+            for c in 0..8 {
+                pblk[r * 8 + c] = combined_luma[(sub_y + r) * 16 + (sub_x + c)];
+            }
+        }
+        if let Some(residuals) = residual_blocks {
+            crate::simd::add_residual_clip_block(
+                &pblk,
+                &residuals[blk],
+                &mut pic.y,
+                dst_off,
+                pic.y_stride,
+            );
+        } else {
+            crate::simd::copy_block_u8(&pblk, &mut pic.y, dst_off, pic.y_stride);
+        }
+    }
+
+    // --- Chroma 8x8 predictor ---
+    let to_chroma = |v: i32| -> i32 {
+        if vol.quarter_sample {
+            luma_qmv_to_chroma(v)
+        } else {
+            luma_mv_to_chroma(v)
+        }
+    };
+    let fwd_c = fm.fwd.map(|[t, b]| {
+        (
+            (to_chroma(t.0), to_chroma(t.1)),
+            (to_chroma(b.0), to_chroma(b.1)),
+        )
+    });
+    let bwd_c = fm.bwd.map(|[t, b]| {
+        (
+            (to_chroma(t.0), to_chroma(t.1)),
+            (to_chroma(b.0), to_chroma(b.1)),
+        )
+    });
+    let c_px = (mb_x * 8) as i32;
+    let c_py = (mb_y * 8) as i32;
+    for plane_idx in 0..2 {
+        let (ref_prev_plane, ref_next_plane, ref_stride) = if plane_idx == 0 {
+            (&prev_ref.cb, &next_ref.cb, prev_ref.c_stride)
+        } else {
+            (&prev_ref.cr, &next_ref.cr, prev_ref.c_stride)
+        };
+        let ref_h = ref_prev_plane.len() / ref_stride;
+        let ref_h_next = ref_next_plane.len() / ref_stride;
+        let mut pred_fwd_c = [0u8; 64];
+        let mut pred_bwd_c = [0u8; 64];
+        if use_fwd {
+            if let Some((t, b)) = fwd_c {
+                crate::interlaced::field_predict_chroma_mb(
+                    ref_prev_plane,
+                    ref_stride,
+                    ref_h,
+                    c_px,
+                    c_py,
+                    t,
+                    b,
+                    fm.fwd_top_ref,
+                    fm.fwd_bot_ref,
+                    vop.rounding_type,
+                    &mut pred_fwd_c,
+                );
+            }
+        }
+        if use_bwd {
+            if let Some((t, b)) = bwd_c {
+                crate::interlaced::field_predict_chroma_mb(
+                    ref_next_plane,
+                    ref_stride,
+                    ref_h_next,
+                    c_px,
+                    c_py,
+                    t,
+                    b,
+                    fm.bwd_top_ref,
+                    fm.bwd_bot_ref,
+                    vop.rounding_type,
+                    &mut pred_bwd_c,
+                );
+            }
+        }
+        let combined_c: [u8; 64] = match mode {
+            BMode::Forward => pred_fwd_c,
+            BMode::Backward => pred_bwd_c,
+            BMode::Interpolated | BMode::Direct | BMode::Skipped => {
+                let mut out = [0u8; 64];
+                for i in 0..64 {
+                    out[i] = ((pred_fwd_c[i] as u16 + pred_bwd_c[i] as u16 + 1) >> 1) as u8;
+                }
+                out
+            }
+        };
+        let dst_plane = if plane_idx == 0 {
+            &mut pic.cb
+        } else {
+            &mut pic.cr
+        };
+        let dst_off = (c_py as usize) * pic.c_stride + (c_px as usize);
+        if let Some(residuals) = residual_blocks {
+            let res_idx = 4 + plane_idx;
+            crate::simd::add_residual_clip_block(
+                &combined_c,
+                &residuals[res_idx],
+                dst_plane,
+                dst_off,
+                pic.c_stride,
+            );
+        } else {
+            crate::simd::copy_block_u8(&combined_c, dst_plane, dst_off, pic.c_stride);
+        }
+    }
+}
+
 /// Luma prediction with VOL-directed half-pel or quarter-pel filter.
 fn predict_luma_block(
     dst: &mut [u8; 64],
@@ -910,10 +1176,10 @@ mod tests {
         // Per-component: dx != 0 → bwdx = fwdx - co_mvx;  dy == 0 → bwdy uses
         // the linear formula.
         let ((fx, fy), (bx, by)) = direct_mode_mvs((8, 0), 2, 4, (1, 2));
-        assert_eq!((fx, fy), (4 + 1, 0 + 2));
+        assert_eq!((fx, fy), (5, 2));
         // dx = 1 (nonzero) → bwdx = fwdx - co_mvx = 5 - 8 = -3
         // dy = 2 (nonzero) → bwdy = fwdy - co_mvy = 2 - 0 = 2
-        assert_eq!((bx, by), (fx - 8, fy - 0));
+        assert_eq!((bx, by), (fx - 8, fy));
     }
 
     #[test]
@@ -937,11 +1203,7 @@ mod tests {
     #[test]
     fn bmv_grid_round_trip() {
         let mut g = BMvGrid::new(4, 3);
-        g.set(
-            2,
-            1,
-            BMbMotion::uni((3, -7), (-1, 4), BMode::Interpolated),
-        );
+        g.set(2, 1, BMbMotion::uni((3, -7), (-1, 4), BMode::Interpolated));
         let m = g.get(2, 1);
         assert_eq!(m.fwd, (3, -7));
         assert_eq!(m.bwd, (-1, 4));

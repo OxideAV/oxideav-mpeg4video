@@ -176,14 +176,14 @@ pub fn parse_vop(br: &mut BitReader<'_>, vol: &VideoObjectLayer) -> Result<Video
     // `no_of_sprite_warping_points` trajectory pairs follow the fcode
     // field and precede the MB-layer. S-VOPs carry the same trajectory
     // but we don't decode S-VOPs yet.
-    let sprite_trajectory =
-        if vol.sprite_enable == 2 && vop_coding_type == VopCodingType::P
-            && vol.no_of_sprite_warping_points > 0
-        {
-            Some(decode_sprite_trajectory(br, vol)?)
-        } else {
-            None
-        };
+    let sprite_trajectory = if vol.sprite_enable == 2
+        && vop_coding_type == VopCodingType::P
+        && vol.no_of_sprite_warping_points > 0
+    {
+        Some(decode_sprite_trajectory(br, vol)?)
+    } else {
+        None
+    };
 
     Ok(VideoObjectPlane {
         vop_coding_type,

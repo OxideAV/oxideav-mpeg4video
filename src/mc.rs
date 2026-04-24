@@ -53,8 +53,17 @@ pub fn predict_block(
     let tap_y = if hy { 1 } else { 0 };
     if src_x >= 0 && src_y >= 0 && src_x + n + tap_x <= ref_w && src_y + n + tap_y <= ref_h {
         predict_block_interior(
-            ref_plane, ref_stride, src_x as usize, src_y as usize, hx, hy, n as usize, round,
-            round2, dst, dst_stride,
+            ref_plane,
+            ref_stride,
+            src_x as usize,
+            src_y as usize,
+            hx,
+            hy,
+            n as usize,
+            round,
+            round2,
+            dst,
+            dst_stride,
         );
         return;
     }
@@ -154,9 +163,8 @@ fn predict_block_interior(
                 let e = &ref_plane[s1 + 1..s1 + 1 + n];
                 let d = j * dst_stride;
                 for i in 0..n {
-                    dst[d + i] =
-                        ((a[i] as u32 + b[i] as u32 + c[i] as u32 + e[i] as u32 + round2) >> 2)
-                            as u8;
+                    dst[d + i] = ((a[i] as u32 + b[i] as u32 + c[i] as u32 + e[i] as u32 + round2)
+                        >> 2) as u8;
                 }
             }
         }
@@ -219,7 +227,14 @@ fn qpel_filter8(s: [i32; 8], rounding: bool) -> u8 {
 
 /// Read a sample with edge-replication clamp.
 #[inline]
-fn clamp_sample(ref_plane: &[u8], ref_stride: usize, ref_w: i32, ref_h: i32, x: i32, y: i32) -> i32 {
+fn clamp_sample(
+    ref_plane: &[u8],
+    ref_stride: usize,
+    ref_w: i32,
+    ref_h: i32,
+    x: i32,
+    y: i32,
+) -> i32 {
     let xc = x.clamp(0, ref_w - 1) as usize;
     let yc = y.clamp(0, ref_h - 1) as usize;
     ref_plane[yc * ref_stride + xc] as i32
@@ -309,9 +324,8 @@ pub fn predict_block_qpel(
     };
 
     // Integer sample from the reference.
-    let int_s = |x: i32, y: i32| -> u8 {
-        clamp_sample(ref_plane, ref_stride, ref_w, ref_h, x, y) as u8
-    };
+    let int_s =
+        |x: i32, y: i32| -> u8 { clamp_sample(ref_plane, ref_stride, ref_w, ref_h, x, y) as u8 };
 
     // Pick the two "anchor" samplers and the mixing weights per sub-pel.
     // We compute sample at position (px, py) where px, py are measured in
@@ -469,7 +483,11 @@ mod tests {
         predict_block_qpel(&refp, 8, 8, 8, 3, 3, 2, 0, 2, false, &mut q, 2);
         // Ramp is `x * 30` on each row. Half-sample at pixel 3.5 should be
         // approximately 3.5*30 = 105. The 8-tap filter rounds to nearest.
-        assert!((q[0] as i32 - 105).abs() <= 1, "half-pel ramp gave {}", q[0]);
+        assert!(
+            (q[0] as i32 - 105).abs() <= 1,
+            "half-pel ramp gave {}",
+            q[0]
+        );
     }
 
     #[test]

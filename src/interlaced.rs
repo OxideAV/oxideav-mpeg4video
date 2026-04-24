@@ -31,9 +31,7 @@
 
 use oxideav_core::Result;
 
-use crate::headers::vol::{
-    ALTERNATE_HORIZONTAL_SCAN, ALTERNATE_VERTICAL_SCAN, ZIGZAG,
-};
+use crate::headers::vol::{ALTERNATE_HORIZONTAL_SCAN, ALTERNATE_VERTICAL_SCAN, ZIGZAG};
 use crate::headers::vop::{VideoObjectPlane, VopCodingType};
 use oxideav_core::bits::BitReader;
 
@@ -196,6 +194,160 @@ pub fn field_dct_reorder_mb(
     }
 }
 
+/// Sample a full 16x16 macroblock prediction from a reference using
+/// two field motion vectors (top + bottom), per §7.6.2.2's
+/// `field_motion_compensate_one_reference()` pseudocode.
+///
+/// The luma MB is assembled row-interleaved — even rows (0, 2, 4, …, 14)
+/// come from the top-field MC, odd rows (1, 3, …, 15) from the
+/// bottom-field MC. Each field-MC call samples an 8x16 strip from the
+/// reference's top or bottom field, selected by `top_field_ref` /
+/// `bot_field_ref`.
+///
+/// `(mb_px, mb_py)` are the top-left frame coordinates of the current
+/// MB. `mv_top = (x, y_frame_half)` and `mv_bot = (x, y_frame_half)`
+/// are the field MVs expressed in the frame-coordinate half-pel units
+/// carried on the MV grid (vertical components already scaled by 2).
+///
+/// Writes into `out_mb` at row stride 16.
+pub fn field_predict_luma_mb(
+    ref_plane: &[u8],
+    ref_stride: usize,
+    ref_h: usize,
+    mb_px: i32,
+    mb_py: i32,
+    mv_top: (i32, i32),
+    mv_bot: (i32, i32),
+    top_field_ref: bool,
+    bot_field_ref: bool,
+    rounding: bool,
+    out_mb: &mut [u8; 256],
+) {
+    // Each field-MC call samples an 8-row field strip into a 16-col-wide
+    // buffer, then we interleave the two strips into a 16x16 frame MB.
+    //
+    // `field_predict_luma_block` takes 8x8 blocks — we call it four times,
+    // two per field (left + right halves of the MB).
+    //
+    // Vertical MV in field coordinates is mv.y / 2 (frame half-pel divided
+    // by 2, since one row in the field plane = two rows in the frame
+    // plane). The frame-coordinate base y translates to field-plane y by
+    // dividing by 2.
+    let field_py = mb_py / 2;
+
+    // Top-field 8x16 strip — two 8x8 blocks side by side.
+    for (x_off, out_col) in [(0i32, 0usize), (8i32, 8usize)] {
+        let mut blk = [0u8; 64];
+        field_predict_luma_block(
+            ref_plane,
+            ref_stride,
+            ref_h,
+            mb_px + x_off,
+            field_py,
+            mv_top.0,
+            mv_top.1 / 2,
+            rounding,
+            top_field_ref,
+            &mut blk,
+        );
+        for r in 0..8 {
+            let frame_row = r * 2; // top-field: even rows 0,2,4,...,14
+            for c in 0..8 {
+                out_mb[frame_row * 16 + out_col + c] = blk[r * 8 + c];
+            }
+        }
+    }
+
+    // Bottom-field 8x16 strip — same layout, but writes odd frame rows.
+    for (x_off, out_col) in [(0i32, 0usize), (8i32, 8usize)] {
+        let mut blk = [0u8; 64];
+        field_predict_luma_block(
+            ref_plane,
+            ref_stride,
+            ref_h,
+            mb_px + x_off,
+            field_py,
+            mv_bot.0,
+            mv_bot.1 / 2,
+            rounding,
+            bot_field_ref,
+            &mut blk,
+        );
+        for r in 0..8 {
+            let frame_row = r * 2 + 1; // bottom-field: odd rows 1,3,...,15
+            for c in 0..8 {
+                out_mb[frame_row * 16 + out_col + c] = blk[r * 8 + c];
+            }
+        }
+    }
+}
+
+/// Chroma counterpart to `field_predict_luma_mb` — samples an 8x8 chroma
+/// MB from a reference using two field MVs. The chroma MVs are
+/// `Div2Round`-reduced from the luma MVs by the caller.
+pub fn field_predict_chroma_mb(
+    ref_plane: &[u8],
+    ref_stride: usize,
+    ref_h: usize,
+    c_px: i32,
+    c_py: i32,
+    mv_top_c: (i32, i32),
+    mv_bot_c: (i32, i32),
+    top_field_ref: bool,
+    bot_field_ref: bool,
+    rounding: bool,
+    out_mb: &mut [u8; 64],
+) {
+    // Chroma is 8x8 per MB (4:2:0). Split into two 8x4 field strips:
+    // rows 0,2,4,6 from top field, rows 1,3,5,7 from bottom field.
+    //
+    // We sample each field as a single 8x4 strip via `field_predict_luma_block`
+    // (which is structurally field-based even for luma-sized blocks), writing
+    // only the 4 rows relevant to the field.
+    let field_stride = ref_stride * 2;
+    let field_h = ref_h / 2;
+    // Top-field 8x4 strip.
+    let field_base_top = if top_field_ref { ref_stride } else { 0 };
+    let mut tmp_top = [0u8; 64];
+    crate::mc::predict_block(
+        &ref_plane[field_base_top.min(ref_plane.len())..],
+        field_stride,
+        ref_stride as i32,
+        field_h as i32,
+        c_px,
+        c_py / 2,
+        mv_top_c.0,
+        mv_top_c.1 / 2,
+        8,
+        rounding,
+        &mut tmp_top,
+        8,
+    );
+    // Bottom-field 8x4 strip.
+    let field_base_bot = if bot_field_ref { ref_stride } else { 0 };
+    let mut tmp_bot = [0u8; 64];
+    crate::mc::predict_block(
+        &ref_plane[field_base_bot.min(ref_plane.len())..],
+        field_stride,
+        ref_stride as i32,
+        field_h as i32,
+        c_px,
+        c_py / 2,
+        mv_bot_c.0,
+        mv_bot_c.1 / 2,
+        8,
+        rounding,
+        &mut tmp_bot,
+        8,
+    );
+    for r in 0..4 {
+        for c in 0..8 {
+            out_mb[(r * 2) * 8 + c] = tmp_top[r * 8 + c];
+            out_mb[(r * 2 + 1) * 8 + c] = tmp_bot[r * 8 + c];
+        }
+    }
+}
+
 /// Field-based luma MC sample: predict an 8x8 field block from the
 /// reference, scaling the vertical MV by 2 so it addresses a field row
 /// (rather than a frame row). The caller positions `block_py_field` such
@@ -294,13 +446,9 @@ mod tests {
         bw.write_bits(0, 7);
         let data = bw.finish();
         let mut br = BitReader::new(&data);
-        let info = parse_interlaced_information(
-            &mut br,
-            MbClass::InterSingleMv,
-            VopCodingType::P,
-            false,
-        )
-        .expect("parse");
+        let info =
+            parse_interlaced_information(&mut br, MbClass::InterSingleMv, VopCodingType::P, false)
+                .expect("parse");
         assert!(!info.dct_type);
         assert!(!info.field_prediction);
     }
@@ -315,13 +463,9 @@ mod tests {
         bw.write_bits(1, 1); // forward_bot=1
         let data = bw.finish();
         let mut br = BitReader::new(&data);
-        let info = parse_interlaced_information(
-            &mut br,
-            MbClass::InterSingleMv,
-            VopCodingType::P,
-            true,
-        )
-        .expect("parse");
+        let info =
+            parse_interlaced_information(&mut br, MbClass::InterSingleMv, VopCodingType::P, true)
+                .expect("parse");
         assert!(info.dct_type);
         assert!(info.field_prediction);
         assert!(!info.forward_top_field_ref);
@@ -341,6 +485,81 @@ mod tests {
         let vop = make_vop(false);
         let scan = choose_scan_interlaced(&vop, false, None);
         assert_eq!(scan[1], ZIGZAG[1]);
+    }
+
+    #[test]
+    fn field_predict_luma_mb_interleaves_fields() {
+        // Build a 32x32 reference where even rows are all 50 and odd rows
+        // are all 200 — i.e. "top field" = 50-valued plane, "bottom field"
+        // = 200-valued plane.
+        let mut reference = vec![0u8; 32 * 32];
+        for r in 0..32 {
+            let v = if r & 1 == 0 { 50 } else { 200 };
+            for c in 0..32 {
+                reference[r * 32 + c] = v;
+            }
+        }
+        let mut out = [0u8; 256];
+        // Zero MVs; top-field-ref=0 (top field of ref = even rows = 50),
+        // bot-field-ref=1 (bottom field of ref = odd rows = 200).
+        field_predict_luma_mb(
+            &reference,
+            32,
+            32,
+            0,
+            0,
+            (0, 0),
+            (0, 0),
+            false,
+            true,
+            false,
+            &mut out,
+        );
+        // Expected MB: even rows filled with top-field sample (50),
+        // odd rows filled with bottom-field sample (200).
+        for r in 0..16 {
+            let expect = if r & 1 == 0 { 50 } else { 200 };
+            for c in 0..16 {
+                assert_eq!(
+                    out[r * 16 + c],
+                    expect,
+                    "row {r} col {c}: got {} expected {expect}",
+                    out[r * 16 + c]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn field_predict_chroma_mb_interleaves_fields() {
+        // 16x16 reference chroma plane, even rows = 100, odd rows = 220.
+        let mut reference = vec![0u8; 16 * 16];
+        for r in 0..16 {
+            let v = if r & 1 == 0 { 100 } else { 220 };
+            for c in 0..16 {
+                reference[r * 16 + c] = v;
+            }
+        }
+        let mut out = [0u8; 64];
+        field_predict_chroma_mb(
+            &reference,
+            16,
+            16,
+            0,
+            0,
+            (0, 0),
+            (0, 0),
+            false,
+            true,
+            false,
+            &mut out,
+        );
+        for r in 0..8 {
+            let expect = if r & 1 == 0 { 100 } else { 220 };
+            for c in 0..8 {
+                assert_eq!(out[r * 8 + c], expect);
+            }
+        }
     }
 
     #[test]
