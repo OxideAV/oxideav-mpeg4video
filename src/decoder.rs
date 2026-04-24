@@ -232,7 +232,27 @@ impl Mpeg4VideoDecoder {
                     let mut br = BitReader::new(payload);
                     self.vol = Some(parse_vol(&mut br)?);
                 }
-                GOV_START_CODE | USER_DATA_START_CODE | VIDEO_SESSION_ERROR_CODE | VOS_END_CODE => {
+                GOV_START_CODE => {
+                    // §6.2.5 / §6.3.5 — Group of VideoObjectPlane header.
+                    // The 18-bit `time_code` (HH:MM:SS) anchors the
+                    // `absolute_base_seconds` counter so the first VOP
+                    // after this GOV carries a `modulo_time_base` /
+                    // `vop_time_increment` pair relative to the GOV's
+                    // start time. Without this reset, subsequent GOVs
+                    // in the stream accumulate into the running base
+                    // and any B-VOP with an I-VOP whose `mtb==0` sits
+                    // in an earlier-ordered time slot gets misdated.
+                    let mut br = BitReader::new(payload);
+                    if let Ok(time_code) = br.read_u32(18) {
+                        let hours = (time_code >> 13) & 0x1F;
+                        let minutes = (time_code >> 7) & 0x3F;
+                        let seconds = time_code & 0x3F;
+                        let total_seconds =
+                            hours as i64 * 3600 + minutes as i64 * 60 + seconds as i64;
+                        self.absolute_base_seconds = total_seconds;
+                    }
+                }
+                USER_DATA_START_CODE | VIDEO_SESSION_ERROR_CODE | VOS_END_CODE => {
                     // Not yet used by this decoder — skip.
                 }
                 VOP_START_CODE => {
