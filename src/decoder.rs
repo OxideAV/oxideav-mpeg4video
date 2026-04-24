@@ -166,18 +166,12 @@ impl Mpeg4VideoDecoder {
                     }
                     let mut br = BitReader::new(payload);
                     let vop = parse_vop(&mut br, &vol)?;
-                    // Interlaced streams parse cleanly through the header
-                    // layer, but field-coded MBs (dct_type / field_prediction)
-                    // aren't reconstructed yet — reject at the VOP layer
-                    // rather than at the VOL so progressive VOPs inside an
-                    // `interlaced == 1` VOL still decode. Per §6.2.5 the
-                    // VOL flag is permissive: it marks the VOL as "may
-                    // contain interlaced VOPs", not as a required mode.
-                    if vop.interlaced && vop.vop_coded {
-                        return Err(Error::unsupported(
-                            "mpeg4 interlaced field coding (VOP-level): follow-up",
-                        ));
-                    }
+                    // Interlaced field coding is decoded through the
+                    // MB-layer `interlaced_information()` parser
+                    // (§6.2.7.3). I-VOP intra MBs run through the
+                    // field-DCT reorder path when `dct_type=1`; P/B-VOP
+                    // inter MBs decode field-predicted MVs and sample
+                    // the reference on the per-field grid.
                     self.handle_vop(&vol, &vop, &mut br)?;
                 }
                 _ => {

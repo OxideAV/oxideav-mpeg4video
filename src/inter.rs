@@ -18,13 +18,16 @@
 use oxideav_core::Result;
 
 use crate::block::{
-    apply_ac_prediction, choose_dc_predictor, choose_scan, decode_inter_ac,
+    apply_ac_prediction, choose_dc_predictor, decode_inter_ac,
     decode_intra_ac, decode_intra_dc_diff, reconstruct_inter_block, reconstruct_intra_block,
     record_ac_prediction_cache, BlockNeighbour, PredDir,
 };
 use crate::gmc::{warp_predict_chroma_block, warp_predict_luma_block, WarpParams};
 use crate::headers::vol::VideoObjectLayer;
 use crate::headers::vop::VideoObjectPlane;
+use crate::interlaced::{
+    choose_scan_interlaced, parse_interlaced_information, InterlacedInfo, MbClass,
+};
 use crate::iq::{dc_scaler, INTRA_DC_VLC_THR_TABLE};
 use crate::mb::{IVopPicture, PredGrid};
 use crate::mc::{luma_mv_to_chroma, luma_qmv_to_chroma, predict_block, predict_block_qpel};
@@ -380,15 +383,43 @@ pub fn decode_p_mb(
         quant = new_q.clamp(1, 31) as u32;
     }
 
-    // 5b. GMC `mcsel` flag (§7.7 amendment). Present only when the VOL
+    // 5b. Interlaced information — §6.2.7.3. Present only when the VOP
+    // advertises `interlaced == 1`. The class of the MB determines which
+    // sub-fields are emitted:
+    //   * Intra MBs — only `dct_type`.
+    //   * Single-MV inter MBs — `dct_type` iff cbp != 0, then
+    //     `field_prediction` + optional field-ref bits.
+    //   * 4MV MBs — only `dct_type` when cbp != 0.
+    let is_intra_mb = matches!(mb_type, mcbpc::PMbType::Intra | mcbpc::PMbType::IntraQ);
+    let is_4mv = matches!(
+        mb_type,
+        mcbpc::PMbType::Inter4MV | mcbpc::PMbType::Inter4MVQ
+    );
+    let cbp_nonzero = cbpy != 0 || cbpc != 0;
+    let il_info = if vop.interlaced {
+        let class = if is_intra_mb {
+            MbClass::Intra
+        } else if is_4mv {
+            MbClass::Inter4Mv
+        } else {
+            MbClass::InterSingleMv
+        };
+        parse_interlaced_information(br, class, vop.vop_coding_type, cbp_nonzero)?
+    } else {
+        InterlacedInfo::default()
+    };
+
+    // 5c. GMC `mcsel` flag (§7.7 amendment). Present only when the VOL
     // advertises `sprite_enable == 2` AND the MB type is Inter / InterQ
     // (single-MV). The bit signals that the MB should be reconstructed
     // by warping the reference through the global transform rather than
     // by translational MC. `mcsel == 1` macroblocks omit the local MV
     // component pair from the bitstream. 4MV and Intra MBs never carry
-    // mcsel.
+    // mcsel. Field-predicted MBs also skip mcsel (GMC and field pred are
+    // mutually exclusive paths in the standard).
     let gmc_mb = if vol.sprite_enable == 2
         && matches!(mb_type, mcbpc::PMbType::Inter | mcbpc::PMbType::InterQ)
+        && !il_info.field_prediction
     {
         br.read_u1()? == 1
     } else {
@@ -397,11 +428,12 @@ pub fn decode_p_mb(
 
     // 6. Motion vectors (skip for intra MBs and for GMC-coded MBs).
     let mut motion = MbMotion::default();
-    let four_mv = matches!(
-        mb_type,
-        mcbpc::PMbType::Inter4MV | mcbpc::PMbType::Inter4MVQ
-    );
-    let is_intra = matches!(mb_type, mcbpc::PMbType::Intra | mcbpc::PMbType::IntraQ);
+    let four_mv = is_4mv;
+    let is_intra = is_intra_mb;
+    // Field-prediction MBs carry TWO MVs (one per field) per §7.6.2.
+    // Decode them into `field_mvs` so the MC stage can apply field
+    // sampling later. For frame-MV MBs `field_mvs` is ignored.
+    let mut field_mvs: [(i32, i32); 2] = [(0, 0); 2];
 
     if is_intra {
         // Intra MB carries (0,0) as future neighbour predictor.
@@ -409,6 +441,42 @@ pub fn decode_p_mb(
     } else if gmc_mb {
         // GMC MB — no MV in bitstream. MV predictor neighbours see (0,0).
         mv_grid.set(mb_x, mb_y, MbMotion::default());
+    } else if il_info.field_prediction {
+        // Field-prediction single-MV MB — decode two MVs (top field,
+        // bottom field). MV predictor averages the two for the grid so
+        // that neighbours see a frame-consistent predictor.
+        let f_code = vop.vop_fcode_forward.max(1);
+        let (px, py) = predict_mv_full(
+            mv_grid,
+            mb_x,
+            mb_y,
+            0,
+            false,
+            slice_first_mb.0,
+            slice_first_mb.1,
+        );
+        // Each field MVD uses the same (frame) predictor, but the decoded
+        // vertical component is in "field coordinates" (1 LSB = half-pel
+        // in the field). §7.6.2.1 reconstructs frame-space MVy by
+        // `MVy = 2 * (MVDy + Py/2)`; for simplicity we apply the frame-
+        // predictor formula and scale y after, matching FFmpeg's approach.
+        for field in 0..2 {
+            let mvx = decode_mv_component(br, f_code, px)?;
+            // Y uses a half-predictor per the spec.
+            let mvy = decode_mv_component(br, f_code, py / 2)?;
+            // Scale MVy to frame coordinates.
+            let mvy_frame = 2 * mvy;
+            field_mvs[field] = (mvx, mvy_frame);
+        }
+        // For predictor neighbour purposes, store the average as the MB's
+        // single MV.
+        let avg = (
+            (field_mvs[0].0 + field_mvs[1].0) / 2,
+            (field_mvs[0].1 + field_mvs[1].1) / 2,
+        );
+        motion.mv = [avg; 4];
+        motion.four_mv = false;
+        mv_grid.set(mb_x, mb_y, motion);
     } else {
         let f_code = vop.vop_fcode_forward.max(1);
         if four_mv {
@@ -474,80 +542,180 @@ pub fn decode_p_mb(
     ];
     let chroma_coded = [(cbpc >> 1) & 1 != 0, cbpc & 1 != 0];
 
-    // For each luma block, apply MC and add residual.
-    for blk in 0..4 {
-        let (mvx, mvy) = motion.mv[blk];
-        let (sub_x, sub_y) = match blk {
-            0 => (0, 0),
-            1 => (8, 0),
-            2 => (0, 8),
-            3 => (8, 8),
-            _ => unreachable!(),
-        };
-        let blk_px = (mb_x * 16 + sub_x) as i32;
-        let blk_py = (mb_y * 16 + sub_y) as i32;
-
-        // Build prediction block. Three paths:
-        //   * GMC — inverse-map through the global warp.
-        //   * QPel translational — 8-tap + bilinear (§7.6.2.2).
-        //   * Half-pel translational — bilinear (§7.6.2.1).
-        let mut pred_buf = [0u8; 64];
-        if gmc_mb {
-            let warp = warp.expect("GMC MB but no warp params");
-            warp_predict_luma_block(
-                warp,
+    // Build the 16×16 luma MB predictor. For frame-MV MBs this is four
+    // 8×8 block copies at the obvious positions. For field-MV MBs the
+    // predictor is built from two 8×16 field strips, each pulled from
+    // one of the reference fields.
+    let mut mb_pred = [0u8; 256];
+    if il_info.field_prediction {
+        // Top-field block strip: blocks 0,1 (MB rows 0,2,4,6,8,10,12,14).
+        let (mvx_t, mvy_t) = field_mvs[0];
+        let (mvx_b, mvy_b) = field_mvs[1];
+        let mb_px = (mb_x * 16) as i32;
+        let mb_py = (mb_y * 16) as i32;
+        // Field-coordinate base y: top field is rows 0,2,... so field y = mb_py / 2.
+        // Bottom field base y = mb_py / 2 (same field plane row, just a different field).
+        let ref_h = reference.y.len() / reference.y_stride;
+        // Top field strip (two 8×8 blocks side by side).
+        for (left_x, out_left_col) in [(0i32, 0usize), (8i32, 8usize)] {
+            let mut tmp = [0u8; 64];
+            crate::interlaced::field_predict_luma_block(
                 &reference.y,
                 reference.y_stride,
-                blk_px,
-                blk_py,
-                8,
-                &mut pred_buf,
-                8,
-            );
-        } else if vol.quarter_sample {
-            predict_block_qpel(
-                &reference.y,
-                reference.y_stride,
-                reference.y_stride as i32,
-                (reference.y.len() / reference.y_stride) as i32,
-                blk_px,
-                blk_py,
-                mvx,
-                mvy,
-                8,
+                ref_h,
+                mb_px + left_x,
+                mb_py / 2,
+                mvx_t,
+                mvy_t,
                 vop.rounding_type,
-                &mut pred_buf,
-                8,
+                il_info.forward_top_field_ref,
+                &mut tmp,
             );
-        } else {
-            predict_block(
-                &reference.y,
-                reference.y_stride,
-                reference.y_stride as i32,
-                (reference.y.len() / reference.y_stride) as i32,
-                blk_px,
-                blk_py,
-                mvx,
-                mvy,
-                8,
-                vop.rounding_type,
-                &mut pred_buf,
-                8,
-            );
+            // Write into mb_pred at top-field rows.
+            for r in 0..8 {
+                let frame_row = r * 2;
+                for c in 0..8 {
+                    mb_pred[frame_row * 16 + out_left_col + c] = tmp[r * 8 + c];
+                }
+            }
         }
+        // Bottom field strip.
+        for (left_x, out_left_col) in [(0i32, 0usize), (8i32, 8usize)] {
+            let mut tmp = [0u8; 64];
+            crate::interlaced::field_predict_luma_block(
+                &reference.y,
+                reference.y_stride,
+                ref_h,
+                mb_px + left_x,
+                mb_py / 2,
+                mvx_b,
+                mvy_b,
+                vop.rounding_type,
+                il_info.forward_bottom_field_ref,
+                &mut tmp,
+            );
+            for r in 0..8 {
+                let frame_row = r * 2 + 1;
+                for c in 0..8 {
+                    mb_pred[frame_row * 16 + out_left_col + c] = tmp[r * 8 + c];
+                }
+            }
+        }
+    } else {
+        // Frame-MV luma predictor — fill each 8×8 block.
+        for blk in 0..4 {
+            let (mvx, mvy) = motion.mv[blk];
+            let (sub_x, sub_y) = match blk {
+                0 => (0usize, 0usize),
+                1 => (8, 0),
+                2 => (0, 8),
+                3 => (8, 8),
+                _ => unreachable!(),
+            };
+            let blk_px = (mb_x * 16 + sub_x) as i32;
+            let blk_py = (mb_y * 16 + sub_y) as i32;
+            let mut pred_buf = [0u8; 64];
+            if gmc_mb {
+                let warp = warp.expect("GMC MB but no warp params");
+                warp_predict_luma_block(
+                    warp,
+                    &reference.y,
+                    reference.y_stride,
+                    blk_px,
+                    blk_py,
+                    8,
+                    &mut pred_buf,
+                    8,
+                );
+            } else if vol.quarter_sample {
+                predict_block_qpel(
+                    &reference.y,
+                    reference.y_stride,
+                    reference.y_stride as i32,
+                    (reference.y.len() / reference.y_stride) as i32,
+                    blk_px,
+                    blk_py,
+                    mvx,
+                    mvy,
+                    8,
+                    vop.rounding_type,
+                    &mut pred_buf,
+                    8,
+                );
+            } else {
+                predict_block(
+                    &reference.y,
+                    reference.y_stride,
+                    reference.y_stride as i32,
+                    (reference.y.len() / reference.y_stride) as i32,
+                    blk_px,
+                    blk_py,
+                    mvx,
+                    mvy,
+                    8,
+                    vop.rounding_type,
+                    &mut pred_buf,
+                    8,
+                );
+            }
+            // Stamp into mb_pred at (sub_x, sub_y).
+            for r in 0..8 {
+                for c in 0..8 {
+                    mb_pred[(sub_y + r) * 16 + (sub_x + c)] = pred_buf[r * 8 + c];
+                }
+            }
+        }
+    }
 
-        // Decode residual if coded; otherwise zero.
+    // Decode per-block residuals. For field-DCT MBs, blocks 0,1 are
+    // top-field strips and 2,3 are bottom-field strips — reorder into
+    // a 16×16 MB buffer before applying the predictor + clip.
+    let mut residual_mb = [0i32; 256];
+    for blk in 0..4 {
+        let scan = choose_scan_interlaced(vop, false, None);
         let mut residual = [0i32; 64];
-        let dst_off = (blk_py as usize) * pic.y_stride + (blk_px as usize);
         if luma_coded[blk] {
-            decode_inter_ac(br, &mut residual, &crate::headers::vol::ZIGZAG)?;
+            decode_inter_ac(br, &mut residual, scan)?;
             let mut out = [0i32; 64];
             reconstruct_inter_block(&mut residual, vol, quant, &mut out)?;
-            crate::simd::add_residual_clip_block(
-                &pred_buf, &out, &mut pic.y, dst_off, pic.y_stride,
-            );
-        } else {
-            crate::simd::copy_block_u8(&pred_buf, &mut pic.y, dst_off, pic.y_stride);
+            // Place into residual_mb at block position (field layout if
+            // dct_type=1, frame layout otherwise).
+            let (sub_x, sub_y) = match blk {
+                0 => (0usize, 0usize),
+                1 => (8, 0),
+                2 => (0, 8),
+                3 => (8, 8),
+                _ => unreachable!(),
+            };
+            if il_info.dct_type {
+                // Field rows: blocks 0,1 contribute to MB even rows
+                // (0,2,4,6,8,10,12,14); blocks 2,3 to odd rows.
+                let field_base = if blk < 2 { 0usize } else { 1usize };
+                let col_base = if blk % 2 == 0 { 0usize } else { 8usize };
+                for r in 0..8 {
+                    let frame_row = field_base + r * 2;
+                    for c in 0..8 {
+                        residual_mb[frame_row * 16 + col_base + c] = out[r * 8 + c];
+                    }
+                }
+            } else {
+                for r in 0..8 {
+                    for c in 0..8 {
+                        residual_mb[(sub_y + r) * 16 + (sub_x + c)] = out[r * 8 + c];
+                    }
+                }
+            }
+        }
+    }
+
+    // Combine predictor + residual, clip to u8, write to pic.
+    {
+        let dst_off = (mb_y * 16) * pic.y_stride + (mb_x * 16);
+        for r in 0..16 {
+            for c in 0..16 {
+                let v = mb_pred[r * 16 + c] as i32 + residual_mb[r * 16 + c];
+                pic.y[dst_off + r * pic.y_stride + c] = v.clamp(0, 255) as u8;
+            }
         }
     }
 
@@ -615,7 +783,8 @@ pub fn decode_p_mb(
             &mut pic.cr
         };
         if coded {
-            decode_inter_ac(br, &mut residual, &crate::headers::vol::ZIGZAG)?;
+            let scan = choose_scan_interlaced(vop, false, None);
+            decode_inter_ac(br, &mut residual, scan)?;
             let mut out = [0i32; 64];
             reconstruct_inter_block(&mut residual, vol, quant, &mut out)?;
             crate::simd::add_residual_clip_block(
@@ -727,6 +896,7 @@ fn decode_intra_blocks_in_p(
             mb_y,
             quant,
             vol,
+            vop,
             pic,
             grid,
         )?;
@@ -745,6 +915,7 @@ fn decode_one_intra_block_p(
     mb_y: usize,
     quant: u32,
     vol: &VideoObjectLayer,
+    vop: &VideoObjectPlane,
     pic: &mut IVopPicture,
     grid: &mut PredGrid,
 ) -> Result<()> {
@@ -756,7 +927,7 @@ fn decode_one_intra_block_p(
         let scale = dc_scaler(block_idx, quant) as i32;
 
         let mut coeffs = [0i32; 64];
-        let scan = choose_scan(ac_pred, dir);
+        let scan = choose_scan_interlaced(vop, ac_pred, Some(dir));
         if coded {
             decode_intra_ac(br, &mut coeffs, scan)?;
         }
@@ -778,7 +949,7 @@ fn decode_one_intra_block_p(
     let (predicted_dc_pel, dc_pred_dir) = predict_dc_p(block_idx, mb_x, mb_y, grid);
 
     let mut coeffs = [0i32; 64];
-    let scan = choose_scan(ac_pred, dc_pred_dir);
+    let scan = choose_scan_interlaced(vop, ac_pred, Some(dc_pred_dir));
     if coded {
         decode_intra_ac(br, &mut coeffs, scan)?;
     }

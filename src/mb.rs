@@ -20,12 +20,16 @@
 use oxideav_core::{Error, Result};
 
 use crate::block::{
-    apply_ac_prediction, choose_dc_predictor, choose_scan, decode_intra_ac,
+    apply_ac_prediction, choose_dc_predictor, decode_intra_ac,
     decode_intra_dc_diff, reconstruct_intra_block, record_ac_prediction_cache, BlockNeighbour,
     PredDir,
 };
 use crate::headers::vol::VideoObjectLayer;
 use crate::headers::vop::VideoObjectPlane;
+use crate::interlaced::{
+    choose_scan_interlaced, field_dct_reorder_mb, parse_interlaced_information, InterlacedInfo,
+    MbClass,
+};
 use crate::iq::{dc_scaler, INTRA_DC_VLC_THR_TABLE};
 use crate::tables::{cbpy, mcbpc, vlc};
 use oxideav_core::bits::BitReader;
@@ -149,6 +153,14 @@ pub fn decode_intra_mb(
         quant = new_q.clamp(1, 31) as u32;
     }
 
+    // 4b. Interlaced information — `interlaced_information()` (§6.2.7.3).
+    // Intra MBs always read `dct_type` when the VOP is interlaced.
+    let il_info = if vop.interlaced {
+        parse_interlaced_information(br, MbClass::Intra, vop.vop_coding_type, true)?
+    } else {
+        InterlacedInfo::default()
+    };
+
     // 5. Per-block decode (order: Y0, Y1, Y2, Y3, Cb, Cr).
     // Each block's `coded` flag comes from CBPY (top 4 bits, order block 0-3
     // = bits 3,2,1,0 per spec) / CBPC (bits 1,0 for Cb, Cr).
@@ -170,35 +182,98 @@ pub fn decode_intra_mb(
     let thr = INTRA_DC_VLC_THR_TABLE[vop.intra_dc_vlc_thr as usize] as u32;
     let use_intra_dc_vlc = quant < thr.max(1);
 
-    // Decode each of the 6 blocks.
-    for block_idx in 0..6 {
-        let coded = if block_idx < 4 {
-            match block_idx {
-                0 => luma_coded[0],
-                1 => luma_coded[1],
-                2 => luma_coded[2],
-                3 => luma_coded[3],
-                _ => unreachable!(),
+    if il_info.dct_type {
+        // Field-DCT intra MB. Decode the four luma blocks into temporary
+        // pel buffers, then reorder their rows into the frame MB layout
+        // before writing to the picture. Chrominance is unaffected
+        // (§7.6.1), so Cb and Cr decode unchanged.
+        let mut luma_out: [[i32; 64]; 4] = [[0i32; 64]; 4];
+        for block_idx in 0..4 {
+            let coded = luma_coded[block_idx];
+            decode_one_intra_block_to(
+                br,
+                block_idx,
+                coded,
+                ac_pred,
+                use_intra_dc_vlc,
+                mb_x,
+                mb_y,
+                quant,
+                vol,
+                vop,
+                &mut luma_out[block_idx],
+                grid,
+            )?;
+        }
+        // Reorder: blocks 0,1 are the top field (even MB rows), blocks 2,3
+        // are the bottom field (odd MB rows). Assemble a 16×16 pel buffer
+        // and clip into the Y plane.
+        let mut mb_out = [0i32; 256];
+        field_dct_reorder_mb(
+            &luma_out[0],
+            &luma_out[1],
+            &luma_out[2],
+            &luma_out[3],
+            &mut mb_out,
+        );
+        let px = mb_x * 16;
+        let py = mb_y * 16;
+        for row in 0..16 {
+            for col in 0..16 {
+                let v = mb_out[row * 16 + col];
+                let v_clamped = v.clamp(0, 255) as u8;
+                pic.y[(py + row) * pic.y_stride + (px + col)] = v_clamped;
             }
-        } else if block_idx == 4 {
-            (cbpc >> 1) & 1 != 0
-        } else {
-            cbpc & 1 != 0
-        };
+        }
+        // Chroma: decode normally.
+        for block_idx in 4..6 {
+            let coded = if block_idx == 4 {
+                (cbpc >> 1) & 1 != 0
+            } else {
+                cbpc & 1 != 0
+            };
+            decode_one_intra_block(
+                br,
+                block_idx,
+                coded,
+                ac_pred,
+                use_intra_dc_vlc,
+                mb_x,
+                mb_y,
+                quant,
+                vol,
+                vop,
+                pic,
+                grid,
+            )?;
+        }
+    } else {
+        // Frame-DCT MB — the original (progressive) path. Works for both
+        // non-interlaced VOPs and interlaced VOPs that chose frame DCT.
+        for block_idx in 0..6 {
+            let coded = if block_idx < 4 {
+                luma_coded[block_idx]
+            } else if block_idx == 4 {
+                (cbpc >> 1) & 1 != 0
+            } else {
+                cbpc & 1 != 0
+            };
 
-        decode_one_intra_block(
-            br,
-            block_idx,
-            coded,
-            ac_pred,
-            use_intra_dc_vlc,
-            mb_x,
-            mb_y,
-            quant,
-            vol,
-            pic,
-            grid,
-        )?;
+            decode_one_intra_block(
+                br,
+                block_idx,
+                coded,
+                ac_pred,
+                use_intra_dc_vlc,
+                mb_x,
+                mb_y,
+                quant,
+                vol,
+                vop,
+                pic,
+                grid,
+            )?;
+        }
     }
 
     Ok(quant)
@@ -215,7 +290,46 @@ fn decode_one_intra_block(
     mb_y: usize,
     quant: u32,
     vol: &VideoObjectLayer,
+    vop: &VideoObjectPlane,
     pic: &mut IVopPicture,
+    grid: &mut PredGrid,
+) -> Result<()> {
+    let mut out = [0i32; 64];
+    decode_one_intra_block_to(
+        br,
+        block_idx,
+        coded,
+        ac_pred,
+        use_intra_dc_vlc,
+        mb_x,
+        mb_y,
+        quant,
+        vol,
+        vop,
+        &mut out,
+        grid,
+    )?;
+    write_block_to_picture(pic, block_idx, mb_x, mb_y, &out);
+    Ok(())
+}
+
+/// Decode a single intra block and return the 64-sample IDCT output in
+/// `out` (signed, pre-clip). The caller chooses where to put the samples
+/// (e.g. the normal `write_block_to_picture` path or the field-DCT MB
+/// reorder path).
+#[allow(clippy::too_many_arguments)]
+fn decode_one_intra_block_to(
+    br: &mut BitReader<'_>,
+    block_idx: usize,
+    coded: bool,
+    ac_pred: bool,
+    use_intra_dc_vlc: bool,
+    mb_x: usize,
+    mb_y: usize,
+    quant: u32,
+    vol: &VideoObjectLayer,
+    vop: &VideoObjectPlane,
+    out: &mut [i32; 64],
     grid: &mut PredGrid,
 ) -> Result<()> {
     // --- Decode DC ---
@@ -228,14 +342,14 @@ fn decode_one_intra_block(
         let raw = br.read_u32(8)? as i32;
         let (_pred_pel, dir) = predict_dc(block_idx, mb_x, mb_y, grid);
         let scale = dc_scaler(block_idx, quant) as i32;
-        return plain_dc_block(
-            br, block_idx, coded, ac_pred, raw, scale, dir, mb_x, mb_y, quant, vol, pic, grid,
+        return plain_dc_block_to(
+            br, block_idx, coded, ac_pred, raw, scale, dir, mb_x, mb_y, quant, vol, vop, out, grid,
         );
     };
 
     // --- Decode AC coefficients (if coded) ---
     let mut coeffs = [0i32; 64];
-    let scan = choose_scan(ac_pred, dc_pred_dir);
+    let scan = choose_scan_interlaced(vop, ac_pred, Some(dc_pred_dir));
 
     if coded {
         decode_intra_ac(br, &mut coeffs, scan)?;
@@ -249,10 +363,6 @@ fn decode_one_intra_block(
     // --- Record this block's post-prediction, pre-dequant ACs for future
     // neighbours BEFORE dequantisation (level space per spec §7.4.3.2). ---
     let nbr_idx = block_neighbour_index(block_idx, mb_x, mb_y, grid);
-    // DC reconstruction per §7.4.3.1 and FFmpeg's mpeg4_get_level_dc:
-    //   pred_dc_in_units = (pred_pel + scale/2) / scale
-    //   recon_units = pred_dc_in_units + dc_diff
-    //   recon_pel = recon_units * scale
     let scale_pel = dc_scaler(block_idx, quant) as i32;
     let pred_units = (predicted_dc_pel + scale_pel / 2) / scale_pel;
     let recon_units = pred_units + dc_diff;
@@ -265,21 +375,19 @@ fn decode_one_intra_block(
         record_ac_prediction_cache(&coeffs, nbr);
     }
 
-    // --- Reconstruct DC (pel domain) into coeffs[0] for IDCT. ---
     coeffs[0] = recon_dc;
 
     // --- Dequant + IDCT. ---
-    let mut out = [0i32; 64];
-    reconstruct_intra_block(&mut coeffs, vol, quant, &mut out)?;
-
-    write_block_to_picture(pic, block_idx, mb_x, mb_y, &out);
+    reconstruct_intra_block(&mut coeffs, vol, quant, out)?;
     Ok(())
 }
 
 /// Plain-DC path (used when `intra_dc_vlc_thr` and the current quant say so).
-/// Reads the 8-bit DC directly and skips AC prediction.
+/// Reads the 8-bit DC directly and skips AC prediction. Writes the IDCT
+/// output into `out` so the caller can splice it into the picture (used
+/// by both the normal path and the field-DCT reorder path).
 #[allow(clippy::too_many_arguments)]
-fn plain_dc_block(
+fn plain_dc_block_to(
     br: &mut BitReader<'_>,
     block_idx: usize,
     coded: bool,
@@ -291,32 +399,24 @@ fn plain_dc_block(
     mb_y: usize,
     quant: u32,
     vol: &VideoObjectLayer,
-    pic: &mut IVopPicture,
+    vop: &VideoObjectPlane,
+    out: &mut [i32; 64],
     grid: &mut PredGrid,
 ) -> Result<()> {
-    // AC still uses the tcoef VLC walk if the block is coded.
     let mut coeffs = [0i32; 64];
-    let scan = choose_scan(ac_pred, dir);
+    let scan = choose_scan_interlaced(vop, ac_pred, Some(dir));
     if coded {
         decode_intra_ac(br, &mut coeffs, scan)?;
     }
-    // AC prediction for plain DC path is skipped — the DC is absolute so
-    // neighbour ACs mean nothing here.
     let _ = ac_pred;
-
     coeffs[0] = raw_dc * dc_scale;
-
-    let mut out = [0i32; 64];
-    reconstruct_intra_block(&mut coeffs, vol, quant, &mut out)?;
-
+    reconstruct_intra_block(&mut coeffs, vol, quant, out)?;
     let nbr_idx = block_neighbour_index(block_idx, mb_x, mb_y, grid);
     let nbr = block_neighbour_mut(grid, block_idx, nbr_idx);
     nbr.dc = coeffs[0];
     nbr.quant = quant as u8;
     nbr.is_intra = true;
-    // Cache ACs (from `coeffs` — the dequantised ACs — as a fallback).
     record_ac_prediction_cache(&coeffs, nbr);
-    write_block_to_picture(pic, block_idx, mb_x, mb_y, &out);
     Ok(())
 }
 
