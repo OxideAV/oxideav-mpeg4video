@@ -40,8 +40,14 @@
 //!   reference bits. Field-DCT intra/inter MBs run through an 8-line
 //!   field-row reorder (`interlaced::field_dct_reorder_mb`), field-
 //!   predicted P-VOP MBs sample the reference through
-//!   `field_predict_luma_block`. `alternate_vertical_scan_flag == 1`
-//!   routes all AC decode through the alt-vertical scan.
+//!   `field_predict_luma_block`. B-VOP field-predicted MBs decode two
+//!   MVs per direction (top + bottom field, §7.6.2.2) — the MVs are
+//!   averaged for the frame-MV predictor chain and stored as
+//!   `field_mvs_fwd`/`field_mvs_bwd` for downstream field sampling.
+//!   B-VOP `dct_type == 1` residuals run through
+//!   `field_dct_reorder_mb` before being added to the MC output.
+//!   `alternate_vertical_scan_flag == 1` routes all AC decode (intra
+//!   and inter) through the alt-vertical scan.
 //!
 //! Header-level parse coverage (no reconstruction yet):
 //! * **Static-sprite VOL** — `sprite_enable == 1` parses the full

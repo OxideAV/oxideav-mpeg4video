@@ -314,6 +314,15 @@ fn decode_bvop_clip_matches_ffmpeg() {
     // We guard at 28 dB as a post-round-4 regression floor; reaching
     // the original 35 dB target requires the remaining B-VOP decode
     // path to be bit-exact.
+    //
+    // Round 5: stabilised at 30.55 dB on the 12-frame progressive
+    // fixture. Frame 7 is an outlier at 22.30 dB — MB(3,3) decodes
+    // as MBTYPE=Backward with bwd MV (0,-16) half-pel, which matches
+    // the bitstream per our MV VLC table (spec Annex B Table 11-11)
+    // but diverges from ffmpeg's reconstruction (ffmpeg's expected
+    // output at that MB resembles forward MC from the I-VOP reference
+    // at zero offset, not backward MC). Root cause not yet isolated
+    // — documented in Round 5 final report; logged for round 6.
     assert!(
         psnr >= 28.0,
         "bvop clip overall PSNR fell below direct-mode floor: {psnr:.2} dB"

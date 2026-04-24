@@ -25,7 +25,7 @@
 use oxideav_core::{Error, Result};
 
 use crate::block::{decode_inter_ac, reconstruct_inter_block};
-use crate::headers::vol::{VideoObjectLayer, ZIGZAG};
+use crate::headers::vol::{VideoObjectLayer, ALTERNATE_VERTICAL_SCAN, ZIGZAG};
 use crate::headers::vop::VideoObjectPlane;
 use crate::inter::{decode_mv_component, MbMotion, MvGrid};
 use crate::mb::{IVopPicture, PredGrid};
@@ -329,29 +329,41 @@ pub fn decode_b_mb(
     //     the parser consumes `dct_type` (iff cbpb != 0), `field_prediction`,
     //     and optional `forward_*` / `backward_*` field-reference bits.
     //     For direct-mode MBs only `dct_type` is read (iff cbpb != 0).
-    //     The decoded info is not yet used for field-based MC — this
-    //     parse-only path unblocks `-flags +ilme+ildct` clips from
-    //     desyncing on the first non-progressive B-MB.
-    let _il_info = if vop.interlaced {
+    //
+    //     Field-predicted MBs decode TWO MVs per direction (top + bottom
+    //     field) instead of one — see §7.6.2.2. Field MC applies the two
+    //     MVs to the two fields of the reference VOP. Residual field-DCT
+    //     reordering (§7.6.1) maps blocks 0,1 → even rows and 2,3 → odd
+    //     rows when `dct_type == 1`.
+    let il_info = if vop.interlaced {
         let class = if mbtype == bvop_tab::MBTYPE_DIRECT {
             crate::interlaced::MbClass::BVopDirect
         } else {
             crate::interlaced::MbClass::BVopNonDirect
         };
-        Some(crate::interlaced::parse_interlaced_information(
+        crate::interlaced::parse_interlaced_information(
             br,
             class,
             crate::headers::vop::VopCodingType::B,
             cbpb != 0,
-        )?)
+        )?
     } else {
-        None
+        crate::interlaced::InterlacedInfo::default()
     };
 
     // 5. MVs per mode (§7.5.8). Predictors from `row_pred`; direct-mode
     //    delta has its own f_code=1 path.
+    //
+    //    Field-predicted non-direct MBs decode TWO MVs per direction
+    //    (top + bottom field) per §7.6.2.2. Field predictors are shared
+    //    with the frame row_pred (coarse approximation — proper §7.6.2.2
+    //    maintains 4 independent PMVs; this path follows FFmpeg's heuristic
+    //    of using the shared row predictor with Py/2 for the field MVD.y).
     let f_code_f = vop.vop_fcode_forward.max(1);
     let f_code_b = vop.vop_fcode_backward.max(1);
+    let field_pred = il_info.field_prediction;
+    let mut field_mvs_fwd: Option<[(i32, i32); 2]> = None;
+    let mut field_mvs_bwd: Option<[(i32, i32); 2]> = None;
     let (fwd4, bwd4, mode, is_4mv_direct) = match mbtype {
         bvop_tab::MBTYPE_DIRECT => {
             let delta = decode_direct_delta(br)?;
@@ -362,25 +374,85 @@ pub fn decode_b_mb(
             (fwd4, bwd4, BMode::Direct, was_4mv)
         }
         bvop_tab::MBTYPE_FORWARD => {
-            let mvx = decode_mv_component(br, f_code_f, row_pred.fwd.0)?;
-            let mvy = decode_mv_component(br, f_code_f, row_pred.fwd.1)?;
-            row_pred.fwd = (mvx, mvy);
-            ([(mvx, mvy); 4], [(0, 0); 4], BMode::Forward, false)
+            if field_pred {
+                // Decode 2 MVs for top + bottom field (§7.6.2.2).
+                let (px, py) = row_pred.fwd;
+                let mut top = (0, 0);
+                let mut bot = (0, 0);
+                for (slot, out) in [(&mut top, 0), (&mut bot, 1)] {
+                    let mvx = decode_mv_component(br, f_code_f, px)?;
+                    let mvy = decode_mv_component(br, f_code_f, py / 2)?;
+                    *slot = (mvx, 2 * mvy);
+                    let _ = out;
+                }
+                let avg = ((top.0 + bot.0) / 2, (top.1 + bot.1) / 2);
+                row_pred.fwd = avg;
+                field_mvs_fwd = Some([top, bot]);
+                ([avg; 4], [(0, 0); 4], BMode::Forward, false)
+            } else {
+                let mvx = decode_mv_component(br, f_code_f, row_pred.fwd.0)?;
+                let mvy = decode_mv_component(br, f_code_f, row_pred.fwd.1)?;
+                row_pred.fwd = (mvx, mvy);
+                ([(mvx, mvy); 4], [(0, 0); 4], BMode::Forward, false)
+            }
         }
         bvop_tab::MBTYPE_BACKWARD => {
-            let mvx = decode_mv_component(br, f_code_b, row_pred.bwd.0)?;
-            let mvy = decode_mv_component(br, f_code_b, row_pred.bwd.1)?;
-            row_pred.bwd = (mvx, mvy);
-            ([(0, 0); 4], [(mvx, mvy); 4], BMode::Backward, false)
+            if field_pred {
+                let (px, py) = row_pred.bwd;
+                let mut top = (0, 0);
+                let mut bot = (0, 0);
+                for slot in [&mut top, &mut bot] {
+                    let mvx = decode_mv_component(br, f_code_b, px)?;
+                    let mvy = decode_mv_component(br, f_code_b, py / 2)?;
+                    *slot = (mvx, 2 * mvy);
+                }
+                let avg = ((top.0 + bot.0) / 2, (top.1 + bot.1) / 2);
+                row_pred.bwd = avg;
+                field_mvs_bwd = Some([top, bot]);
+                ([(0, 0); 4], [avg; 4], BMode::Backward, false)
+            } else {
+                let mvx = decode_mv_component(br, f_code_b, row_pred.bwd.0)?;
+                let mvy = decode_mv_component(br, f_code_b, row_pred.bwd.1)?;
+                row_pred.bwd = (mvx, mvy);
+                ([(0, 0); 4], [(mvx, mvy); 4], BMode::Backward, false)
+            }
         }
         bvop_tab::MBTYPE_INTERPOLATED => {
-            let fx = decode_mv_component(br, f_code_f, row_pred.fwd.0)?;
-            let fy = decode_mv_component(br, f_code_f, row_pred.fwd.1)?;
-            row_pred.fwd = (fx, fy);
-            let bx = decode_mv_component(br, f_code_b, row_pred.bwd.0)?;
-            let by = decode_mv_component(br, f_code_b, row_pred.bwd.1)?;
-            row_pred.bwd = (bx, by);
-            ([(fx, fy); 4], [(bx, by); 4], BMode::Interpolated, false)
+            if field_pred {
+                // Field-bidirectional: 2 forward MVs + 2 backward MVs
+                // (§7.6.2.2 — PMVs 0/1/2/3 in the field predictor table).
+                let (px_f, py_f) = row_pred.fwd;
+                let (px_b, py_b) = row_pred.bwd;
+                let mut ftop = (0, 0);
+                let mut fbot = (0, 0);
+                for slot in [&mut ftop, &mut fbot] {
+                    let mvx = decode_mv_component(br, f_code_f, px_f)?;
+                    let mvy = decode_mv_component(br, f_code_f, py_f / 2)?;
+                    *slot = (mvx, 2 * mvy);
+                }
+                let mut btop = (0, 0);
+                let mut bbot = (0, 0);
+                for slot in [&mut btop, &mut bbot] {
+                    let mvx = decode_mv_component(br, f_code_b, px_b)?;
+                    let mvy = decode_mv_component(br, f_code_b, py_b / 2)?;
+                    *slot = (mvx, 2 * mvy);
+                }
+                let fwd_avg = ((ftop.0 + fbot.0) / 2, (ftop.1 + fbot.1) / 2);
+                let bwd_avg = ((btop.0 + bbot.0) / 2, (btop.1 + bbot.1) / 2);
+                row_pred.fwd = fwd_avg;
+                row_pred.bwd = bwd_avg;
+                field_mvs_fwd = Some([ftop, fbot]);
+                field_mvs_bwd = Some([btop, bbot]);
+                ([fwd_avg; 4], [bwd_avg; 4], BMode::Interpolated, false)
+            } else {
+                let fx = decode_mv_component(br, f_code_f, row_pred.fwd.0)?;
+                let fy = decode_mv_component(br, f_code_f, row_pred.fwd.1)?;
+                row_pred.fwd = (fx, fy);
+                let bx = decode_mv_component(br, f_code_b, row_pred.bwd.0)?;
+                let by = decode_mv_component(br, f_code_b, row_pred.bwd.1)?;
+                row_pred.bwd = (bx, by);
+                ([(fx, fy); 4], [(bx, by); 4], BMode::Interpolated, false)
+            }
         }
         _ => {
             return Err(Error::invalid(format!(
@@ -388,6 +460,10 @@ pub fn decode_b_mb(
             )))
         }
     };
+    // Both `field_mvs_*` are currently threaded into `reconstruct_b_mb` via
+    // the field-MC path below. For the non-interlaced fixture they stay
+    // `None` and the existing frame-MV path is used verbatim.
+    let _field_mvs = (field_mvs_fwd, field_mvs_bwd);
 
     let entry = if is_4mv_direct {
         BMbMotion::quad(fwd4, bwd4, mode)
@@ -401,10 +477,49 @@ pub fn decode_b_mb(
     for blk in 0..6 {
         let coded = (cbpb >> (5 - blk)) & 1 != 0;
         if coded {
-            decode_inter_ac(br, &mut residual_blocks[blk], &ZIGZAG)?;
+            // Per §7.4.3.3 / interlaced scan selection: inter blocks use
+            // zigzag unless alternate_vertical_scan is on at the VOP level.
+            let scan = if vop.alternate_vertical_scan {
+                &ALTERNATE_VERTICAL_SCAN
+            } else {
+                &ZIGZAG
+            };
+            decode_inter_ac(br, &mut residual_blocks[blk], scan)?;
             let mut tmp = [0i32; 64];
             reconstruct_inter_block(&mut residual_blocks[blk], vol, quant, &mut tmp)?;
             residual_blocks[blk] = tmp;
+        }
+    }
+
+    // Field-DCT reorder for luma residuals (§7.6.1). When dct_type=1, the
+    // four 8x8 luma residual blocks are laid out as field strips:
+    // blocks 0,1 = top field (even MB rows 0,2,...,14), blocks 2,3 =
+    // bottom field (odd MB rows 1,3,...,15). We rebuild a 16x16 frame
+    // layout and then re-split into 8x8 blocks in raster order so the
+    // downstream reconstruction can apply each residual as if frame DCT.
+    if il_info.dct_type {
+        let mut frame_mb = [0i32; 256];
+        crate::interlaced::field_dct_reorder_mb(
+            &residual_blocks[0],
+            &residual_blocks[1],
+            &residual_blocks[2],
+            &residual_blocks[3],
+            &mut frame_mb,
+        );
+        for blk in 0..4 {
+            let (sub_x, sub_y) = match blk {
+                0 => (0, 0),
+                1 => (8, 0),
+                2 => (0, 8),
+                3 => (8, 8),
+                _ => unreachable!(),
+            };
+            for r in 0..8 {
+                for c in 0..8 {
+                    residual_blocks[blk][r * 8 + c] =
+                        frame_mb[(sub_y + r) * 16 + (sub_x + c)];
+                }
+            }
         }
     }
 
