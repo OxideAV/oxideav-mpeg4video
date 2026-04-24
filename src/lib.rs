@@ -57,6 +57,7 @@ pub mod encoder;
 pub mod gmc;
 pub mod headers;
 pub mod inter;
+pub mod interlaced;
 pub mod iq;
 pub mod mb;
 pub mod mc;
