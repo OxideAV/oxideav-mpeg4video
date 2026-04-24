@@ -72,11 +72,19 @@ pub fn trb_trd(prev_time: i64, cur_time: i64, next_time: i64) -> (i32, i32) {
 }
 
 /// Compute direct-mode forward and backward MVs from a co-located P-VOP
-/// MV (§7.6.5.3 equations 118–121).
+/// MV (§7.5.9.5.2 equations in the committee draft).
 ///
-/// `co_mv` is the MV of the corresponding MB in the forward reference
-/// (actually the backward reference's past — i.e. the future P-VOP's MV
-/// pointing into its own reference). `trb, trd` come from `trb_trd()`.
+/// Per the ISO spec:
+/// ```text
+/// MVFx = (TRB * MVx) / TRD + MVDx
+/// MVBx = (MVDx == 0) ? ((TRB - TRD) * MVx) / TRD : MVFx - MVx
+/// MVFy = (TRB * MVy) / TRD + MVDy
+/// MVBy = (MVDy == 0) ? ((TRB - TRD) * MVy) / TRD : MVFy - MVy
+/// ```
+/// The decision on which backward formula to use is **per-component**.
+///
+/// `co_mv` is the MV of the corresponding MB in the most recently decoded
+/// I- or P-VOP (the backward reference). `trb, trd` come from `trb_trd()`.
 /// `delta` is the optional small `mvd_b` vector (read only for direct mode).
 ///
 /// Returns `(fwd_mv, bwd_mv)` in luma half-pel units.
@@ -86,15 +94,17 @@ pub fn direct_mode_mvs(
     trd: i32,
     delta: (i32, i32),
 ) -> ((i32, i32), (i32, i32)) {
-    // Forward:  MV_F = trb * MV / trd + delta
-    // Backward: MV_B = (trb - trd) * MV / trd   (when delta == 0)
-    //        or MV_B = MV_F - MV                 (when delta != 0)
     let mv_f_x = trb * co_mv.0 / trd + delta.0;
     let mv_f_y = trb * co_mv.1 / trd + delta.1;
-    let (mv_b_x, mv_b_y) = if delta == (0, 0) {
-        ((trb - trd) * co_mv.0 / trd, (trb - trd) * co_mv.1 / trd)
+    let mv_b_x = if delta.0 == 0 {
+        (trb - trd) * co_mv.0 / trd
     } else {
-        (mv_f_x - co_mv.0, mv_f_y - co_mv.1)
+        mv_f_x - co_mv.0
+    };
+    let mv_b_y = if delta.1 == 0 {
+        (trb - trd) * co_mv.1 / trd
+    } else {
+        mv_f_y - co_mv.1
     };
     ((mv_f_x, mv_f_y), (mv_b_x, mv_b_y))
 }
@@ -113,11 +123,35 @@ pub fn decode_direct_delta(br: &mut BitReader<'_>) -> Result<(i32, i32)> {
     Ok((dx, dy))
 }
 
+/// Row-local predictor state for B-VOP MV decode (§7.5.8).
+///
+/// Forward and backward MV predictors run as independent streams; each
+/// resets to `(0, 0)` at the start of every macroblock row and updates
+/// only when a macroblock of the matching mode decodes a vector. Skipped
+/// and direct-mode MBs do NOT update the predictors.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BRowPred {
+    pub fwd: (i32, i32),
+    pub bwd: (i32, i32),
+}
+
+impl BRowPred {
+    pub fn reset(&mut self) {
+        self.fwd = (0, 0);
+        self.bwd = (0, 0);
+    }
+}
+
 /// Decode one B-VOP macroblock. Writes reconstructed pels to `pic`, updates
 /// `bmv_grid`, returns the new quant.
 ///
 /// `co_mv_grid` is the MV grid from the future reference P-VOP — used for
 /// direct-mode co-located MV lookup.
+///
+/// `row_pred` holds the running forward/backward predictors for the current
+/// MB row (§7.5.8 — "reset to zero only at the beginning of each macroblock
+/// row"). It is updated in place when a forward/backward/interpolated MB
+/// decodes its vector.
 #[allow(clippy::too_many_arguments)]
 pub fn decode_b_mb(
     br: &mut BitReader<'_>,
@@ -128,6 +162,7 @@ pub fn decode_b_mb(
     vop: &VideoObjectPlane,
     pic: &mut IVopPicture,
     bmv_grid: &mut BMvGrid,
+    row_pred: &mut BRowPred,
     prev_ref: &IVopPicture,
     next_ref: &IVopPicture,
     co_mv_grid: Option<&MvGrid>,
@@ -135,12 +170,45 @@ pub fn decode_b_mb(
     trd: i32,
     _slice_first_mb: (usize, usize),
 ) -> Result<u32> {
-    let quant = quant_in;
+    let mut quant = quant_in;
 
-    // 1. MODB.
+    // §6.2.7 / §7.5.9.5.4 — if the co-located P-VOP MB has
+    // `not_coded == 1`, the B-VOP MB is NOT coded in the bitstream (no
+    // MODB read). It is reconstructed as forward mode with the zero MV.
+    let co_located_not_coded = co_mv_grid
+        .map(|g| g.get(mb_x, mb_y).not_coded)
+        .unwrap_or(false);
+    if co_located_not_coded {
+        bmv_grid.set(
+            mb_x,
+            mb_y,
+            BMbMotion {
+                fwd: (0, 0),
+                bwd: (0, 0),
+                mode: Some(BMode::Forward),
+            },
+        );
+        reconstruct_b_mb(
+            pic,
+            prev_ref,
+            next_ref,
+            mb_x,
+            mb_y,
+            (0, 0),
+            (0, 0),
+            BMode::Forward,
+            vol,
+            vop,
+            None,
+        );
+        return Ok(quant);
+    }
+
+    // 1. MODB (§6.2.7 / Table 11-3).
     let modb = vlc::decode(br, bvop_tab::modb_table())?;
     if modb == bvop_tab::MODB_SKIPPED {
-        // Direct mode with zero delta, no residual.
+        // §7.5.9.5.4 — MODB=='0' reconstructs via direct mode with zero
+        // delta. Predictors are NOT updated.
         let co_mv = co_mv_grid
             .map(|g| g.get(mb_x, mb_y).mv[0])
             .unwrap_or((0, 0));
@@ -154,21 +222,52 @@ pub fn decode_b_mb(
                 mode: Some(BMode::Skipped),
             },
         );
-        reconstruct_b_mb(pic, prev_ref, next_ref, mb_x, mb_y, fwd, bwd, vol, vop, None);
+        reconstruct_b_mb(
+            pic,
+            prev_ref,
+            next_ref,
+            mb_x,
+            mb_y,
+            fwd,
+            bwd,
+            BMode::Skipped,
+            vol,
+            vop,
+            None,
+        );
         return Ok(quant);
     }
 
-    // 2. MBTYPE.
+    // 2. MBTYPE (§6.2.7 / Table 11-4).
     let mbtype = vlc::decode(br, bvop_tab::mbtype_table())?;
 
-    // 3. Optional CBPB (6 bits) when modb == MODB_MBTYPE_CBPB.
+    // 3. Optional CBPB (6 bits) when modb == MODB_MBTYPE_CBPB. Only present
+    //    for non-direct modes per the syntax diagram.
     let cbpb = if modb == bvop_tab::MODB_MBTYPE_CBPB {
         br.read_u32(6)? as u8
     } else {
         0
     };
 
-    // 4. MVs per mode.
+    // 4. dquant — per spec: "if (mb_type != '1' && cbpb != 0) dquant". That
+    //    is, dquant is present for non-direct modes whenever any residual
+    //    block is coded. The 2-bit dquant table maps 00→-1, 01→-2, 10→+1,
+    //    11→+2 (Table 6-17).
+    if mbtype != bvop_tab::MBTYPE_DIRECT && cbpb != 0 {
+        let dquant_code = br.read_u32(2)? as i32;
+        let delta = match dquant_code {
+            0b00 => -1,
+            0b01 => -2,
+            0b10 => 1,
+            0b11 => 2,
+            _ => unreachable!(),
+        };
+        let q = (quant as i32 + delta).clamp(1, 31) as u32;
+        quant = q;
+    }
+
+    // 5. MVs per mode (§7.5.8). Predictors from `row_pred`; direct-mode
+    //    delta has its own f_code=1 path.
     let f_code_f = vop.vop_fcode_forward.max(1);
     let f_code_b = vop.vop_fcode_backward.max(1);
     let (fwd_mv, bwd_mv, mode) = match mbtype {
@@ -178,27 +277,29 @@ pub fn decode_b_mb(
                 .map(|g| g.get(mb_x, mb_y).mv[0])
                 .unwrap_or((0, 0));
             let (fwd, bwd) = direct_mode_mvs(co_mv, trb, trd, delta);
+            // Direct-mode: predictors NOT updated (spec says row predictors
+            // track only forward/backward MBs that explicitly decoded an MV).
             (fwd, bwd, BMode::Direct)
         }
         bvop_tab::MBTYPE_FORWARD => {
-            let px = bmv_grid.get(mb_x, mb_y).fwd;
-            let mvx = decode_mv_component(br, f_code_f, px.0)?;
-            let mvy = decode_mv_component(br, f_code_f, px.1)?;
+            let mvx = decode_mv_component(br, f_code_f, row_pred.fwd.0)?;
+            let mvy = decode_mv_component(br, f_code_f, row_pred.fwd.1)?;
+            row_pred.fwd = (mvx, mvy);
             ((mvx, mvy), (0, 0), BMode::Forward)
         }
         bvop_tab::MBTYPE_BACKWARD => {
-            let px = bmv_grid.get(mb_x, mb_y).bwd;
-            let mvx = decode_mv_component(br, f_code_b, px.0)?;
-            let mvy = decode_mv_component(br, f_code_b, px.1)?;
+            let mvx = decode_mv_component(br, f_code_b, row_pred.bwd.0)?;
+            let mvy = decode_mv_component(br, f_code_b, row_pred.bwd.1)?;
+            row_pred.bwd = (mvx, mvy);
             ((0, 0), (mvx, mvy), BMode::Backward)
         }
         bvop_tab::MBTYPE_INTERPOLATED => {
-            let pxf = bmv_grid.get(mb_x, mb_y).fwd;
-            let fx = decode_mv_component(br, f_code_f, pxf.0)?;
-            let fy = decode_mv_component(br, f_code_f, pxf.1)?;
-            let pxb = bmv_grid.get(mb_x, mb_y).bwd;
-            let bx = decode_mv_component(br, f_code_b, pxb.0)?;
-            let by = decode_mv_component(br, f_code_b, pxb.1)?;
+            let fx = decode_mv_component(br, f_code_f, row_pred.fwd.0)?;
+            let fy = decode_mv_component(br, f_code_f, row_pred.fwd.1)?;
+            row_pred.fwd = (fx, fy);
+            let bx = decode_mv_component(br, f_code_b, row_pred.bwd.0)?;
+            let by = decode_mv_component(br, f_code_b, row_pred.bwd.1)?;
+            row_pred.bwd = (bx, by);
             ((fx, fy), (bx, by), BMode::Interpolated)
         }
         _ => {
@@ -218,7 +319,7 @@ pub fn decode_b_mb(
         },
     );
 
-    // 5. Residual + MC.
+    // 6. Residual + MC.
     let mut residual_blocks = [[0i32; 64]; 6];
     for blk in 0..6 {
         let coded = (cbpb >> (5 - blk)) & 1 != 0;
@@ -238,6 +339,7 @@ pub fn decode_b_mb(
         mb_y,
         fwd_mv,
         bwd_mv,
+        mode,
         vol,
         vop,
         Some(&residual_blocks),
@@ -246,7 +348,42 @@ pub fn decode_b_mb(
     Ok(quant)
 }
 
-/// Combine forward + backward predictions, add residuals, write into `pic`.
+/// Public wrapper over `reconstruct_b_mb` used by the decoder when it
+/// needs to reconstruct an implicitly-skipped B-MB (e.g. jumping over a
+/// range covered by a video-packet resync marker).
+#[allow(clippy::too_many_arguments)]
+pub fn reconstruct_b_mb_public(
+    pic: &mut IVopPicture,
+    prev_ref: &IVopPicture,
+    next_ref: &IVopPicture,
+    mb_x: usize,
+    mb_y: usize,
+    fwd_mv: (i32, i32),
+    bwd_mv: (i32, i32),
+    mode: BMode,
+    vol: &VideoObjectLayer,
+    vop: &VideoObjectPlane,
+    residual_blocks: Option<&[[i32; 64]; 6]>,
+) {
+    reconstruct_b_mb(
+        pic,
+        prev_ref,
+        next_ref,
+        mb_x,
+        mb_y,
+        fwd_mv,
+        bwd_mv,
+        mode,
+        vol,
+        vop,
+        residual_blocks,
+    );
+}
+
+/// Combine forward + backward predictions according to `mode`, add
+/// residuals, write into `pic`. Dispatch is driven by the explicit
+/// `mode` argument — relying on MV magnitudes alone is ambiguous because
+/// a genuine (0,0) forward MV is valid.
 #[allow(clippy::too_many_arguments)]
 fn reconstruct_b_mb(
     pic: &mut IVopPicture,
@@ -256,22 +393,16 @@ fn reconstruct_b_mb(
     mb_y: usize,
     fwd_mv: (i32, i32),
     bwd_mv: (i32, i32),
+    mode: BMode,
     vol: &VideoObjectLayer,
     vop: &VideoObjectPlane,
     residual_blocks: Option<&[[i32; 64]; 6]>,
 ) {
-    let use_fwd = fwd_mv != (0, 0) || residual_blocks.is_none();
-    let use_bwd = bwd_mv != (0, 0);
-    let _ = (use_fwd, use_bwd); // Tracked for clarity — actual mode dispatch via mv args.
-
-    // We always generate both predictions; when a mode doesn't use one
-    // (Forward / Backward) the corresponding MV is (0,0) AND the other ref
-    // shouldn't be sampled. Distinguish via the MV-pair magnitudes — a
-    // (0,0) MV with zero residual is exactly copy-from-reference, so the
-    // "degenerate" path is handled naturally by picking `prev_ref` for a
-    // forward-only MB and `next_ref` for a backward-only MB.
-
-    // For each luma block.
+    // Per §7.5.9: luminance MC runs on 8x8 blocks in direct mode and on
+    // the full 16x16 MB in all other modes. Our MV is 16x16 (non-direct)
+    // or scaled from the co-located 16x16 (direct w/o 4MV on the P-VOP);
+    // we apply the same 8x8-block sampling for both cases — the MV is
+    // identical across the 4 luma blocks when the co-located MV is 16x16.
     for blk in 0..4 {
         let (sub_x, sub_y) = match blk {
             0 => (0, 0),
@@ -283,42 +414,30 @@ fn reconstruct_b_mb(
         let blk_px = (mb_x * 16 + sub_x) as i32;
         let blk_py = (mb_y * 16 + sub_y) as i32;
 
-        let mut pred_fwd = [0u8; 64];
-        let mut pred_bwd = [0u8; 64];
-        predict_luma_block(
-            &mut pred_fwd,
-            prev_ref,
-            blk_px,
-            blk_py,
-            fwd_mv,
-            vol,
-            vop,
+        let use_fwd = matches!(
+            mode,
+            BMode::Forward | BMode::Interpolated | BMode::Direct | BMode::Skipped
         );
-        predict_luma_block(
-            &mut pred_bwd,
-            next_ref,
-            blk_px,
-            blk_py,
-            bwd_mv,
-            vol,
-            vop,
+        let use_bwd = matches!(
+            mode,
+            BMode::Backward | BMode::Interpolated | BMode::Direct | BMode::Skipped
         );
 
-        // Average forward and backward for interpolated / direct modes; for
-        // forward-only or backward-only modes one of the two is the actual
-        // ref value at MV(0,0) — so averaging biases toward the unused ref,
-        // which is wrong. Heuristic: both predictions are taken from the
-        // unmodified ref when their MV is (0,0); in that case we can't
-        // distinguish. The B-VOP MB type dictates which to use — we encode
-        // that by zeroing the unused-side buffer BEFORE the combine. We
-        // don't have the MBMode here but can infer it: if both MVs are
-        // (0,0), we pick `pred_fwd` (arbitrarily — the block is skipped
-        // direct with zero motion).
-        let combined: [u8; 64] = match (fwd_mv, bwd_mv) {
-            ((0, 0), (bx, by)) if bx != 0 || by != 0 => pred_bwd,
-            ((fx, fy), (0, 0)) if fx != 0 || fy != 0 => pred_fwd,
-            _ => {
-                // Average — rounding to nearest.
+        let mut pred_fwd = [0u8; 64];
+        let mut pred_bwd = [0u8; 64];
+        if use_fwd {
+            predict_luma_block(&mut pred_fwd, prev_ref, blk_px, blk_py, fwd_mv, vol, vop);
+        }
+        if use_bwd {
+            predict_luma_block(&mut pred_bwd, next_ref, blk_px, blk_py, bwd_mv, vol, vop);
+        }
+
+        let combined: [u8; 64] = match mode {
+            BMode::Forward => pred_fwd,
+            BMode::Backward => pred_bwd,
+            BMode::Interpolated | BMode::Direct | BMode::Skipped => {
+                // Average — rounding to nearest (§7.5.9 — bi-directional MC
+                // emits `(fwd + bwd + 1) >> 1`).
                 let mut out = [0u8; 64];
                 for i in 0..64 {
                     out[i] = ((pred_fwd[i] as u16 + pred_bwd[i] as u16 + 1) >> 1) as u8;
@@ -330,7 +449,11 @@ fn reconstruct_b_mb(
         let dst_off = (blk_py as usize) * pic.y_stride + (blk_px as usize);
         if let Some(residuals) = residual_blocks {
             crate::simd::add_residual_clip_block(
-                &combined, &residuals[blk], &mut pic.y, dst_off, pic.y_stride,
+                &combined,
+                &residuals[blk],
+                &mut pic.y,
+                dst_off,
+                pic.y_stride,
             );
         } else {
             crate::simd::copy_block_u8(&combined, &mut pic.y, dst_off, pic.y_stride);
@@ -347,6 +470,14 @@ fn reconstruct_b_mb(
     };
     let fwd_c = (to_chroma(fwd_mv.0), to_chroma(fwd_mv.1));
     let bwd_c = (to_chroma(bwd_mv.0), to_chroma(bwd_mv.1));
+    let use_fwd = matches!(
+        mode,
+        BMode::Forward | BMode::Interpolated | BMode::Direct | BMode::Skipped
+    );
+    let use_bwd = matches!(
+        mode,
+        BMode::Backward | BMode::Interpolated | BMode::Direct | BMode::Skipped
+    );
     for plane_idx in 0..2 {
         let (ref_prev_plane, ref_next_plane, ref_stride) = if plane_idx == 0 {
             (&prev_ref.cb, &next_ref.cb, prev_ref.c_stride)
@@ -357,40 +488,42 @@ fn reconstruct_b_mb(
         let blk_py = (mb_y * 8) as i32;
         let mut pred_fwd = [0u8; 64];
         let mut pred_bwd = [0u8; 64];
-        // Chroma is always half-pel — use the plain `predict_block` even
-        // under QPel luma.
-        predict_block(
-            ref_prev_plane,
-            ref_stride,
-            ref_stride as i32,
-            (ref_prev_plane.len() / ref_stride) as i32,
-            blk_px,
-            blk_py,
-            fwd_c.0,
-            fwd_c.1,
-            8,
-            vop.rounding_type,
-            &mut pred_fwd,
-            8,
-        );
-        predict_block(
-            ref_next_plane,
-            ref_stride,
-            ref_stride as i32,
-            (ref_next_plane.len() / ref_stride) as i32,
-            blk_px,
-            blk_py,
-            bwd_c.0,
-            bwd_c.1,
-            8,
-            vop.rounding_type,
-            &mut pred_bwd,
-            8,
-        );
-        let combined: [u8; 64] = match (fwd_mv, bwd_mv) {
-            ((0, 0), (bx, by)) if bx != 0 || by != 0 => pred_bwd,
-            ((fx, fy), (0, 0)) if fx != 0 || fy != 0 => pred_fwd,
-            _ => {
+        if use_fwd {
+            predict_block(
+                ref_prev_plane,
+                ref_stride,
+                ref_stride as i32,
+                (ref_prev_plane.len() / ref_stride) as i32,
+                blk_px,
+                blk_py,
+                fwd_c.0,
+                fwd_c.1,
+                8,
+                vop.rounding_type,
+                &mut pred_fwd,
+                8,
+            );
+        }
+        if use_bwd {
+            predict_block(
+                ref_next_plane,
+                ref_stride,
+                ref_stride as i32,
+                (ref_next_plane.len() / ref_stride) as i32,
+                blk_px,
+                blk_py,
+                bwd_c.0,
+                bwd_c.1,
+                8,
+                vop.rounding_type,
+                &mut pred_bwd,
+                8,
+            );
+        }
+        let combined: [u8; 64] = match mode {
+            BMode::Forward => pred_fwd,
+            BMode::Backward => pred_bwd,
+            BMode::Interpolated | BMode::Direct | BMode::Skipped => {
                 let mut out = [0u8; 64];
                 for i in 0..64 {
                     out[i] = ((pred_fwd[i] as u16 + pred_bwd[i] as u16 + 1) >> 1) as u8;
@@ -520,10 +653,24 @@ mod tests {
 
     #[test]
     fn direct_mode_with_delta_uses_fwd_diff() {
-        // With delta != 0, bwd is derived as fwd - co_mv.
+        // Per-component: dx != 0 → bwdx = fwdx - co_mvx;  dy == 0 → bwdy uses
+        // the linear formula.
         let ((fx, fy), (bx, by)) = direct_mode_mvs((8, 0), 2, 4, (1, 2));
         assert_eq!((fx, fy), (4 + 1, 0 + 2));
+        // dx = 1 (nonzero) → bwdx = fwdx - co_mvx = 5 - 8 = -3
+        // dy = 2 (nonzero) → bwdy = fwdy - co_mvy = 2 - 0 = 2
         assert_eq!((bx, by), (fx - 8, fy - 0));
+    }
+
+    #[test]
+    fn direct_mode_per_component_delta() {
+        // Only x has a delta → y uses the linear backward formula.
+        let ((fx, fy), (bx, by)) = direct_mode_mvs((8, -4), 2, 4, (1, 0));
+        // fwdx = 2*8/4 + 1 = 5;  fwdy = 2*(-4)/4 + 0 = -2
+        assert_eq!((fx, fy), (5, -2));
+        // bwdx (dx=1, nonzero): fwdx - co_mvx = 5 - 8 = -3
+        // bwdy (dy=0):          (trb-trd)*co_mvy/trd = -2*(-4)/4 = 2
+        assert_eq!((bx, by), (-3, 2));
     }
 
     #[test]
