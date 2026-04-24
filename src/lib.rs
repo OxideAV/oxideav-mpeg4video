@@ -25,20 +25,25 @@
 //!   §7.7.5 / §7.7.6. `sprite_brightness_change == 1` not yet applied
 //!   during reconstruction but the VLC (Table 11-33) is decoded.
 //!
+//! * **Interlaced field coding (§6.2.7.3, §7.6)** — VOL + VOP-level
+//!   interlaced flags are parsed, MB-layer `interlaced_information()`
+//!   consumes `dct_type`, `field_prediction`, and the four field-
+//!   reference bits. Field-DCT intra/inter MBs run through an 8-line
+//!   field-row reorder (`interlaced::field_dct_reorder_mb`), field-
+//!   predicted P-VOP MBs sample the reference through
+//!   `field_predict_luma_block`. `alternate_vertical_scan_flag == 1`
+//!   routes all AC decode through the alt-vertical scan.
+//!
 //! Header-level parse coverage (no reconstruction yet):
 //! * **Static-sprite VOL** — `sprite_enable == 1` parses the full
 //!   Table 6-7 payload (rectangle + warping + brightness +
 //!   low_latency) and exposes `SpriteRect`. S-VOP decode still returns
 //!   `Unsupported` at the VOP layer.
-//! * **Interlaced** — VOP-level `interlaced`, `top_field_first`, and
-//!   `alternate_vertical_scan_flag` are parsed when the VOL advertises
-//!   `interlaced == 1`. Progressive VOPs inside such a VOL decode
-//!   normally; field-coded VOPs return `Unsupported`.
 //!
 //! Out of scope (returns `Unsupported`):
-//! * S-VOPs / static-sprite decoding (`sprite_enable == 1`).
-//! * Interlaced field coding, scalability, data partitioning, reversible
-//!   VLCs.
+//! * S-VOPs / static-sprite reconstruction (`sprite_enable == 1`) —
+//!   the I-VOP canvas + S-VOP warp onto canvas is not yet decoded.
+//! * Scalability, data partitioning, reversible VLCs.
 //! * MPEG-4 Studio / AVC Simple profiles.
 //! * Encoder: I-VOPs only — P / B / S VOPs are out of scope (§6.2.5).
 //!
@@ -252,3 +257,4 @@ mod lib_tests {
         assert!(reg.resolve_tag_ref(&c).is_none());
     }
 }
+

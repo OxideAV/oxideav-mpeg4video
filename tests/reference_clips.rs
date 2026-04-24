@@ -693,3 +693,4 @@ fn parse_gmc_clip_vol() {
         vol.sprite_brightness_change
     );
 }
+
