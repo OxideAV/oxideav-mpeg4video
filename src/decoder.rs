@@ -650,24 +650,55 @@ pub fn decode_bvop_pic(
                             None,
                         );
                     } else {
-                        // Fallback direct-mode skip using co-located MV.
-                        let co_mv = co_mv_grid
-                            .map(|g| g.get(mb_x, mb_y).mv[0])
-                            .unwrap_or((0, 0));
-                        let (fwd, bwd) = crate::bvop::direct_mode_mvs(co_mv, trb, trd, (0, 0));
-                        crate::bvop::reconstruct_b_mb_public(
-                            &mut pic,
-                            prev_ref,
-                            next_ref,
-                            mb_x,
-                            mb_y,
-                            fwd,
-                            bwd,
-                            crate::bvop::BMode::Skipped,
-                            vol,
-                            vop,
-                            None,
+                        // Fallback direct-mode skip. §7.5.9.5.2: when the
+                        // co-located P-MB is 4MV, each sub-block MV is
+                        // scaled independently.
+                        let (co_mvs4, was_4mv) = match co_mv_grid {
+                            Some(g) => {
+                                let co = g.get(mb_x, mb_y);
+                                if co.four_mv {
+                                    (co.mv, true)
+                                } else {
+                                    ([co.mv[0]; 4], false)
+                                }
+                            }
+                            None => ([(0, 0); 4], false),
+                        };
+                        let (fwd4, bwd4) = crate::bvop::direct_mode_mvs_4(
+                            co_mvs4,
+                            trb,
+                            trd,
+                            (0, 0),
                         );
+                        if was_4mv {
+                            crate::bvop::reconstruct_b_mb_public_4mv(
+                                &mut pic,
+                                prev_ref,
+                                next_ref,
+                                mb_x,
+                                mb_y,
+                                fwd4,
+                                bwd4,
+                                crate::bvop::BMode::Skipped,
+                                vol,
+                                vop,
+                                None,
+                            );
+                        } else {
+                            crate::bvop::reconstruct_b_mb_public(
+                                &mut pic,
+                                prev_ref,
+                                next_ref,
+                                mb_x,
+                                mb_y,
+                                fwd4[0],
+                                bwd4[0],
+                                crate::bvop::BMode::Skipped,
+                                vol,
+                                vop,
+                                None,
+                            );
+                        }
                     }
                     mb_idx += 1;
                 }

@@ -50,11 +50,48 @@ pub enum BMode {
 /// B-VOPs use independent MV prediction streams for forward and backward
 /// MVs (§7.6.5) — the forward MV of the current MB is predicted only from
 /// forward MVs of previous MBs. The grid is threaded separately for each.
+///
+/// For 4MV direct mode (§7.5.9.5) the four per-block forward/backward
+/// vectors are stored in `fwd4`/`bwd4`; `fwd`/`bwd` keep the block-0
+/// vectors so callers that only need a single 16x16 summary stay valid.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BMbMotion {
     pub fwd: (i32, i32),
     pub bwd: (i32, i32),
+    /// Per-block forward MVs (index 0..3 in raster order inside the MB).
+    /// All four entries equal `fwd` when not 4MV direct.
+    pub fwd4: [(i32, i32); 4],
+    /// Per-block backward MVs — same layout as `fwd4`.
+    pub bwd4: [(i32, i32); 4],
+    /// True when the MB used 4MV direct mode (per-block MVs differ).
+    pub four_mv_direct: bool,
     pub mode: Option<BMode>,
+}
+
+impl BMbMotion {
+    /// Construct from a single 16x16 forward/backward pair.
+    fn uni(fwd: (i32, i32), bwd: (i32, i32), mode: BMode) -> Self {
+        Self {
+            fwd,
+            bwd,
+            fwd4: [fwd; 4],
+            bwd4: [bwd; 4],
+            four_mv_direct: false,
+            mode: Some(mode),
+        }
+    }
+
+    /// Construct from 4 per-block forward/backward pairs (4MV direct mode).
+    fn quad(fwd4: [(i32, i32); 4], bwd4: [(i32, i32); 4], mode: BMode) -> Self {
+        Self {
+            fwd: fwd4[0],
+            bwd: bwd4[0],
+            fwd4,
+            bwd4,
+            four_mv_direct: true,
+            mode: Some(mode),
+        }
+    }
 }
 
 /// Compute TRB and TRD for direct-mode scaling.
@@ -107,6 +144,28 @@ pub fn direct_mode_mvs(
         mv_f_y - co_mv.1
     };
     ((mv_f_x, mv_f_y), (mv_b_x, mv_b_y))
+}
+
+/// 4MV variant of `direct_mode_mvs` — one MVD delta applies to all four
+/// sub-block vectors (§7.5.9.5.2, per-i formulas with `MVDx/MVDy` shared).
+///
+/// `co_mvs4` are the 4 per-block MVs of the co-located P-MB. Returns arrays
+/// of forward and backward MVs, one per luma 8x8 block in raster order.
+#[allow(clippy::type_complexity)]
+pub fn direct_mode_mvs_4(
+    co_mvs4: [(i32, i32); 4],
+    trb: i32,
+    trd: i32,
+    delta: (i32, i32),
+) -> ([(i32, i32); 4], [(i32, i32); 4]) {
+    let mut fwd = [(0i32, 0i32); 4];
+    let mut bwd = [(0i32, 0i32); 4];
+    for i in 0..4 {
+        let (f, b) = direct_mode_mvs(co_mvs4[i], trb, trd, delta);
+        fwd[i] = f;
+        bwd[i] = b;
+    }
+    (fwd, bwd)
 }
 
 /// Read the optional small `mvd_b` delta used by direct mode
@@ -182,11 +241,7 @@ pub fn decode_b_mb(
         bmv_grid.set(
             mb_x,
             mb_y,
-            BMbMotion {
-                fwd: (0, 0),
-                bwd: (0, 0),
-                mode: Some(BMode::Forward),
-            },
+            BMbMotion::uni((0, 0), (0, 0), BMode::Forward),
         );
         reconstruct_b_mb(
             pic,
@@ -194,8 +249,8 @@ pub fn decode_b_mb(
             next_ref,
             mb_x,
             mb_y,
-            (0, 0),
-            (0, 0),
+            [(0, 0); 4],
+            [(0, 0); 4],
             BMode::Forward,
             vol,
             vop,
@@ -209,27 +264,22 @@ pub fn decode_b_mb(
     if modb == bvop_tab::MODB_SKIPPED {
         // §7.5.9.5.4 — MODB=='0' reconstructs via direct mode with zero
         // delta. Predictors are NOT updated.
-        let co_mv = co_mv_grid
-            .map(|g| g.get(mb_x, mb_y).mv[0])
-            .unwrap_or((0, 0));
-        let (fwd, bwd) = direct_mode_mvs(co_mv, trb, trd, (0, 0));
-        bmv_grid.set(
-            mb_x,
-            mb_y,
-            BMbMotion {
-                fwd,
-                bwd,
-                mode: Some(BMode::Skipped),
-            },
-        );
+        let (co_mvs4, was_4mv) = colocated_mvs4(co_mv_grid, mb_x, mb_y);
+        let (fwd4, bwd4) = direct_mode_mvs_4(co_mvs4, trb, trd, (0, 0));
+        let entry = if was_4mv {
+            BMbMotion::quad(fwd4, bwd4, BMode::Skipped)
+        } else {
+            BMbMotion::uni(fwd4[0], bwd4[0], BMode::Skipped)
+        };
+        bmv_grid.set(mb_x, mb_y, entry);
         reconstruct_b_mb(
             pic,
             prev_ref,
             next_ref,
             mb_x,
             mb_y,
-            fwd,
-            bwd,
+            fwd4,
+            bwd4,
             BMode::Skipped,
             vol,
             vop,
@@ -270,28 +320,26 @@ pub fn decode_b_mb(
     //    delta has its own f_code=1 path.
     let f_code_f = vop.vop_fcode_forward.max(1);
     let f_code_b = vop.vop_fcode_backward.max(1);
-    let (fwd_mv, bwd_mv, mode) = match mbtype {
+    let (fwd4, bwd4, mode, is_4mv_direct) = match mbtype {
         bvop_tab::MBTYPE_DIRECT => {
             let delta = decode_direct_delta(br)?;
-            let co_mv = co_mv_grid
-                .map(|g| g.get(mb_x, mb_y).mv[0])
-                .unwrap_or((0, 0));
-            let (fwd, bwd) = direct_mode_mvs(co_mv, trb, trd, delta);
+            let (co_mvs4, was_4mv) = colocated_mvs4(co_mv_grid, mb_x, mb_y);
+            let (fwd4, bwd4) = direct_mode_mvs_4(co_mvs4, trb, trd, delta);
             // Direct-mode: predictors NOT updated (spec says row predictors
             // track only forward/backward MBs that explicitly decoded an MV).
-            (fwd, bwd, BMode::Direct)
+            (fwd4, bwd4, BMode::Direct, was_4mv)
         }
         bvop_tab::MBTYPE_FORWARD => {
             let mvx = decode_mv_component(br, f_code_f, row_pred.fwd.0)?;
             let mvy = decode_mv_component(br, f_code_f, row_pred.fwd.1)?;
             row_pred.fwd = (mvx, mvy);
-            ((mvx, mvy), (0, 0), BMode::Forward)
+            ([(mvx, mvy); 4], [(0, 0); 4], BMode::Forward, false)
         }
         bvop_tab::MBTYPE_BACKWARD => {
             let mvx = decode_mv_component(br, f_code_b, row_pred.bwd.0)?;
             let mvy = decode_mv_component(br, f_code_b, row_pred.bwd.1)?;
             row_pred.bwd = (mvx, mvy);
-            ((0, 0), (mvx, mvy), BMode::Backward)
+            ([(0, 0); 4], [(mvx, mvy); 4], BMode::Backward, false)
         }
         bvop_tab::MBTYPE_INTERPOLATED => {
             let fx = decode_mv_component(br, f_code_f, row_pred.fwd.0)?;
@@ -300,7 +348,7 @@ pub fn decode_b_mb(
             let bx = decode_mv_component(br, f_code_b, row_pred.bwd.0)?;
             let by = decode_mv_component(br, f_code_b, row_pred.bwd.1)?;
             row_pred.bwd = (bx, by);
-            ((fx, fy), (bx, by), BMode::Interpolated)
+            ([(fx, fy); 4], [(bx, by); 4], BMode::Interpolated, false)
         }
         _ => {
             return Err(Error::invalid(format!(
@@ -309,15 +357,12 @@ pub fn decode_b_mb(
         }
     };
 
-    bmv_grid.set(
-        mb_x,
-        mb_y,
-        BMbMotion {
-            fwd: fwd_mv,
-            bwd: bwd_mv,
-            mode: Some(mode),
-        },
-    );
+    let entry = if is_4mv_direct {
+        BMbMotion::quad(fwd4, bwd4, mode)
+    } else {
+        BMbMotion::uni(fwd4[0], bwd4[0], mode)
+    };
+    bmv_grid.set(mb_x, mb_y, entry);
 
     // 6. Residual + MC.
     let mut residual_blocks = [[0i32; 64]; 6];
@@ -337,8 +382,8 @@ pub fn decode_b_mb(
         next_ref,
         mb_x,
         mb_y,
-        fwd_mv,
-        bwd_mv,
+        fwd4,
+        bwd4,
         mode,
         vol,
         vop,
@@ -348,9 +393,54 @@ pub fn decode_b_mb(
     Ok(quant)
 }
 
+/// Pull the 4 co-located per-block MVs from the reference P-VOP grid.
+/// Returns `(mvs4, was_4mv)` — when `was_4mv` is false, all four entries
+/// are equal to the single 16x16 MV.
+fn colocated_mvs4(
+    co_mv_grid: Option<&MvGrid>,
+    mb_x: usize,
+    mb_y: usize,
+) -> ([(i32, i32); 4], bool) {
+    match co_mv_grid {
+        Some(g) => {
+            let co = g.get(mb_x, mb_y);
+            if co.four_mv {
+                (co.mv, true)
+            } else {
+                ([co.mv[0]; 4], false)
+            }
+        }
+        None => ([(0, 0); 4], false),
+    }
+}
+
+/// 4MV-aware variant of `reconstruct_b_mb_public`: accepts per-block
+/// forward and backward MVs directly. Used by the decoder for implicit
+/// direct-mode skips when the co-located P-MB was coded in 4MV mode.
+#[allow(clippy::too_many_arguments)]
+pub fn reconstruct_b_mb_public_4mv(
+    pic: &mut IVopPicture,
+    prev_ref: &IVopPicture,
+    next_ref: &IVopPicture,
+    mb_x: usize,
+    mb_y: usize,
+    fwd4: [(i32, i32); 4],
+    bwd4: [(i32, i32); 4],
+    mode: BMode,
+    vol: &VideoObjectLayer,
+    vop: &VideoObjectPlane,
+    residual_blocks: Option<&[[i32; 64]; 6]>,
+) {
+    reconstruct_b_mb(
+        pic, prev_ref, next_ref, mb_x, mb_y, fwd4, bwd4, mode, vol, vop, residual_blocks,
+    );
+}
+
 /// Public wrapper over `reconstruct_b_mb` used by the decoder when it
 /// needs to reconstruct an implicitly-skipped B-MB (e.g. jumping over a
-/// range covered by a video-packet resync marker).
+/// range covered by a video-packet resync marker). Accepts a single
+/// 16x16 fwd/bwd pair — internal per-block storage is populated by
+/// replicating it across the four blocks.
 #[allow(clippy::too_many_arguments)]
 pub fn reconstruct_b_mb_public(
     pic: &mut IVopPicture,
@@ -371,8 +461,8 @@ pub fn reconstruct_b_mb_public(
         next_ref,
         mb_x,
         mb_y,
-        fwd_mv,
-        bwd_mv,
+        [fwd_mv; 4],
+        [bwd_mv; 4],
         mode,
         vol,
         vop,
@@ -384,6 +474,10 @@ pub fn reconstruct_b_mb_public(
 /// residuals, write into `pic`. Dispatch is driven by the explicit
 /// `mode` argument — relying on MV magnitudes alone is ambiguous because
 /// a genuine (0,0) forward MV is valid.
+///
+/// `fwd4`/`bwd4` carry one MV per luma 8x8 block in raster order. In
+/// all modes except 4MV direct the four entries are equal (the caller
+/// fills them by replication).
 #[allow(clippy::too_many_arguments)]
 fn reconstruct_b_mb(
     pic: &mut IVopPicture,
@@ -391,18 +485,17 @@ fn reconstruct_b_mb(
     next_ref: &IVopPicture,
     mb_x: usize,
     mb_y: usize,
-    fwd_mv: (i32, i32),
-    bwd_mv: (i32, i32),
+    fwd4: [(i32, i32); 4],
+    bwd4: [(i32, i32); 4],
     mode: BMode,
     vol: &VideoObjectLayer,
     vop: &VideoObjectPlane,
     residual_blocks: Option<&[[i32; 64]; 6]>,
 ) {
-    // Per §7.5.9: luminance MC runs on 8x8 blocks in direct mode and on
-    // the full 16x16 MB in all other modes. Our MV is 16x16 (non-direct)
-    // or scaled from the co-located 16x16 (direct w/o 4MV on the P-VOP);
-    // we apply the same 8x8-block sampling for both cases — the MV is
-    // identical across the 4 luma blocks when the co-located MV is 16x16.
+    // Per §7.5.9.5.3: for direct mode, luma MC runs on 8x8 blocks using
+    // the per-block MVs (fwd4/bwd4). For non-direct modes each of fwd4
+    // holds the same 16x16 MV across all 4 entries, so the same 8x8
+    // loop yields the correct 16x16 prediction.
     for blk in 0..4 {
         let (sub_x, sub_y) = match blk {
             0 => (0, 0),
@@ -413,6 +506,8 @@ fn reconstruct_b_mb(
         };
         let blk_px = (mb_x * 16 + sub_x) as i32;
         let blk_py = (mb_y * 16 + sub_y) as i32;
+        let fwd_mv = fwd4[blk];
+        let bwd_mv = bwd4[blk];
 
         let use_fwd = matches!(
             mode,
@@ -460,7 +555,17 @@ fn reconstruct_b_mb(
         }
     }
 
-    // Chroma — derive half-pel chroma MVs.
+    // Chroma — derive half-pel chroma MVs. §7.5.9.5.3: the chroma forward
+    // MV is the sum of K luma forward MVs divided by 2K with rounding;
+    // K = 4 when all four luma vectors differ (4MV direct), K = 1 when
+    // they are equal. For non-direct modes fwd4[i] is the same vector
+    // for all i, so the average equals the 16x16 MV and the formula
+    // degenerates to the usual chroma half-pel reduction.
+    let avg4 = |v: &[(i32, i32); 4]| -> (i32, i32) {
+        let sx: i32 = v.iter().map(|(x, _)| *x).sum();
+        let sy: i32 = v.iter().map(|(_, y)| *y).sum();
+        (sx / 4, sy / 4)
+    };
     let to_chroma = |v: i32| -> i32 {
         if vol.quarter_sample {
             luma_qmv_to_chroma(v)
@@ -468,8 +573,10 @@ fn reconstruct_b_mb(
             luma_mv_to_chroma(v)
         }
     };
-    let fwd_c = (to_chroma(fwd_mv.0), to_chroma(fwd_mv.1));
-    let bwd_c = (to_chroma(bwd_mv.0), to_chroma(bwd_mv.1));
+    let fwd_luma = avg4(&fwd4);
+    let bwd_luma = avg4(&bwd4);
+    let fwd_c = (to_chroma(fwd_luma.0), to_chroma(fwd_luma.1));
+    let bwd_c = (to_chroma(bwd_luma.0), to_chroma(bwd_luma.1));
     let use_fwd = matches!(
         mode,
         BMode::Forward | BMode::Interpolated | BMode::Direct | BMode::Skipped
@@ -686,15 +793,46 @@ mod tests {
         g.set(
             2,
             1,
-            BMbMotion {
-                fwd: (3, -7),
-                bwd: (-1, 4),
-                mode: Some(BMode::Interpolated),
-            },
+            BMbMotion::uni((3, -7), (-1, 4), BMode::Interpolated),
         );
         let m = g.get(2, 1);
         assert_eq!(m.fwd, (3, -7));
         assert_eq!(m.bwd, (-1, 4));
+        assert_eq!(m.fwd4, [(3, -7); 4]);
+        assert_eq!(m.bwd4, [(-1, 4); 4]);
+        assert!(!m.four_mv_direct);
         assert_eq!(m.mode, Some(BMode::Interpolated));
+    }
+
+    #[test]
+    fn direct_mode_4mv_per_block() {
+        // Four distinct co-located MVs → four distinct direct-mode MVs.
+        let co4 = [(8, 0), (-8, 0), (0, 8), (0, -8)];
+        let (fwd4, bwd4) = direct_mode_mvs_4(co4, 2, 4, (0, 0));
+        // TRB/TRD = 1/2 → fwd_i = co_i / 2.
+        assert_eq!(fwd4, [(4, 0), (-4, 0), (0, 4), (0, -4)]);
+        // (TRB - TRD)/TRD = -1/2 → bwd_i = -co_i / 2.
+        assert_eq!(bwd4, [(-4, 0), (4, 0), (0, -4), (0, 4)]);
+    }
+
+    #[test]
+    fn direct_mode_4mv_delta_shared() {
+        // Single delta applies to all four sub-block MVs (§7.5.9.5.2).
+        let co4 = [(8, 0), (8, 0), (0, 8), (0, 8)];
+        let (fwd4, _) = direct_mode_mvs_4(co4, 4, 4, (1, -1));
+        // TRB/TRD = 1 → fwd_i = co_i + delta.
+        assert_eq!(fwd4, [(9, -1), (9, -1), (1, 7), (1, 7)]);
+    }
+
+    #[test]
+    fn quad_builder_preserves_flag() {
+        let f = [(1, 2), (3, 4), (5, 6), (7, 8)];
+        let b = [(-1, -2), (-3, -4), (-5, -6), (-7, -8)];
+        let m = BMbMotion::quad(f, b, BMode::Direct);
+        assert!(m.four_mv_direct);
+        assert_eq!(m.fwd, f[0]);
+        assert_eq!(m.bwd, b[0]);
+        assert_eq!(m.fwd4, f);
+        assert_eq!(m.bwd4, b);
     }
 }

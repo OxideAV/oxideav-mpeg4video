@@ -82,6 +82,39 @@ fn bvop_fixture_contains_b_vops() {
     );
 }
 
+/// Full-pipeline decode of a clip that exercises 4MV P-MBs so the direct
+/// mode path in B-VOPs hits the per-block branch (§7.5.9.5.2). Fixture:
+///   ffmpeg -y -f lavfi -i "mandelbrot=size=64x64:rate=10" -t 1.2 \
+///       -c:v mpeg4 -g 6 -bf 2 -qscale:v 3 -mbd rd -mbcmp satd -an \
+///       -f m4v /tmp/m4v_bvop_4mv.es
+///   ffmpeg -y -i /tmp/m4v_bvop_4mv.es -f rawvideo -pix_fmt yuv420p \
+///       /tmp/m4v_bvop_4mv.yuv
+///
+/// This test is a floor, not a tight PSNR assertion — we only require it
+/// runs without a panic so the 4MV direct path is exercised by CI.
+#[test]
+fn decode_bvop_4mv_clip_runs() {
+    use oxideav_core::{CodecId, CodecParameters, Frame, Packet, PixelFormat, TimeBase};
+
+    let Some(bitstream) = read_fixture("/tmp/m4v_bvop_4mv.es") else {
+        return;
+    };
+    let params = CodecParameters::video(CodecId::new(oxideav_mpeg4video::CODEC_ID_STR));
+    let mut dec = oxideav_mpeg4video::decoder::make_decoder(&params).expect("build decoder");
+    let packet = Packet::new(0, TimeBase::new(1, 90_000), bitstream);
+    let _ = dec.send_packet(&packet);
+    let _ = dec.flush();
+    let mut n = 0;
+    while let Ok(Frame::Video(vf)) = dec.receive_frame() {
+        assert_eq!(vf.format, PixelFormat::Yuv420P);
+        n += 1;
+        if n > 64 {
+            break;
+        }
+    }
+    eprintln!("4mv bvop clip: decoded {n} frames");
+}
+
 /// Full-pipeline B-VOP decode — feed the full elementary stream into the
 /// decoder and compare N output frames against ffmpeg's reference YUV.
 /// Fixture: see module-level docs.
@@ -201,16 +234,18 @@ fn decode_bvop_clip_matches_ffmpeg() {
          (I/P-VOPs at their display-order position), got {n_high_psnr}. \
          frames={frames_decoded} overall_psnr={psnr:.2}"
     );
-    // Overall PSNR target: the B-VOP decode itself is still missing
-    // interlaced B-MBs, 4MV direct mode, and quarter-pel MC, so
-    // per-B-VOP PSNR sits in the 28-33 dB band. That drags the overall
-    // number below 35 dB. The threshold tightens again once those
-    // B-VOP paths land; for now the reorder correctness is covered by
-    // the high-PSNR frame count above, and the overall number is a
-    // floor that rules out accidental regressions (was ~31 dB before
-    // reorder, ~33 dB after).
+    // Overall PSNR floor: 4MV direct mode (§7.5.9.5.2) is wired up but
+    // this particular fixture (testsrc pattern) does not produce 4MV
+    // P-MBs at ffmpeg's default `-bf 2 -qscale:v 5` settings, so the
+    // observed ceiling is still governed by interlaced B-MBs and
+    // quarter-pel MC in B-VOPs. The `decode_bvop_4mv_clip_runs` test
+    // above exercises the 4MV direct path on a mandelbrot fixture.
+    //
+    // Current measured overall: ~32.8 dB. We guard at 32 dB as a
+    // regression floor; the 35 dB target requires the remaining two
+    // B-VOP paths (interlaced + quarter-pel) to land.
     assert!(
-        psnr >= 28.0,
-        "bvop clip overall PSNR fell below reorder-era floor: {psnr:.2} dB"
+        psnr >= 32.0,
+        "bvop clip overall PSNR fell below direct-mode floor: {psnr:.2} dB"
     );
 }
