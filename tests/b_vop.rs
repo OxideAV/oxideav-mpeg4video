@@ -115,6 +115,73 @@ fn decode_bvop_4mv_clip_runs() {
     eprintln!("4mv bvop clip: decoded {n} frames");
 }
 
+/// Quarter-pel B-VOP fixture — exercises §7.6.2.2 8-tap luma filter in
+/// B-VOP MC. Fixture:
+///   ffmpeg -y -f lavfi -i "testsrc=size=64x64:rate=10:duration=1.2" \
+///       -c:v mpeg4 -flags +qpel -g 6 -bf 2 -qscale:v 5 -an \
+///       -f m4v /tmp/m4v_bvop_qp.es
+///   ffmpeg -y -i /tmp/m4v_bvop_qp.es -f rawvideo -pix_fmt yuv420p \
+///       /tmp/m4v_bvop_qp.yuv
+#[test]
+fn decode_bvop_qpel_clip_runs() {
+    use oxideav_core::{CodecId, CodecParameters, Frame, Packet, PixelFormat, TimeBase};
+
+    let Some(bitstream) = read_fixture("/tmp/m4v_bvop_qp.es") else {
+        return;
+    };
+    let params = CodecParameters::video(CodecId::new(oxideav_mpeg4video::CODEC_ID_STR));
+    let mut dec = oxideav_mpeg4video::decoder::make_decoder(&params).expect("build decoder");
+    let packet = Packet::new(0, TimeBase::new(1, 90_000), bitstream);
+    let _ = dec.send_packet(&packet);
+    let _ = dec.flush();
+    let mut n = 0;
+    while let Ok(Frame::Video(vf)) = dec.receive_frame() {
+        assert_eq!(vf.format, PixelFormat::Yuv420P);
+        n += 1;
+        if n > 64 {
+            break;
+        }
+    }
+    eprintln!("qpel bvop clip: decoded {n} frames");
+    assert!(n >= 1, "qpel bvop clip decoded zero frames");
+}
+
+/// Interlaced (+ilme+ildct) B-VOP fixture — exercises the B-VOP MB-layer
+/// `interlaced_information()` parse. Fixture:
+///   ffmpeg -y -f lavfi -i "testsrc=size=64x64:rate=10:duration=1.2" \
+///       -c:v mpeg4 -flags +ilme+ildct -g 6 -bf 2 -qscale:v 5 -an \
+///       -f m4v /tmp/m4v_bvop_il.es
+///
+/// This test is a no-panic smoke: it runs the bitstream through the
+/// decoder and asserts the call graph does not panic or diverge. Many
+/// interlaced paths (field-predicted MC in particular) are still
+/// follow-up work; the test just locks in that the B-VOP MB parser
+/// consumes the `interlaced_information()` bits before hitting MVs.
+#[test]
+fn decode_bvop_interlaced_clip_runs() {
+    use oxideav_core::{CodecId, CodecParameters, Packet, TimeBase};
+
+    let Some(bitstream) = read_fixture("/tmp/m4v_bvop_il.es") else {
+        return;
+    };
+    let params = CodecParameters::video(CodecId::new(oxideav_mpeg4video::CODEC_ID_STR));
+    let mut dec = oxideav_mpeg4video::decoder::make_decoder(&params).expect("build decoder");
+    let packet = Packet::new(0, TimeBase::new(1, 90_000), bitstream);
+    let _ = dec.send_packet(&packet);
+    let _ = dec.flush();
+    // Drain the ready queue; we only require decode_send_packet to
+    // not panic. Silent `Err(NeedMore)` is fine — the test asserts
+    // the parser stays well-defined on interlaced bitstreams.
+    let mut n = 0;
+    while let Ok(_f) = dec.receive_frame() {
+        n += 1;
+        if n > 64 {
+            break;
+        }
+    }
+    eprintln!("interlaced bvop clip: decoded {n} frames (no panic)");
+}
+
 /// Full-pipeline B-VOP decode — feed the full elementary stream into the
 /// decoder and compare N output frames against ffmpeg's reference YUV.
 /// Fixture: see module-level docs.

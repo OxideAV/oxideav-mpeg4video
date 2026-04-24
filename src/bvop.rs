@@ -324,6 +324,30 @@ pub fn decode_b_mb(
         quant = q;
     }
 
+    // 4b. Interlaced information (§6.2.7 / §6.2.7.3). Present only when
+    //     the VOP advertises `interlaced == 1`. For B-VOP non-direct MBs
+    //     the parser consumes `dct_type` (iff cbpb != 0), `field_prediction`,
+    //     and optional `forward_*` / `backward_*` field-reference bits.
+    //     For direct-mode MBs only `dct_type` is read (iff cbpb != 0).
+    //     The decoded info is not yet used for field-based MC — this
+    //     parse-only path unblocks `-flags +ilme+ildct` clips from
+    //     desyncing on the first non-progressive B-MB.
+    let _il_info = if vop.interlaced {
+        let class = if mbtype == bvop_tab::MBTYPE_DIRECT {
+            crate::interlaced::MbClass::BVopDirect
+        } else {
+            crate::interlaced::MbClass::BVopNonDirect
+        };
+        Some(crate::interlaced::parse_interlaced_information(
+            br,
+            class,
+            crate::headers::vop::VopCodingType::B,
+            cbpb != 0,
+        )?)
+    } else {
+        None
+    };
+
     // 5. MVs per mode (§7.5.8). Predictors from `row_pred`; direct-mode
     //    delta has its own f_code=1 path.
     let f_code_f = vop.vop_fcode_forward.max(1);
