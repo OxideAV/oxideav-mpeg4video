@@ -1,20 +1,23 @@
-//! B-VOP VLC tables (ISO/IEC 14496-2 §7.6.5 / Annex B).
+//! B-VOP VLC tables (ISO/IEC 14496-2 §7.6.5 / Table 11-3 / Table 11-4).
 //!
-//! * **MODB** (Table B-16) — 1- or 2-bit prefix per B-MB.
-//!   - `1`    → skipped (no MBTYPE, no CBPB, MV inherited via direct mode at 0).
-//!   - `00`   → MBTYPE follows AND CBPB follows.
-//!   - `01`   → MBTYPE follows, CBPB absent (all-zero cbpb).
+//! * **MODB** (Table 11-3) — 1- or 2-bit prefix per B-MB.
+//!   - `0`    → no mb_type, no cbpb — macroblock takes the default
+//!     (direct-mode forward+backward prediction with zero delta,
+//!     no residual).
+//!   - `10`   → mb_type present, cbpb absent (all-zero cbpb).
+//!   - `11`   → mb_type present AND cbpb present.
 //!
 //!   Our decoded MODB value:
-//!     * 0 → skipped
-//!     * 1 → "01" case (mbtype only)
-//!     * 2 → "00" case (mbtype + cbpb)
+//!     * 0 → skipped / default (no mbtype, no cbpb)
+//!     * 1 → mbtype only
+//!     * 2 → mbtype + cbpb
 //!
-//! * **MBTYPE** (Table B-18) — 1..=4 bit prefix per non-skipped B-MB.
-//!   - `1`     → Interpolated (mvd_forward AND mvd_backward)
-//!   - `01`    → Backward only (mvd_backward)
-//!   - `001`   → Forward only (mvd_forward)
-//!   - `0001`  → Direct (scaled co-located MV + optional mvd_forward)
+//! * **MBTYPE** (Table 11-4, non-scalable B-VOPs) — 1..=4 bit prefix per
+//!   non-skipped B-MB.
+//!   - `1`     → direct (scaled co-located MV plus optional delta)
+//!   - `01`    → interpolate MC+Q (mvd_forward AND mvd_backward)
+//!   - `001`   → backward MC+Q  (mvd_backward only)
+//!   - `0001`  → forward MC+Q   (mvd_forward only)
 //!
 //!   Our decoded MBTYPE value:
 //!     * 0 → Direct
@@ -38,16 +41,16 @@ pub const MBTYPE_BACKWARD: u8 = 2;
 pub const MBTYPE_FORWARD: u8 = 3;
 
 const MODB_ROWS: [(u8, u32, u8); 3] = [
-    (1, 0b1, MODB_SKIPPED),
-    (2, 0b01, MODB_MBTYPE_ONLY),
-    (2, 0b00, MODB_MBTYPE_CBPB),
+    (1, 0b0, MODB_SKIPPED),
+    (2, 0b10, MODB_MBTYPE_ONLY),
+    (2, 0b11, MODB_MBTYPE_CBPB),
 ];
 
 const MBTYPE_ROWS: [(u8, u32, u8); 4] = [
-    (1, 0b1, MBTYPE_INTERPOLATED),
-    (2, 0b01, MBTYPE_BACKWARD),
-    (3, 0b001, MBTYPE_FORWARD),
-    (4, 0b0001, MBTYPE_DIRECT),
+    (1, 0b1, MBTYPE_DIRECT),
+    (2, 0b01, MBTYPE_INTERPOLATED),
+    (3, 0b001, MBTYPE_BACKWARD),
+    (4, 0b0001, MBTYPE_FORWARD),
 ];
 
 pub fn modb_table() -> &'static [VlcEntry<u8>] {
@@ -80,26 +83,36 @@ mod tests {
 
     #[test]
     fn modb_decodes_all_variants() {
-        // "1" → skipped
-        let mut br = BitReader::new(&[0x80]);
-        assert_eq!(vlc::decode(&mut br, modb_table()).unwrap(), MODB_SKIPPED);
-        // "01" → mbtype only
-        let mut br = BitReader::new(&[0x40]);
-        assert_eq!(vlc::decode(&mut br, modb_table()).unwrap(), MODB_MBTYPE_ONLY);
-        // "00" → mbtype + cbpb
+        // "0" → skipped / default
         let mut br = BitReader::new(&[0x00]);
+        assert_eq!(vlc::decode(&mut br, modb_table()).unwrap(), MODB_SKIPPED);
+        // "10" → mbtype only
+        let mut br = BitReader::new(&[0x80]);
+        assert_eq!(vlc::decode(&mut br, modb_table()).unwrap(), MODB_MBTYPE_ONLY);
+        // "11" → mbtype + cbpb
+        let mut br = BitReader::new(&[0xC0]);
         assert_eq!(vlc::decode(&mut br, modb_table()).unwrap(), MODB_MBTYPE_CBPB);
     }
 
     #[test]
     fn mbtype_decodes_all_variants() {
+        // "1" → direct
         let mut br = BitReader::new(&[0x80]);
-        assert_eq!(vlc::decode(&mut br, mbtype_table()).unwrap(), MBTYPE_INTERPOLATED);
-        let mut br = BitReader::new(&[0x40]);
-        assert_eq!(vlc::decode(&mut br, mbtype_table()).unwrap(), MBTYPE_BACKWARD);
-        let mut br = BitReader::new(&[0x20]);
-        assert_eq!(vlc::decode(&mut br, mbtype_table()).unwrap(), MBTYPE_FORWARD);
-        let mut br = BitReader::new(&[0x10]);
         assert_eq!(vlc::decode(&mut br, mbtype_table()).unwrap(), MBTYPE_DIRECT);
+        // "01" → interpolated
+        let mut br = BitReader::new(&[0x40]);
+        assert_eq!(
+            vlc::decode(&mut br, mbtype_table()).unwrap(),
+            MBTYPE_INTERPOLATED
+        );
+        // "001" → backward
+        let mut br = BitReader::new(&[0x20]);
+        assert_eq!(
+            vlc::decode(&mut br, mbtype_table()).unwrap(),
+            MBTYPE_BACKWARD
+        );
+        // "0001" → forward
+        let mut br = BitReader::new(&[0x10]);
+        assert_eq!(vlc::decode(&mut br, mbtype_table()).unwrap(), MBTYPE_FORWARD);
     }
 }
