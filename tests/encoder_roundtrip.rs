@@ -426,6 +426,112 @@ fn encode_bvop_roundtrip_psnr() {
     }
 }
 
+/// Round-12 vti_bits regression: encoder previously hardcoded
+/// `bits_needed(23) = 5` in every VOP header, so any non-24fps stream
+/// emitted a header whose vti_bits width disagreed with the VOL's
+/// `bits_needed(resolution-1)`. The decoder reads the bit-width from the
+/// VOL, so it would mis-parse vop_time_increment + every following bit
+/// (vop_coded, intra_dc_vlc_thr, vop_quant) and either reject the frame
+/// or decode a wildly wrong picture.
+///
+/// Drive the encoder at **30 fps** (frame_rate.num = 30 → resolution = 30
+/// → vti_bits = bits_needed(29) = 5; same width by coincidence) AND at
+/// **15 fps** (resolution = 15 → vti_bits = bits_needed(14) = 4; this
+/// is the one that actually crashed before the fix). Confirm the
+/// roundtrip lossless-ish (>30 dB).
+#[test]
+fn encode_15fps_vti_bits_roundtrip() {
+    let path = "/tmp/m4v_30fps.yuv";
+    if !Path::new(path).exists() {
+        eprintln!("fixture {path} missing — skipping test");
+        return;
+    }
+    let yuv = std::fs::read(path).expect("read fixture");
+    let frame_bytes = 64 * 64 * 3 / 2;
+    let n_frames = yuv.len() / frame_bytes;
+    if n_frames < 2 {
+        eprintln!("fixture has only {n_frames} frames — skipping");
+        return;
+    }
+
+    for fps in [15u32, 30u32] {
+        eprintln!("---- fps={fps} ----");
+        let mut params = CodecParameters::video(CodecId::new(oxideav_mpeg4video::CODEC_ID_STR));
+        params.media_type = MediaType::Video;
+        params.width = Some(64);
+        params.height = Some(64);
+        params.pixel_format = Some(PixelFormat::Yuv420P);
+        params.frame_rate = Some(Rational::new(fps as i64, 1));
+        let mut enc = oxideav_mpeg4video::encoder::make_encoder(&params).expect("build enc");
+
+        for i in 0..n_frames.min(4) {
+            let off = i * frame_bytes;
+            let chunk = &yuv[off..off + frame_bytes];
+            let mut vf = make_video_frame(chunk);
+            vf.pts = Some(i as i64);
+            vf.time_base = TimeBase::new(1, fps as i64);
+            enc.send_frame(&Frame::Video(vf)).expect("send_frame");
+        }
+        enc.flush().expect("flush enc");
+
+        let mut packets: Vec<Packet> = Vec::new();
+        loop {
+            match enc.receive_packet() {
+                Ok(p) => packets.push(p),
+                Err(oxideav_core::Error::Eof) => break,
+                Err(oxideav_core::Error::NeedMore) => break,
+                Err(e) => panic!("enc.receive_packet: {e:?}"),
+            }
+        }
+        eprintln!("fps={fps}: encoded {} packets", packets.len());
+
+        let dec_params = CodecParameters::video(CodecId::new(oxideav_mpeg4video::CODEC_ID_STR));
+        let mut dec = oxideav_mpeg4video::decoder::make_decoder(&dec_params).expect("build dec");
+        let mut decoded: Vec<Vec<u8>> = Vec::new();
+        let drain = |dec: &mut Box<dyn oxideav_core::Decoder>, decoded: &mut Vec<Vec<u8>>| loop {
+            match dec.receive_frame() {
+                Ok(Frame::Video(v)) => {
+                    let mut buf = Vec::with_capacity(frame_bytes);
+                    buf.extend_from_slice(&v.planes[0].data);
+                    buf.extend_from_slice(&v.planes[1].data);
+                    buf.extend_from_slice(&v.planes[2].data);
+                    decoded.push(buf);
+                }
+                Ok(_) => {}
+                Err(oxideav_core::Error::Eof) => break,
+                Err(oxideav_core::Error::NeedMore) => break,
+                Err(e) => {
+                    eprintln!("dec.receive_frame error: {e:?}");
+                    break;
+                }
+            }
+        };
+        for pkt in &packets {
+            if let Err(e) = dec.send_packet(pkt) {
+                panic!("fps={fps}: dec.send_packet error: {e:?} — vti_bits regression?");
+            }
+            drain(&mut dec, &mut decoded);
+        }
+        let _ = dec.flush();
+        drain(&mut dec, &mut decoded);
+        eprintln!("fps={fps}: decoded {} frames", decoded.len());
+
+        // PSNR sanity — the I-frame path should land >30 dB on any sensible
+        // quant. A vti_bits desync would scramble the entire VOP and PSNR
+        // would collapse far below this floor.
+        assert!(
+            !decoded.is_empty(),
+            "fps={fps}: decoder produced 0 frames — vti_bits desync"
+        );
+        let psnr = psnr_db(&yuv[..frame_bytes], &decoded[0]);
+        eprintln!("fps={fps}: I-VOP roundtrip PSNR = {psnr:.2} dB");
+        assert!(
+            psnr >= 30.0,
+            "fps={fps}: I-VOP PSNR {psnr:.2} dB below 30 dB — vti_bits desync"
+        );
+    }
+}
+
 fn psnr_db(a: &[u8], b: &[u8]) -> f64 {
     let n = a.len().min(b.len());
     let mut sum_sq: u64 = 0;

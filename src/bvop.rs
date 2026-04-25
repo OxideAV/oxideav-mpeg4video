@@ -86,7 +86,7 @@ impl BMbMotion {
     }
 
     /// Construct from 4 per-block forward/backward pairs (4MV direct mode).
-    fn quad(fwd4: [(i32, i32); 4], bwd4: [(i32, i32); 4], mode: BMode) -> Self {
+    pub fn quad(fwd4: [(i32, i32); 4], bwd4: [(i32, i32); 4], mode: BMode) -> Self {
         Self {
             fwd: fwd4[0],
             bwd: bwd4[0],

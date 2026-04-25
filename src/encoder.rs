@@ -291,8 +291,9 @@ impl Mpeg4VideoEncoder {
         }
         // Display time in VOL time-base ticks = original frame pts.
         let time_inc = display_time_inc(v, self.display_index);
+        let vti_resolution = (self.frame_rate.num as u32).max(1);
         if is_keyframe {
-            write_i_vop_header(&mut bw, time_inc, self.vop_quant);
+            write_i_vop_header(&mut bw, time_inc, self.vop_quant, vti_resolution);
             let pic = encode_i_vop_body_and_reconstruct(&mut bw, v, self.vop_quant)?;
             self.reference = Some(pic);
             self.reference_grid = None;
@@ -309,6 +310,7 @@ impl Mpeg4VideoEncoder {
                 self.vop_quant,
                 self.rounding_type,
                 self.f_code_fwd,
+                vti_resolution,
             );
             let (pic, grid) = encode_p_vop_body_with_grid(
                 &mut bw,
@@ -358,8 +360,9 @@ impl Mpeg4VideoEncoder {
         }
 
         let time_inc = display_time_inc(v, self.display_index);
+        let vti_resolution = (self.frame_rate.num as u32).max(1);
         if is_keyframe {
-            write_i_vop_header(&mut bw, time_inc, self.vop_quant);
+            write_i_vop_header(&mut bw, time_inc, self.vop_quant, vti_resolution);
             let pic = encode_i_vop_body_and_reconstruct(&mut bw, v, self.vop_quant)?;
             self.reference = Some(pic);
             self.reference_grid = None; // I-VOPs have no MV grid.
@@ -375,6 +378,7 @@ impl Mpeg4VideoEncoder {
                 self.vop_quant,
                 self.rounding_type,
                 self.f_code_fwd,
+                vti_resolution,
             );
             let (pic, grid) = encode_p_vop_body_with_grid(
                 &mut bw,
@@ -455,12 +459,14 @@ impl Mpeg4VideoEncoder {
         let cur_time = time_inc_u as i64;
         let (trb, trd) = trb_trd(prev_time, cur_time, next_time);
         let mut bw = BitWriter::with_capacity(8192);
+        let vti_resolution = (self.frame_rate.num as u32).max(1);
         write_b_vop_header(
             &mut bw,
             time_inc_u,
             self.vop_quant,
             self.f_code_fwd,
             self.f_code_fwd,
+            vti_resolution,
         );
 
         // Co-located grid: `next_backward`'s MV grid. An I-VOP has no
@@ -635,16 +641,19 @@ fn align_with_one_zero_then_ones(bw: &mut BitWriter) {
 /// stream — encoded as the `vop_time_increment` (with `modulo_time_base = 0`
 /// since we keep time_inc < resolution). `vop_quant` is constant across the
 /// picture.
-fn write_i_vop_header(bw: &mut BitWriter, time_inc: u32, vop_quant: u32) {
+///
+/// `vti_resolution` is the `vop_time_increment_resolution` written into the
+/// VOL header (== frame_rate.num) — used to derive `vop_time_increment`'s
+/// width per §6.3.5: `bits_needed(resolution - 1)`. Round-12 fix: was
+/// previously hardcoded to `bits_needed(23) = 5`, which broke any non-24fps
+/// stream because the decoder reads the bits-width from the VOL header.
+fn write_i_vop_header(bw: &mut BitWriter, time_inc: u32, vop_quant: u32, vti_resolution: u32) {
     write_start_code(bw, VOP_START_CODE);
     bw.write_bits(0, 2); // vop_coding_type = 00 (I)
     bw.write_bits(0, 1); // modulo_time_base = `0` (terminator)
     bw.write_bits(1, 1); // marker
-                         // vop_time_increment_resolution was 24 in the default config → 5 bits.
-                         // But to be safe we re-derive bits from the resolution. The frame_rate
-                         // numerator is what we wrote into the VOL.
-    let vti_bits = bits_needed(/* resolution-1 */ 23).max(1);
-    bw.write_bits(time_inc % 24, vti_bits);
+    let vti_bits = bits_needed(vti_resolution.saturating_sub(1)).max(1);
+    bw.write_bits(time_inc % vti_resolution.max(1), vti_bits);
     bw.write_bits(1, 1); // marker
 
     bw.write_bits(1, 1); // vop_coded = 1
@@ -658,19 +667,23 @@ fn write_i_vop_header(bw: &mut BitWriter, time_inc: u32, vop_quant: u32) {
 /// Emit the VOP header for a B-VOP (§6.2.5, vop_coding_type == 2). Mirrors
 /// `write_p_vop_header` plus the extra `vop_fcode_backward` field. No
 /// `vop_rounding_type` for B-VOPs (inherited from the enclosing P context).
+///
+/// `vti_resolution` — see `write_i_vop_header`; round-12 fix to honour the
+/// VOL's actual `vop_time_increment_resolution`.
 fn write_b_vop_header(
     bw: &mut BitWriter,
     time_inc: u32,
     vop_quant: u32,
     f_code_fwd: u8,
     f_code_bwd: u8,
+    vti_resolution: u32,
 ) {
     write_start_code(bw, VOP_START_CODE);
     bw.write_bits(0b10, 2); // vop_coding_type = 10 (B)
     bw.write_bits(0, 1); // modulo_time_base = `0` terminator
     bw.write_bits(1, 1); // marker
-    let vti_bits = bits_needed(23).max(1);
-    bw.write_bits(time_inc % 24, vti_bits);
+    let vti_bits = bits_needed(vti_resolution.saturating_sub(1)).max(1);
+    bw.write_bits(time_inc % vti_resolution.max(1), vti_bits);
     bw.write_bits(1, 1); // marker
 
     bw.write_bits(1, 1); // vop_coded = 1
@@ -685,19 +698,23 @@ fn write_b_vop_header(
 /// plus the P-VOP-specific `vop_rounding_type` and `vop_fcode_forward` fields
 /// (§6.2.5). `time_inc` is per-picture. `rounding_type` is the half-pel
 /// rounding flag; `f_code_fwd` is the forward motion range code (1..=7).
+///
+/// `vti_resolution` — see `write_i_vop_header`; round-12 fix to honour the
+/// VOL's actual `vop_time_increment_resolution`.
 fn write_p_vop_header(
     bw: &mut BitWriter,
     time_inc: u32,
     vop_quant: u32,
     rounding_type: bool,
     f_code_fwd: u8,
+    vti_resolution: u32,
 ) {
     write_start_code(bw, VOP_START_CODE);
     bw.write_bits(0b01, 2); // vop_coding_type = 01 (P)
     bw.write_bits(0, 1); // modulo_time_base = `0` terminator
     bw.write_bits(1, 1); // marker
-    let vti_bits = bits_needed(23).max(1);
-    bw.write_bits(time_inc % 24, vti_bits);
+    let vti_bits = bits_needed(vti_resolution.saturating_sub(1)).max(1);
+    bw.write_bits(time_inc % vti_resolution.max(1), vti_bits);
     bw.write_bits(1, 1); // marker
 
     bw.write_bits(1, 1); // vop_coded = 1
