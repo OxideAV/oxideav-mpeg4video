@@ -3,10 +3,18 @@
 //! Scope:
 //! * Per-MB mode decision between Forward, Backward, Bidirectional (Interpolated)
 //!   and Direct by comparing SAD. The cheapest mode wins.
-//! * Emits `MODB` (Table 11-3) + `MBTYPE` (Table 11-4) + optional `CBPB` +
-//!   forward / backward MVDs + inter texture walk. Residuals are inter-coded
-//!   using the same H.263 inter quant + Table B-17 tcoef walk as the P-VOP
-//!   path.
+//! * Emits `MODB` (Table B.3) + `MBTYPE` (Table B.4) + optional `CBPB` +
+//!   `dbquant` (Table 6-33) + forward / backward MVDs + inter texture walk.
+//!   Residuals are inter-coded using the same H.263 inter quant + Table B-17
+//!   tcoef walk as the P-VOP path.
+//! * **Round 11 — cbpb residual emit landed.** When the per-block
+//!   forward DCT + quantiser produces non-zero AC levels, the MB layer
+//!   switches to MODB="00", emits a 6-bit `cbpb` mask (bit 5 = Y0 ..
+//!   bit 0 = Cr), emits `dbquant=0` (single bit `0` from Table 6-33,
+//!   B-VOP-specific quant-delta VLC) for non-direct modes, and walks
+//!   each coded block through `write_inter_ac` (Table B-17). Direct
+//!   mode uses MODB="00" + mbtype="1" + cbpb + (no dbquant, per
+//!   §6.2.7) + zero MV delta + residuals.
 //! * `co_located_not_coded` inheritance (§7.5.9.5.4) — when the co-located
 //!   P-MB was `not_coded`, the B-MB is implicitly skipped (no bits emitted).
 //! * MV prediction: separate per-row predictor state for forward + backward
@@ -36,7 +44,7 @@ use crate::mb::IVopPicture;
 use crate::mc::luma_mv_to_chroma;
 use crate::pvop::{
     encode_inter_block, load_chroma_block, load_luma_mb, predict_chroma_block, predict_luma_mb,
-    wrap_mvd, write_mv_component,
+    wrap_mvd, write_inter_ac, write_mv_component,
 };
 use crate::tables::bvop as bvop_tab;
 use oxideav_core::bits::BitWriter;
@@ -190,12 +198,12 @@ fn estimate_b_mb(
         // Bit-cost penalty per mode (heuristic — helps direct win on
         // motion-compensation friendly content).
         //
-        // NOTE: This round favours direct strongly because ffmpeg's
-        // decoder reports "illegal MB_type" on some non-direct B-MBs we
-        // emit — root cause TBD and tracked in follow-up items. Favouring
-        // direct keeps the bitstream syntactically simple (MODB = "1",
-        // no mbtype VLC, no MVD) and sidesteps the mismatch. Our own
-        // decoder is unaffected either way (39 dB self-consistency).
+        // Direct mode still wins on near-static content because it costs
+        // a single MODB bit ("1") and zero MV bits. Non-direct modes
+        // pay for mbtype + MVDs + (now) cbpb + dbquant + residual VLCs.
+        // The penalties below were tuned for the prior "no-residual"
+        // path; with cbpb residual emit landed (round 11) the relative
+        // bit costs shift slightly but the penalties remain reasonable.
         const DIRECT_BONUS: i64 = -200;
         const FWD_ONLY_PENALTY: i64 = 48;
         const BWD_ONLY_PENALTY: i64 = 48;
@@ -589,31 +597,40 @@ fn emit_b_mb(
         return;
     }
 
-    // This encoder never emits residual for B-MBs (cbpb == 0 always). The
-    // B-VOP body is pure motion-compensation; residual emit is gated
-    // behind a `dbquant` sidechannel (2004 Table 6-33, B-VOP-specific
-    // quantiser-delta VLC) and the spec requires `dbquant` when
-    // `mb_type != direct && cbpb != 0` (§6.2.7) — to keep the path
-    // drift-free we skip residual emit entirely. This costs ~0-3 dB of
-    // PSNR vs a residual-emitting encoder; the motion predictor is the
-    // dominant quality driver for close reference frames.
-    let any_coded = false;
+    // Residual presence per block (Y0..Y3, Cb, Cr). cbpb bit 5 = blk 0 (Y0),
+    // bit 0 = blk 5 (Cr) — matches decoder `(cbpb >> (5 - blk)) & 1`.
+    let mut cbpb: u8 = 0;
+    for (blk, &c) in mb.coded.iter().enumerate() {
+        if c {
+            cbpb |= 1 << (5 - blk);
+        }
+    }
+    let any_coded = cbpb != 0;
 
     // MODB selection (2004 Table B.3):
-    //   - "1"    → skipped (direct mode, no cbpb).
-    //   - "01"   → mbtype, no cbpb.
-    //   - "00"   → mbtype + cbpb. (not emitted — we force cbpb = 0.)
+    //   - "1"    → skipped/default (direct mode, zero delta, no residual).
+    //   - "01"   → mb_type present, cbpb absent (implicit zero).
+    //   - "00"   → mb_type AND cbpb present.
+    //
+    // We emit the skipped form only for Direct mode with no residual AND
+    // zero direct delta — both conditions hold by construction (we always
+    // pick delta = (0,0) for direct).
     if matches!(mb.mode, BMode::Direct) && !any_coded {
         // MODB = "1" — single bit. No mbtype, no MVs, no residuals.
         bw.write_bits(0b1, 1);
-        // Row predictors NOT updated for direct mode (spec §7.5.8).
+        // Row predictors NOT updated for direct mode (§7.5.8).
         return;
     }
 
-    // MODB = "01" (mbtype only, cbpb implicit zero).
-    bw.write_bits(0b01, 2);
+    if any_coded {
+        // MODB = "00" — mbtype + cbpb both present.
+        bw.write_bits(0b00, 2);
+    } else {
+        // MODB = "01" — mbtype only, cbpb implicit zero.
+        bw.write_bits(0b01, 2);
+    }
 
-    // MBTYPE (Table 11-4, 1..=4 bits):
+    // MBTYPE (Table B.4, 1..=4 bits):
     match mb.mode {
         BMode::Direct => bw.write_bits(0b1, 1),
         BMode::Interpolated => bw.write_bits(0b01, 2),
@@ -622,7 +639,25 @@ fn emit_b_mb(
         BMode::Skipped => unreachable!("skipped handled above"),
     }
 
-    // Motion vectors per mode (§7.6.5.3).
+    // CBPB (6 bits, Y0..Y3 Cb Cr — bit 5 = Y0 .. bit 0 = Cr) — only when
+    // MODB == "00". §6.2.7 / Table 11-3.
+    if any_coded {
+        bw.write_bits(cbpb as u32, 6);
+    }
+
+    // dbquant — §6.3.5 / Table 6-33: present iff `mbtype != DIRECT &&
+    // cbpb != 0`. Codes:
+    //     0   → delta = 0 (no quant change)
+    //     10  → delta = -2
+    //     11  → delta = +2
+    // We always emit the single-bit `0` because the encoder keeps the
+    // VOP-level quant constant — round-9 fix made the decoder use this
+    // exact VLC, so emitting `0` is decoded as "no quant change".
+    if any_coded && !matches!(mb.mode, BMode::Direct) {
+        bw.write_bits(0, 1);
+    }
+
+    // Motion vectors per mode (§7.6.5.3). Same order as the decoder.
     match mb.mode {
         BMode::Direct => {
             // Direct-mode `mvd_b` delta — we always emit (0, 0).
@@ -663,10 +698,20 @@ fn emit_b_mb(
         BMode::Skipped => unreachable!(),
     }
 
-    // Touch unused fields so the compiler doesn't complain.
+    // Residual coefficients — per-block walk in Y0..Y3, Cb, Cr order. Inter
+    // tcoef VLC (Table B-17) — same emitter as P-VOPs since B-MB residuals
+    // are coded as inter blocks. The decoder reads each coded block in the
+    // same order (`for blk in 0..6` then `(cbpb >> (5 - blk)) & 1`).
+    if any_coded {
+        for blk in 0..6 {
+            if mb.coded[blk] {
+                write_inter_ac(bw, &mb.ac_levels[blk]);
+            }
+        }
+    }
+
+    // Touch unused tables so the compiler doesn't complain when we revisit.
     let _ = ZIGZAG;
-    let _ = mb.ac_levels;
-    let _ = mb.coded;
     let _ = mb.recon_y;
     let _ = mb.recon_cb;
     let _ = mb.recon_cr;
@@ -693,12 +738,10 @@ mod tests {
 
 // -------------------------------------------------------------------------
 // Follow-up items:
-// * `dbquant = 0` emission. The encoder currently sidesteps `cbpb != 0`
-//   entirely (`any_coded = false`) so no `dbquant` ever reaches the
-//   bitstream. When residual emit is re-enabled the emitter must use
-//   the 2004 Table 6-33 VLC (`0`→0, `10`→-2, `11`→+2), NOT the P-VOP
-//   2-bit `dquant`. The decoder path is updated; matching emitter work
-//   is a one-liner (write `0`, `10`, or `11`).
+// * Adaptive dbquant. Round 11 always emits `dbquant = 0` (the
+//   "no quant change" single-bit code, Table 6-33). Picking ±2 per MB
+//   based on a residual-energy heuristic could squeeze another fraction
+//   of a dB on busy content but isn't required for correctness.
 // * 4MV direct emit — the spec allows direct-mode B-MBs to borrow the
 //   co-located P-MB's 4MV. Decoder supports this via `BMbMotion::quad`.
 //   Encoder always emits single-MV direct.
