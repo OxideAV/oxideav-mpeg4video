@@ -938,10 +938,106 @@ fn p_vop_qpel_bitrate_no_worse_than_halfpel() {
     );
 }
 
-/// Encoder factory rejects QPel + B-frames (round 15 only landed P-VOP
-/// QPel; the B-VOP encoder still assumes half-pel).
+/// Round-16 — B-VOP QPel motion compensation roundtrip. Drives the
+/// encoder with `bf=2 qpel=1` against the sub-pel-motion fixture, then
+/// reconstructs through our decoder. The encoder must produce a
+/// decodable stream and the per-frame PSNR must match the half-pel
+/// equivalent within 1.5 dB (the constant-Q residual quantiser caps
+/// reconstruction error). The QPel B-VOP encoder operates on the same
+/// 8-tap filter (§7.6.2.2 eqs. 7-37/7-38) and same MVD VLC as P-VOP
+/// QPel — the only differences are the additional 8-candidate qpel
+/// refine for the backward MV and the QPel-aware direct-mode predictor.
 #[test]
-fn qpel_with_b_frames_rejected() {
+fn b_vop_qpel_round_trip() {
+    let (width, height) = (32u32, 32u32);
+    let num_frames = 6u32;
+    let src: Vec<VideoFrame> = (0..num_frames)
+        .map(|i| make_qpel_friendly_frame(i, width, height))
+        .collect();
+
+    let roundtrip = |qpel: bool| -> (usize, f64) {
+        let mut params = CodecParameters::video(CodecId::new(oxideav_mpeg4video::CODEC_ID_STR));
+        params.media_type = MediaType::Video;
+        params.width = Some(width);
+        params.height = Some(height);
+        params.pixel_format = Some(PixelFormat::Yuv420P);
+        params.frame_rate = Some(Rational::new(24, 1));
+        params.options.insert("bf", "2");
+        if qpel {
+            params.options.insert("qpel", "1");
+        }
+        let mut enc = oxideav_mpeg4video::encoder::make_encoder(&params).expect("build enc");
+        for f in &src {
+            enc.send_frame(&Frame::Video(f.clone()))
+                .expect("send_frame");
+        }
+        enc.flush().expect("flush enc");
+
+        let mut packets: Vec<Packet> = Vec::new();
+        loop {
+            match enc.receive_packet() {
+                Ok(p) => packets.push(p),
+                Err(oxideav_core::Error::NeedMore) | Err(oxideav_core::Error::Eof) => break,
+                Err(e) => panic!("receive_packet: {e:?}"),
+            }
+        }
+        let mut es = Vec::new();
+        for pkt in &packets {
+            es.extend_from_slice(&pkt.data);
+        }
+        let dec_params = CodecParameters::video(CodecId::new(oxideav_mpeg4video::CODEC_ID_STR));
+        let mut dec =
+            oxideav_mpeg4video::decoder::make_decoder(&dec_params).expect("build decoder");
+        let in_pkt = Packet::new(0, TimeBase::new(1, 24), es.clone());
+        let _ = dec.send_packet(&in_pkt);
+        let _ = dec.flush();
+        let mut decoded: Vec<VideoFrame> = Vec::new();
+        loop {
+            match dec.receive_frame() {
+                Ok(Frame::Video(f)) => decoded.push(f),
+                Ok(_) => {}
+                Err(oxideav_core::Error::NeedMore) | Err(oxideav_core::Error::Eof) => break,
+                Err(_) => break,
+            }
+        }
+        // Mean PSNR across all decoded frames (when display order
+        // happens to align with src order — for this small case it does).
+        let mut sum = 0.0;
+        let mut cnt = 0;
+        for (s, d) in src.iter().zip(decoded.iter()) {
+            sum += psnr(&flatten_frame(s), &flatten_frame(d));
+            cnt += 1;
+        }
+        let mean = if cnt > 0 { sum / cnt as f64 } else { 0.0 };
+        (es.len(), mean)
+    };
+
+    let (size_half, mean_half) = roundtrip(false);
+    let (size_qpel, mean_qpel) = roundtrip(true);
+    eprintln!(
+        "B-VOP bytes — half-pel: {size_half}, qpel: {size_qpel} | \
+         mean PSNR — half-pel: {mean_half:.2} dB, qpel: {mean_qpel:.2} dB"
+    );
+    assert!(
+        mean_qpel > 24.0,
+        "QPel B-VOP roundtrip PSNR {mean_qpel:.2} dB too low (decoder/encoder mismatch?)"
+    );
+    assert!(
+        (mean_qpel - mean_half).abs() < 2.0,
+        "QPel B-VOP PSNR {mean_qpel:.2} dB diverged > 2.0 dB from half-pel {mean_half:.2} dB"
+    );
+    assert!(
+        size_qpel <= (size_half * 5) / 4,
+        "QPel B-VOP size {size_qpel} ballooned > 1.25× half-pel {size_half}"
+    );
+}
+
+/// Round-16: QPel + B-frames is now implemented. The B-VOP encoder
+/// accepts a `quarter_sample` flag and switches its forward/backward ME,
+/// MC, chroma reduction, and direct-mode MV scaling to QPel paths
+/// (§7.6.2.2). The encoder factory must accept the combination.
+#[test]
+fn qpel_with_b_frames_accepted() {
     let mut params = CodecParameters::video(CodecId::new(oxideav_mpeg4video::CODEC_ID_STR));
     params.media_type = MediaType::Video;
     params.width = Some(32);
@@ -951,5 +1047,8 @@ fn qpel_with_b_frames_rejected() {
     params.options.insert("qpel", "1");
     params.options.insert("bf", "2");
     let res = oxideav_mpeg4video::encoder::make_encoder(&params);
-    assert!(res.is_err(), "QPel + B-frames combination must be rejected");
+    assert!(
+        res.is_ok(),
+        "QPel + B-frames must be accepted (round-16 lifted the rejection)"
+    );
 }

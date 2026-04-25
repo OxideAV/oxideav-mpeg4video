@@ -426,6 +426,176 @@ fn encode_bvop_roundtrip_psnr() {
     }
 }
 
+/// Round-16 — QPel + B-frames roundtrip + bytes comparison.
+///
+/// Drives the encoder twice on the same `bf=2` testsrc fixture, once
+/// with `qpel=0` (half-pel) and once with `qpel=1` (quarter-pel). Both
+/// runs must produce decodable bitstreams (our decoder), and the QPel
+/// variant must hit at least the same PSNR floor as half-pel (≥ 40 dB
+/// per the round-11 baseline) without ballooning bytes.
+///
+/// We also dump both bitstreams to /tmp so a manual `ffmpeg -i` can
+/// cross-decode them (the encoder factory already advertises QPel via
+/// VOL `quarter_sample = 1` + verid=2; the decoder must accept).
+#[test]
+fn encode_bvop_qpel_roundtrip_psnr() {
+    let path = "/tmp/m4v_bf_in.yuv";
+    if !Path::new(path).exists() {
+        eprintln!("fixture {path} missing — skipping test");
+        return;
+    }
+    let yuv = std::fs::read(path).expect("read fixture");
+    let frame_bytes = 64 * 64 * 3 / 2;
+    let n_frames = yuv.len() / frame_bytes;
+    if n_frames < 4 {
+        eprintln!("fixture has only {n_frames} frames — skipping");
+        return;
+    }
+
+    let run = |qpel: bool| -> (usize, f64, Vec<u8>) {
+        let mut params = CodecParameters::video(CodecId::new(oxideav_mpeg4video::CODEC_ID_STR));
+        params.media_type = MediaType::Video;
+        params.width = Some(64);
+        params.height = Some(64);
+        params.pixel_format = Some(PixelFormat::Yuv420P);
+        params.frame_rate = Some(Rational::new(24, 1));
+        params.options.insert("bf".to_string(), "2".to_string());
+        if qpel {
+            params.options.insert("qpel".to_string(), "1".to_string());
+        }
+        let mut enc = oxideav_mpeg4video::encoder::make_encoder(&params).expect("build enc");
+        for i in 0..n_frames {
+            let off = i * frame_bytes;
+            let chunk = &yuv[off..off + frame_bytes];
+            let mut vf = make_video_frame(chunk);
+            vf.pts = Some(i as i64);
+            vf.time_base = TimeBase::new(1, 24);
+            enc.send_frame(&Frame::Video(vf)).expect("send_frame");
+        }
+        enc.flush().expect("flush enc");
+
+        let mut packets: Vec<Packet> = Vec::new();
+        let mut bitstream: Vec<u8> = Vec::new();
+        loop {
+            match enc.receive_packet() {
+                Ok(p) => {
+                    bitstream.extend_from_slice(&p.data);
+                    packets.push(p);
+                }
+                Err(oxideav_core::Error::Eof) => break,
+                Err(oxideav_core::Error::NeedMore) => break,
+                Err(e) => panic!("enc.receive_packet: {e:?}"),
+            }
+        }
+
+        // Decode through our decoder.
+        let dec_params = CodecParameters::video(CodecId::new(oxideav_mpeg4video::CODEC_ID_STR));
+        let mut dec = oxideav_mpeg4video::decoder::make_decoder(&dec_params).expect("build dec");
+        let mut decoded: Vec<Vec<u8>> = Vec::new();
+        let drain = |dec: &mut Box<dyn oxideav_core::Decoder>, decoded: &mut Vec<Vec<u8>>| loop {
+            match dec.receive_frame() {
+                Ok(Frame::Video(v)) => {
+                    let mut buf = Vec::with_capacity(frame_bytes);
+                    buf.extend_from_slice(&v.planes[0].data);
+                    buf.extend_from_slice(&v.planes[1].data);
+                    buf.extend_from_slice(&v.planes[2].data);
+                    decoded.push(buf);
+                }
+                Ok(_) => {}
+                Err(oxideav_core::Error::Eof) => break,
+                Err(oxideav_core::Error::NeedMore) => break,
+                Err(e) => {
+                    eprintln!("dec.receive_frame error: {e:?}");
+                    break;
+                }
+            }
+        };
+        for pkt in &packets {
+            if let Err(e) = dec.send_packet(pkt) {
+                eprintln!("dec.send_packet error: {e:?}");
+                break;
+            }
+            drain(&mut dec, &mut decoded);
+        }
+        let _ = dec.flush();
+        drain(&mut dec, &mut decoded);
+
+        // Per-frame mean PSNR.
+        let m = decoded.len().min(n_frames);
+        let mut sum_psnr = 0.0;
+        for i in 0..m {
+            let src = &yuv[i * frame_bytes..(i + 1) * frame_bytes];
+            sum_psnr += psnr_db(src, &decoded[i]);
+        }
+        let avg = if m > 0 { sum_psnr / m as f64 } else { 0.0 };
+        (bitstream.len(), avg, bitstream)
+    };
+
+    let (size_half, psnr_half, bs_half) = run(false);
+    let (size_qpel, psnr_qpel, bs_qpel) = run(true);
+    let _ = std::fs::write("/tmp/m4v_bf_qpel0.m4v", &bs_half);
+    let _ = std::fs::write("/tmp/m4v_bf_qpel1.m4v", &bs_qpel);
+    eprintln!(
+        "B-VOP roundtrip — half-pel: {size_half} bytes, PSNR {psnr_half:.2} dB | \
+         qpel: {size_qpel} bytes, PSNR {psnr_qpel:.2} dB"
+    );
+
+    // Both must self-decode at the round-11 PSNR floor.
+    assert!(
+        psnr_half >= 39.0,
+        "B-VOP half-pel PSNR {psnr_half:.2} dB < 39.0 dB regression bar"
+    );
+    assert!(
+        psnr_qpel >= 39.0,
+        "B-VOP QPel PSNR {psnr_qpel:.2} dB < 39.0 dB regression bar"
+    );
+    // PSNR mustn't diverge wildly from half-pel (the 8-tap MC is at
+    // worst as good as bilinear on flat content).
+    assert!(
+        (psnr_qpel - psnr_half).abs() < 1.5,
+        "B-VOP QPel PSNR {psnr_qpel:.2} dB diverged > 1.5 dB from half-pel {psnr_half:.2} dB"
+    );
+    // QPel mustn't balloon bytes — at worst a small overhead from extra
+    // MVD bits on flat content.
+    assert!(
+        size_qpel <= (size_half * 5) / 4,
+        "B-VOP QPel size {size_qpel} ballooned > 1.25× half-pel {size_half}"
+    );
+
+    // Cross-decode sanity check via ffmpeg if available. Failure is
+    // logged but doesn't fail the test (CI without ffmpeg still passes).
+    if let Ok(tmp) = std::env::var("TMPDIR") {
+        let es_path = std::path::PathBuf::from(&tmp).join("oxideav_bvop_qpel.m4v");
+        let yuv_out = std::path::PathBuf::from(&tmp).join("oxideav_bvop_qpel_ffmpeg.yuv");
+        let _ = std::fs::write(&es_path, &bs_qpel);
+        let status = Command::new("ffmpeg")
+            .args(["-y", "-f", "m4v", "-i"])
+            .arg(&es_path)
+            .args(["-f", "rawvideo", "-pix_fmt", "yuv420p"])
+            .arg(&yuv_out)
+            .status();
+        match status {
+            Ok(s) if s.success() => {
+                if let Ok(buf) = std::fs::read(&yuv_out) {
+                    let m = (buf.len() / frame_bytes).min(n_frames);
+                    let mut sum = 0.0;
+                    for i in 0..m {
+                        let src = &yuv[i * frame_bytes..(i + 1) * frame_bytes];
+                        let dec = &buf[i * frame_bytes..(i + 1) * frame_bytes];
+                        sum += psnr_db(src, dec);
+                    }
+                    let avg = if m > 0 { sum / m as f64 } else { 0.0 };
+                    eprintln!(
+                        "ffmpeg cross-decode B-VOP QPel: avg PSNR {avg:.2} dB over {m} frames"
+                    );
+                }
+            }
+            Ok(s) => eprintln!("ffmpeg cross-decode exit {s}"),
+            Err(e) => eprintln!("ffmpeg not available: {e}"),
+        }
+    }
+}
+
 /// Round-12 vti_bits regression: encoder previously hardcoded
 /// `bits_needed(23) = 5` in every VOP header, so any non-24fps stream
 /// emitted a header whose vti_bits width disagreed with the VOL's

@@ -139,17 +139,12 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         .map(|s| !matches!(s, "" | "0" | "false" | "False" | "FALSE"))
         .unwrap_or(DEFAULT_QUARTER_SAMPLE);
 
-    // Quarter-sample + B-frames is not yet supported. The B-VOP encoder
-    // (`bvop_enc.rs`) explicitly assumes `vol.quarter_sample == false`
-    // (see the module docstring); enabling QPel under -bf N would emit
-    // half-pel B-MVs against a QPel VOL header, mis-decoding every B-MB.
-    // Reject the combination at the factory rather than silently produce
-    // a malformed bitstream.
-    if quarter_sample && max_b_frames > 0 {
-        return Err(Error::unsupported(
-            "mpeg4 encoder: QPel (quarter_sample) + B-frames is not implemented",
-        ));
-    }
+    // Round-16: QPel + B-frames is now implemented. The B-VOP encoder
+    // (`bvop_enc.rs`) accepts a `quarter_sample` flag and switches its
+    // forward/backward ME, MC, chroma reduction, and direct-mode MV
+    // scaling to the quarter-pel paths (§7.6.2.2). The bitstream stays
+    // conformant: the VOL `quarter_sample = 1` flag tells the decoder
+    // that all forward/backward MVDs in B-VOPs are in QPel units.
 
     Ok(Box::new(Mpeg4VideoEncoder {
         output_params,
@@ -529,6 +524,7 @@ impl Mpeg4VideoEncoder {
             self.f_code_fwd,
             trb,
             trd,
+            self.quarter_sample,
         )?;
         bw.align_to_byte_zero();
         let bytes = bw.finish();

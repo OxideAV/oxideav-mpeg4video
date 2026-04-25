@@ -35,11 +35,24 @@
 //!   magic-number bias without changing PSNR/bytes on the regression
 //!   fixture; values >= +50 actively hurt.
 //!
+//! * **Round 16 — quarter-pel B-VOP encoder**. The forward + backward ME
+//!   pipelines now extend through an additional 8-candidate quarter-pel
+//!   refinement step around the half-pel best (§7.5.4 / §7.6.2.2). MVs
+//!   are stored in quarter-pel units when `quarter_sample == true`, the
+//!   8-tap-filter predictor (`predict_block_qpel`, eqs. 7-37/7-38) is
+//!   used everywhere a half-pel `predict_block` was used, and the chroma
+//!   MV reduction switches to `luma_qmv_to_chroma` (§7.6.2.2 eq. 107).
+//!   Direct mode inherits per-block QPel MVs from the co-located P-MB —
+//!   the spec formulas (§7.5.9.5) are unit-agnostic, so a QPel input
+//!   yields a QPel output. The MV VLC writer (Table B-12) is also
+//!   unit-agnostic — `write_mv_component` emits `diff` bits with no
+//!   awareness of the unit. The LSB now denotes the quarter-pel bit per
+//!   §7.6.3.
+//!
 //! Out of scope (fall through to safer encoding or return unchanged):
 //! * Interlaced field MVs — the B-VOP header advertises progressive
 //!   (interlaced == 0 in the VOL), so the decoder never enters the
 //!   field-MB paths.
-//! * Quarter-pel — we keep `vol.quarter_sample == false`.
 //! * Alternate vertical scan — `vop.alternate_vertical_scan == false`.
 
 use oxideav_core::Result;
@@ -48,10 +61,10 @@ use crate::bvop::{direct_mode_mvs, direct_mode_mvs_4, BMbMotion, BMode, BMvGrid,
 use crate::headers::vol::ZIGZAG;
 use crate::inter::MvGrid;
 use crate::mb::IVopPicture;
-use crate::mc::{luma_mv_to_chroma, predict_block};
+use crate::mc::{luma_mv_to_chroma, luma_qmv_to_chroma, predict_block, predict_block_qpel};
 use crate::pvop::{
     encode_inter_block, load_chroma_block, load_luma_mb, predict_chroma_block, predict_luma_mb,
-    wrap_mvd, write_inter_ac, write_mv_component,
+    predict_luma_mb_qpel, wrap_mvd, write_inter_ac, write_mv_component,
 };
 use crate::tables::bvop as bvop_tab;
 use oxideav_core::bits::BitWriter;
@@ -123,6 +136,12 @@ impl BMbEncoding {
 ///   Consulted for co-located inheritance + direct-mode MV scaling.
 /// * `trb`, `trd` — temporal distance ratio (see `bvop::trb_trd`).
 /// * `f_code_fwd`, `f_code_bwd` — MV range codes (kept at 1 here).
+/// * `quarter_sample` — when `true`, MVs are encoded in quarter-pel units
+///   (§7.6.2.2). The forward + backward ME runs an extra 8-candidate
+///   refinement step around the half-pel best, the 8-tap filter is used
+///   for MC, and chroma MV reduction switches to `luma_qmv_to_chroma`
+///   (eq. 107). Direct-mode MV scaling (§7.5.9.5) is unit-agnostic so
+///   QPel co-located MVs scale to QPel B-MVs naturally.
 ///
 /// Returns `Ok(())` — B-VOPs never become references, so no picture is
 /// returned.
@@ -138,6 +157,7 @@ pub fn encode_b_vop_body(
     f_code_bwd: u8,
     trb: i32,
     trd: i32,
+    quarter_sample: bool,
 ) -> Result<()> {
     let width = v.width as usize;
     let height = v.height as usize;
@@ -157,6 +177,10 @@ pub fn encode_b_vop_body(
             // the B-MB direct mode MUST scale per-block MVs via
             // `direct_mode_mvs_4`. When the P-MB used 1MV, all 4 entries
             // collapse to the single 16×16 MV.
+            //
+            // QPel: `prev_ref_grid` carries P-MB MVs in the same unit the
+            // P-VOP encoder used. With `quarter_sample = true`, those are
+            // already QPel — no per-unit scaling is needed.
             let co_mvs4: [(i32, i32); 4] = if co.four_mv { co.mv } else { [co.mv[0]; 4] };
             let co_was_4mv = co.four_mv;
 
@@ -170,7 +194,17 @@ pub fn encode_b_vop_body(
             }
 
             let mb = estimate_b_mb(
-                v, prev_ref, next_ref, mb_x, mb_y, vop_quant, co_mvs4, co_was_4mv, trb, trd,
+                v,
+                prev_ref,
+                next_ref,
+                mb_x,
+                mb_y,
+                vop_quant,
+                co_mvs4,
+                co_was_4mv,
+                trb,
+                trd,
+                quarter_sample,
             )?;
 
             emit_b_mb(bw, &mb, &mut row_pred, f_code_fwd, f_code_bwd);
@@ -201,6 +235,10 @@ pub fn encode_b_vop_body(
 /// P-MB was 1MV). `co_was_4mv` records whether the P-MB used 4MV — this
 /// is forwarded to direct-mode predictor construction so we use
 /// `direct_mode_mvs_4` (per §7.5.9.5).
+///
+/// `quarter_sample` selects QPel ME + MC (§7.6.2.2). When `true` the
+/// returned MVs (in `BMbEncoding::fwd_mv`, `bwd_mv`, `fwd4`, `bwd4`)
+/// are in quarter-pel units; otherwise half-pel.
 #[allow(clippy::too_many_arguments)]
 fn estimate_b_mb(
     v: &oxideav_core::VideoFrame,
@@ -213,30 +251,74 @@ fn estimate_b_mb(
     co_was_4mv: bool,
     trb: i32,
     trd: i32,
+    quarter_sample: bool,
 ) -> Result<BMbEncoding> {
     let src_y = load_luma_mb(v, mb_x, mb_y);
 
     // ---- Forward ME (search prev_ref) ----
+    // Integer + half-pel refine, then optionally QPel refine. The returned
+    // MV is in the active unit (half-pel or quarter-pel).
     let (fwd_int_x, fwd_int_y) = diamond_search(prev_ref, &src_y, mb_x, mb_y);
-    let (fwd_mv_x, fwd_mv_y) =
+    let (fwd_h_x, fwd_h_y) =
         halfpel_refine(prev_ref, &src_y, mb_x, mb_y, fwd_int_x, fwd_int_y, false);
+    let (fwd_mv_x, fwd_mv_y) = if quarter_sample {
+        qpel_refine_mb(prev_ref, &src_y, mb_x, mb_y, fwd_h_x, fwd_h_y, false)
+    } else {
+        (fwd_h_x, fwd_h_y)
+    };
     let fwd_mv = (fwd_mv_x, fwd_mv_y);
-    let fwd_sad = sad_halfpel(prev_ref, &src_y, mb_x, mb_y, fwd_mv_x, fwd_mv_y);
+    let fwd_sad = sad_mb_any(
+        prev_ref,
+        &src_y,
+        mb_x,
+        mb_y,
+        fwd_mv_x,
+        fwd_mv_y,
+        false,
+        quarter_sample,
+    );
 
     // ---- Backward ME (search next_ref) ----
     let (bwd_int_x, bwd_int_y) = diamond_search(next_ref, &src_y, mb_x, mb_y);
-    let (bwd_mv_x, bwd_mv_y) =
+    let (bwd_h_x, bwd_h_y) =
         halfpel_refine(next_ref, &src_y, mb_x, mb_y, bwd_int_x, bwd_int_y, false);
+    let (bwd_mv_x, bwd_mv_y) = if quarter_sample {
+        qpel_refine_mb(next_ref, &src_y, mb_x, mb_y, bwd_h_x, bwd_h_y, false)
+    } else {
+        (bwd_h_x, bwd_h_y)
+    };
     let bwd_mv = (bwd_mv_x, bwd_mv_y);
-    let bwd_sad = sad_halfpel(next_ref, &src_y, mb_x, mb_y, bwd_mv_x, bwd_mv_y);
+    let bwd_sad = sad_mb_any(
+        next_ref,
+        &src_y,
+        mb_x,
+        mb_y,
+        bwd_mv_x,
+        bwd_mv_y,
+        false,
+        quarter_sample,
+    );
 
     // ---- Bidirectional SAD — average of forward + backward predictors ----
-    let bi_sad = sad_bidir(prev_ref, next_ref, &src_y, mb_x, mb_y, fwd_mv, bwd_mv);
+    let bi_sad = sad_bidir_any(
+        prev_ref,
+        next_ref,
+        &src_y,
+        mb_x,
+        mb_y,
+        fwd_mv,
+        bwd_mv,
+        quarter_sample,
+    );
 
     // ---- Direct mode — co-located scaling + (0,0) delta. ----
     // 4MV-aware (§7.5.9.5): when the co-located P-MB used 4MV, the four
     // sub-block MVs scale independently to (fwd_i, bwd_i). The 1MV case
     // collapses to the same formula with all four entries equal.
+    //
+    // QPel: §7.5.9.5 formulas (`trb*MV/trd ± delta`) are linear in the MV
+    // and only multiply by integer ratios — they preserve the unit. With
+    // QPel inputs we get QPel outputs at no extra cost.
     let (direct_fwd4, direct_bwd4) = direct_mode_mvs_4(co_mvs4, trb, trd, (0, 0));
     // Single-MV summary (used by 1MV-direct callers and as a debug aid):
     let (direct_fwd, direct_bwd) = if co_was_4mv {
@@ -248,7 +330,7 @@ fn estimate_b_mb(
         direct_mode_mvs(co_mvs4[0], trb, trd, (0, 0))
     };
     let direct_sad = if co_was_4mv {
-        sad_bidir_4mv(
+        sad_bidir_4mv_any(
             prev_ref,
             next_ref,
             &src_y,
@@ -256,10 +338,18 @@ fn estimate_b_mb(
             mb_y,
             direct_fwd4,
             direct_bwd4,
+            quarter_sample,
         )
     } else {
-        sad_bidir(
-            prev_ref, next_ref, &src_y, mb_x, mb_y, direct_fwd, direct_bwd,
+        sad_bidir_any(
+            prev_ref,
+            next_ref,
+            &src_y,
+            mb_x,
+            mb_y,
+            direct_fwd,
+            direct_bwd,
+            quarter_sample,
         )
     };
 
@@ -344,6 +434,7 @@ fn estimate_b_mb(
         chosen_fwd4,
         chosen_bwd4,
         direct_4mv,
+        quarter_sample,
     );
 
     // ---- Residual + quant + reconstruction (inter path) ----
@@ -428,6 +519,11 @@ fn load_luma_sample(
 /// 8×8 block has its own forward + backward MV, so each block needs its
 /// own predictor. Chroma MV uses the average of the 4 luma MVs (matches
 /// the decoder convention in `inter.rs`).
+///
+/// `quarter_sample` selects between half-pel (`predict_block`) and QPel
+/// (`predict_block_qpel`, eqs. 7-37/7-38) luma prediction, and between
+/// `luma_mv_to_chroma` and `luma_qmv_to_chroma` (§7.6.2.2 eq. 107) for
+/// the chroma MV reduction. The MV unit must match the dispatch.
 #[allow(clippy::too_many_arguments)]
 fn build_predictor(
     prev_ref: &IVopPicture,
@@ -440,6 +536,7 @@ fn build_predictor(
     fwd4: [(i32, i32); 4],
     bwd4: [(i32, i32); 4],
     direct_4mv: bool,
+    quarter_sample: bool,
 ) -> ([u8; 256], [u8; 64], [u8; 64]) {
     let mut pred_fwd_y = [0u8; 256];
     let mut pred_bwd_y = [0u8; 256];
@@ -459,22 +556,31 @@ fn build_predictor(
 
     if use_fwd {
         if direct_4mv {
-            predict_luma_mb_4mv(prev_ref, mb_x, mb_y, fwd4, false, &mut pred_fwd_y);
+            predict_luma_mb_4mv_any(
+                prev_ref,
+                mb_x,
+                mb_y,
+                fwd4,
+                false,
+                quarter_sample,
+                &mut pred_fwd_y,
+            );
         } else {
-            predict_luma_mb(
+            predict_luma_mb_any(
                 prev_ref,
                 mb_x,
                 mb_y,
                 fwd_mv.0,
                 fwd_mv.1,
                 false,
+                quarter_sample,
                 &mut pred_fwd_y,
             );
         }
         // Chroma MV: average of 4 luma MVs in 4MV mode (matches the
         // decoder path in `inter.rs::reconstruct_inter_mb`), single
-        // luma MV otherwise.
-        let (cmx, cmy) = chroma_mv_for_mb(direct_4mv, fwd_mv, fwd4);
+        // luma MV otherwise. QPel uses `luma_qmv_to_chroma` (eq. 107).
+        let (cmx, cmy) = chroma_mv_for_mb(direct_4mv, fwd_mv, fwd4, quarter_sample);
         predict_chroma_block(
             &prev_ref.cb,
             prev_ref.c_stride,
@@ -498,19 +604,28 @@ fn build_predictor(
     }
     if use_bwd {
         if direct_4mv {
-            predict_luma_mb_4mv(next_ref, mb_x, mb_y, bwd4, false, &mut pred_bwd_y);
+            predict_luma_mb_4mv_any(
+                next_ref,
+                mb_x,
+                mb_y,
+                bwd4,
+                false,
+                quarter_sample,
+                &mut pred_bwd_y,
+            );
         } else {
-            predict_luma_mb(
+            predict_luma_mb_any(
                 next_ref,
                 mb_x,
                 mb_y,
                 bwd_mv.0,
                 bwd_mv.1,
                 false,
+                quarter_sample,
                 &mut pred_bwd_y,
             );
         }
-        let (cmx, cmy) = chroma_mv_for_mb(direct_4mv, bwd_mv, bwd4);
+        let (cmx, cmy) = chroma_mv_for_mb(direct_4mv, bwd_mv, bwd4, quarter_sample);
         predict_chroma_block(
             &next_ref.cb,
             next_ref.c_stride,
@@ -606,44 +721,114 @@ fn predict_luma_mb_4mv(
     }
 }
 
-/// Pick the chroma MV for an MB. In 1MV mode this is just `luma_mv_to_chroma`
-/// applied to the single MV. In 4MV mode chroma uses the average of the 4
-/// luma MVs scaled to chroma — same formula the decoder uses (see
-/// `inter.rs` lines around the `(cmx, cmy) = if four_mv { ... }` block).
-fn chroma_mv_for_mb(four_mv: bool, single_mv: (i32, i32), mvs4: [(i32, i32); 4]) -> (i32, i32) {
-    if four_mv {
-        let sx: i32 = mvs4.iter().map(|(x, _)| *x).sum();
-        let sy: i32 = mvs4.iter().map(|(_, y)| *y).sum();
-        (luma_mv_to_chroma(sx / 4), luma_mv_to_chroma(sy / 4))
-    } else {
-        (
-            luma_mv_to_chroma(single_mv.0),
-            luma_mv_to_chroma(single_mv.1),
-        )
+/// QPel variant of `predict_luma_mb_4mv` — per-block MVs run through
+/// the 8-tap quarter-pel filter (`predict_block_qpel`, eqs. 7-37/7-38).
+/// MVs are in quarter-pel units.
+fn predict_luma_mb_4mv_qpel(
+    reference: &IVopPicture,
+    mb_x: usize,
+    mb_y: usize,
+    mvs4_q: [(i32, i32); 4],
+    rounding: bool,
+    out: &mut [u8; 256],
+) {
+    let ref_h = (reference.y.len() / reference.y_stride) as i32;
+    let ref_w = reference.y_stride as i32;
+    let px = (mb_x * 16) as i32;
+    let py = (mb_y * 16) as i32;
+    for (blk, (sub_x, sub_y)) in [(0, 0), (8, 0), (0, 8), (8, 8)].iter().enumerate() {
+        let (mvx, mvy) = mvs4_q[blk];
+        let mut tmp = [0u8; 64];
+        predict_block_qpel(
+            &reference.y,
+            reference.y_stride,
+            ref_w,
+            ref_h,
+            px + *sub_x,
+            py + *sub_y,
+            mvx,
+            mvy,
+            8,
+            rounding,
+            &mut tmp,
+            8,
+        );
+        for j in 0..8 {
+            for i in 0..8 {
+                out[(*sub_y as usize + j) * 16 + (*sub_x as usize + i)] = tmp[j * 8 + i];
+            }
+        }
     }
 }
 
-/// 4MV variant of `sad_bidir`: build per-block forward and backward
-/// predictors, average them, sum |src - avg| over the full 16×16 MB.
-fn sad_bidir_4mv(
-    prev_ref: &IVopPicture,
-    next_ref: &IVopPicture,
-    src: &[u8; 256],
+/// Dispatch luma 4MV predictor to half-pel or QPel based on
+/// `quarter_sample`. The MV unit must match the dispatch.
+fn predict_luma_mb_4mv_any(
+    reference: &IVopPicture,
     mb_x: usize,
     mb_y: usize,
-    fwd4: [(i32, i32); 4],
-    bwd4: [(i32, i32); 4],
-) -> u32 {
-    let mut pf = [0u8; 256];
-    let mut pb = [0u8; 256];
-    predict_luma_mb_4mv(prev_ref, mb_x, mb_y, fwd4, false, &mut pf);
-    predict_luma_mb_4mv(next_ref, mb_x, mb_y, bwd4, false, &mut pb);
-    let mut s = 0u32;
-    for i in 0..256 {
-        let p = (pf[i] as u16 + pb[i] as u16 + 1) >> 1;
-        s = s.wrapping_add((src[i] as i32 - p as i32).unsigned_abs());
+    mvs4: [(i32, i32); 4],
+    rounding: bool,
+    quarter_sample: bool,
+    out: &mut [u8; 256],
+) {
+    if quarter_sample {
+        predict_luma_mb_4mv_qpel(reference, mb_x, mb_y, mvs4, rounding, out);
+    } else {
+        predict_luma_mb_4mv(reference, mb_x, mb_y, mvs4, rounding, out);
     }
-    s
+}
+
+/// Dispatch luma 1MV predictor to half-pel (`predict_luma_mb`) or QPel
+/// (`predict_luma_mb_qpel`) based on `quarter_sample`. The MV unit must
+/// match the dispatch.
+#[allow(clippy::too_many_arguments)]
+fn predict_luma_mb_any(
+    reference: &IVopPicture,
+    mb_x: usize,
+    mb_y: usize,
+    mvx: i32,
+    mvy: i32,
+    rounding: bool,
+    quarter_sample: bool,
+    out: &mut [u8; 256],
+) {
+    if quarter_sample {
+        predict_luma_mb_qpel(reference, mb_x, mb_y, mvx, mvy, rounding, out);
+    } else {
+        predict_luma_mb(reference, mb_x, mb_y, mvx, mvy, rounding, out);
+    }
+}
+
+/// Pick the chroma MV for an MB. In 1MV mode this is just the active
+/// luma→chroma reduction applied to the single MV. In 4MV mode chroma
+/// uses the average of the 4 luma MVs scaled to chroma — same formula
+/// the decoder uses (see `inter.rs` lines around the
+/// `(cmx, cmy) = if four_mv { ... }` block).
+///
+/// `quarter_sample` switches between `luma_mv_to_chroma` (half-pel input)
+/// and `luma_qmv_to_chroma` (QPel input, §7.6.2.2 eq. 107). Chroma
+/// output is always half-pel.
+fn chroma_mv_for_mb(
+    four_mv: bool,
+    single_mv: (i32, i32),
+    mvs4: [(i32, i32); 4],
+    quarter_sample: bool,
+) -> (i32, i32) {
+    let to_chroma = |v: i32| -> i32 {
+        if quarter_sample {
+            luma_qmv_to_chroma(v)
+        } else {
+            luma_mv_to_chroma(v)
+        }
+    };
+    if four_mv {
+        let sx: i32 = mvs4.iter().map(|(x, _)| *x).sum();
+        let sy: i32 = mvs4.iter().map(|(_, y)| *y).sum();
+        (to_chroma(sx / 4), to_chroma(sy / 4))
+    } else {
+        (to_chroma(single_mv.0), to_chroma(single_mv.1))
+    }
 }
 
 // -------------------------------------------------------------------------
@@ -739,17 +924,6 @@ fn halfpel_refine(
     (best_x, best_y)
 }
 
-fn sad_halfpel(
-    reference: &IVopPicture,
-    src: &[u8; 256],
-    mb_x: usize,
-    mb_y: usize,
-    mv_x_half: i32,
-    mv_y_half: i32,
-) -> u32 {
-    sad_halfpel_with_rounding(reference, src, mb_x, mb_y, mv_x_half, mv_y_half, false)
-}
-
 fn sad_halfpel_with_rounding(
     reference: &IVopPicture,
     src: &[u8; 256],
@@ -770,7 +944,40 @@ fn sad_halfpel_with_rounding(
     s
 }
 
-fn sad_bidir(
+/// Single-MV SAD with active-unit dispatch. The MV is in half-pel or
+/// quarter-pel units depending on `quarter_sample`.
+#[allow(clippy::too_many_arguments)]
+fn sad_mb_any(
+    reference: &IVopPicture,
+    src: &[u8; 256],
+    mb_x: usize,
+    mb_y: usize,
+    mvx: i32,
+    mvy: i32,
+    rounding: bool,
+    quarter_sample: bool,
+) -> u32 {
+    let mut pred = [0u8; 256];
+    predict_luma_mb_any(
+        reference,
+        mb_x,
+        mb_y,
+        mvx,
+        mvy,
+        rounding,
+        quarter_sample,
+        &mut pred,
+    );
+    let mut s = 0u32;
+    for i in 0..256 {
+        s = s.wrapping_add((src[i] as i32 - pred[i] as i32).unsigned_abs());
+    }
+    s
+}
+
+/// Bidirectional SAD with active-unit dispatch.
+#[allow(clippy::too_many_arguments)]
+fn sad_bidir_any(
     prev_ref: &IVopPicture,
     next_ref: &IVopPicture,
     src: &[u8; 256],
@@ -778,17 +985,102 @@ fn sad_bidir(
     mb_y: usize,
     fwd_mv: (i32, i32),
     bwd_mv: (i32, i32),
+    quarter_sample: bool,
 ) -> u32 {
     let mut pf = [0u8; 256];
     let mut pb = [0u8; 256];
-    predict_luma_mb(prev_ref, mb_x, mb_y, fwd_mv.0, fwd_mv.1, false, &mut pf);
-    predict_luma_mb(next_ref, mb_x, mb_y, bwd_mv.0, bwd_mv.1, false, &mut pb);
+    predict_luma_mb_any(
+        prev_ref,
+        mb_x,
+        mb_y,
+        fwd_mv.0,
+        fwd_mv.1,
+        false,
+        quarter_sample,
+        &mut pf,
+    );
+    predict_luma_mb_any(
+        next_ref,
+        mb_x,
+        mb_y,
+        bwd_mv.0,
+        bwd_mv.1,
+        false,
+        quarter_sample,
+        &mut pb,
+    );
     let mut s = 0u32;
     for i in 0..256 {
         let p = (pf[i] as u16 + pb[i] as u16 + 1) >> 1;
         s = s.wrapping_add((src[i] as i32 - p as i32).unsigned_abs());
     }
     s
+}
+
+/// 4MV bidirectional SAD with active-unit dispatch.
+#[allow(clippy::too_many_arguments)]
+fn sad_bidir_4mv_any(
+    prev_ref: &IVopPicture,
+    next_ref: &IVopPicture,
+    src: &[u8; 256],
+    mb_x: usize,
+    mb_y: usize,
+    fwd4: [(i32, i32); 4],
+    bwd4: [(i32, i32); 4],
+    quarter_sample: bool,
+) -> u32 {
+    let mut pf = [0u8; 256];
+    let mut pb = [0u8; 256];
+    predict_luma_mb_4mv_any(prev_ref, mb_x, mb_y, fwd4, false, quarter_sample, &mut pf);
+    predict_luma_mb_4mv_any(next_ref, mb_x, mb_y, bwd4, false, quarter_sample, &mut pb);
+    let mut s = 0u32;
+    for i in 0..256 {
+        let p = (pf[i] as u16 + pb[i] as u16 + 1) >> 1;
+        s = s.wrapping_add((src[i] as i32 - p as i32).unsigned_abs());
+    }
+    s
+}
+
+/// Quarter-pel refinement step for a 16×16 MB. Evaluates the 8
+/// surrounding quarter-pel candidates around `(mvx_half * 2, mvy_half * 2)`
+/// (the half-pel best, doubled into QPel units) and returns the best MV
+/// in quarter-pel units (§7.5.4 / §7.6.2.2).
+///
+/// Search window cap: ±32 quarter-pels to stay within the f_code=1
+/// range (§7.6.3 — `range = 32 * f`, `f=1` here).
+fn qpel_refine_mb(
+    reference: &IVopPicture,
+    src: &[u8; 256],
+    mb_x: usize,
+    mb_y: usize,
+    mvx_half: i32,
+    mvy_half: i32,
+    rounding: bool,
+) -> (i32, i32) {
+    let center_qx = mvx_half * 2;
+    let center_qy = mvy_half * 2;
+    let mut best_qx = center_qx;
+    let mut best_qy = center_qy;
+    let mut best_sad = sad_mb_any(reference, src, mb_x, mb_y, best_qx, best_qy, rounding, true);
+    for dy in -1..=1 {
+        for dx in -1..=1 {
+            if dx == 0 && dy == 0 {
+                continue;
+            }
+            let qx = center_qx + dx;
+            let qy = center_qy + dy;
+            if qx.abs() > 32 || qy.abs() > 32 {
+                continue;
+            }
+            let s = sad_mb_any(reference, src, mb_x, mb_y, qx, qy, rounding, true);
+            if s < best_sad {
+                best_sad = s;
+                best_qx = qx;
+                best_qy = qy;
+            }
+        }
+    }
+    (best_qx, best_qy)
 }
 
 // -------------------------------------------------------------------------
@@ -951,17 +1243,24 @@ mod tests {
         // luma_mv_to_chroma is a 2:1 reduction with the spec rounding
         // table; we just verify the average step is (sx/4, sy/4).
         let mvs = [(2, 4), (2, 4), (2, 4), (2, 4)];
-        let (cx_4mv, cy_4mv) = chroma_mv_for_mb(true, (0, 0), mvs);
-        let (cx_1mv, cy_1mv) = chroma_mv_for_mb(false, (2, 4), mvs);
+        let (cx_4mv, cy_4mv) = chroma_mv_for_mb(true, (0, 0), mvs, false);
+        let (cx_1mv, cy_1mv) = chroma_mv_for_mb(false, (2, 4), mvs, false);
         assert_eq!(cx_4mv, cx_1mv);
         assert_eq!(cy_4mv, cy_1mv);
 
         // Distinct per-block MVs averaging to (3, 3).
         let mvs = [(0, 0), (4, 4), (4, 4), (4, 4)];
-        let (cx, cy) = chroma_mv_for_mb(true, (0, 0), mvs);
+        let (cx, cy) = chroma_mv_for_mb(true, (0, 0), mvs, false);
         // sum = (12, 12); avg = (3, 3); scaled to chroma via spec table.
         let (cx_ref, cy_ref) = (luma_mv_to_chroma(3), luma_mv_to_chroma(3));
         assert_eq!((cx, cy), (cx_ref, cy_ref));
+
+        // Round-16 QPel chroma reduction: when `quarter_sample == true`,
+        // `chroma_mv_for_mb` must use `luma_qmv_to_chroma` (§7.6.2.2 eq.
+        // 107). Verify the dispatch.
+        let mvs_q = [(8, 4), (8, 4), (8, 4), (8, 4)];
+        let (cx_q, cy_q) = chroma_mv_for_mb(false, (8, 4), mvs_q, true);
+        assert_eq!((cx_q, cy_q), (luma_qmv_to_chroma(8), luma_qmv_to_chroma(4)));
     }
 
     #[test]
@@ -1116,7 +1415,7 @@ mod tests {
                 let co = grid.get(mb_x, mb_y);
                 let co_mvs4: [(i32, i32); 4] = if co.four_mv { co.mv } else { [co.mv[0]; 4] };
                 let mb = estimate_b_mb(
-                    &v, &prev, &next, mb_x, mb_y, 4, co_mvs4, co.four_mv, trb, trd,
+                    &v, &prev, &next, mb_x, mb_y, 4, co_mvs4, co.four_mv, trb, trd, false,
                 )
                 .expect("estimate_b_mb");
                 emit_b_mb(&mut bw, &mb, &mut row_pred, 1, 1);
@@ -1163,6 +1462,10 @@ mod tests {
 //   4MV-direct on real streams.
 // * Interlaced field MVs — requires `interlaced = 1` in the VOL and the
 //   per-MB `interlaced_information()` path. Out of scope for this cut.
-// * Quarter-pel — requires `quarter_sample = 1` in the VOL. Out of
-//   scope for this cut (f_code_fwd/bwd stay at 1, half-pel only).
+// * Quarter-pel — landed round 16. The B-VOP encoder threads
+//   `quarter_sample` through ME (forward + backward QPel refine), MC
+//   (`predict_luma_mb_qpel` / `predict_block_qpel`), chroma reduction
+//   (`luma_qmv_to_chroma`), and direct-mode predictors. The MV VLC
+//   writer is unit-agnostic — `write_mv_component` emits the QPel MVD
+//   verbatim per §7.6.3 (LSB now denotes the quarter-pel bit).
 // -------------------------------------------------------------------------
