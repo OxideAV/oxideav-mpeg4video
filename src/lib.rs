@@ -88,8 +88,8 @@ pub mod simd;
 pub mod start_codes;
 pub mod tables;
 
-use oxideav_codec::{CodecInfo, CodecRegistry};
 use oxideav_core::{CodecCapabilities, CodecId, CodecTag, ProbeContext};
+use oxideav_core::{CodecInfo, CodecRegistry};
 
 /// The canonical oxideav codec id for MPEG-4 Part 2 video.
 ///

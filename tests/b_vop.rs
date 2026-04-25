@@ -374,7 +374,7 @@ fn decode_bvop_clip_matches_ffmpeg() {
 mod encoder_b_vops {
     use std::process::Command;
 
-    use oxideav_codec::Encoder;
+    use oxideav_core::Encoder;
     use oxideav_core::{
         bits::BitReader, CodecId, CodecOptions, CodecParameters, Frame, MediaType, Packet,
         PixelFormat, Rational, TimeBase, VideoFrame, VideoPlane,

@@ -38,7 +38,7 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use oxideav_codec::Encoder;
+use oxideav_core::Encoder;
 use oxideav_core::{
     CodecId, CodecParameters, Error, Frame, MediaType, Packet, PixelFormat, Rational, Result,
     TimeBase, VideoFrame,

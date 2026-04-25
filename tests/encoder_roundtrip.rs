@@ -28,7 +28,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use oxideav_codec::Encoder;
+use oxideav_core::Encoder;
 use oxideav_core::{
     CodecId, CodecParameters, Frame, MediaType, Packet, PixelFormat, Rational, TimeBase,
     VideoFrame, VideoPlane,
