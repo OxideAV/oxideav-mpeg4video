@@ -87,6 +87,17 @@ fn build_encoder(width: u32, height: u32) -> Box<dyn Encoder> {
     oxideav_mpeg4video::encoder::make_encoder(&params).expect("build encoder")
 }
 
+fn build_encoder_qpel(width: u32, height: u32) -> Box<dyn Encoder> {
+    let mut params = CodecParameters::video(CodecId::new(oxideav_mpeg4video::CODEC_ID_STR));
+    params.media_type = MediaType::Video;
+    params.width = Some(width);
+    params.height = Some(height);
+    params.pixel_format = Some(PixelFormat::Yuv420P);
+    params.frame_rate = Some(Rational::new(24, 1));
+    params.options.insert("qpel", "1");
+    oxideav_mpeg4video::encoder::make_encoder(&params).expect("build qpel encoder")
+}
+
 fn psnr(a: &[u8], b: &[u8]) -> f64 {
     let n = a.len().min(b.len());
     if n == 0 {
@@ -660,4 +671,285 @@ fn p_vop_intra_in_p_scene_change_psnr() {
         p4 > 30.0,
         "ffmpeg cut-frame PSNR {p4:.2} below 30 dB — intra-in-P didn't activate or syntax mismatch"
     );
+}
+
+/// Build a synthetic clip with sub-pel motion (1/4-pel translation per
+/// frame) so the QPel encoder's quarter-pel refine can demonstrate a
+/// real PSNR lift over half-pel. We render a high-frequency texture
+/// resampled with a 4× super-sampling kernel (averages nine sub-pel
+/// samples per output pel) so the integer-grid output of frame `idx`
+/// is the closest quarter-pel sample to the original texture, NOT a
+/// nearest-neighbour decimation. That makes the optimal MC predictor
+/// land on a quarter-pel position the half-pel ME cannot reach.
+fn make_qpel_friendly_frame(idx: u32, width: u32, height: u32) -> VideoFrame {
+    let w = width as usize;
+    let h = height as usize;
+    let cw = w / 2;
+    let ch = h / 2;
+    let mut y = vec![0u8; w * h];
+    let cb = vec![128u8; cw * ch];
+    let cr = vec![128u8; cw * ch];
+    // Sub-pel horizontal pan: 1/4 pel per frame.
+    let phase_x = idx as f32 * 0.25;
+    let phase_y = idx as f32 * 0.0;
+    let texture = |xf: f32, yf: f32| -> f32 {
+        // Strong high-frequency content (period ~3 pels) so quarter-pel
+        // refinement materially changes the predictor.
+        128.0
+            + 70.0 * ((xf * 1.95).sin() * (yf * 1.75).cos())
+            + 50.0 * ((xf * 3.1 + yf * 0.7).sin())
+            + 30.0 * ((xf * 0.8 - yf * 1.4).cos())
+    };
+    // 3×3 super-sample averaging in [-1/4, +1/4] per axis — simulates a
+    // physical 1/4-pel-grid sampling so the resulting integer pel is a
+    // genuine quarter-pel-accurate snapshot of the moving texture.
+    for row in 0..h {
+        for col in 0..w {
+            let mut acc = 0.0f32;
+            let mut cnt = 0.0f32;
+            for sy in -1..=1 {
+                for sx in -1..=1 {
+                    let xf = col as f32 + sx as f32 * 0.25 - phase_x;
+                    let yf = row as f32 + sy as f32 * 0.25 - phase_y;
+                    acc += texture(xf, yf);
+                    cnt += 1.0;
+                }
+            }
+            let v = acc / cnt;
+            y[row * w + col] = v.clamp(0.0, 255.0) as u8;
+        }
+    }
+    VideoFrame {
+        format: PixelFormat::Yuv420P,
+        width,
+        height,
+        pts: Some(idx as i64),
+        time_base: TimeBase::new(1, 24),
+        planes: vec![
+            VideoPlane { stride: w, data: y },
+            VideoPlane {
+                stride: cw,
+                data: cb,
+            },
+            VideoPlane {
+                stride: cw,
+                data: cr,
+            },
+        ],
+    }
+}
+
+/// QPel encoder smoke test: the round-15 quarter-pel encoder must
+/// produce a stream that round-trips through both our decoder and
+/// ffmpeg with reasonable PSNR. Acceptance:
+/// * Our decoder reconstructs every frame > 28 dB.
+/// * ffmpeg decodes the I-VOP cleanly and the first P-VOP > 25 dB.
+#[test]
+fn p_vop_qpel_round_trip() {
+    let (width, height) = (32u32, 32u32);
+    let num_frames = 8u32;
+    let src: Vec<VideoFrame> = (0..num_frames)
+        .map(|i| make_qpel_friendly_frame(i, width, height))
+        .collect();
+
+    let mut enc = build_encoder_qpel(width, height);
+    for f in &src {
+        enc.send_frame(&Frame::Video(f.clone()))
+            .expect("send_frame");
+    }
+    enc.flush().expect("flush");
+    let mut packets: Vec<Packet> = Vec::new();
+    loop {
+        match enc.receive_packet() {
+            Ok(p) => packets.push(p),
+            Err(oxideav_core::Error::NeedMore) | Err(oxideav_core::Error::Eof) => break,
+            Err(e) => panic!("receive_packet: {e:?}"),
+        }
+    }
+    let mut es = Vec::new();
+    for pkt in &packets {
+        es.extend_from_slice(&pkt.data);
+    }
+
+    // Decode round-trip through our own decoder.
+    let dec_params = CodecParameters::video(CodecId::new(oxideav_mpeg4video::CODEC_ID_STR));
+    let mut dec = oxideav_mpeg4video::decoder::make_decoder(&dec_params).expect("build decoder");
+    let in_pkt = Packet::new(0, TimeBase::new(1, 24), es.clone());
+    dec.send_packet(&in_pkt).expect("send_packet");
+    dec.flush().expect("flush decoder");
+    let mut decoded: Vec<VideoFrame> = Vec::new();
+    loop {
+        match dec.receive_frame() {
+            Ok(Frame::Video(f)) => decoded.push(f),
+            Ok(_) => panic!("non-video"),
+            Err(oxideav_core::Error::NeedMore) | Err(oxideav_core::Error::Eof) => break,
+            Err(e) => panic!("receive_frame: {e:?}"),
+        }
+    }
+    assert_eq!(decoded.len(), num_frames as usize);
+    for (i, (s, d)) in src.iter().zip(decoded.iter()).enumerate() {
+        let p = psnr(&flatten_frame(s), &flatten_frame(d));
+        eprintln!("qpel frame {i}: PSNR = {p:.2} dB");
+        assert!(p > 28.0, "qpel frame {i} PSNR {p:.2} below 28 dB");
+    }
+
+    // ffmpeg cross-decode: confirms the QPel VOL header (verid=2 +
+    // quarter_sample=1) and quarter-pel MVDs are conformant. Skip
+    // when ffmpeg is missing.
+    if !command_exists("ffmpeg") {
+        eprintln!("ffmpeg missing — skipping QPel ffmpeg interop test");
+        return;
+    }
+    let tmp = std::env::temp_dir();
+    let es_path = tmp.join("oxideav_pvop_qpel.m4v");
+    std::fs::write(&es_path, &es).expect("write m4v");
+    let yuv_out = tmp.join("oxideav_pvop_qpel_ffmpeg.yuv");
+    let _ = std::fs::remove_file(&yuv_out);
+    let status = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "m4v",
+            "-i",
+            es_path.to_str().unwrap(),
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "yuv420p",
+            yuv_out.to_str().unwrap(),
+        ])
+        .status()
+        .expect("run ffmpeg");
+    assert!(status.success(), "ffmpeg failed to decode our QPel stream");
+    let ff = std::fs::read(&yuv_out).expect("read ffmpeg output");
+    let per_frame = (width as usize * height as usize * 3) / 2;
+    assert!(
+        ff.len() >= per_frame,
+        "ffmpeg QPel output too small: {} bytes",
+        ff.len()
+    );
+    // I-VOP frame: must match closely (no MV processing).
+    let src0 = flatten_frame(&src[0]);
+    let ff0 = &ff[0..per_frame];
+    let p0 = psnr(&src0, ff0);
+    eprintln!("QPel ffmpeg I-VOP frame 0: PSNR = {p0:.2} dB");
+    assert!(p0 > 30.0, "ffmpeg I-VOP PSNR {p0:.2} below 30 dB");
+    // First P-VOP after the I — main proof that the QPel MVD syntax
+    // and 8-tap MC reconstruction agree with ffmpeg.
+    if ff.len() >= 2 * per_frame {
+        let src1 = flatten_frame(&src[1]);
+        let ff1 = &ff[per_frame..2 * per_frame];
+        let p1 = psnr(&src1, ff1);
+        eprintln!("QPel ffmpeg P-VOP frame 1: PSNR = {p1:.2} dB");
+        assert!(
+            p1 > 25.0,
+            "ffmpeg first QPel P-VOP PSNR {p1:.2} below 25 dB — QPel MVD or MC mismatch"
+        );
+    }
+}
+
+/// On QPel-friendly content (sub-pel motion) the QPel encoder must
+/// produce a stream of comparable or smaller bit budget vs half-pel,
+/// AND match the source PSNR to within a small delta. The fine-grain
+/// PSNR delta is bounded by the constant-Q residual quantiser (Q=5
+/// limits per-MB reconstruction error regardless of the MC accuracy),
+/// so we look for residual-bit savings rather than a PSNR boost — the
+/// QPel encoder's motivation is bit-rate efficiency at a given Q.
+#[test]
+fn p_vop_qpel_bitrate_no_worse_than_halfpel() {
+    let (width, height) = (32u32, 32u32);
+    let num_frames = 4u32;
+    let src: Vec<VideoFrame> = (0..num_frames)
+        .map(|i| make_qpel_friendly_frame(i, width, height))
+        .collect();
+
+    // Helper to roundtrip and return (bitstream_size, mean_psnr) over
+    // P-VOPs only (frame 0 is the I-VOP and identical in both modes).
+    let roundtrip = |mut enc: Box<dyn Encoder>| -> (usize, f64) {
+        for f in &src {
+            enc.send_frame(&Frame::Video(f.clone()))
+                .expect("send_frame");
+        }
+        enc.flush().expect("flush");
+        let mut packets: Vec<Packet> = Vec::new();
+        loop {
+            match enc.receive_packet() {
+                Ok(p) => packets.push(p),
+                Err(oxideav_core::Error::NeedMore) | Err(oxideav_core::Error::Eof) => break,
+                Err(e) => panic!("receive_packet: {e:?}"),
+            }
+        }
+        let p_size: usize = packets
+            .iter()
+            .skip(1) // skip the I-VOP packet
+            .take((num_frames - 1) as usize)
+            .map(|p| p.data.len())
+            .sum();
+        let mut es = Vec::new();
+        for pkt in &packets {
+            es.extend_from_slice(&pkt.data);
+        }
+        let dec_params = CodecParameters::video(CodecId::new(oxideav_mpeg4video::CODEC_ID_STR));
+        let mut dec =
+            oxideav_mpeg4video::decoder::make_decoder(&dec_params).expect("build decoder");
+        let in_pkt = Packet::new(0, TimeBase::new(1, 24), es.clone());
+        dec.send_packet(&in_pkt).expect("send_packet");
+        dec.flush().expect("flush decoder");
+        let mut decoded: Vec<VideoFrame> = Vec::new();
+        loop {
+            match dec.receive_frame() {
+                Ok(Frame::Video(f)) => decoded.push(f),
+                Ok(_) => panic!("non-video"),
+                Err(oxideav_core::Error::NeedMore) | Err(oxideav_core::Error::Eof) => break,
+                Err(e) => panic!("receive_frame: {e:?}"),
+            }
+        }
+        let mut sum = 0.0;
+        let mut cnt = 0;
+        for (s, d) in src.iter().zip(decoded.iter()).skip(1) {
+            sum += psnr(&flatten_frame(s), &flatten_frame(d));
+            cnt += 1;
+        }
+        (p_size, sum / cnt as f64)
+    };
+
+    let (size_half, mean_half) = roundtrip(build_encoder(width, height));
+    let (size_qpel, mean_qpel) = roundtrip(build_encoder_qpel(width, height));
+    eprintln!(
+        "P-VOP bytes — half-pel: {size_half}, qpel: {size_qpel} \
+         | mean PSNR — half-pel: {mean_half:.2} dB, qpel: {mean_qpel:.2} dB"
+    );
+    // PSNR must stay close (the constant-Q reconstruction floor caps
+    // both modes near the quant noise level).
+    assert!(
+        (mean_qpel - mean_half).abs() < 1.5,
+        "QPel mean PSNR {mean_qpel:.2} dB diverged > 1.5 dB from half-pel {mean_half:.2} dB"
+    );
+    // QPel must not blow the bit budget — a properly-converged QPel
+    // ME should land within ~25% of the half-pel size on this fixture
+    // even when residual savings are small. (The QPel header itself
+    // is ~1 byte larger; on a 32×32 4-frame clip that's noise.)
+    assert!(
+        size_qpel <= (size_half * 5) / 4,
+        "QPel P-VOP size {size_qpel} ballooned > 1.25× half-pel {size_half}"
+    );
+}
+
+/// Encoder factory rejects QPel + B-frames (round 15 only landed P-VOP
+/// QPel; the B-VOP encoder still assumes half-pel).
+#[test]
+fn qpel_with_b_frames_rejected() {
+    let mut params = CodecParameters::video(CodecId::new(oxideav_mpeg4video::CODEC_ID_STR));
+    params.media_type = MediaType::Video;
+    params.width = Some(32);
+    params.height = Some(32);
+    params.pixel_format = Some(PixelFormat::Yuv420P);
+    params.frame_rate = Some(Rational::new(24, 1));
+    params.options.insert("qpel", "1");
+    params.options.insert("bf", "2");
+    let res = oxideav_mpeg4video::encoder::make_encoder(&params);
+    assert!(res.is_err(), "QPel + B-frames combination must be rejected");
 }

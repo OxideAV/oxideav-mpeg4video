@@ -63,7 +63,7 @@ use crate::encoder::{block_pel_position, encode_intra_mb_in_p, fdct8x8};
 use crate::headers::vol::ZIGZAG;
 use crate::inter::{MbMotion, MvGrid};
 use crate::mb::{IVopPicture, PredGrid};
-use crate::mc::{luma_mv_to_chroma, predict_block};
+use crate::mc::{luma_mv_to_chroma, luma_qmv_to_chroma, predict_block, predict_block_qpel};
 use crate::tables::{mv as mv_tab, tcoef};
 use oxideav_core::bits::BitWriter;
 
@@ -188,8 +188,15 @@ pub fn encode_p_vop_body(
     f_code_fwd: u8,
     rounding_type: bool,
 ) -> Result<IVopPicture> {
-    let (pic, _mv_grid) =
-        encode_p_vop_body_with_grid(bw, v, reference, vop_quant, f_code_fwd, rounding_type)?;
+    let (pic, _mv_grid) = encode_p_vop_body_with_grid(
+        bw,
+        v,
+        reference,
+        vop_quant,
+        f_code_fwd,
+        rounding_type,
+        false,
+    )?;
     Ok(pic)
 }
 
@@ -207,6 +214,7 @@ pub fn encode_p_vop_body_with_grid(
     vop_quant: u32,
     f_code_fwd: u8,
     rounding_type: bool,
+    quarter_sample: bool,
 ) -> Result<(IVopPicture, MvGrid)> {
     let width = v.width as usize;
     let height = v.height as usize;
@@ -233,6 +241,7 @@ pub fn encode_p_vop_body_with_grid(
                 vop_quant,
                 rounding_type,
                 &mv_grid,
+                quarter_sample,
             )?;
 
             // Intra-in-P decision (§6.3.7): the inter SAD is the cost we
@@ -425,46 +434,79 @@ fn estimate_and_encode_mb(
     vop_quant: u32,
     rounding: bool,
     mv_grid: &MvGrid,
+    quarter_sample: bool,
 ) -> Result<PMbEncoding> {
     // 1. Integer-pel search over the 16×16 luma MB.
     let src_y_block = load_luma_mb(v, mb_x, mb_y);
     let (int_x, int_y) = diamond_search_integer(reference, &src_y_block, mb_x, mb_y);
-    // 2. Half-pel refinement → 1MV result.
+    // 2. Half-pel refinement → seed for QPel refine when QPel is on.
     let (mvx_half, mvy_half) =
         halfpel_refine(reference, &src_y_block, mb_x, mb_y, int_x, int_y, rounding);
     let _ = mv_grid; // MV predictor is applied only when writing MVD, not ME.
 
+    // 3. Quarter-pel refinement (§7.5.4 / §7.6.2.2) — only when QPel
+    //    is enabled in the VOL. The 8 surrounding quarter-pel
+    //    positions are evaluated against the 8-tap-filter predictor.
+    //    `mvx_q`/`mvy_q` are stored in quarter-pel units when QPel is
+    //    on (i.e. `mvx_q = 2 * mvx_half + dq_x`); when QPel is off
+    //    they remain in half-pel units (`mvx_q = mvx_half`) so the
+    //    rest of the pipeline uses the existing half-pel predictors.
+    let (mvx_1mv, mvy_1mv) = if quarter_sample {
+        qpel_refine_mb(
+            reference,
+            &src_y_block,
+            mb_x,
+            mb_y,
+            mvx_half,
+            mvy_half,
+            rounding,
+        )
+    } else {
+        (mvx_half, mvy_half)
+    };
+
     // 1MV SAD baseline — full-MB SAD against the 1MV predictor.
     let mut pred_y_1mv = [0u8; 256];
-    predict_luma_mb(
+    predict_luma_mb_any(
         reference,
         mb_x,
         mb_y,
-        mvx_half,
-        mvy_half,
+        mvx_1mv,
+        mvy_1mv,
         rounding,
+        quarter_sample,
         &mut pred_y_1mv,
     );
     let sad_1mv = sad_full_mb(&src_y_block, &pred_y_1mv);
 
-    // 3. 4MV ME — refine each 8×8 luma block around the 1MV result.
+    // 4. 4MV ME — refine each 8×8 luma block around the 1MV result.
     //    The four per-block MVs are independent; we keep the search small
     //    (`±FOUR_MV_REFINE_INT` integer pels) since the 1MV already pinned
-    //    the rough motion. Each block does diamond + half-pel refine.
-    let mut mv4_half = [(mvx_half, mvy_half); 4];
+    //    the rough motion. Each block does diamond + half-pel refine
+    //    (+ optional QPel refine when QPel is on).
+    let mut mv4 = [(mvx_1mv, mvy_1mv); 4];
     let mut sad_4mv: u32 = 0;
     let block_offsets: [(i32, i32); 4] = [(0, 0), (8, 0), (0, 8), (8, 8)];
     for blk in 0..4 {
         let (sub_x, sub_y) = block_offsets[blk];
         let src_blk = read_luma_block_from_mb_xy(v, mb_x, mb_y, sub_x as usize, sub_y as usize);
         let (mvx_b, mvy_b, sad_b) = estimate_block_mv_8x8(
-            reference, &src_blk, mb_x, mb_y, sub_x, sub_y, mvx_half, mvy_half, rounding,
+            reference,
+            &src_blk,
+            mb_x,
+            mb_y,
+            sub_x,
+            sub_y,
+            mvx_1mv,
+            mvy_1mv,
+            rounding,
+            quarter_sample,
         );
-        mv4_half[blk] = (mvx_b, mvy_b);
+        mv4[blk] = (mvx_b, mvy_b);
         sad_4mv = sad_4mv.saturating_add(sad_b);
     }
 
-    // 4. Mode decision — favour 1MV unless 4MV beats it by more than the
+    // 5. Mode decision — favour 1MV unless 4MV beats it by more than the
     //    lambda penalty. 1MV ties win because they're cheaper to code and
     //    avoid splitting the MB's chroma predictor.
     let four_mv = sad_4mv.saturating_add(FOURMV_LAMBDA) < sad_1mv;
@@ -472,14 +514,27 @@ fn estimate_and_encode_mb(
     let (mv_repr, pred_y) = if four_mv {
         // Build the 4MV luma predictor.
         let mut pred = [0u8; 256];
-        predict_luma_mb_4mv(reference, mb_x, mb_y, mv4_half, rounding, &mut pred);
+        predict_luma_mb_4mv_any(
+            reference,
+            mb_x,
+            mb_y,
+            mv4,
+            rounding,
+            quarter_sample,
+            &mut pred,
+        );
         // Predictor-grid summary MV — pick block 0's MV as the canonical
         // 16×16 MV. The decoder does the same for skipped neighbour
         // queries (mv[0] is the 4MV block-0 vector by convention).
-        (mv4_half[0], pred)
+        (mv4[0], pred)
     } else {
-        ((mvx_half, mvy_half), pred_y_1mv)
+        ((mvx_1mv, mvy_1mv), pred_y_1mv)
     };
+    // Keep the legacy field name for compatibility with downstream call
+    // sites — `mv4_half` carries the 4 per-block MVs in the active
+    // unit (half-pel when `quarter_sample == false`, quarter-pel
+    // otherwise).
+    let mv4_half = mv4;
 
     // Stash the chosen-mode luma SAD for the intra-in-P decision in
     // `encode_p_vop_body_with_grid`. We use the SAD against the chosen
@@ -495,15 +550,26 @@ fn estimate_and_encode_mb(
         ..Default::default()
     };
 
-    // 5. Build chroma predictors. In 4MV mode chroma uses the average of
+    // 6. Build chroma predictors. In 4MV mode chroma uses the average of
     //    the 4 luma MVs scaled to chroma per §7.5.9.5 (matches the
     //    decoder's `(cmx, cmy) = if four_mv { ... }` branch in inter.rs).
+    //    QPel mode reduces each luma component through `luma_qmv_to_chroma`
+    //    (§7.6.2.2 eq. (107)) instead of `luma_mv_to_chroma`. The decoder
+    //    applies the same branch — see `inter::decode_p_mb`'s `to_chroma`
+    //    closure.
+    let to_chroma = |luma: i32| -> i32 {
+        if quarter_sample {
+            luma_qmv_to_chroma(luma)
+        } else {
+            luma_mv_to_chroma(luma)
+        }
+    };
     let (cmx, cmy) = if four_mv {
         let sx: i32 = mv4_half.iter().map(|(x, _)| *x).sum();
         let sy: i32 = mv4_half.iter().map(|(_, y)| *y).sum();
-        (luma_mv_to_chroma(sx / 4), luma_mv_to_chroma(sy / 4))
+        (to_chroma(sx / 4), to_chroma(sy / 4))
     } else {
-        (luma_mv_to_chroma(mvx_half), luma_mv_to_chroma(mvy_half))
+        (to_chroma(mvx_1mv), to_chroma(mvy_1mv))
     };
     let mut pred_cb = [0u8; 64];
     let mut pred_cr = [0u8; 64];
@@ -569,9 +635,11 @@ fn estimate_and_encode_mb(
     // reconstructed. 4MV MBs cannot be `not_coded` (Inter4MV is its own
     // MCBPC group; the decoder's not_coded path forces 1MV with MV=(0,0)).
     let all_zero = !mb.luma_coded.iter().any(|&c| c) && !mb.chroma_coded.iter().any(|&c| c);
-    if !mb.four_mv && all_zero && mvx_half == 0 && mvy_half == 0 {
+    if !mb.four_mv && all_zero && mvx_1mv == 0 && mvy_1mv == 0 {
         // Make sure the reconstructed samples equal the reference region,
-        // which they do by construction (residual=0, MV=0).
+        // which they do by construction (residual=0, MV=0). Holds for
+        // QPel MV(0,0) as well — the (0,0) qpel position is identical
+        // to the integer-pel sample.
         mb.skipped = true;
     }
 
@@ -588,10 +656,14 @@ fn sad_full_mb(src: &[u8; 256], pred: &[u8; 256]) -> u32 {
 }
 
 /// Per-8×8-block ME — diamond search over a small `±FOUR_MV_REFINE_INT`
-/// window around (`init_mvx`, `init_mvy`) followed by half-pel refinement.
-/// Returns (mvx_half, mvy_half, sad).
+/// window around (`init_mvx`, `init_mvy`) followed by half-pel refinement,
+/// and optionally a final quarter-pel refinement when `quarter_sample` is
+/// on (§7.6.2.2). Returns `(mvx, mvy, sad)` in the active MV unit
+/// (half-pel or quarter-pel).
 ///
-/// `sub_x`, `sub_y` are the block's offset inside the macroblock (0 or 8).
+/// `init_mvx_init`, `init_mvy_init` carry the 1MV-result MV in the active
+/// unit. `sub_x`, `sub_y` are the block's offset inside the macroblock
+/// (0 or 8).
 #[allow(clippy::too_many_arguments)]
 fn estimate_block_mv_8x8(
     reference: &IVopPicture,
@@ -600,18 +672,21 @@ fn estimate_block_mv_8x8(
     mb_y: usize,
     sub_x: i32,
     sub_y: i32,
-    init_mvx_half: i32,
-    init_mvy_half: i32,
+    init_mvx_init: i32,
+    init_mvy_init: i32,
     rounding: bool,
+    quarter_sample: bool,
 ) -> (i32, i32, u32) {
     let ref_h = (reference.y.len() / reference.y_stride) as i32;
     let ref_w = reference.y_stride as i32;
     let blk_px = (mb_x * 16) as i32 + sub_x;
     let blk_py = (mb_y * 16) as i32 + sub_y;
 
-    // Seed integer search from the 1MV result rounded toward zero.
-    let init_int_x = init_mvx_half / 2;
-    let init_int_y = init_mvy_half / 2;
+    // Convert the 1MV-unit init back to integer-pel for diamond seed.
+    // QPel: divide by 4. Half-pel: divide by 2.
+    let scale = if quarter_sample { 4 } else { 2 };
+    let init_int_x = init_mvx_init / scale;
+    let init_int_y = init_mvy_init / scale;
     let mut best_x = init_int_x;
     let mut best_y = init_int_y;
     let mut best_sad = sad_block_integer(
@@ -624,7 +699,9 @@ fn estimate_block_mv_8x8(
             let nx = best_x + dx;
             let ny = best_y + dy;
             // Stay inside the search window AND inside the 1MV f_code=1
-            // range (±32 half-pels = ±16 integer pels).
+            // range (±32 half-pels = ±16 integer pels; same window in
+            // QPel since f_code=1 quarter-pels span ±8 integer pels —
+            // we keep the integer-pel cap conservative).
             if (nx - init_int_x).abs() > FOUR_MV_REFINE_INT
                 || (ny - init_int_y).abs() > FOUR_MV_REFINE_INT
                 || nx.abs() > MAX_SEARCH_INT
@@ -668,7 +745,71 @@ fn estimate_block_mv_8x8(
             }
         }
     }
-    (best_hx, best_hy, best_hsad)
+    if !quarter_sample {
+        return (best_hx, best_hy, best_hsad);
+    }
+    // Quarter-pel refine (§7.6.2.2) — 8 candidates around the
+    // half-pel best, expressed in QPel units `(best_hx*2, best_hy*2)`.
+    let mut best_qx = best_hx * 2;
+    let mut best_qy = best_hy * 2;
+    let mut best_qsad = sad_block_qpel(
+        reference, src_blk, blk_px, blk_py, best_qx, best_qy, rounding,
+    );
+    for dy in -1..=1 {
+        for dx in -1..=1 {
+            if dx == 0 && dy == 0 {
+                continue;
+            }
+            let qx = best_hx * 2 + dx;
+            let qy = best_hy * 2 + dy;
+            // Cap at the f_code=1 QPel range (±32 quarter-pels = ±8 int pels).
+            if qx.abs() > 32 || qy.abs() > 32 {
+                continue;
+            }
+            let s = sad_block_qpel(reference, src_blk, blk_px, blk_py, qx, qy, rounding);
+            if s < best_qsad {
+                best_qsad = s;
+                best_qx = qx;
+                best_qy = qy;
+            }
+        }
+    }
+    (best_qx, best_qy, best_qsad)
+}
+
+/// Quarter-pel SAD for one 8×8 luma block. Builds the 8×8 QPel
+/// predictor via `predict_block_qpel` and compares.
+fn sad_block_qpel(
+    reference: &IVopPicture,
+    src: &[u8; 64],
+    blk_px: i32,
+    blk_py: i32,
+    mvx_q: i32,
+    mvy_q: i32,
+    rounding: bool,
+) -> u32 {
+    let ref_h = (reference.y.len() / reference.y_stride) as i32;
+    let ref_w = reference.y_stride as i32;
+    let mut pred = [0u8; 64];
+    predict_block_qpel(
+        &reference.y,
+        reference.y_stride,
+        ref_w,
+        ref_h,
+        blk_px,
+        blk_py,
+        mvx_q,
+        mvy_q,
+        8,
+        rounding,
+        &mut pred,
+        8,
+    );
+    let mut s = 0u32;
+    for i in 0..64 {
+        s = s.wrapping_add((src[i] as i32 - pred[i] as i32).unsigned_abs());
+    }
+    s
 }
 
 /// Read one 8×8 luma source block at the given sub-MB position. Mirrors
@@ -908,6 +1049,179 @@ fn sad_halfpel(
         s = s.wrapping_add((src[i] as i32 - pred[i] as i32).unsigned_abs());
     }
     s
+}
+
+/// Refine half-pel MV to quarter-pel by evaluating the 8 surrounding
+/// quarter-pel candidates around `(mvx_half * 2, mvy_half * 2)`. Per
+/// §7.5.4 / §7.6.2.2, quarter-pel motion estimation extends the
+/// half-pel result by one quarter-pel step on each axis. Returns the
+/// MV in quarter-pel units.
+fn qpel_refine_mb(
+    reference: &IVopPicture,
+    src: &[u8; 256],
+    mb_x: usize,
+    mb_y: usize,
+    mvx_half: i32,
+    mvy_half: i32,
+    rounding: bool,
+) -> (i32, i32) {
+    let center_qx = mvx_half * 2;
+    let center_qy = mvy_half * 2;
+    let mut best_qx = center_qx;
+    let mut best_qy = center_qy;
+    let mut best_sad = sad_qpel_mb(reference, src, mb_x, mb_y, best_qx, best_qy, rounding);
+    for dy in -1..=1 {
+        for dx in -1..=1 {
+            if dx == 0 && dy == 0 {
+                continue;
+            }
+            let qx = center_qx + dx;
+            let qy = center_qy + dy;
+            // Cap at the f_code=1 quarter-pel range (±32 quarter-pels).
+            if qx.abs() > 32 || qy.abs() > 32 {
+                continue;
+            }
+            let s = sad_qpel_mb(reference, src, mb_x, mb_y, qx, qy, rounding);
+            if s < best_sad {
+                best_sad = s;
+                best_qx = qx;
+                best_qy = qy;
+            }
+        }
+    }
+    (best_qx, best_qy)
+}
+
+/// Quarter-pel SAD over a 16×16 luma MB. Builds the predictor with
+/// `predict_luma_mb_qpel` and compares against `src`.
+fn sad_qpel_mb(
+    reference: &IVopPicture,
+    src: &[u8; 256],
+    mb_x: usize,
+    mb_y: usize,
+    mvx_q: i32,
+    mvy_q: i32,
+    rounding: bool,
+) -> u32 {
+    let mut pred = [0u8; 256];
+    predict_luma_mb_qpel(reference, mb_x, mb_y, mvx_q, mvy_q, rounding, &mut pred);
+    let mut s = 0u32;
+    for i in 0..256 {
+        s = s.wrapping_add((src[i] as i32 - pred[i] as i32).unsigned_abs());
+    }
+    s
+}
+
+/// QPel-aware luma MB predictor — dispatches to `predict_luma_mb_qpel`
+/// when `quarter_sample` is on, else `predict_luma_mb` (half-pel).
+pub(crate) fn predict_luma_mb_any(
+    reference: &IVopPicture,
+    mb_x: usize,
+    mb_y: usize,
+    mvx: i32,
+    mvy: i32,
+    rounding: bool,
+    quarter_sample: bool,
+    out: &mut [u8; 256],
+) {
+    if quarter_sample {
+        predict_luma_mb_qpel(reference, mb_x, mb_y, mvx, mvy, rounding, out);
+    } else {
+        predict_luma_mb(reference, mb_x, mb_y, mvx, mvy, rounding, out);
+    }
+}
+
+/// QPel-aware 4MV luma MB predictor — see `predict_luma_mb_any`.
+pub(crate) fn predict_luma_mb_4mv_any(
+    reference: &IVopPicture,
+    mb_x: usize,
+    mb_y: usize,
+    mv4: [(i32, i32); 4],
+    rounding: bool,
+    quarter_sample: bool,
+    out: &mut [u8; 256],
+) {
+    if quarter_sample {
+        predict_luma_mb_4mv_qpel(reference, mb_x, mb_y, mv4, rounding, out);
+    } else {
+        predict_luma_mb_4mv(reference, mb_x, mb_y, mv4, rounding, out);
+    }
+}
+
+/// Build a 16×16 luma predictor using the QPel 8-tap filter.
+pub(crate) fn predict_luma_mb_qpel(
+    reference: &IVopPicture,
+    mb_x: usize,
+    mb_y: usize,
+    mv_x_q: i32,
+    mv_y_q: i32,
+    rounding: bool,
+    out: &mut [u8; 256],
+) {
+    let ref_h = (reference.y.len() / reference.y_stride) as i32;
+    let ref_w = reference.y_stride as i32;
+    let px = (mb_x * 16) as i32;
+    let py = (mb_y * 16) as i32;
+    for (sub_x, sub_y) in [(0, 0), (8, 0), (0, 8), (8, 8)] {
+        let mut tmp = [0u8; 64];
+        predict_block_qpel(
+            &reference.y,
+            reference.y_stride,
+            ref_w,
+            ref_h,
+            px + sub_x,
+            py + sub_y,
+            mv_x_q,
+            mv_y_q,
+            8,
+            rounding,
+            &mut tmp,
+            8,
+        );
+        for j in 0..8 {
+            for i in 0..8 {
+                out[(sub_y as usize + j) * 16 + (sub_x as usize + i)] = tmp[j * 8 + i];
+            }
+        }
+    }
+}
+
+/// Build a 16×16 luma predictor from four per-block QPel MVs.
+pub(crate) fn predict_luma_mb_4mv_qpel(
+    reference: &IVopPicture,
+    mb_x: usize,
+    mb_y: usize,
+    mv4_q: [(i32, i32); 4],
+    rounding: bool,
+    out: &mut [u8; 256],
+) {
+    let ref_h = (reference.y.len() / reference.y_stride) as i32;
+    let ref_w = reference.y_stride as i32;
+    let px = (mb_x * 16) as i32;
+    let py = (mb_y * 16) as i32;
+    for (blk, (sub_x, sub_y)) in [(0i32, 0i32), (8, 0), (0, 8), (8, 8)].iter().enumerate() {
+        let (mvx, mvy) = mv4_q[blk];
+        let mut tmp = [0u8; 64];
+        predict_block_qpel(
+            &reference.y,
+            reference.y_stride,
+            ref_w,
+            ref_h,
+            px + *sub_x,
+            py + *sub_y,
+            mvx,
+            mvy,
+            8,
+            rounding,
+            &mut tmp,
+            8,
+        );
+        for j in 0..8 {
+            for i in 0..8 {
+                out[(*sub_y as usize + j) * 16 + (*sub_x as usize + i)] = tmp[j * 8 + i];
+            }
+        }
+    }
 }
 
 // -------------------------------------------------------------------------
@@ -1515,6 +1829,65 @@ mod tests {
             assert_eq!(dec_cbpc, cbpc, "cbpc round-trip mismatch");
         }
     }
+
+    /// Quarter-pel ME finds a non-zero quarter-pel offset when the
+    /// source is a 1/4-pel-shifted version of the reference. The
+    /// 8-tap predictor at MV(1,0) (qpel) should beat MV(0,0) by a
+    /// noticeable SAD margin.
+    #[test]
+    fn qpel_refine_finds_quarter_pel_shift() {
+        // Build a tiny reference — uniform horizontal ramp 0..16
+        // tiled across a 32×32 plane. The half-pel filter at MV(1,0)h
+        // (i.e. +0.5 pels) gives sample[i] + sample[i+1] / 2 = avg —
+        // the QPel filter at MV(1,0)q (i.e. +0.25 pels) gives a value
+        // weighted toward the integer. A source pre-shifted by exactly
+        // 0.25 pels should match the QPel(1,0) predictor better.
+        let w: usize = 32;
+        let h: usize = 32;
+        let mut reference = IVopPicture::new(w, h);
+        for j in 0..h {
+            for i in 0..w {
+                reference.y[j * reference.y_stride + i] = ((i % 16) * 16) as u8;
+            }
+        }
+        for px in reference.cb.iter_mut() {
+            *px = 128;
+        }
+        for px in reference.cr.iter_mut() {
+            *px = 128;
+        }
+
+        // Source MB: the same ramp evaluated at sub-pel +0.25.  The
+        // 8-tap QPel filter applied to `ref_plane` at MV(1,0)q would
+        // produce roughly this content. We manufacture the MB by
+        // running the encoder's own QPel filter from `predict_block_qpel`
+        // — that gives the exact target the QPel ME should converge to.
+        let mut src_mb = [0u8; 256];
+        crate::pvop::predict_luma_mb_qpel(&reference, 0, 0, 1, 0, false, &mut src_mb);
+
+        // Run the QPel refine starting from the half-pel MV(0,0) (the
+        // half-pel best for this source). The source pattern has no
+        // vertical variation, so the y-axis MV is ambiguous (any
+        // value in {-1, 0, 1} produces the same SAD); only the x
+        // component is constrained.
+        let (mvx_q, mvy_q) = qpel_refine_mb(&reference, &src_mb, 0, 0, 0, 0, false);
+        assert_eq!(
+            mvx_q, 1,
+            "QPel ME failed to converge to x=1 on a 1/4-pel shifted source (got mvx={mvx_q}, mvy={mvy_q})"
+        );
+        assert!(
+            mvy_q.abs() <= 1,
+            "QPel y-axis MV {mvy_q} outside the ambiguity band ±1 for a horizontally-only ramp"
+        );
+        // Sanity: the QPel SAD at the ME's choice must be no worse
+        // than the half-pel anchor at (0,0)q.
+        let sad_chosen = sad_qpel_mb(&reference, &src_mb, 0, 0, mvx_q, mvy_q, false);
+        let sad_anchor = sad_qpel_mb(&reference, &src_mb, 0, 0, 0, 0, false);
+        assert!(
+            sad_chosen <= sad_anchor,
+            "QPel ME chose MV with worse SAD ({sad_chosen}) than anchor ({sad_anchor})"
+        );
+    }
 }
 
 // -------------------------------------------------------------------------
@@ -1536,7 +1909,24 @@ mod tests {
 //   on scene cuts and large-motion regions where MC is futile. The
 //   PredGrid is now threaded through the P-VOP loop and reset for
 //   every inter MB to mirror the decoder's `reset_pred_grid_mb`.
-// * GMC, sprites, quarter-pel motion, OBMC — deliberately out of scope
-//   for this encoder. They would each require material bitstream
-//   changes (sprite metadata, the `quarter_pel` flag path) and are
-//   tracked separately from the P-VOP work.
+// * Quarter-pel motion (§7.6.2.2 / §7.5.4) — landed in round 15.
+//   The encoder emits a verid=2 VOL with `quarter_sample = 1` when
+//   built with `params.options["qpel"] = "1"`. ME chains
+//   integer-pel diamond → half-pel refine → quarter-pel refine
+//   (8 candidates around the half-pel best); the predictor uses
+//   `predict_block_qpel` (the existing decoder-side 8-tap filter
+//   from `mc.rs`). MVs are stored in quarter-pel units in
+//   `MbMotion`/`MvGrid`; chroma derivation flips between
+//   `luma_mv_to_chroma` and `luma_qmv_to_chroma`. QPel + B-frames
+//   is rejected at the encoder factory (the B-VOP encoder still
+//   assumes half-pel — see `bvop_enc.rs`).
+// * GMC, sprites, OBMC — deliberately out of scope for this
+//   encoder. They each require material bitstream changes
+//   (sprite metadata, OBMC overlap window) and are tracked
+//   separately from the P-VOP work.
+// * RDO mode decision — current intra-vs-inter and 1MV-vs-4MV
+//   pickers compare SAD with a fixed bias. A Lagrangian
+//   `D + λ·R` decision (where R is the bit cost of each
+//   candidate's MVD + MCBPC + CBPY + AC walk) would tighten the
+//   picks especially at higher Q. Tracked as a future-work
+//   item; quarter-pel was the round-15 priority.

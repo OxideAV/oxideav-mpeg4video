@@ -80,6 +80,13 @@ pub const DEFAULT_F_CODE_FWD: u8 = 1;
 /// B-VOP path entirely (I + P only, matching pre-round-8 behaviour).
 pub const DEFAULT_MAX_B_FRAMES: u32 = 0;
 
+/// Default `quarter_sample` flag. When `true` the encoder advertises QPel
+/// in the VOL header (verid=2 + `quarter_sample = 1`) and uses the
+/// quarter-pel motion-estimation + 8-tap-filter prediction path
+/// (§7.6.2.2). When `false` (default) the encoder uses half-pel motion
+/// (the round-1..14 path).
+pub const DEFAULT_QUARTER_SAMPLE: bool = false;
+
 /// Encoder factory used by `register()`.
 pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     let width = params
@@ -117,13 +124,32 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
 
     let time_base = TimeBase::new(frame_rate.den, frame_rate.num);
 
-    // Options — currently only the `bf` (max B-frames) knob. Default 0
-    // matches the pre-round-8 encoder (I + P only).
+    // Options — currently the `bf` (max B-frames) knob and the `qpel`
+    // (quarter-sample motion) knob. Defaults preserve the round-14
+    // behaviour (no B-frames, half-pel motion).
     let max_b_frames = params
         .options
         .get("bf")
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(DEFAULT_MAX_B_FRAMES);
+
+    let quarter_sample = params
+        .options
+        .get("qpel")
+        .map(|s| !matches!(s, "" | "0" | "false" | "False" | "FALSE"))
+        .unwrap_or(DEFAULT_QUARTER_SAMPLE);
+
+    // Quarter-sample + B-frames is not yet supported. The B-VOP encoder
+    // (`bvop_enc.rs`) explicitly assumes `vol.quarter_sample == false`
+    // (see the module docstring); enabling QPel under -bf N would emit
+    // half-pel B-MVs against a QPel VOL header, mis-decoding every B-MB.
+    // Reject the combination at the factory rather than silently produce
+    // a malformed bitstream.
+    if quarter_sample && max_b_frames > 0 {
+        return Err(Error::unsupported(
+            "mpeg4 encoder: QPel (quarter_sample) + B-frames is not implemented",
+        ));
+    }
 
     Ok(Box::new(Mpeg4VideoEncoder {
         output_params,
@@ -135,6 +161,7 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         gop_size: DEFAULT_GOP_SIZE,
         f_code_fwd: DEFAULT_F_CODE_FWD,
         max_b_frames,
+        quarter_sample,
         pending: VecDeque::new(),
         b_queue: VecDeque::new(),
         eof: false,
@@ -160,6 +187,11 @@ struct Mpeg4VideoEncoder {
     f_code_fwd: u8,
     /// Max consecutive B-VOPs between two reference pictures. 0 = no B-VOPs.
     max_b_frames: u32,
+    /// VOL `quarter_sample` flag. When `true` the encoder operates in
+    /// QPel mode (verid=2 + quarter-pel motion vectors + 8-tap MC
+    /// filter). See `pvop::encode_p_vop_body_with_grid` for the QPel
+    /// motion-estimation path.
+    quarter_sample: bool,
     pending: VecDeque<Packet>,
     /// Display-order B-frame queue — flushed on the next I/P encode.
     b_queue: VecDeque<VideoFrame>,
@@ -288,6 +320,7 @@ impl Mpeg4VideoEncoder {
                 self.frame_rate,
                 self.vop_quant,
                 self.max_b_frames > 0,
+                self.quarter_sample,
             );
             self.headers_emitted = true;
         }
@@ -321,6 +354,7 @@ impl Mpeg4VideoEncoder {
                 self.vop_quant,
                 self.f_code_fwd,
                 self.rounding_type,
+                self.quarter_sample,
             )?;
             self.reference = Some(pic);
             self.reference_grid = Some(grid);
@@ -357,6 +391,7 @@ impl Mpeg4VideoEncoder {
                 self.frame_rate,
                 self.vop_quant,
                 self.max_b_frames > 0,
+                self.quarter_sample,
             );
             self.headers_emitted = true;
         }
@@ -389,6 +424,7 @@ impl Mpeg4VideoEncoder {
                 self.vop_quant,
                 self.f_code_fwd,
                 self.rounding_type,
+                self.quarter_sample,
             )?;
             self.reference = Some(pic);
             self.reference_grid = Some(grid);
@@ -555,14 +591,19 @@ fn write_vos_vo_vol(
     frame_rate: Rational,
     _q: u32,
     enable_b_vops: bool,
+    quarter_sample: bool,
 ) {
     // VOS.
     write_start_code(bw, VOS_START_CODE);
-    // profile_and_level_indication — ASP Level 1 (`0xF1`) when B-VOPs are
-    // used (matches ffmpeg's own -bf 2 output), Simple Profile Level 1
-    // (`0x01`) otherwise. ASP is required for B-VOPs; Simple Profile
-    // explicitly forbids them (§Annex N).
-    let pli = if enable_b_vops { 0xF1 } else { 0x01 };
+    // profile_and_level_indication — pick the smallest PLI that admits
+    // every feature we actually emit. ASP Level 1 (`0xF1`) accepts both
+    // B-VOPs and quarter_sample (§Annex N); Simple Profile Level 1
+    // (`0x01`) is the most-compatible PLI for plain I+P half-pel.
+    let pli = if enable_b_vops || quarter_sample {
+        0xF1
+    } else {
+        0x01
+    };
     bw.write_bits(pli, 8);
 
     // Visual Object.
@@ -579,11 +620,27 @@ fn write_vos_vo_vol(
     // Video Object Layer — id 0x20.
     write_start_code(bw, 0x20);
     bw.write_bits(0, 1); // random_accessible_vol = 0
-                         // video_object_type_indication — Main (4) when B-VOPs are on, Simple
-                         // (1) otherwise. Main explicitly permits B-VOPs.
-    let vot_indication = if enable_b_vops { 4 } else { 1 };
+                         // video_object_type_indication — ASP (4) when B-VOPs OR QPel are on
+                         // (Annex N requires verid>=2 for QPel anyway), Simple (1)
+                         // otherwise. We share the "use ASP" bit between the two
+                         // features since both require the verid=2 VOL syntax.
+    let vot_indication = if enable_b_vops || quarter_sample {
+        4
+    } else {
+        1
+    };
     bw.write_bits(vot_indication, 8);
-    bw.write_bits(0, 1); // is_object_layer_identifier = 0
+    // `is_object_layer_identifier` is required for QPel (so we can emit
+    // verid=2). For the half-pel + no-B path keep it 0 so the bitstream
+    // is byte-for-byte identical to round-14.
+    let needs_verid2 = quarter_sample;
+    if needs_verid2 {
+        bw.write_bits(1, 1); // is_object_layer_identifier = 1
+        bw.write_bits(2, 4); // verid = 2 (QPel + newpred + reduced_resolution_vop syntax)
+        bw.write_bits(0, 3); // priority = 0
+    } else {
+        bw.write_bits(0, 1); // is_object_layer_identifier = 0 (verid implicitly 1)
+    }
     bw.write_bits(1, 4); // aspect_ratio_info = 1 (square)
     bw.write_bits(1, 1); // vol_control_parameters = 1
     bw.write_bits(1, 2); // chroma_format = 1 (4:2:0)
@@ -612,14 +669,31 @@ fn write_vos_vo_vol(
 
     bw.write_bits(0, 1); // interlaced = 0
     bw.write_bits(1, 1); // obmc_disable = 1
-    bw.write_bits(0, 1); // sprite_enable = 0 (verid==1 → 1 bit)
+                         // sprite_enable — 1 bit when verid==1, 2 bits when verid>=2
+                         // (per the round-2000 corrigendum that introduced
+                         // GMC). Always 0 in the encoder (no sprite/GMC
+                         // emitted).
+    if needs_verid2 {
+        bw.write_bits(0, 2); // sprite_enable = 0 (verid>=2 → 2 bits)
+    } else {
+        bw.write_bits(0, 1); // sprite_enable = 0 (verid==1 → 1 bit)
+    }
     bw.write_bits(0, 1); // not_8_bit = 0
     bw.write_bits(0, 1); // mpeg_quant = 0 (use H.263 quant)
-                         // verid==1 → no quarter_sample bit emitted.
+                         // quarter_sample — verid>=2 only. `1` selects QPel motion
+                         // (§7.6.2.2 8-tap filter); `0` keeps half-pel.
+    if needs_verid2 {
+        bw.write_bits(if quarter_sample { 1 } else { 0 }, 1);
+    }
     bw.write_bits(1, 1); // complexity_estimation_disable = 1
     bw.write_bits(1, 1); // resync_marker_disable = 1
     bw.write_bits(0, 1); // data_partitioned = 0
-                         // verid==1 → no newpred / reduced_resolution_vop bits.
+                         // verid>=2 adds newpred_enable + reduced_resolution_vop_enable.
+                         // Both 0 — we don't emit those features.
+    if needs_verid2 {
+        bw.write_bits(0, 1); // newpred_enable = 0
+        bw.write_bits(0, 1); // reduced_resolution_vop_enable = 0
+    }
     bw.write_bits(0, 1); // scalability = 0
 
     align_with_one_zero_then_ones(bw);
