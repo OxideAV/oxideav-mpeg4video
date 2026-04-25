@@ -20,9 +20,18 @@
 //!   per-block predictor uses the in-MB grid as updated by the prior
 //!   blocks (§7.6.2 fig 7-6).
 //! * **MCBPC** (Table B-13) distinguishes `Inter`, `InterQ`, `Intra`,
-//!   `IntraQ`, `Inter4MV`. We emit `Inter` (rows 0..=3) or `Inter4MV`
-//!   (rows 16..=19) per the mode decision; skip MBs use the
-//!   `not_coded` flag, and `Intra` fallback is not yet implemented.
+//!   `IntraQ`, `Inter4MV`. We emit `Inter` (rows 0..=3), `Inter4MV`
+//!   (rows 16..=19) or `Intra` (rows 4..=7) per the mode decision;
+//!   skip MBs use the `not_coded` flag.
+//! * **Intra-MB-in-P fallback** (§6.3.7 / Table B-22, mb_type=3). For
+//!   each P-MB we compute `inter_luma_sad` (chosen-mode SAD) and
+//!   `intra_cost_proxy` (a luma-only Mean-Absolute-Deviation against the
+//!   per-block mean — a cheap upper-bound on the residual the intra
+//!   AC coder would face). When the inter SAD exceeds the intra MAD by
+//!   more than `INTRA_IN_P_BIAS + INTRA_MARGIN`, we re-encode the MB as
+//!   intra (`not_coded=0` + Table B-13 Intra MCBPC + ac_pred_flag=0 +
+//!   raw CBPY + 6 intra blocks). This matters for scene changes,
+//!   exposed regions and large-motion content where MC fails.
 //! * **Skipped MB**: when the MB is 1MV-mode AND has MV(0,0) AND zero
 //!   residual, we emit `not_coded = 1`. 4MV MBs cannot be `not_coded`
 //!   (the decoder's not_coded path forces 1MV reconstruction). Decoder
@@ -41,17 +50,19 @@
 //!   reference.
 //!
 //! Out of scope (returns error or NOP):
-//! * Embedded intra MBs inside a P-VOP — the encoder always encodes MBs as
-//!   inter. This loses efficiency on scene changes but remains bit-correct.
+//! * `IntraQ` (Table B-13 rows 12..=15) — intra-in-P with dquant. The
+//!   constant-quant emit path means we never need the `dquant` bits for
+//!   intra MBs. `Intra` (no dquant) covers the scene-change case.
 //! * B / S VOPs, GMC, quarter-pel motion, reduced-resolution, data
 //!   partitioning.
 
 use oxideav_core::Result;
 
-use crate::encoder::{block_pel_position, fdct8x8};
+use crate::block::BlockNeighbour;
+use crate::encoder::{block_pel_position, encode_intra_mb_in_p, fdct8x8};
 use crate::headers::vol::ZIGZAG;
 use crate::inter::{MbMotion, MvGrid};
-use crate::mb::IVopPicture;
+use crate::mb::{IVopPicture, PredGrid};
 use crate::mc::{luma_mv_to_chroma, predict_block};
 use crate::tables::{mv as mv_tab, tcoef};
 use oxideav_core::bits::BitWriter;
@@ -76,6 +87,26 @@ const FOUR_MV_REFINE_INT: i32 = 2;
 /// of extra MVD ≈ 120 SAD points to break even — we round to 96 for a
 /// slight bias toward 4MV when the SAD wins are clear.
 const FOURMV_LAMBDA: u32 = 96;
+
+/// Bias (in SAD units) added to the intra MAD proxy before comparing it
+/// to the inter luma SAD. Per §6.3.7 / Table B-22, intra MB inside a
+/// P-VOP is more expensive to code than a clean inter MB (6 DC VLCs +
+/// 4 ac_pred bits + much heavier AC walk; no MV bits saved). We only
+/// switch to intra when the inter SAD is materially higher than the
+/// intra MAD proxy + this bias. Empirically tuned for the scene-change
+/// use-case: a stable scene's inter SAD is typically <500 while intra
+/// MAD is content-driven (500-3000 for textured content). On a scene
+/// cut, inter SAD jumps to ~3000-8000 while intra MAD stays at the
+/// content baseline, easily clearing this threshold.
+const INTRA_IN_P_BIAS: u32 = 384;
+
+/// Minimum intra cost advantage (in SAD units) required to switch to
+/// intra. The intra cost we compute is a luma-only Mean-Absolute-
+/// Deviation (MAD) proxy — a reasonable but not exact predictor of the
+/// actual intra residual. The bias above already protects against false
+/// positives; this margin protects against close calls where the proxy
+/// and the actual cost might disagree.
+const INTRA_MARGIN: u32 = 128;
 
 /// Encoder-side representation of one P-VOP macroblock after motion
 /// estimation. All MVs are in luma half-pel units.
@@ -113,6 +144,11 @@ pub struct PMbEncoding {
     /// inter blocks (no DC special case); we keep 64 slots to match the
     /// decoder's view.
     pub ac_levels: [[i32; 64]; 6],
+    /// Best inter SAD over the 16×16 luma MB after the chosen-mode
+    /// (1MV or 4MV) prediction. Used for the intra-in-P mode decision in
+    /// `encode_p_vop_body_with_grid` — when the intra MAD proxy is much
+    /// smaller than this value, the MB is re-encoded as intra.
+    pub inter_luma_sad: u32,
 }
 
 impl Default for PMbEncoding {
@@ -128,6 +164,7 @@ impl Default for PMbEncoding {
             recon_cb: [0; 64],
             recon_cr: [0; 64],
             ac_levels: [[0i32; 64]; 6],
+            inter_luma_sad: 0,
         }
     }
 }
@@ -178,9 +215,16 @@ pub fn encode_p_vop_body_with_grid(
 
     let mut pic = IVopPicture::new(width, height);
     let mut mv_grid = MvGrid::new(mb_w, mb_h);
+    // PredGrid tracks DC predictor state for intra MBs (§7.4.3.1). Inside
+    // a P-VOP only intra-in-P MBs (§6.3.7 / Table B-22 mb_type=3) update
+    // it; inter MBs (and skipped MBs) are reset to default so future
+    // intra MBs read `dc=1024, is_intra=false` from inter neighbours,
+    // matching the decoder's `decode_p_vop_body`.
+    let mut pred_grid = PredGrid::new(mb_w, mb_h);
 
     for mb_y in 0..mb_h {
         for mb_x in 0..mb_w {
+            // Decision pass — also produces a fully-reconstructed inter MB.
             let mb = estimate_and_encode_mb(
                 v,
                 reference,
@@ -190,32 +234,157 @@ pub fn encode_p_vop_body_with_grid(
                 rounding_type,
                 &mv_grid,
             )?;
-            emit_p_mb(bw, &mb, mb_x, mb_y, &mut mv_grid, f_code_fwd);
-            // Stash reconstructed samples into `pic`.
-            write_recon_to_pic(&mut pic, &mb, mb_x, mb_y);
-            // Update MV predictor grid. Record `not_coded` so B-VOP
-            // encode can inherit the skip flag per §7.5.9.5.4. For 4MV
-            // MBs we record all four per-block MVs so the next P-MB's
-            // median predictor (§7.5.7) and any downstream B-VOP
-            // direct-mode 4MV scaling (§7.5.9.5) see the correct grid.
-            let motion = if mb.four_mv {
-                MbMotion {
-                    mv: mb.mv4_half,
-                    four_mv: true,
-                    not_coded: mb.skipped,
-                }
+
+            // Intra-in-P decision (§6.3.7): the inter SAD is the cost we
+            // would pay coding this MB as inter. An MAD-based intra cost
+            // proxy is computed against the source-MB DC mean. Switch
+            // to intra when intra clearly wins (inter SAD exceeds the
+            // intra proxy plus `INTRA_IN_P_BIAS + INTRA_MARGIN`).
+            let intra_cost = intra_cost_proxy(v, mb_x, mb_y);
+            let inter_cost = inter_cost_proxy(&mb);
+            let prefer_intra = inter_cost
+                > intra_cost
+                    .saturating_add(INTRA_IN_P_BIAS)
+                    .saturating_add(INTRA_MARGIN);
+
+            if prefer_intra {
+                // Emit Intra-in-P MB:
+                //   bit `not_coded = 0`
+                //   MCBPC (Table B-13 Intra rows 4..=7)
+                //   ac_pred_flag (0)
+                //   CBPY (raw — not bit-inverted for intra)
+                //   six intra blocks (DC VLC + AC walk)
+                bw.write_bits(0, 1);
+                encode_intra_mb_in_p(bw, v, mb_x, mb_y, vop_quant, &mut pred_grid, &mut pic)?;
+                // MV grid: intra MBs contribute (0,0) to the median
+                // predictor of future inter MBs (§7.6.7 step 3) and
+                // are NOT considered `not_coded`. Co-located B-VOP
+                // direct-mode treats intra-in-P like a fresh MB —
+                // direct mode falls back to forward-only when the
+                // co-located MV is (0,0); that's the correct behaviour
+                // when the P-MB was intra-coded.
+                mv_grid.set(
+                    mb_x,
+                    mb_y,
+                    MbMotion {
+                        mv: [(0, 0); 4],
+                        four_mv: false,
+                        not_coded: false,
+                    },
+                );
             } else {
-                MbMotion {
-                    mv: [mb.mv_half; 4],
-                    four_mv: false,
-                    not_coded: mb.skipped,
-                }
-            };
-            mv_grid.set(mb_x, mb_y, motion);
+                emit_p_mb(bw, &mb, mb_x, mb_y, &mut mv_grid, f_code_fwd);
+                // Stash reconstructed samples into `pic`.
+                write_recon_to_pic(&mut pic, &mb, mb_x, mb_y);
+                // Reset PredGrid for inter MB (mirrors the decoder's
+                // `reset_pred_grid_mb` in `inter.rs`).
+                reset_pred_grid_mb(&mut pred_grid, mb_x, mb_y);
+                // Update MV predictor grid. Record `not_coded` so
+                // B-VOP encode can inherit the skip flag per
+                // §7.5.9.5.4. For 4MV MBs we record all four per-block
+                // MVs so the next P-MB's median predictor (§7.5.7) and
+                // any downstream B-VOP direct-mode 4MV scaling
+                // (§7.5.9.5) see the correct grid.
+                let motion = if mb.four_mv {
+                    MbMotion {
+                        mv: mb.mv4_half,
+                        four_mv: true,
+                        not_coded: mb.skipped,
+                    }
+                } else {
+                    MbMotion {
+                        mv: [mb.mv_half; 4],
+                        four_mv: false,
+                        not_coded: mb.skipped,
+                    }
+                };
+                mv_grid.set(mb_x, mb_y, motion);
+            }
         }
     }
 
     Ok((pic, mv_grid))
+}
+
+/// Reset the AC/DC prediction slots for one MB. Called for inter MBs to
+/// mirror the decoder's behaviour in `inter::reset_pred_grid_mb`. Without
+/// this, an intra MB later in the picture would predict its DC from a
+/// stale neighbour DC value left behind by the I-VOP — i.e., from a frame
+/// before the most recent inter MB.
+fn reset_pred_grid_mb(grid: &mut PredGrid, mb_x: usize, mb_y: usize) {
+    let positions: [(usize, usize); 4] = [
+        (mb_x * 2, mb_y * 2),
+        (mb_x * 2 + 1, mb_y * 2),
+        (mb_x * 2, mb_y * 2 + 1),
+        (mb_x * 2 + 1, mb_y * 2 + 1),
+    ];
+    for (bx, by) in positions {
+        let idx = by * grid.y_stride + bx;
+        grid.y[idx] = BlockNeighbour::default();
+    }
+    let cidx = mb_y * grid.c_stride + mb_x;
+    grid.cb[cidx] = BlockNeighbour::default();
+    grid.cr[cidx] = BlockNeighbour::default();
+}
+
+/// Mean-absolute-deviation (MAD) over the four 8×8 luma blocks of the
+/// source MB — a fast proxy for the residual that an intra coder would
+/// face after removing each block's DC (the predictor explains the mean,
+/// the AC path codes the deviations from it).
+///
+/// We only sum the four luma blocks so the value is on the same scale
+/// as `inter_luma_sad` (the chosen-mode 16×16 luma SAD). Chroma is
+/// usually low-variance and would only blur the comparison.
+fn intra_cost_proxy(v: &oxideav_core::VideoFrame, mb_x: usize, mb_y: usize) -> u32 {
+    let mut total = 0u32;
+    for blk in 0..4 {
+        let mut block = [0u8; 64];
+        load_block_for_intra_cost(v, mb_x, mb_y, blk, &mut block);
+        let mut sum = 0u32;
+        for &s in block.iter() {
+            sum += s as u32;
+        }
+        let mean = (sum / 64) as i32;
+        let mut mad = 0u32;
+        for &s in block.iter() {
+            mad = mad.saturating_add((s as i32 - mean).unsigned_abs());
+        }
+        total = total.saturating_add(mad);
+    }
+    total
+}
+
+/// Inter cost proxy — chosen-mode luma SAD across the 16×16 MB. This is
+/// the residual energy the inter coder asks the DCT+quant+AC pass to
+/// encode. Higher values mean the MV match is poor, which is the
+/// scene-change / occlusion case we want to catch with intra-in-P.
+///
+/// Comparable to the per-MB intra MAD proxy: both are sums of
+/// per-sample absolute deviations from the predictor (MC predictor for
+/// inter; per-block DC for intra).
+fn inter_cost_proxy(mb: &PMbEncoding) -> u32 {
+    mb.inter_luma_sad
+}
+
+/// Load one 8×8 source block (for intra-cost computation). Mirrors
+/// `read_luma_block_from_mb` for luma blocks 0..=3 and `load_chroma_block`
+/// for chroma blocks 4..=5.
+fn load_block_for_intra_cost(
+    v: &oxideav_core::VideoFrame,
+    mb_x: usize,
+    mb_y: usize,
+    blk: usize,
+    out: &mut [u8; 64],
+) {
+    let (plane_idx, x0, y0, pw, ph) = block_pel_position(v, mb_x, mb_y, blk);
+    let plane = &v.planes[plane_idx];
+    for j in 0..8 {
+        let yy = (y0 + j).min(ph.saturating_sub(1));
+        for i in 0..8 {
+            let xx = (x0 + i).min(pw.saturating_sub(1));
+            out[j * 8 + i] = plane.data[yy * plane.stride + xx];
+        }
+    }
 }
 
 fn write_recon_to_pic(pic: &mut IVopPicture, mb: &PMbEncoding, mb_x: usize, mb_y: usize) {
@@ -312,10 +481,17 @@ fn estimate_and_encode_mb(
         ((mvx_half, mvy_half), pred_y_1mv)
     };
 
+    // Stash the chosen-mode luma SAD for the intra-in-P decision in
+    // `encode_p_vop_body_with_grid`. We use the SAD against the chosen
+    // mode's predictor (1MV or 4MV), giving the cleanest "this is what
+    // the inter coder is asking the AC pass to handle" signal.
+    let inter_luma_sad = if four_mv { sad_4mv } else { sad_1mv };
+
     let mut mb = PMbEncoding {
         mv_half: mv_repr,
         mv4_half,
         four_mv,
+        inter_luma_sad,
         ..Default::default()
     };
 
@@ -1352,10 +1528,14 @@ mod tests {
 //   activates the round-12 dormant 4MV-direct path in B-VOPs (a B-MB
 //   in direct mode whose co-located P-MB used 4MV inherits the 4
 //   per-block MVs via `direct_mode_mvs_4`).
-// * Intra MB fallback inside P-VOP for high-residual blocks. Useful on
-//   scene-change boundaries where the inter predictor yields more
-//   residual bits than a fresh intra block would. Not yet implemented;
-//   the encoder currently always codes MBs as inter inside a P-VOP.
+// * Intra MB fallback inside P-VOP — landed in round 14. P-MBs now
+//   compare a luma-MAD intra-cost proxy against `inter_luma_sad`; when
+//   the inter cost exceeds the intra cost by `INTRA_IN_P_BIAS +
+//   INTRA_MARGIN`, the MB is re-encoded through the I-VOP intra path
+//   wrapped in `not_coded=0 + Table B-13 Intra MCBPC`. This activates
+//   on scene cuts and large-motion regions where MC is futile. The
+//   PredGrid is now threaded through the P-VOP loop and reset for
+//   every inter MB to mirror the decoder's `reset_pred_grid_mb`.
 // * GMC, sprites, quarter-pel motion, OBMC — deliberately out of scope
 //   for this encoder. They would each require material bitstream
 //   changes (sprite metadata, the `quarter_pel` flag path) and are

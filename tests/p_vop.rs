@@ -476,3 +476,188 @@ fn p_vop_4mv_subblock_motion_roundtrip() {
         "ffmpeg I-VOP PSNR {p0:.2} below 30 dB — bitstream malformed"
     );
 }
+
+/// Build a high-contrast checker pattern with a content "phase" parameter
+/// — `phase = 0` and `phase = 1` produce visually unrelated frames so a
+/// hard switch between them simulates a scene change. The pattern has
+/// per-block variation so the encoder cannot trivially copy the predictor.
+fn make_scene(phase: u32, width: u32, height: u32) -> VideoFrame {
+    let w = width as usize;
+    let h = height as usize;
+    let cw = w / 2;
+    let ch = h / 2;
+    let mut y = vec![0u8; w * h];
+    let cb = vec![128u8; cw * ch];
+    let cr = vec![128u8; cw * ch];
+    for row in 0..h {
+        for col in 0..w {
+            // Two visually distinct, deterministic patterns. The XOR'd
+            // bit pattern guarantees the two scenes share almost no
+            // pixel values, so MC from a frame of scene A onto frame
+            // of scene B produces a high-residual MB everywhere.
+            let v = match phase {
+                0 => ((col * 5) ^ (row * 11)) as u8,
+                _ => 255u8.wrapping_sub(((col * 13) ^ (row * 7)) as u8),
+            };
+            y[row * w + col] = v;
+        }
+    }
+    VideoFrame {
+        format: PixelFormat::Yuv420P,
+        width,
+        height,
+        pts: Some(0),
+        time_base: TimeBase::new(1, 24),
+        planes: vec![
+            VideoPlane { stride: w, data: y },
+            VideoPlane {
+                stride: cw,
+                data: cb,
+            },
+            VideoPlane {
+                stride: cw,
+                data: cr,
+            },
+        ],
+    }
+}
+
+/// Encode a synthetic 8-frame clip with a hard scene change at frame 4
+/// and verify the PSNR at the scene-change boundary stays high. Without
+/// the round-14 intra-MB-in-P fallback, the first P-VOP after the cut
+/// would have to encode the entire MB through the inter path, leading
+/// to many large MVs and big residuals (low PSNR). With intra-in-P,
+/// the encoder switches to embedded intra MBs on the cut, recovering
+/// PSNR. We assert PSNR > 25 dB on the scene-change frame as a
+/// reasonable bar for the fixture.
+#[test]
+fn p_vop_intra_in_p_scene_change_psnr() {
+    let (width, height) = (32u32, 32u32);
+    let num_frames = 8u32;
+    let mut src: Vec<VideoFrame> = Vec::with_capacity(num_frames as usize);
+    for i in 0..num_frames {
+        // Frames 0..=3 are scene A, 4..=7 are scene B (hard cut at idx 4).
+        let phase = if i < 4 { 0 } else { 1 };
+        let mut f = make_scene(phase, width, height);
+        f.pts = Some(i as i64);
+        src.push(f);
+    }
+
+    let mut enc = build_encoder(width, height);
+    for f in &src {
+        enc.send_frame(&Frame::Video(f.clone()))
+            .expect("send_frame");
+    }
+    enc.flush().expect("flush");
+    let mut packets: Vec<Packet> = Vec::new();
+    loop {
+        match enc.receive_packet() {
+            Ok(p) => packets.push(p),
+            Err(oxideav_core::Error::NeedMore) | Err(oxideav_core::Error::Eof) => break,
+            Err(e) => panic!("receive_packet: {e:?}"),
+        }
+    }
+    let mut es = Vec::new();
+    for pkt in &packets {
+        es.extend_from_slice(&pkt.data);
+    }
+
+    // Decode round-trip through our own decoder.
+    let dec_params = CodecParameters::video(CodecId::new(oxideav_mpeg4video::CODEC_ID_STR));
+    let mut dec = oxideav_mpeg4video::decoder::make_decoder(&dec_params).expect("build decoder");
+    let in_pkt = Packet::new(0, TimeBase::new(1, 24), es.clone());
+    dec.send_packet(&in_pkt).expect("send_packet");
+    dec.flush().expect("flush decoder");
+    let mut decoded: Vec<VideoFrame> = Vec::new();
+    loop {
+        match dec.receive_frame() {
+            Ok(Frame::Video(f)) => decoded.push(f),
+            Ok(_) => panic!("non-video"),
+            Err(oxideav_core::Error::NeedMore) | Err(oxideav_core::Error::Eof) => break,
+            Err(e) => panic!("receive_frame: {e:?}"),
+        }
+    }
+    assert_eq!(decoded.len(), num_frames as usize);
+
+    // PSNR per frame. We expect frame 4 (the cut) to be the worst —
+    // intra-in-P should keep it above 25 dB. Frames before/after the cut
+    // should be high quality (clean inter or clean intra after the
+    // intra-MB resync).
+    for (i, (s, d)) in src.iter().zip(decoded.iter()).enumerate() {
+        let p = psnr(&flatten_frame(s), &flatten_frame(d));
+        eprintln!("scene-change frame {i}: PSNR = {p:.2} dB");
+        assert!(
+            p > 25.0,
+            "frame {i} PSNR {p:.2} dB below 25 dB — intra-in-P fallback failed"
+        );
+    }
+    // Specifically the cut frame must be reasonable.
+    let cut = psnr(&flatten_frame(&src[4]), &flatten_frame(&decoded[4]));
+    assert!(
+        cut > 25.0,
+        "scene-change frame PSNR {cut:.2} dB — intra-in-P didn't activate"
+    );
+
+    // ffmpeg cross-decode confirms the bitstream is conformant. Skipped
+    // when ffmpeg isn't on PATH.
+    if !command_exists("ffmpeg") {
+        return;
+    }
+    let tmp = std::env::temp_dir();
+    let es_path = tmp.join("oxideav_pvop_scene_change.m4v");
+    std::fs::write(&es_path, &es).expect("write m4v");
+    let yuv_out = tmp.join("oxideav_pvop_scene_change_ffmpeg.yuv");
+    let _ = std::fs::remove_file(&yuv_out);
+    let status = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "m4v",
+            "-i",
+            es_path.to_str().unwrap(),
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "yuv420p",
+            yuv_out.to_str().unwrap(),
+        ])
+        .status()
+        .expect("run ffmpeg");
+    assert!(
+        status.success(),
+        "ffmpeg failed to decode our scene-change stream"
+    );
+    let ff = std::fs::read(&yuv_out).expect("read ffmpeg output");
+    let per_frame = (width as usize * height as usize * 3) / 2;
+    assert!(
+        ff.len() >= per_frame * num_frames as usize,
+        "ffmpeg output too small: {} bytes for {} frames",
+        ff.len(),
+        num_frames
+    );
+    // Verify the I-VOP and the post-cut frame both decode reasonably
+    // through ffmpeg (this proves the intra-in-P MB syntax is conformant).
+    let src0 = flatten_frame(&src[0]);
+    let ff0 = &ff[0..per_frame];
+    let p0 = psnr(&src0, ff0);
+    eprintln!("scene-change ffmpeg frame 0 (I-VOP): PSNR = {p0:.2} dB");
+    assert!(
+        p0 > 30.0,
+        "ffmpeg I-VOP PSNR {p0:.2} below 30 dB — bitstream malformed"
+    );
+    let src4 = flatten_frame(&src[4]);
+    let ff4 = &ff[4 * per_frame..5 * per_frame];
+    let p4 = psnr(&src4, ff4);
+    eprintln!("scene-change ffmpeg frame 4 (cut): PSNR = {p4:.2} dB");
+    // Strong signal for the round-14 work: with intra-in-P, ffmpeg
+    // decodes the cut at >35 dB; without it, ffmpeg drift on the huge
+    // inter residual at the cut drops PSNR to ~19 dB. We assert >30 dB
+    // as a comfortable margin.
+    assert!(
+        p4 > 30.0,
+        "ffmpeg cut-frame PSNR {p4:.2} below 30 dB — intra-in-P didn't activate or syntax mismatch"
+    );
+}

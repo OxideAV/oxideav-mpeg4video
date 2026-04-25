@@ -7,10 +7,12 @@
 //!   intra blocks (Y0..Y3, Cb, Cr) with intra DC VLC + signed residual and
 //!   intra AC tcoef VLC walk (Table B-16).
 //! * P-VOP body: half-pel motion estimation (integer diamond + half-pel
-//!   refinement), 1MV / 4MV mode decision (§7.5.7 / §7.6.7),
-//!   median-predicted MVD with Table B-12, inter texture coding
-//!   (H.263 inter quant + Table B-17 tcoef walk), and `not_coded`
-//!   skip MBs. See `pvop.rs`.
+//!   refinement), 1MV / 4MV / Intra-in-P mode decision (§7.5.7 / §7.6.7
+//!   / §6.3.7), median-predicted MVD with Table B-12, inter texture
+//!   coding (H.263 inter quant + Table B-17 tcoef walk), `not_coded`
+//!   skip MBs. Embedded intra MBs use `encode_intra_mb_in_p` which
+//!   shares the I-VOP intra encode path but emits Table B-13 Intra
+//!   MCBPC rows. See `pvop.rs`.
 //! * H.263 quantisation (`mpeg_quant = 0`) — chosen to avoid mismatch
 //!   control. `vop_quant` is configurable (default 5) and stays constant
 //!   across the picture (no dquant).
@@ -759,6 +761,20 @@ pub(crate) fn encode_i_vop_body_and_reconstruct(
     Ok(pic)
 }
 
+/// Selects which MCBPC table to use when emitting an intra MB. I-VOPs use
+/// the small Table B-10 (4 entries: 0..=3 for the four `cbpc` values).
+/// P-VOPs use Table B-13's "Intra" rows 4..=7 — the call site also
+/// emits a leading `not_coded = 0` bit and the encoded MCBPC bit-pattern
+/// is different. See §6.3.5 / §6.3.7.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IntraMcbpcKind {
+    /// I-VOP: Table B-10.
+    IVop,
+    /// P-VOP: Table B-13 rows 4..=7 (Intra group). The caller is expected
+    /// to also emit `not_coded = 0` BEFORE invoking the intra encoder.
+    PVop,
+}
+
 /// Encode one intra macroblock AND reconstruct it into `pic`. The
 /// reconstructed samples mirror what the decoder would produce from the
 /// emitted bitstream, so the resulting picture is bit-exact w.r.t. downstream
@@ -772,7 +788,47 @@ fn encode_intra_mb_reconstruct(
     grid: &mut PredGrid,
     pic: &mut IVopPicture,
 ) -> Result<()> {
-    encode_intra_mb_inner(bw, v, mb_x, mb_y, quant, grid, Some(pic))
+    encode_intra_mb_inner(
+        bw,
+        v,
+        mb_x,
+        mb_y,
+        quant,
+        grid,
+        Some(pic),
+        IntraMcbpcKind::IVop,
+    )
+}
+
+/// Encode one intra macroblock embedded inside a P-VOP. Identical to the
+/// I-VOP intra encoder except the MCBPC table is Table B-13's Intra rows
+/// (caller emits `not_coded = 0` BEFORE calling this). The reconstructed
+/// MB is written into `pic` and the DC/AC prediction `grid` is updated so
+/// downstream MBs predict from it.
+///
+/// `pic` is a 16×16 luma + 2×8×8 chroma reconstruction destination
+/// (stamped via `write_recon_to_picture`). It must be the same picture
+/// that the P-VOP's MC reconstruction writes into so that subsequent
+/// reference-frame access is consistent.
+pub(crate) fn encode_intra_mb_in_p(
+    bw: &mut BitWriter,
+    v: &VideoFrame,
+    mb_x: usize,
+    mb_y: usize,
+    quant: u32,
+    grid: &mut PredGrid,
+    pic: &mut IVopPicture,
+) -> Result<()> {
+    encode_intra_mb_inner(
+        bw,
+        v,
+        mb_x,
+        mb_y,
+        quant,
+        grid,
+        Some(pic),
+        IntraMcbpcKind::PVop,
+    )
 }
 
 fn encode_intra_mb_inner(
@@ -783,6 +839,7 @@ fn encode_intra_mb_inner(
     quant: u32,
     grid: &mut PredGrid,
     mut pic: Option<&mut IVopPicture>,
+    mcbpc_kind: IntraMcbpcKind,
 ) -> Result<()> {
     // Read all six 8×8 sample blocks from the source frame (with edge
     // replication for the bottom-right partial macroblocks if any).
@@ -851,12 +908,18 @@ fn encode_intra_mb_inner(
         }
     }
 
-    // MCBPC for I (Table B-10): mcbpc value = cbpc (no IntraQ — quant is
-    // constant across the picture).
-    write_mcbpc_intra(bw, cbpc);
+    // MCBPC: I-VOP uses Table B-10 (mcbpc value = cbpc, no IntraQ — quant
+    // is constant across the picture). P-VOP intra uses Table B-13 rows
+    // 4..=7 (Intra group); the caller already emitted the `not_coded = 0`
+    // bit so the next field on the wire is the MCBPC VLC.
+    match mcbpc_kind {
+        IntraMcbpcKind::IVop => write_mcbpc_intra(bw, cbpc),
+        IntraMcbpcKind::PVop => write_mcbpc_p_intra(bw, cbpc),
+    }
     // ac_pred_flag = 0 (we never emit AC predictions).
     bw.write_bits(0, 1);
-    // CBPY (decoder uses the raw value directly for intra MBs — see mb.rs).
+    // CBPY (decoder uses the raw value directly for intra MBs — see mb.rs
+    // for I-VOP, inter.rs `decode_intra_blocks_in_p` for P-VOP).
     write_cbpy(bw, cbpy);
 
     // For each block: emit DC VLC + sign + residual + (if AC coded) AC walk.
@@ -1072,6 +1135,20 @@ fn write_mcbpc_intra(bw: &mut BitWriter, cbpc: u8) {
         1 => (3, 0b001),
         2 => (3, 0b010),
         3 => (3, 0b011),
+        _ => unreachable!("cbpc out of range: {cbpc}"),
+    };
+    bw.write_bits(code, bits);
+}
+
+/// Table B-13 rows 4..=7 — Intra MB inside a P-VOP, indexed by `cbpc`.
+/// The decoder's `decompose_inter` maps this to `(PMbType::Intra, cbpc)`.
+/// Codewords mirror the table in `tables/mcbpc.rs::P_ROWS`.
+fn write_mcbpc_p_intra(bw: &mut BitWriter, cbpc: u8) {
+    let (bits, code) = match cbpc {
+        0 => (5, 0b00011),
+        1 => (8, 0b00000100),
+        2 => (8, 0b00000011),
+        3 => (7, 0b0000011),
         _ => unreachable!("cbpc out of range: {cbpc}"),
     };
     bw.write_bits(code, bits);
@@ -1360,6 +1437,31 @@ mod tests {
             let mut br = BitReader::new(&data);
             let got = decode_intra_dc_diff(&mut br, 4).unwrap();
             assert_eq!(got, diff, "chroma DC round-trip failed for {diff}");
+        }
+    }
+
+    /// Verify the P-VOP intra MCBPC writer (Table B-13 rows 4..=7) round-trips
+    /// through the decoder's `decompose_inter` to `(PMbType::Intra, cbpc)`.
+    /// Catches any codeword swap with the I-VOP table or the Intra4MV rows.
+    #[test]
+    fn mcbpc_p_intra_roundtrip() {
+        use crate::tables::mcbpc::{decompose_inter, p_table, PMbType};
+        use crate::tables::vlc;
+        use oxideav_core::bits::BitReader;
+        for cbpc in 0..4u8 {
+            let mut bw = BitWriter::new();
+            write_mcbpc_p_intra(&mut bw, cbpc);
+            let mut data = bw.finish();
+            data.extend_from_slice(&[0xFF, 0xFF]);
+            let mut br = BitReader::new(&data);
+            let v = vlc::decode(&mut br, p_table()).unwrap();
+            let (mb_type, dec_cbpc) = decompose_inter(v);
+            assert_eq!(
+                mb_type,
+                PMbType::Intra,
+                "cbpc={cbpc} decoded as {mb_type:?} not Intra"
+            );
+            assert_eq!(dec_cbpc, cbpc, "cbpc round-trip mismatch for {cbpc}");
         }
     }
 }
