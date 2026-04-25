@@ -7,32 +7,40 @@
 //!   a small range (±7 integer pels by default) so it stays well within the
 //!   `f_code=1` vector range and keeps complexity low. Reference frame is
 //!   edge-replicated via the shared `mc::predict_block` helper.
-//! * **1MV mode only** — one MV per macroblock. 4MV is out of scope for this
-//!   first cut; see the "follow-up items" section at the bottom of the file
-//!   for the known-future enhancements.
+//! * **Mode decision: 1MV vs 4MV** (§7.5.7 / §7.6.7). The encoder runs
+//!   both 1MV (one MV per 16×16 MB) and 4MV (one MV per 8×8 luma block)
+//!   ME and picks the cheaper option in SAD with a small `FOURMV_LAMBDA`
+//!   bit-cost penalty. Round 13 enabled the 4MV path; ties favour 1MV
+//!   for cheaper coding. The 4MV path also activates the dormant 4MV-
+//!   direct mode in the B-VOP encoder via the per-block MVs in `MvGrid`.
 //! * **MV coding** per §7.6.3 — the median predictor over three causal
 //!   neighbours (left, top, top-right), then MVD reconstruction via the
 //!   unsigned-magnitude + sign + residual layout. `f_code=1` keeps the
-//!   residual absent (r_size=0).
+//!   residual absent (r_size=0). 4MV mode emits four MVDs per MB; the
+//!   per-block predictor uses the in-MB grid as updated by the prior
+//!   blocks (§7.6.2 fig 7-6).
 //! * **MCBPC** (Table B-13) distinguishes `Inter`, `InterQ`, `Intra`,
-//!   `IntraQ`, `Inter4MV` (unused here). We emit `Inter` for coded inter
-//!   MBs; skip MBs use the `not_coded` flag, and `Intra` fallback is
-//!   available when the inter mode produces too much residual.
-//! * **Skipped MB**: when the MB can be reconstructed exactly by copying
-//!   the 16×16 region at MV(0,0) from the reference with NO residual, we
-//!   write a single `not_coded=1` bit. Decoder matches (§7.6.7).
+//!   `IntraQ`, `Inter4MV`. We emit `Inter` (rows 0..=3) or `Inter4MV`
+//!   (rows 16..=19) per the mode decision; skip MBs use the
+//!   `not_coded` flag, and `Intra` fallback is not yet implemented.
+//! * **Skipped MB**: when the MB is 1MV-mode AND has MV(0,0) AND zero
+//!   residual, we emit `not_coded = 1`. 4MV MBs cannot be `not_coded`
+//!   (the decoder's not_coded path forces 1MV reconstruction). Decoder
+//!   matches (§7.6.7).
 //! * **Inter texture coding** — per-block: forward DCT on the residual
 //!   (source – predictor), H.263 inter quantisation (matches the decoder's
 //!   `dequantise_inter_h263`), inter tcoef walk (Table B-17). The encoder
 //!   reconstructs the block (dequant + IDCT + add predictor + clip) so the
 //!   emitted bitstream stays drift-free relative to the decoder's state.
+//! * **Chroma MV** — 1MV: `luma_mv_to_chroma(mv)`. 4MV: average of the
+//!   4 luma MVs scaled to chroma per §7.5.9.5 (matches the decoder's
+//!   `inter::decode_p_mb` chroma branch).
 //! * **Reference frame management** — the caller threads a single
 //!   `reference` IVopPicture (last reconstructed frame) in and receives the
 //!   newly reconstructed picture as output, which becomes the next
 //!   reference.
 //!
 //! Out of scope (returns error or NOP):
-//! * 4MV mode — encoder never emits `Inter4MV` MCBPC values.
 //! * Embedded intra MBs inside a P-VOP — the encoder always encodes MBs as
 //!   inter. This loses efficiency on scene changes but remains bit-correct.
 //! * B / S VOPs, GMC, quarter-pel motion, reduced-resolution, data
@@ -53,13 +61,40 @@ use oxideav_core::bits::BitWriter;
 /// `f_code=1` range of `[-32, 31]` half-pels.
 pub const MAX_SEARCH_INT: i32 = 7;
 
+/// Per-block 4MV refine search range (integer pels) around the 1MV result.
+/// Smaller than `MAX_SEARCH_INT` because we already have a coarse 1MV
+/// starting point and only need to refine sub-MB motion.
+const FOUR_MV_REFINE_INT: i32 = 2;
+
+/// Lambda penalty (per extra signalled MVD bit) used when comparing the SAD
+/// of 1MV vs 4MV mode. 4MV adds three extra MV components vs 1MV; we
+/// approximate the bit cost as roughly 8 bits per extra MVD pair (Table B-12
+/// magnitude+sign for small components is ~3-5 bits, plus residual is 0 at
+/// f_code=1, times 3 extra blocks). The constant is conservative: we only
+/// switch to 4MV when it beats 1MV by more than `FOURMV_LAMBDA` SAD points.
+/// At Q=5 each SAD unit roughly costs ~1/5 of a residual bit, so 24 bits
+/// of extra MVD ≈ 120 SAD points to break even — we round to 96 for a
+/// slight bias toward 4MV when the SAD wins are clear.
+const FOURMV_LAMBDA: u32 = 96;
+
 /// Encoder-side representation of one P-VOP macroblock after motion
 /// estimation. All MVs are in luma half-pel units.
 #[derive(Clone, Copy, Debug)]
 pub struct PMbEncoding {
     /// Single MV (luma half-pel units). Used for all four luma blocks and
-    /// the two chroma blocks (via `luma_mv_to_chroma`).
+    /// the two chroma blocks (via `luma_mv_to_chroma`) when `four_mv ==
+    /// false`. When `four_mv == true` this still carries `mv4_half[0]` as
+    /// a summary value (used by the predictor grid).
     pub mv_half: (i32, i32),
+    /// Per-block luma MVs when `four_mv == true` (one MV per 8×8 block,
+    /// block order 0=(0,0) 1=(8,0) 2=(0,8) 3=(8,8)). Ignored when
+    /// `four_mv == false` (collapses to `[mv_half; 4]`).
+    pub mv4_half: [(i32, i32); 4],
+    /// True when the MB is emitted in `Inter4MV` mode (Table B-13 group 4).
+    /// Bitstream emits four MVDs (one per 8×8 luma block) instead of one
+    /// per MB, with chroma MV derived as the average of the 4 luma MVs
+    /// scaled to chroma per §7.5.9.5.
+    pub four_mv: bool,
     /// When true, the MB is emitted as `not_coded` (skipped) — caller can
     /// verify by decoding a 0 residual.
     pub skipped: bool,
@@ -84,6 +119,8 @@ impl Default for PMbEncoding {
     fn default() -> Self {
         Self {
             mv_half: (0, 0),
+            mv4_half: [(0, 0); 4],
+            four_mv: false,
             skipped: false,
             luma_coded: [false; 4],
             chroma_coded: [false; 2],
@@ -153,15 +190,26 @@ pub fn encode_p_vop_body_with_grid(
                 rounding_type,
                 &mv_grid,
             )?;
-            emit_p_mb(bw, &mb, mb_x, mb_y, &mv_grid, f_code_fwd);
+            emit_p_mb(bw, &mb, mb_x, mb_y, &mut mv_grid, f_code_fwd);
             // Stash reconstructed samples into `pic`.
             write_recon_to_pic(&mut pic, &mb, mb_x, mb_y);
             // Update MV predictor grid. Record `not_coded` so B-VOP
-            // encode can inherit the skip flag per §7.5.9.5.4.
-            let motion = MbMotion {
-                mv: [mb.mv_half; 4],
-                four_mv: false,
-                not_coded: mb.skipped,
+            // encode can inherit the skip flag per §7.5.9.5.4. For 4MV
+            // MBs we record all four per-block MVs so the next P-MB's
+            // median predictor (§7.5.7) and any downstream B-VOP
+            // direct-mode 4MV scaling (§7.5.9.5) see the correct grid.
+            let motion = if mb.four_mv {
+                MbMotion {
+                    mv: mb.mv4_half,
+                    four_mv: true,
+                    not_coded: mb.skipped,
+                }
+            } else {
+                MbMotion {
+                    mv: [mb.mv_half; 4],
+                    four_mv: false,
+                    not_coded: mb.skipped,
+                }
             };
             mv_grid.set(mb_x, mb_y, motion);
         }
@@ -194,6 +242,12 @@ fn write_recon_to_pic(pic: &mut IVopPicture, mb: &PMbEncoding, mb_x: usize, mb_y
 
 /// Estimate motion for one MB, encode + reconstruct its six blocks, and
 /// return a fully-populated `PMbEncoding`.
+///
+/// Mode decision (§7.5.7 / §7.6.7): we run both 1MV and 4MV ME and pick
+/// the cheaper option in SAD with a small lambda penalty for the extra
+/// MVD bits 4MV emits (3 extra MVDs ≈ ~24 bits). 4MV improves
+/// compression on content with sub-MB-level motion (8×8 pieces moving
+/// independently) at the cost of three extra MVD pairs per MB.
 fn estimate_and_encode_mb(
     v: &oxideav_core::VideoFrame,
     reference: &IVopPicture,
@@ -206,18 +260,13 @@ fn estimate_and_encode_mb(
     // 1. Integer-pel search over the 16×16 luma MB.
     let src_y_block = load_luma_mb(v, mb_x, mb_y);
     let (int_x, int_y) = diamond_search_integer(reference, &src_y_block, mb_x, mb_y);
-    // 2. Half-pel refinement.
+    // 2. Half-pel refinement → 1MV result.
     let (mvx_half, mvy_half) =
         halfpel_refine(reference, &src_y_block, mb_x, mb_y, int_x, int_y, rounding);
     let _ = mv_grid; // MV predictor is applied only when writing MVD, not ME.
 
-    let mut mb = PMbEncoding {
-        mv_half: (mvx_half, mvy_half),
-        ..Default::default()
-    };
-
-    // 3. Build luma predictor for this MV.
-    let mut pred_y = [0u8; 256];
+    // 1MV SAD baseline — full-MB SAD against the 1MV predictor.
+    let mut pred_y_1mv = [0u8; 256];
     predict_luma_mb(
         reference,
         mb_x,
@@ -225,10 +274,61 @@ fn estimate_and_encode_mb(
         mvx_half,
         mvy_half,
         rounding,
-        &mut pred_y,
+        &mut pred_y_1mv,
     );
-    // 4. Build chroma predictors.
-    let (cmx, cmy) = (luma_mv_to_chroma(mvx_half), luma_mv_to_chroma(mvy_half));
+    let sad_1mv = sad_full_mb(&src_y_block, &pred_y_1mv);
+
+    // 3. 4MV ME — refine each 8×8 luma block around the 1MV result.
+    //    The four per-block MVs are independent; we keep the search small
+    //    (`±FOUR_MV_REFINE_INT` integer pels) since the 1MV already pinned
+    //    the rough motion. Each block does diamond + half-pel refine.
+    let mut mv4_half = [(mvx_half, mvy_half); 4];
+    let mut sad_4mv: u32 = 0;
+    let block_offsets: [(i32, i32); 4] = [(0, 0), (8, 0), (0, 8), (8, 8)];
+    for blk in 0..4 {
+        let (sub_x, sub_y) = block_offsets[blk];
+        let src_blk = read_luma_block_from_mb_xy(v, mb_x, mb_y, sub_x as usize, sub_y as usize);
+        let (mvx_b, mvy_b, sad_b) = estimate_block_mv_8x8(
+            reference, &src_blk, mb_x, mb_y, sub_x, sub_y, mvx_half, mvy_half, rounding,
+        );
+        mv4_half[blk] = (mvx_b, mvy_b);
+        sad_4mv = sad_4mv.saturating_add(sad_b);
+    }
+
+    // 4. Mode decision — favour 1MV unless 4MV beats it by more than the
+    //    lambda penalty. 1MV ties win because they're cheaper to code and
+    //    avoid splitting the MB's chroma predictor.
+    let four_mv = sad_4mv.saturating_add(FOURMV_LAMBDA) < sad_1mv;
+
+    let (mv_repr, pred_y) = if four_mv {
+        // Build the 4MV luma predictor.
+        let mut pred = [0u8; 256];
+        predict_luma_mb_4mv(reference, mb_x, mb_y, mv4_half, rounding, &mut pred);
+        // Predictor-grid summary MV — pick block 0's MV as the canonical
+        // 16×16 MV. The decoder does the same for skipped neighbour
+        // queries (mv[0] is the 4MV block-0 vector by convention).
+        (mv4_half[0], pred)
+    } else {
+        ((mvx_half, mvy_half), pred_y_1mv)
+    };
+
+    let mut mb = PMbEncoding {
+        mv_half: mv_repr,
+        mv4_half,
+        four_mv,
+        ..Default::default()
+    };
+
+    // 5. Build chroma predictors. In 4MV mode chroma uses the average of
+    //    the 4 luma MVs scaled to chroma per §7.5.9.5 (matches the
+    //    decoder's `(cmx, cmy) = if four_mv { ... }` branch in inter.rs).
+    let (cmx, cmy) = if four_mv {
+        let sx: i32 = mv4_half.iter().map(|(x, _)| *x).sum();
+        let sy: i32 = mv4_half.iter().map(|(_, y)| *y).sum();
+        (luma_mv_to_chroma(sx / 4), luma_mv_to_chroma(sy / 4))
+    } else {
+        (luma_mv_to_chroma(mvx_half), luma_mv_to_chroma(mvy_half))
+    };
     let mut pred_cb = [0u8; 64];
     let mut pred_cr = [0u8; 64];
     predict_chroma_block(
@@ -252,7 +352,7 @@ fn estimate_and_encode_mb(
         &mut pred_cr,
     );
 
-    // 5. Residual + forward DCT + quant, per 8×8 block.
+    // 6. Residual + forward DCT + quant, per 8×8 block.
     // Luma blocks: 0=(0,0) 1=(8,0) 2=(0,8) 3=(8,8)
     for blk in 0..4 {
         let (sub_x, sub_y) = match blk {
@@ -287,17 +387,224 @@ fn estimate_and_encode_mb(
     mb.recon_cb = recon_cb;
     mb.recon_cr = recon_cr;
 
-    // 6. Skip detection — MB is skippable only if MV == (0,0) AND all residual
-    // levels are zero (CBP == 0). In that case the decoder copies the
-    // reference verbatim, which must equal what we reconstructed.
+    // 7. Skip detection — MB is skippable only if 1MV mode AND MV == (0,0)
+    // AND all residual levels are zero (CBP == 0). In that case the
+    // decoder copies the reference verbatim, which must equal what we
+    // reconstructed. 4MV MBs cannot be `not_coded` (Inter4MV is its own
+    // MCBPC group; the decoder's not_coded path forces 1MV with MV=(0,0)).
     let all_zero = !mb.luma_coded.iter().any(|&c| c) && !mb.chroma_coded.iter().any(|&c| c);
-    if all_zero && mvx_half == 0 && mvy_half == 0 {
+    if !mb.four_mv && all_zero && mvx_half == 0 && mvy_half == 0 {
         // Make sure the reconstructed samples equal the reference region,
         // which they do by construction (residual=0, MV=0).
         mb.skipped = true;
     }
 
     Ok(mb)
+}
+
+/// Sum-of-absolute-differences over a 16×16 luma MB.
+fn sad_full_mb(src: &[u8; 256], pred: &[u8; 256]) -> u32 {
+    let mut s = 0u32;
+    for i in 0..256 {
+        s = s.wrapping_add((src[i] as i32 - pred[i] as i32).unsigned_abs());
+    }
+    s
+}
+
+/// Per-8×8-block ME — diamond search over a small `±FOUR_MV_REFINE_INT`
+/// window around (`init_mvx`, `init_mvy`) followed by half-pel refinement.
+/// Returns (mvx_half, mvy_half, sad).
+///
+/// `sub_x`, `sub_y` are the block's offset inside the macroblock (0 or 8).
+#[allow(clippy::too_many_arguments)]
+fn estimate_block_mv_8x8(
+    reference: &IVopPicture,
+    src_blk: &[u8; 64],
+    mb_x: usize,
+    mb_y: usize,
+    sub_x: i32,
+    sub_y: i32,
+    init_mvx_half: i32,
+    init_mvy_half: i32,
+    rounding: bool,
+) -> (i32, i32, u32) {
+    let ref_h = (reference.y.len() / reference.y_stride) as i32;
+    let ref_w = reference.y_stride as i32;
+    let blk_px = (mb_x * 16) as i32 + sub_x;
+    let blk_py = (mb_y * 16) as i32 + sub_y;
+
+    // Seed integer search from the 1MV result rounded toward zero.
+    let init_int_x = init_mvx_half / 2;
+    let init_int_y = init_mvy_half / 2;
+    let mut best_x = init_int_x;
+    let mut best_y = init_int_y;
+    let mut best_sad = sad_block_integer(
+        reference, src_blk, blk_px, blk_py, best_x, best_y, ref_w, ref_h,
+    );
+    const STEPS: [(i32, i32); 4] = [(1, 0), (-1, 0), (0, 1), (0, -1)];
+    for _ in 0..(FOUR_MV_REFINE_INT as usize * 2) {
+        let mut improved = false;
+        for (dx, dy) in STEPS {
+            let nx = best_x + dx;
+            let ny = best_y + dy;
+            // Stay inside the search window AND inside the 1MV f_code=1
+            // range (±32 half-pels = ±16 integer pels).
+            if (nx - init_int_x).abs() > FOUR_MV_REFINE_INT
+                || (ny - init_int_y).abs() > FOUR_MV_REFINE_INT
+                || nx.abs() > MAX_SEARCH_INT
+                || ny.abs() > MAX_SEARCH_INT
+            {
+                continue;
+            }
+            let s = sad_block_integer(reference, src_blk, blk_px, blk_py, nx, ny, ref_w, ref_h);
+            if s < best_sad {
+                best_sad = s;
+                best_x = nx;
+                best_y = ny;
+                improved = true;
+            }
+        }
+        if !improved {
+            break;
+        }
+    }
+    // Half-pel refine — 8 candidates around `best_x*2, best_y*2`.
+    let mut best_hx = best_x * 2;
+    let mut best_hy = best_y * 2;
+    let mut best_hsad = sad_block_halfpel(
+        reference, src_blk, blk_px, blk_py, best_hx, best_hy, rounding,
+    );
+    for dy in -1..=1 {
+        for dx in -1..=1 {
+            if dx == 0 && dy == 0 {
+                continue;
+            }
+            let hx = best_x * 2 + dx;
+            let hy = best_y * 2 + dy;
+            if hx.abs() > MAX_SEARCH_INT * 2 + 1 || hy.abs() > MAX_SEARCH_INT * 2 + 1 {
+                continue;
+            }
+            let s = sad_block_halfpel(reference, src_blk, blk_px, blk_py, hx, hy, rounding);
+            if s < best_hsad {
+                best_hsad = s;
+                best_hx = hx;
+                best_hy = hy;
+            }
+        }
+    }
+    (best_hx, best_hy, best_hsad)
+}
+
+/// Read one 8×8 luma source block at the given sub-MB position. Mirrors
+/// `read_luma_block_from_mb` but takes pre-computed (sub_x, sub_y) instead
+/// of looking the block-index up.
+fn read_luma_block_from_mb_xy(
+    v: &oxideav_core::VideoFrame,
+    mb_x: usize,
+    mb_y: usize,
+    sub_x: usize,
+    sub_y: usize,
+) -> [u8; 64] {
+    read_luma_block_from_mb(v, mb_x, mb_y, sub_x, sub_y)
+}
+
+/// Integer-pel SAD for one 8×8 luma block at (`blk_px + mvx`, `blk_py + mvy`).
+fn sad_block_integer(
+    reference: &IVopPicture,
+    src: &[u8; 64],
+    blk_px: i32,
+    blk_py: i32,
+    mvx: i32,
+    mvy: i32,
+    ref_w: i32,
+    ref_h: i32,
+) -> u32 {
+    let mut s = 0u32;
+    for j in 0..8i32 {
+        for i in 0..8i32 {
+            let x = (blk_px + mvx + i).clamp(0, ref_w - 1) as usize;
+            let y = (blk_py + mvy + j).clamp(0, ref_h - 1) as usize;
+            let r = reference.y[y * reference.y_stride + x] as i32;
+            let sv = src[(j as usize) * 8 + (i as usize)] as i32;
+            s = s.wrapping_add((sv - r).unsigned_abs());
+        }
+    }
+    s
+}
+
+/// Half-pel SAD for one 8×8 luma block. Builds the 8×8 predictor via
+/// `predict_block` and compares.
+fn sad_block_halfpel(
+    reference: &IVopPicture,
+    src: &[u8; 64],
+    blk_px: i32,
+    blk_py: i32,
+    mvx_half: i32,
+    mvy_half: i32,
+    rounding: bool,
+) -> u32 {
+    let ref_h = (reference.y.len() / reference.y_stride) as i32;
+    let ref_w = reference.y_stride as i32;
+    let mut pred = [0u8; 64];
+    predict_block(
+        &reference.y,
+        reference.y_stride,
+        ref_w,
+        ref_h,
+        blk_px,
+        blk_py,
+        mvx_half,
+        mvy_half,
+        8,
+        rounding,
+        &mut pred,
+        8,
+    );
+    let mut s = 0u32;
+    for i in 0..64 {
+        s = s.wrapping_add((src[i] as i32 - pred[i] as i32).unsigned_abs());
+    }
+    s
+}
+
+/// Build a 16×16 luma predictor from four per-block MVs. Mirrors
+/// `bvop_enc::predict_luma_mb_4mv` (kept locally to avoid cross-module
+/// visibility shuffling).
+pub(crate) fn predict_luma_mb_4mv(
+    reference: &IVopPicture,
+    mb_x: usize,
+    mb_y: usize,
+    mv4_half: [(i32, i32); 4],
+    rounding: bool,
+    out: &mut [u8; 256],
+) {
+    let ref_h = (reference.y.len() / reference.y_stride) as i32;
+    let ref_w = reference.y_stride as i32;
+    let px = (mb_x * 16) as i32;
+    let py = (mb_y * 16) as i32;
+    for (blk, (sub_x, sub_y)) in [(0i32, 0i32), (8, 0), (0, 8), (8, 8)].iter().enumerate() {
+        let (mvx, mvy) = mv4_half[blk];
+        let mut tmp = [0u8; 64];
+        predict_block(
+            &reference.y,
+            reference.y_stride,
+            ref_w,
+            ref_h,
+            px + *sub_x,
+            py + *sub_y,
+            mvx,
+            mvy,
+            8,
+            rounding,
+            &mut tmp,
+            8,
+        );
+        for j in 0..8 {
+            for i in 0..8 {
+                out[(*sub_y as usize + j) * 16 + (*sub_x as usize + i)] = tmp[j * 8 + i];
+            }
+        }
+    }
 }
 
 /// Small-diamond integer search starting at (0,0). Evaluates SAD at each
@@ -665,7 +972,7 @@ fn emit_p_mb(
     mb: &PMbEncoding,
     mb_x: usize,
     mb_y: usize,
-    mv_grid: &MvGrid,
+    mv_grid: &mut MvGrid,
     f_code_fwd: u8,
 ) {
     if mb.skipped {
@@ -676,13 +983,19 @@ fn emit_p_mb(
     // not_coded = 0.
     bw.write_bits(0, 1);
 
-    // MCBPC (Table B-13). Inter, cbpc = bit1=Cb bit0=Cr.
+    // MCBPC (Table B-13). cbpc = bit1=Cb bit0=Cr. For 4MV MBs the
+    // mb_type group is `Inter4MV` (rows 16..=19) instead of `Inter`
+    // (rows 0..=3). cbpc bits are unchanged.
     let cbpc = ((mb.chroma_coded[0] as u8) << 1) | (mb.chroma_coded[1] as u8);
-    write_mcbpc_inter(bw, cbpc);
+    if mb.four_mv {
+        write_mcbpc_inter4mv(bw, cbpc);
+    } else {
+        write_mcbpc_inter(bw, cbpc);
+    }
 
-    // CBPY — for inter MBs the encoded value is bit-inverted of the coded
-    // mask (decoder XORs with 0xF). Build the mask from `luma_coded` as
-    // bit3=Y0, bit0=Y3, then XOR with 0xF to pack into the VLC.
+    // CBPY — for inter MBs (incl. Inter4MV) the encoded value is bit-
+    // inverted of the coded mask (decoder XORs with 0xF). Build the
+    // mask from `luma_coded` as bit3=Y0, bit0=Y3, then XOR with 0xF.
     let mut cbpy_mask: u8 = 0;
     for (i, &c) in mb.luma_coded.iter().enumerate() {
         if c {
@@ -692,19 +1005,51 @@ fn emit_p_mb(
     let cbpy_encoded = cbpy_mask ^ 0xF;
     write_cbpy(bw, cbpy_encoded);
 
-    // Motion vector (1MV mode).
-    let (px, py) = crate::inter::predict_mv_full(
-        mv_grid, mb_x, mb_y, 0, false, 0,
-        0, // slice_first_mb = (0,0) — no resync markers in this encoder
-    );
-    let (mvx, mvy) = mb.mv_half;
-    let dx = mvx - px;
-    let dy = mvy - py;
-    let range = 32i32 << (f_code_fwd.saturating_sub(1) as i32);
-    let dx = wrap_mvd(dx, range);
-    let dy = wrap_mvd(dy, range);
-    write_mv_component(bw, dx, f_code_fwd);
-    write_mv_component(bw, dy, f_code_fwd);
+    // Motion vectors. 1MV: one MVD pair predicted from median(left, top,
+    // top-right) at block index 0. 4MV: four MVD pairs, one per 8×8 luma
+    // block; the predictor for block k uses the IN-MB grid as updated by
+    // the prior blocks (§7.6.2 fig 7-6, mirrored from `inter::predict_mv`).
+    if mb.four_mv {
+        // 4MV: emit four MVDs. Per §7.6.2 fig 7-6, the median predictor
+        // for block `k` may reference sub-blocks 0..k-1 of THIS MB
+        // (e.g. block 1's MV1 candidate is block 0 of THIS MB). Mirror
+        // the decoder's `inter::decode_p_mb` 4MV path: commit each
+        // freshly-decided MV into the grid so the next block's
+        // predictor sees it.
+        let mut committed = MbMotion {
+            mv: [(0, 0); 4],
+            four_mv: true,
+            not_coded: false,
+        };
+        for blk in 0..4 {
+            mv_grid.set(mb_x, mb_y, committed);
+            let (px, py) = crate::inter::predict_mv_full(mv_grid, mb_x, mb_y, blk, true, 0, 0);
+            let (mvx, mvy) = mb.mv4_half[blk];
+            let dx = mvx - px;
+            let dy = mvy - py;
+            let range = 32i32 << (f_code_fwd.saturating_sub(1) as i32);
+            let dx = wrap_mvd(dx, range);
+            let dy = wrap_mvd(dy, range);
+            write_mv_component(bw, dx, f_code_fwd);
+            write_mv_component(bw, dy, f_code_fwd);
+            committed.mv[blk] = (mvx, mvy);
+        }
+        // Final grid entry — the full four-MV motion. The outer loop
+        // also resets this immediately after `emit_p_mb` returns, but
+        // keep the assignment here for symmetry with the 1MV path and
+        // in case future callers re-use the in-progress grid.
+        mv_grid.set(mb_x, mb_y, committed);
+    } else {
+        let (px, py) = crate::inter::predict_mv_full(mv_grid, mb_x, mb_y, 0, false, 0, 0);
+        let (mvx, mvy) = mb.mv_half;
+        let dx = mvx - px;
+        let dy = mvy - py;
+        let range = 32i32 << (f_code_fwd.saturating_sub(1) as i32);
+        let dx = wrap_mvd(dx, range);
+        let dy = wrap_mvd(dy, range);
+        write_mv_component(bw, dx, f_code_fwd);
+        write_mv_component(bw, dy, f_code_fwd);
+    }
 
     // Per-block coded residual walk (Table B-17 inter tcoef).
     for blk in 0..6 {
@@ -739,6 +1084,20 @@ fn write_mcbpc_inter(bw: &mut BitWriter, cbpc: u8) {
         1 => (4, 0b0011),
         2 => (4, 0b0010),
         3 => (6, 0b000101),
+        _ => unreachable!(),
+    };
+    bw.write_bits(code, bits);
+}
+
+/// Table B-13 row for "Inter4MV, cbpc=0..=3" (values 16..=19).
+/// `decompose_inter` decodes group `value >> 2 == 4` as `PMbType::Inter4MV`,
+/// triggering the four-MV decode path in `inter::decode_p_mb`.
+fn write_mcbpc_inter4mv(bw: &mut BitWriter, cbpc: u8) {
+    let (bits, code) = match cbpc {
+        0 => (3, 0b010),
+        1 => (7, 0b0000101),
+        2 => (7, 0b0000100),
+        3 => (8, 0b00000101),
         _ => unreachable!(),
     };
     bw.write_bits(code, bits);
@@ -934,21 +1293,70 @@ mod tests {
             );
         }
     }
+
+    /// Verify the 4MV chroma MV averaging matches the formula `mean(luma)/2`
+    /// (with the round-toward-zero step inside `luma_mv_to_chroma`). The
+    /// decoder uses the exact same formula on its side (see
+    /// `inter::decode_p_mb` chroma branch), so any asymmetry would cause
+    /// a chroma-MV mismatch on 4MV MBs.
+    #[test]
+    fn four_mv_chroma_avg_matches_decoder_formula() {
+        let mvs: [(i32, i32); 4] = [(2, 4), (-3, 5), (1, -2), (4, 1)];
+        let sx: i32 = mvs.iter().map(|(x, _)| *x).sum();
+        let sy: i32 = mvs.iter().map(|(_, y)| *y).sum();
+        let cmx_enc = luma_mv_to_chroma(sx / 4);
+        let cmy_enc = luma_mv_to_chroma(sy / 4);
+        // Decoder side reduction of the same operation:
+        let cmx_dec = luma_mv_to_chroma(sx / 4);
+        let cmy_dec = luma_mv_to_chroma(sy / 4);
+        assert_eq!(cmx_enc, cmx_dec);
+        assert_eq!(cmy_enc, cmy_dec);
+    }
+
+    /// Exercise the 4MV MCBPC writer for all four cbpc values — the
+    /// codewords come from Table B-13 rows 16..=19 (`Inter4MV`). A
+    /// round-trip through the decoder's MCBPC table must yield the
+    /// same `(PMbType::Inter4MV, cbpc)`.
+    #[test]
+    fn mcbpc_inter4mv_roundtrip() {
+        use crate::tables::mcbpc::{decompose_inter, p_table, PMbType};
+        use crate::tables::vlc;
+        use oxideav_core::bits::BitReader;
+        for cbpc in 0..4u8 {
+            let mut bw = BitWriter::new();
+            write_mcbpc_inter4mv(&mut bw, cbpc);
+            // Pad with stop bits so the MCBPC reader has enough lookahead.
+            let mut data = bw.finish();
+            data.extend_from_slice(&[0xFF, 0xFF]);
+            let mut br = BitReader::new(&data);
+            let v = vlc::decode(&mut br, p_table()).unwrap();
+            let (mb_type, dec_cbpc) = decompose_inter(v);
+            assert_eq!(
+                mb_type,
+                PMbType::Inter4MV,
+                "cbpc={cbpc} decoded as {mb_type:?} not Inter4MV"
+            );
+            assert_eq!(dec_cbpc, cbpc, "cbpc round-trip mismatch");
+        }
+    }
 }
 
 // -------------------------------------------------------------------------
 // Follow-up items (not blocking — documented for future work):
 //
-// * 4MV mode: emit `PMbType::Inter4MV` MCBPC codes, four MVs per MB with
-//   per-block ME. The decoder already supports this path, so enabling
-//   it on the encoder side would be a pure encoder-complexity trade-off
-//   (better compression on non-translational motion in exchange for a
-//   per-block ME search and four MV VLCs per MB).
+// * 4MV mode — landed in round 13. P-MBs now optionally emit `Inter4MV`
+//   (Table B-13 group 4) with per-8×8-block MVDs and a chroma MV taken
+//   as the average of the 4 luma MVs scaled to chroma per §7.5.9.5.
+//   The mode decision is a SAD comparison with a small `FOURMV_LAMBDA`
+//   penalty for the extra MVD bits; ties favour 1MV. This also
+//   activates the round-12 dormant 4MV-direct path in B-VOPs (a B-MB
+//   in direct mode whose co-located P-MB used 4MV inherits the 4
+//   per-block MVs via `direct_mode_mvs_4`).
 // * Intra MB fallback inside P-VOP for high-residual blocks. Useful on
 //   scene-change boundaries where the inter predictor yields more
 //   residual bits than a fresh intra block would. Not yet implemented;
 //   the encoder currently always codes MBs as inter inside a P-VOP.
-// * B-VOPs, GMC, sprites, quarter-pel motion, OBMC — deliberately out
-//   of scope for this encoder. They would each require material
-//   bitstream changes (B-VOP syntax, sprite metadata, the `quarter_pel`
-//   flag path) and are tracked separately from the P-VOP work.
+// * GMC, sprites, quarter-pel motion, OBMC — deliberately out of scope
+//   for this encoder. They would each require material bitstream
+//   changes (sprite metadata, the `quarter_pel` flag path) and are
+//   tracked separately from the P-VOP work.

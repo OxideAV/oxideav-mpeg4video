@@ -7,9 +7,10 @@
 //!   intra blocks (Y0..Y3, Cb, Cr) with intra DC VLC + signed residual and
 //!   intra AC tcoef VLC walk (Table B-16).
 //! * P-VOP body: half-pel motion estimation (integer diamond + half-pel
-//!   refinement), 1MV mode, median-predicted MVD with Table B-12, inter
-//!   texture coding (H.263 inter quant + Table B-17 tcoef walk), and
-//!   `not_coded` skip MBs. See `pvop.rs`.
+//!   refinement), 1MV / 4MV mode decision (§7.5.7 / §7.6.7),
+//!   median-predicted MVD with Table B-12, inter texture coding
+//!   (H.263 inter quant + Table B-17 tcoef walk), and `not_coded`
+//!   skip MBs. See `pvop.rs`.
 //! * H.263 quantisation (`mpeg_quant = 0`) — chosen to avoid mismatch
 //!   control. `vop_quant` is configurable (default 5) and stays constant
 //!   across the picture (no dquant).
@@ -25,8 +26,7 @@
 //!   Reference frame is the most recent reconstructed picture.
 //!
 //! Out of scope (returns `Error::Unsupported` from the encoder factory):
-//! * 4MV mode for P-VOPs.
-//! * B / S VOPs (§6.2.5).
+//! * S VOPs (§6.2.5).
 //! * Sprites / GMC (§6.2.4 sprite_enable).
 //! * Interlace, scalability, data partitioning, reversible VLCs.
 //!
