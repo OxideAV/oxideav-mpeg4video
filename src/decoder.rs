@@ -38,8 +38,7 @@ use std::collections::VecDeque;
 use oxideav_core::frame::VideoPlane;
 use oxideav_core::Decoder;
 use oxideav_core::{
-    CodecId, CodecParameters, Error, Frame, Packet, PixelFormat, Rational, Result, TimeBase,
-    VideoFrame,
+    CodecId, CodecParameters, Error, Frame, Packet, Rational, Result, TimeBase, VideoFrame,
 };
 
 use crate::bvop::{decode_b_mb, trb_trd, BMvGrid, BRowPred};
@@ -742,7 +741,7 @@ pub fn pic_to_video_frame(
     vol: &VideoObjectLayer,
     pic: &IVopPicture,
     pts: Option<i64>,
-    tb: TimeBase,
+    _tb: TimeBase,
 ) -> VideoFrame {
     let w = vol.width as usize;
     let h = vol.height as usize;
@@ -761,11 +760,7 @@ pub fn pic_to_video_frame(
             .copy_from_slice(&pic.cr[row * pic.c_stride..row * pic.c_stride + cw]);
     }
     VideoFrame {
-        format: PixelFormat::Yuv420P,
-        width: w as u32,
-        height: h as u32,
         pts,
-        time_base: tb,
         planes: vec![
             VideoPlane { stride: w, data: y },
             VideoPlane {

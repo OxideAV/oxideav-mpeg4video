@@ -225,16 +225,6 @@ impl Encoder for Mpeg4VideoEncoder {
             Frame::Video(v) => v,
             _ => return Err(Error::invalid("mpeg4 encoder: video frames only")),
         };
-        if v.width != self.width || v.height != self.height {
-            return Err(Error::invalid(
-                "mpeg4 encoder: frame dimensions do not match encoder config",
-            ));
-        }
-        if v.format != PixelFormat::Yuv420P {
-            return Err(Error::invalid(
-                "mpeg4 encoder: only Yuv420P input frames supported",
-            ));
-        }
         if v.planes.len() != 3 {
             return Err(Error::invalid("mpeg4 encoder: expected 3 planes"));
         }
@@ -324,7 +314,7 @@ impl Mpeg4VideoEncoder {
         let vti_resolution = (self.frame_rate.num as u32).max(1);
         if is_keyframe {
             write_i_vop_header(&mut bw, time_inc, self.vop_quant, vti_resolution);
-            let pic = encode_i_vop_body_and_reconstruct(&mut bw, v, self.vop_quant)?;
+            let pic = encode_i_vop_body_and_reconstruct(&mut bw, v, self.width, self.height, self.vop_quant)?;
             self.reference = Some(pic);
             self.reference_grid = None;
             self.reference_time = time_inc as i64;
@@ -345,6 +335,8 @@ impl Mpeg4VideoEncoder {
             let (pic, grid) = encode_p_vop_body_with_grid(
                 &mut bw,
                 v,
+                self.width,
+                self.height,
                 reference,
                 self.vop_quant,
                 self.f_code_fwd,
@@ -395,7 +387,7 @@ impl Mpeg4VideoEncoder {
         let vti_resolution = (self.frame_rate.num as u32).max(1);
         if is_keyframe {
             write_i_vop_header(&mut bw, time_inc, self.vop_quant, vti_resolution);
-            let pic = encode_i_vop_body_and_reconstruct(&mut bw, v, self.vop_quant)?;
+            let pic = encode_i_vop_body_and_reconstruct(&mut bw, v, self.width, self.height, self.vop_quant)?;
             self.reference = Some(pic);
             self.reference_grid = None; // I-VOPs have no MV grid.
             self.reference_time = time_inc as i64;
@@ -415,6 +407,8 @@ impl Mpeg4VideoEncoder {
             let (pic, grid) = encode_p_vop_body_with_grid(
                 &mut bw,
                 v,
+                self.width,
+                self.height,
                 reference,
                 self.vop_quant,
                 self.f_code_fwd,
@@ -516,6 +510,8 @@ impl Mpeg4VideoEncoder {
         encode_b_vop_body(
             &mut bw,
             v,
+            self.width,
+            self.height,
             prev_forward,
             next_backward,
             grid,
@@ -808,10 +804,12 @@ fn write_p_vop_header(
 pub(crate) fn encode_i_vop_body_and_reconstruct(
     bw: &mut BitWriter,
     v: &VideoFrame,
+    width: u32,
+    height: u32,
     vop_quant: u32,
 ) -> Result<IVopPicture> {
-    let width = v.width as usize;
-    let height = v.height as usize;
+    let width = width as usize;
+    let height = height as usize;
     let mb_w = width.div_ceil(16);
     let mb_h = height.div_ceil(16);
 
@@ -825,7 +823,7 @@ pub(crate) fn encode_i_vop_body_and_reconstruct(
 
     for mb_y in 0..mb_h {
         for mb_x in 0..mb_w {
-            encode_intra_mb_reconstruct(bw, v, mb_x, mb_y, vop_quant, &mut grid, &mut pic)?;
+            encode_intra_mb_reconstruct(bw, v, width, height, mb_x, mb_y, vop_quant, &mut grid, &mut pic)?;
         }
     }
     Ok(pic)
@@ -852,6 +850,8 @@ pub(crate) enum IntraMcbpcKind {
 fn encode_intra_mb_reconstruct(
     bw: &mut BitWriter,
     v: &VideoFrame,
+    width: usize,
+    height: usize,
     mb_x: usize,
     mb_y: usize,
     quant: u32,
@@ -861,6 +861,8 @@ fn encode_intra_mb_reconstruct(
     encode_intra_mb_inner(
         bw,
         v,
+        width,
+        height,
         mb_x,
         mb_y,
         quant,
@@ -883,6 +885,8 @@ fn encode_intra_mb_reconstruct(
 pub(crate) fn encode_intra_mb_in_p(
     bw: &mut BitWriter,
     v: &VideoFrame,
+    width: usize,
+    height: usize,
     mb_x: usize,
     mb_y: usize,
     quant: u32,
@@ -892,6 +896,8 @@ pub(crate) fn encode_intra_mb_in_p(
     encode_intra_mb_inner(
         bw,
         v,
+        width,
+        height,
         mb_x,
         mb_y,
         quant,
@@ -904,6 +910,8 @@ pub(crate) fn encode_intra_mb_in_p(
 fn encode_intra_mb_inner(
     bw: &mut BitWriter,
     v: &VideoFrame,
+    width: usize,
+    height: usize,
     mb_x: usize,
     mb_y: usize,
     quant: u32,
@@ -915,7 +923,7 @@ fn encode_intra_mb_inner(
     // replication for the bottom-right partial macroblocks if any).
     let mut blocks = [[0i32; 64]; 6];
     for blk in 0..6 {
-        load_block_samples(v, mb_x, mb_y, blk, &mut blocks[blk]);
+        load_block_samples(v, width, height, mb_x, mb_y, blk, &mut blocks[blk]);
     }
 
     // Forward DCT each block (no level shift — MPEG-4 stores DC directly in
@@ -1086,8 +1094,16 @@ fn write_recon_to_picture(
 // Sample fetch + neighbour-grid bookkeeping
 // -------------------------------------------------------------------------
 
-fn load_block_samples(v: &VideoFrame, mb_x: usize, mb_y: usize, blk: usize, out: &mut [i32; 64]) {
-    let (plane_idx, x0, y0, pw, ph) = block_pel_position(v, mb_x, mb_y, blk);
+fn load_block_samples(
+    v: &VideoFrame,
+    width: usize,
+    height: usize,
+    mb_x: usize,
+    mb_y: usize,
+    blk: usize,
+    out: &mut [i32; 64],
+) {
+    let (plane_idx, x0, y0, pw, ph) = block_pel_position(width, height, mb_x, mb_y, blk);
     let p = &v.planes[plane_idx];
     for j in 0..8 {
         let yy = (y0 + j).min(ph.saturating_sub(1));
@@ -1099,13 +1115,14 @@ fn load_block_samples(v: &VideoFrame, mb_x: usize, mb_y: usize, blk: usize, out:
 }
 
 pub(crate) fn block_pel_position(
-    v: &VideoFrame,
+    width: usize,
+    height: usize,
     mb_x: usize,
     mb_y: usize,
     blk: usize,
 ) -> (usize, usize, usize, usize, usize) {
-    let w = v.width as usize;
-    let h = v.height as usize;
+    let w = width;
+    let h = height;
     let cw = w.div_ceil(2);
     let ch = h.div_ceil(2);
     match blk {

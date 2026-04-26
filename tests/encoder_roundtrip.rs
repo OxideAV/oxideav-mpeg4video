@@ -54,11 +54,7 @@ fn make_video_frame(yuv: &[u8]) -> VideoFrame {
     let cb = yuv[4096..5120].to_vec();
     let cr = yuv[5120..6144].to_vec();
     VideoFrame {
-        format: PixelFormat::Yuv420P,
-        width: 64,
-        height: 64,
         pts: Some(0),
-        time_base: TimeBase::new(1, 24),
         planes: vec![
             VideoPlane {
                 stride: 64,
@@ -345,7 +341,6 @@ fn encode_bvop_roundtrip_psnr() {
         let chunk = &yuv[off..off + frame_bytes];
         let mut vf = make_video_frame(chunk);
         vf.pts = Some(i as i64);
-        vf.time_base = TimeBase::new(1, 24);
         enc.send_frame(&Frame::Video(vf)).expect("send_frame");
     }
     enc.flush().expect("flush enc");
@@ -469,7 +464,6 @@ fn encode_bvop_qpel_roundtrip_psnr() {
             let chunk = &yuv[off..off + frame_bytes];
             let mut vf = make_video_frame(chunk);
             vf.pts = Some(i as i64);
-            vf.time_base = TimeBase::new(1, 24);
             enc.send_frame(&Frame::Video(vf)).expect("send_frame");
         }
         enc.flush().expect("flush enc");
@@ -639,7 +633,6 @@ fn encode_15fps_vti_bits_roundtrip() {
             let chunk = &yuv[off..off + frame_bytes];
             let mut vf = make_video_frame(chunk);
             vf.pts = Some(i as i64);
-            vf.time_base = TimeBase::new(1, fps as i64);
             enc.send_frame(&Frame::Video(vf)).expect("send_frame");
         }
         enc.flush().expect("flush enc");

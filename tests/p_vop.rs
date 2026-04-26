@@ -50,11 +50,7 @@ fn make_frame(idx: u32, width: u32, height: u32) -> VideoFrame {
         }
     }
     VideoFrame {
-        format: PixelFormat::Yuv420P,
-        width,
-        height,
         pts: Some(idx as i64),
-        time_base: TimeBase::new(1, 24),
         planes: vec![
             VideoPlane { stride: w, data: y },
             VideoPlane {
@@ -364,11 +360,7 @@ fn make_subblock_motion_frame(
         }
     }
     VideoFrame {
-        format: PixelFormat::Yuv420P,
-        width,
-        height,
         pts: Some(idx as i64),
-        time_base: TimeBase::new(1, 24),
         planes: vec![
             VideoPlane { stride: w, data: y },
             VideoPlane {
@@ -514,11 +506,7 @@ fn make_scene(phase: u32, width: u32, height: u32) -> VideoFrame {
         }
     }
     VideoFrame {
-        format: PixelFormat::Yuv420P,
-        width,
-        height,
         pts: Some(0),
-        time_base: TimeBase::new(1, 24),
         planes: vec![
             VideoPlane { stride: w, data: y },
             VideoPlane {
@@ -720,11 +708,7 @@ fn make_qpel_friendly_frame(idx: u32, width: u32, height: u32) -> VideoFrame {
         }
     }
     VideoFrame {
-        format: PixelFormat::Yuv420P,
-        width,
-        height,
         pts: Some(idx as i64),
-        time_base: TimeBase::new(1, 24),
         planes: vec![
             VideoPlane { stride: w, data: y },
             VideoPlane {

@@ -106,7 +106,6 @@ fn decode_bvop_4mv_clip_runs() {
     let _ = dec.flush();
     let mut n = 0;
     while let Ok(Frame::Video(vf)) = dec.receive_frame() {
-        assert_eq!(vf.format, PixelFormat::Yuv420P);
         n += 1;
         if n > 64 {
             break;
@@ -136,7 +135,6 @@ fn decode_bvop_qpel_clip_runs() {
     let _ = dec.flush();
     let mut n = 0;
     while let Ok(Frame::Video(vf)) = dec.receive_frame() {
-        assert_eq!(vf.format, PixelFormat::Yuv420P);
         n += 1;
         if n > 64 {
             break;
@@ -264,9 +262,6 @@ fn decode_bvop_clip_matches_ffmpeg() {
                 break;
             }
         };
-        assert_eq!(frame.format, PixelFormat::Yuv420P);
-        assert_eq!(frame.width, 64);
-        assert_eq!(frame.height, 64);
         let mut ours = Vec::with_capacity(frame_size);
         ours.extend_from_slice(&frame.planes[0].data);
         ours.extend_from_slice(&frame.planes[1].data);
@@ -405,11 +400,7 @@ mod encoder_b_vops {
             }
         }
         VideoFrame {
-            format: PixelFormat::Yuv420P,
-            width,
-            height,
             pts: Some(idx as i64),
-            time_base: TimeBase::new(1, 24),
             planes: vec![
                 VideoPlane { stride: w, data: y },
                 VideoPlane {

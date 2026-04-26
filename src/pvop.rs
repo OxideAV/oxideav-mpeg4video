@@ -183,6 +183,8 @@ impl Default for PMbEncoding {
 pub fn encode_p_vop_body(
     bw: &mut BitWriter,
     v: &oxideav_core::VideoFrame,
+    width: u32,
+    height: u32,
     reference: &IVopPicture,
     vop_quant: u32,
     f_code_fwd: u8,
@@ -191,6 +193,8 @@ pub fn encode_p_vop_body(
     let (pic, _mv_grid) = encode_p_vop_body_with_grid(
         bw,
         v,
+        width,
+        height,
         reference,
         vop_quant,
         f_code_fwd,
@@ -210,14 +214,16 @@ pub fn encode_p_vop_body(
 pub fn encode_p_vop_body_with_grid(
     bw: &mut BitWriter,
     v: &oxideav_core::VideoFrame,
+    width: u32,
+    height: u32,
     reference: &IVopPicture,
     vop_quant: u32,
     f_code_fwd: u8,
     rounding_type: bool,
     quarter_sample: bool,
 ) -> Result<(IVopPicture, MvGrid)> {
-    let width = v.width as usize;
-    let height = v.height as usize;
+    let width = width as usize;
+    let height = height as usize;
     let mb_w = width.div_ceil(16);
     let mb_h = height.div_ceil(16);
 
@@ -235,6 +241,8 @@ pub fn encode_p_vop_body_with_grid(
             // Decision pass — also produces a fully-reconstructed inter MB.
             let mb = estimate_and_encode_mb(
                 v,
+                width,
+                height,
                 reference,
                 mb_x,
                 mb_y,
@@ -249,7 +257,7 @@ pub fn encode_p_vop_body_with_grid(
             // proxy is computed against the source-MB DC mean. Switch
             // to intra when intra clearly wins (inter SAD exceeds the
             // intra proxy plus `INTRA_IN_P_BIAS + INTRA_MARGIN`).
-            let intra_cost = intra_cost_proxy(v, mb_x, mb_y);
+            let intra_cost = intra_cost_proxy(v, width, height, mb_x, mb_y);
             let inter_cost = inter_cost_proxy(&mb);
             let prefer_intra = inter_cost
                 > intra_cost
@@ -264,7 +272,7 @@ pub fn encode_p_vop_body_with_grid(
                 //   CBPY (raw — not bit-inverted for intra)
                 //   six intra blocks (DC VLC + AC walk)
                 bw.write_bits(0, 1);
-                encode_intra_mb_in_p(bw, v, mb_x, mb_y, vop_quant, &mut pred_grid, &mut pic)?;
+                encode_intra_mb_in_p(bw, v, width, height, mb_x, mb_y, vop_quant, &mut pred_grid, &mut pic)?;
                 // MV grid: intra MBs contribute (0,0) to the median
                 // predictor of future inter MBs (§7.6.7 step 3) and
                 // are NOT considered `not_coded`. Co-located B-VOP
@@ -344,11 +352,17 @@ fn reset_pred_grid_mb(grid: &mut PredGrid, mb_x: usize, mb_y: usize) {
 /// We only sum the four luma blocks so the value is on the same scale
 /// as `inter_luma_sad` (the chosen-mode 16×16 luma SAD). Chroma is
 /// usually low-variance and would only blur the comparison.
-fn intra_cost_proxy(v: &oxideav_core::VideoFrame, mb_x: usize, mb_y: usize) -> u32 {
+fn intra_cost_proxy(
+    v: &oxideav_core::VideoFrame,
+    width: usize,
+    height: usize,
+    mb_x: usize,
+    mb_y: usize,
+) -> u32 {
     let mut total = 0u32;
     for blk in 0..4 {
         let mut block = [0u8; 64];
-        load_block_for_intra_cost(v, mb_x, mb_y, blk, &mut block);
+        load_block_for_intra_cost(v, width, height, mb_x, mb_y, blk, &mut block);
         let mut sum = 0u32;
         for &s in block.iter() {
             sum += s as u32;
@@ -380,12 +394,14 @@ fn inter_cost_proxy(mb: &PMbEncoding) -> u32 {
 /// for chroma blocks 4..=5.
 fn load_block_for_intra_cost(
     v: &oxideav_core::VideoFrame,
+    width: usize,
+    height: usize,
     mb_x: usize,
     mb_y: usize,
     blk: usize,
     out: &mut [u8; 64],
 ) {
-    let (plane_idx, x0, y0, pw, ph) = block_pel_position(v, mb_x, mb_y, blk);
+    let (plane_idx, x0, y0, pw, ph) = block_pel_position(width, height, mb_x, mb_y, blk);
     let plane = &v.planes[plane_idx];
     for j in 0..8 {
         let yy = (y0 + j).min(ph.saturating_sub(1));
@@ -428,6 +444,8 @@ fn write_recon_to_pic(pic: &mut IVopPicture, mb: &PMbEncoding, mb_x: usize, mb_y
 /// independently) at the cost of three extra MVD pairs per MB.
 fn estimate_and_encode_mb(
     v: &oxideav_core::VideoFrame,
+    width: usize,
+    height: usize,
     reference: &IVopPicture,
     mb_x: usize,
     mb_y: usize,
@@ -437,7 +455,7 @@ fn estimate_and_encode_mb(
     quarter_sample: bool,
 ) -> Result<PMbEncoding> {
     // 1. Integer-pel search over the 16×16 luma MB.
-    let src_y_block = load_luma_mb(v, mb_x, mb_y);
+    let src_y_block = load_luma_mb(v, width, height, mb_x, mb_y);
     let (int_x, int_y) = diamond_search_integer(reference, &src_y_block, mb_x, mb_y);
     // 2. Half-pel refinement → seed for QPel refine when QPel is on.
     let (mvx_half, mvy_half) =
@@ -489,7 +507,8 @@ fn estimate_and_encode_mb(
     let block_offsets: [(i32, i32); 4] = [(0, 0), (8, 0), (0, 8), (8, 8)];
     for blk in 0..4 {
         let (sub_x, sub_y) = block_offsets[blk];
-        let src_blk = read_luma_block_from_mb_xy(v, mb_x, mb_y, sub_x as usize, sub_y as usize);
+        let src_blk =
+            read_luma_block_from_mb_xy(v, width, height, mb_x, mb_y, sub_x as usize, sub_y as usize);
         let (mvx_b, mvy_b, sad_b) = estimate_block_mv_8x8(
             reference,
             &src_blk,
@@ -604,7 +623,7 @@ fn estimate_and_encode_mb(
             3 => (8, 8),
             _ => unreachable!(),
         };
-        let src = read_luma_block_from_mb(v, mb_x, mb_y, sub_x, sub_y);
+        let src = read_luma_block_from_mb(v, width, height, mb_x, mb_y, sub_x, sub_y);
         let pred_blk = read_pred_block(&pred_y, 16, sub_x, sub_y);
         let (levels, recon) = encode_inter_block(&src, &pred_blk, vop_quant);
         mb.luma_coded[blk] = levels.iter().any(|&l| l != 0);
@@ -618,8 +637,8 @@ fn estimate_and_encode_mb(
     }
 
     // Chroma blocks.
-    let src_cb = load_chroma_block(v, 1, mb_x, mb_y);
-    let src_cr = load_chroma_block(v, 2, mb_x, mb_y);
+    let src_cb = load_chroma_block(v, width, height, 1, mb_x, mb_y);
+    let src_cr = load_chroma_block(v, width, height, 2, mb_x, mb_y);
     let (levels_cb, recon_cb) = encode_inter_block(&src_cb, &pred_cb, vop_quant);
     let (levels_cr, recon_cr) = encode_inter_block(&src_cr, &pred_cr, vop_quant);
     mb.chroma_coded[0] = levels_cb.iter().any(|&l| l != 0);
@@ -817,12 +836,14 @@ fn sad_block_qpel(
 /// of looking the block-index up.
 fn read_luma_block_from_mb_xy(
     v: &oxideav_core::VideoFrame,
+    width: usize,
+    height: usize,
     mb_x: usize,
     mb_y: usize,
     sub_x: usize,
     sub_y: usize,
 ) -> [u8; 64] {
-    read_luma_block_from_mb(v, mb_x, mb_y, sub_x, sub_y)
+    read_luma_block_from_mb(v, width, height, mb_x, mb_y, sub_x, sub_y)
 }
 
 /// Integer-pel SAD for one 8×8 luma block at (`blk_px + mvx`, `blk_py + mvy`).
@@ -1294,10 +1315,16 @@ pub(crate) fn predict_chroma_block(
     );
 }
 
-pub(crate) fn load_luma_mb(v: &oxideav_core::VideoFrame, mb_x: usize, mb_y: usize) -> [u8; 256] {
+pub(crate) fn load_luma_mb(
+    v: &oxideav_core::VideoFrame,
+    width: usize,
+    height: usize,
+    mb_x: usize,
+    mb_y: usize,
+) -> [u8; 256] {
     let mut out = [0u8; 256];
-    let w = v.width as usize;
-    let h = v.height as usize;
+    let w = width;
+    let h = height;
     let plane = &v.planes[0];
     for j in 0..16 {
         let yy = (mb_y * 16 + j).min(h.saturating_sub(1));
@@ -1311,13 +1338,15 @@ pub(crate) fn load_luma_mb(v: &oxideav_core::VideoFrame, mb_x: usize, mb_y: usiz
 
 pub(crate) fn load_chroma_block(
     v: &oxideav_core::VideoFrame,
+    width: usize,
+    height: usize,
     plane_idx: usize,
     mb_x: usize,
     mb_y: usize,
 ) -> [u8; 64] {
     let mut out = [0u8; 64];
-    let cw = (v.width as usize).div_ceil(2);
-    let ch = (v.height as usize).div_ceil(2);
+    let cw = width.div_ceil(2);
+    let ch = height.div_ceil(2);
     let plane = &v.planes[plane_idx];
     for j in 0..8 {
         let yy = (mb_y * 8 + j).min(ch.saturating_sub(1));
@@ -1331,13 +1360,16 @@ pub(crate) fn load_chroma_block(
 
 fn read_luma_block_from_mb(
     v: &oxideav_core::VideoFrame,
+    width: usize,
+    height: usize,
     mb_x: usize,
     mb_y: usize,
     sub_x: usize,
     sub_y: usize,
 ) -> [u8; 64] {
     let mut out = [0u8; 64];
-    let (_, x0, y0, pw, ph) = block_pel_position(v, mb_x, mb_y, block_index_for_sub(sub_x, sub_y));
+    let (_, x0, y0, pw, ph) =
+        block_pel_position(width, height, mb_x, mb_y, block_index_for_sub(sub_x, sub_y));
     let plane = &v.planes[0];
     for j in 0..8 {
         let yy = (y0 + j).min(ph.saturating_sub(1));

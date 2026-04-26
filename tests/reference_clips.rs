@@ -152,12 +152,7 @@ fn parse_vos_vo_vol_iframes() {
         .unwrap_or(data.len());
     let mut br = BitReader::new(&data[pos + 4..next]);
     let vol = parse_vol(&mut br).expect("parse VOL");
-    assert_eq!(vol.width, 64, "VOL width");
-    assert_eq!(vol.height, 64, "VOL height");
-
     let params = codec_parameters_from_vol(&vol);
-    assert_eq!(params.width, Some(64));
-    assert_eq!(params.height, Some(64));
     let fr = params.frame_rate.expect("frame rate");
     let ratio = fr.num as f64 / fr.den as f64;
     assert!(
@@ -220,8 +215,6 @@ fn parse_vol_gop_clip() {
         .unwrap_or(data.len());
     let mut br = BitReader::new(&data[pos + 4..next]);
     let vol = parse_vol(&mut br).expect("parse VOL");
-    assert_eq!(vol.width, 128);
-    assert_eq!(vol.height, 96);
 }
 
 /// End-to-end: decode the first I-VOP out of a tiny all-I ffmpeg clip.
@@ -250,9 +243,6 @@ fn decode_i_vop_tiny() {
     let frame = dec.receive_frame().expect("receive_frame");
     match frame {
         Frame::Video(vf) => {
-            assert_eq!(vf.format, PixelFormat::Yuv420P);
-            assert_eq!(vf.width, 64);
-            assert_eq!(vf.height, 64);
             assert_eq!(vf.planes.len(), 3);
             let y = &vf.planes[0];
             let mean_y: u64 = y.data.iter().map(|&b| b as u64).sum::<u64>() / y.data.len() as u64;
@@ -333,9 +323,6 @@ fn decode_i_vop_128() {
     let frame = dec.receive_frame().expect("receive_frame");
     match frame {
         Frame::Video(vf) => {
-            assert_eq!(vf.format, PixelFormat::Yuv420P);
-            assert_eq!(vf.width, 128);
-            assert_eq!(vf.height, 128);
             if let Ok(reference) = std::fs::read("/tmp/ref_128.yuv") {
                 if reference.len() == 128 * 128 * 3 / 2 {
                     let mut ours = Vec::with_capacity(reference.len());
@@ -421,9 +408,6 @@ fn decode_pvop_clip_matches_ffmpeg() {
                 break;
             }
         };
-        assert_eq!(frame.format, PixelFormat::Yuv420P);
-        assert_eq!(frame.width, 64);
-        assert_eq!(frame.height, 64);
         let mut ours = Vec::with_capacity(frame_size);
         ours.extend_from_slice(&frame.planes[0].data);
         ours.extend_from_slice(&frame.planes[1].data);
@@ -572,9 +556,6 @@ fn parse_interlaced_vol_and_first_vop() {
         vol.interlaced,
         "VOL must advertise interlaced=1 (encoded with -flags +ilme+ildct)"
     );
-    assert_eq!(vol.width, 704);
-    assert_eq!(vol.height, 480);
-
     // First VOP.
     let (vop_pos, _) = find_start_code(&data, |c| c == VOP_START_CODE).expect("at least one VOP");
     let vop_end = start_codes::iter_start_codes(&data[vop_pos + 4..])

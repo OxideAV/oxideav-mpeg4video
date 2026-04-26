@@ -149,6 +149,8 @@ impl BMbEncoding {
 pub fn encode_b_vop_body(
     bw: &mut BitWriter,
     v: &oxideav_core::VideoFrame,
+    width: u32,
+    height: u32,
     prev_ref: &IVopPicture,
     next_ref: &IVopPicture,
     prev_ref_grid: &MvGrid,
@@ -159,8 +161,8 @@ pub fn encode_b_vop_body(
     trd: i32,
     quarter_sample: bool,
 ) -> Result<()> {
-    let width = v.width as usize;
-    let height = v.height as usize;
+    let width = width as usize;
+    let height = height as usize;
     let mb_w = width.div_ceil(16);
     let mb_h = height.div_ceil(16);
 
@@ -195,6 +197,8 @@ pub fn encode_b_vop_body(
 
             let mb = estimate_b_mb(
                 v,
+                width,
+                height,
                 prev_ref,
                 next_ref,
                 mb_x,
@@ -242,6 +246,8 @@ pub fn encode_b_vop_body(
 #[allow(clippy::too_many_arguments)]
 fn estimate_b_mb(
     v: &oxideav_core::VideoFrame,
+    width: usize,
+    height: usize,
     prev_ref: &IVopPicture,
     next_ref: &IVopPicture,
     mb_x: usize,
@@ -253,7 +259,7 @@ fn estimate_b_mb(
     trd: i32,
     quarter_sample: bool,
 ) -> Result<BMbEncoding> {
-    let src_y = load_luma_mb(v, mb_x, mb_y);
+    let src_y = load_luma_mb(v, width, height, mb_x, mb_y);
 
     // ---- Forward ME (search prev_ref) ----
     // Integer + half-pel refine, then optionally QPel refine. The returned
@@ -438,8 +444,8 @@ fn estimate_b_mb(
     );
 
     // ---- Residual + quant + reconstruction (inter path) ----
-    let src_cb = load_chroma_block(v, 1, mb_x, mb_y);
-    let src_cr = load_chroma_block(v, 2, mb_x, mb_y);
+    let src_cb = load_chroma_block(v, width, height, 1, mb_x, mb_y);
+    let src_cr = load_chroma_block(v, width, height, 2, mb_x, mb_y);
 
     let mut ac_levels = [[0i32; 64]; 6];
     let mut coded = [false; 6];
@@ -457,7 +463,7 @@ fn estimate_b_mb(
         let mut pred_blk = [0u8; 64];
         for j in 0..8 {
             for i in 0..8 {
-                src_blk[j * 8 + i] = load_luma_sample(v, mb_x, mb_y, sub_x + i, sub_y + j);
+                src_blk[j * 8 + i] = load_luma_sample(v, width, height, mb_x, mb_y, sub_x + i, sub_y + j);
                 pred_blk[j * 8 + i] = pred_y[(sub_y + j) * 16 + (sub_x + i)];
             }
         }
@@ -495,13 +501,15 @@ fn estimate_b_mb(
 
 fn load_luma_sample(
     v: &oxideav_core::VideoFrame,
+    width: usize,
+    height: usize,
     mb_x: usize,
     mb_y: usize,
     sub_x: usize,
     sub_y: usize,
 ) -> u8 {
-    let w = v.width as usize;
-    let h = v.height as usize;
+    let w = width;
+    let h = height;
     let plane = &v.planes[0];
     let xx = (mb_x * 16 + sub_x).min(w.saturating_sub(1));
     let yy = (mb_y * 16 + sub_y).min(h.saturating_sub(1));
@@ -1369,7 +1377,7 @@ mod tests {
 
         // Set up a 32x32 source VideoFrame whose MB(0,0) equals expected.
         // Other MBs are uniform to keep things deterministic.
-        use oxideav_core::{PixelFormat, VideoFrame, VideoPlane};
+        use oxideav_core::{VideoFrame, VideoPlane};
         let mut y_data = vec![128u8; 32 * 32];
         let cb_data = vec![128u8; 16 * 16];
         let cr_data = vec![128u8; 16 * 16];
@@ -1379,9 +1387,6 @@ mod tests {
             }
         }
         let v = VideoFrame {
-            width: 32,
-            height: 32,
-            format: PixelFormat::Yuv420P,
             planes: vec![
                 VideoPlane {
                     data: y_data,
@@ -1397,7 +1402,6 @@ mod tests {
                 },
             ],
             pts: None,
-            time_base: oxideav_core::TimeBase::new(1, 24),
         };
 
         // Encode one B-VOP body into a discarded BitWriter; we only care
@@ -1415,7 +1419,7 @@ mod tests {
                 let co = grid.get(mb_x, mb_y);
                 let co_mvs4: [(i32, i32); 4] = if co.four_mv { co.mv } else { [co.mv[0]; 4] };
                 let mb = estimate_b_mb(
-                    &v, &prev, &next, mb_x, mb_y, 4, co_mvs4, co.four_mv, trb, trd, false,
+                    &v, 32, 32, &prev, &next, mb_x, mb_y, 4, co_mvs4, co.four_mv, trb, trd, false,
                 )
                 .expect("estimate_b_mb");
                 emit_b_mb(&mut bw, &mb, &mut row_pred, 1, 1);
