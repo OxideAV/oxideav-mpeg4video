@@ -94,7 +94,7 @@ fn bvop_fixture_contains_b_vops() {
 /// runs without a panic so the 4MV direct path is exercised by CI.
 #[test]
 fn decode_bvop_4mv_clip_runs() {
-    use oxideav_core::{CodecId, CodecParameters, Frame, Packet, PixelFormat, TimeBase};
+    use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
 
     let Some(bitstream) = read_fixture("/tmp/m4v_bvop_4mv.es") else {
         return;
@@ -105,7 +105,7 @@ fn decode_bvop_4mv_clip_runs() {
     let _ = dec.send_packet(&packet);
     let _ = dec.flush();
     let mut n = 0;
-    while let Ok(Frame::Video(vf)) = dec.receive_frame() {
+    while let Ok(Frame::Video(_vf)) = dec.receive_frame() {
         n += 1;
         if n > 64 {
             break;
@@ -123,7 +123,7 @@ fn decode_bvop_4mv_clip_runs() {
 ///       /tmp/m4v_bvop_qp.yuv
 #[test]
 fn decode_bvop_qpel_clip_runs() {
-    use oxideav_core::{CodecId, CodecParameters, Frame, Packet, PixelFormat, TimeBase};
+    use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
 
     let Some(bitstream) = read_fixture("/tmp/m4v_bvop_qp.es") else {
         return;
@@ -134,7 +134,7 @@ fn decode_bvop_qpel_clip_runs() {
     let _ = dec.send_packet(&packet);
     let _ = dec.flush();
     let mut n = 0;
-    while let Ok(Frame::Video(vf)) = dec.receive_frame() {
+    while let Ok(Frame::Video(_vf)) = dec.receive_frame() {
         n += 1;
         if n > 64 {
             break;
@@ -223,7 +223,7 @@ fn decode_bvop_interlaced_clip_runs() {
 /// Fixture: see module-level docs.
 #[test]
 fn decode_bvop_clip_matches_ffmpeg() {
-    use oxideav_core::{CodecId, CodecParameters, Frame, Packet, PixelFormat, TimeBase};
+    use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
 
     let Some(bitstream) = read_fixture("/tmp/m4v_bvop_64.es") else {
         return;

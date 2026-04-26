@@ -226,7 +226,7 @@ fn parse_vol_gop_clip() {
 /// `crate::resync` for the marker layout.
 #[test]
 fn decode_i_vop_tiny() {
-    use oxideav_core::{CodecId, CodecParameters, Frame, Packet, PixelFormat, TimeBase};
+    use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
 
     let Some(data) = read_fixture("/tmp/ref-mpeg4-iframes.avi") else {
         return;
@@ -306,7 +306,7 @@ fn decode_i_vop_tiny() {
 ///       -f rawvideo -pix_fmt yuv420p /tmp/ref_128.yuv
 #[test]
 fn decode_i_vop_128() {
-    use oxideav_core::{CodecId, CodecParameters, Frame, Packet, PixelFormat, TimeBase};
+    use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
 
     let Some(data) = read_fixture("/tmp/ref-mpeg4-128.avi") else {
         return;
@@ -373,7 +373,7 @@ fn decode_i_vop_128() {
 /// (so a mix of I and P-VOPs).
 #[test]
 fn decode_pvop_clip_matches_ffmpeg() {
-    use oxideav_core::{CodecId, CodecParameters, Frame, Packet, PixelFormat, TimeBase};
+    use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
 
     let Some(bitstream) = read_fixture("/tmp/m4v_gop_64.es") else {
         return;
