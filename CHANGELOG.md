@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- encoder: per-VOP-type quantiser knobs (`qp`, `qp_i`, `qp_p`, `qp_b`)
+  exposed via `CodecParameters::options`. Each value is range-checked
+  to `[1, 31]` (the 5-bit `vop_quant` field) and rejected with
+  `Error::invalid` when out of range.
+- encoder: `g` (GOP-size) knob — picks the I-VOP cadence in frames.
+  Range-checked to `[1, 300]`.
+
+### Changed
+
+- encoder: `cargo fmt` reflows on `bvop_enc.rs`, `encoder.rs`, `pvop.rs`
+  + silenced an unused `vol` binding in `tests/reference_clips.rs` so
+  `cargo clippy --all-targets -- -D warnings` is green again.
+
 ## [0.1.2](https://github.com/OxideAV/oxideav-mpeg4video/compare/v0.1.1...v0.1.2) - 2026-04-25
 
 ### Other

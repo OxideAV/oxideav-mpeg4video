@@ -66,10 +66,21 @@ use oxideav_core::bits::BitWriter;
 /// `vop_quant = 5`.
 pub const DEFAULT_VOP_QUANT: u32 = 5;
 
+/// Minimum and maximum legal `vop_quant` values per the VOP-header 5-bit
+/// field (§6.2.5). Zero is reserved and 32+ doesn't fit in 5 bits, so the
+/// encoder rejects anything outside `[1, 31]`.
+pub const MIN_VOP_QUANT: u32 = 1;
+pub const MAX_VOP_QUANT: u32 = 31;
+
 /// Default GOP size (I-VOP cadence). Emit an I-VOP every `DEFAULT_GOP_SIZE`
 /// frames; all other frames are P-VOPs. The P-VOP test in
 /// `tests/p_vop.rs` exercises this with `GOP_SIZE = 16` (1 I + 15 P).
 pub const DEFAULT_GOP_SIZE: u32 = 16;
+
+/// Conservative upper bound on the `g` (GOP-size) option. Larger
+/// values are accepted at the spec level but break our reference-frame
+/// drift tests; 300 is a sensible ceiling for any short-form clip.
+pub const MAX_GOP_SIZE: u32 = 300;
 
 /// Forward motion-vector range code for P-VOPs. `f_code = 1` gives the
 /// smallest range `[-32, 31]` half-pels which is plenty for the encoder's
@@ -124,9 +135,11 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
 
     let time_base = TimeBase::new(frame_rate.den, frame_rate.num);
 
-    // Options — currently the `bf` (max B-frames) knob and the `qpel`
-    // (quarter-sample motion) knob. Defaults preserve the round-14
-    // behaviour (no B-frames, half-pel motion).
+    // Options — `bf` (max B-frames), `qpel` (quarter-sample motion),
+    // `qp` (per-VOP-type quantiser; aliases `qp_i` / `qp_p` / `qp_b`
+    // for I, P and B VOPs separately) and `g` (GOP size: I-VOP cadence
+    // in frames). Defaults preserve the round-14..18 behaviour
+    // (no B-frames, half-pel motion, vop_quant=5, GOP=16).
     let max_b_frames = params
         .options
         .get("bf")
@@ -138,6 +151,45 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         .get("qpel")
         .map(|s| !matches!(s, "" | "0" | "false" | "False" | "FALSE"))
         .unwrap_or(DEFAULT_QUARTER_SAMPLE);
+
+    // `qp` sets the default quant for all VOP types; `qp_i`, `qp_p`
+    // and `qp_b` override per VOP type. All values are clamped to
+    // [MIN_VOP_QUANT, MAX_VOP_QUANT] — out-of-range strings are
+    // rejected with `Error::invalid` so callers get a clear signal
+    // rather than silent clamping.
+    let parse_qp = |key: &str| -> Result<Option<u32>> {
+        let Some(s) = params.options.get(key) else {
+            return Ok(None);
+        };
+        let v: u32 = s.parse().map_err(|_| {
+            Error::invalid(format!("mpeg4 encoder: option {key}={s} not an integer"))
+        })?;
+        if !(MIN_VOP_QUANT..=MAX_VOP_QUANT).contains(&v) {
+            return Err(Error::invalid(format!(
+                "mpeg4 encoder: option {key}={v} outside [{MIN_VOP_QUANT}, {MAX_VOP_QUANT}]"
+            )));
+        }
+        Ok(Some(v))
+    };
+    let qp_default = parse_qp("qp")?.unwrap_or(DEFAULT_VOP_QUANT);
+    let vop_quant_i = parse_qp("qp_i")?.unwrap_or(qp_default);
+    let vop_quant_p = parse_qp("qp_p")?.unwrap_or(qp_default);
+    let vop_quant_b = parse_qp("qp_b")?.unwrap_or(qp_default);
+
+    let gop_size = match params.options.get("g") {
+        Some(s) => {
+            let v: u32 = s.parse().map_err(|_| {
+                Error::invalid(format!("mpeg4 encoder: option g={s} not an integer"))
+            })?;
+            if !(1..=MAX_GOP_SIZE).contains(&v) {
+                return Err(Error::invalid(format!(
+                    "mpeg4 encoder: option g={v} outside [1, {MAX_GOP_SIZE}]"
+                )));
+            }
+            v
+        }
+        None => DEFAULT_GOP_SIZE,
+    };
 
     // Round-16: QPel + B-frames is now implemented. The B-VOP encoder
     // (`bvop_enc.rs`) accepts a `quarter_sample` flag and switches its
@@ -152,8 +204,10 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         height,
         frame_rate,
         time_base,
-        vop_quant: DEFAULT_VOP_QUANT,
-        gop_size: DEFAULT_GOP_SIZE,
+        vop_quant_i,
+        vop_quant_p,
+        vop_quant_b,
+        gop_size,
         f_code_fwd: DEFAULT_F_CODE_FWD,
         max_b_frames,
         quarter_sample,
@@ -177,7 +231,14 @@ struct Mpeg4VideoEncoder {
     height: u32,
     frame_rate: Rational,
     time_base: TimeBase,
-    vop_quant: u32,
+    /// Per-VOP-type quantisers. Each VOP is encoded with the matching
+    /// `vop_quant_{i,p,b}`; the value is written verbatim to the
+    /// 5-bit VOP-header `vop_quant` field (§6.2.5). Defaults to the
+    /// shared `qp` knob (= `DEFAULT_VOP_QUANT` when unset). All three
+    /// stay constant within a picture (no dquant emission).
+    vop_quant_i: u32,
+    vop_quant_p: u32,
+    vop_quant_b: u32,
     gop_size: u32,
     f_code_fwd: u8,
     /// Max consecutive B-VOPs between two reference pictures. 0 = no B-VOPs.
@@ -303,7 +364,7 @@ impl Mpeg4VideoEncoder {
                 self.width,
                 self.height,
                 self.frame_rate,
-                self.vop_quant,
+                self.vop_quant_i,
                 self.max_b_frames > 0,
                 self.quarter_sample,
             );
@@ -313,13 +374,13 @@ impl Mpeg4VideoEncoder {
         let time_inc = display_time_inc(v, self.display_index);
         let vti_resolution = (self.frame_rate.num as u32).max(1);
         if is_keyframe {
-            write_i_vop_header(&mut bw, time_inc, self.vop_quant, vti_resolution);
+            write_i_vop_header(&mut bw, time_inc, self.vop_quant_i, vti_resolution);
             let pic = encode_i_vop_body_and_reconstruct(
                 &mut bw,
                 v,
                 self.width,
                 self.height,
-                self.vop_quant,
+                self.vop_quant_i,
             )?;
             self.reference = Some(pic);
             self.reference_grid = None;
@@ -333,7 +394,7 @@ impl Mpeg4VideoEncoder {
             write_p_vop_header(
                 &mut bw,
                 time_inc,
-                self.vop_quant,
+                self.vop_quant_p,
                 self.rounding_type,
                 self.f_code_fwd,
                 vti_resolution,
@@ -344,7 +405,7 @@ impl Mpeg4VideoEncoder {
                 self.width,
                 self.height,
                 reference,
-                self.vop_quant,
+                self.vop_quant_p,
                 self.f_code_fwd,
                 self.rounding_type,
                 self.quarter_sample,
@@ -382,7 +443,7 @@ impl Mpeg4VideoEncoder {
                 self.width,
                 self.height,
                 self.frame_rate,
-                self.vop_quant,
+                self.vop_quant_i,
                 self.max_b_frames > 0,
                 self.quarter_sample,
             );
@@ -392,13 +453,13 @@ impl Mpeg4VideoEncoder {
         let time_inc = display_time_inc(v, self.display_index);
         let vti_resolution = (self.frame_rate.num as u32).max(1);
         if is_keyframe {
-            write_i_vop_header(&mut bw, time_inc, self.vop_quant, vti_resolution);
+            write_i_vop_header(&mut bw, time_inc, self.vop_quant_i, vti_resolution);
             let pic = encode_i_vop_body_and_reconstruct(
                 &mut bw,
                 v,
                 self.width,
                 self.height,
-                self.vop_quant,
+                self.vop_quant_i,
             )?;
             self.reference = Some(pic);
             self.reference_grid = None; // I-VOPs have no MV grid.
@@ -411,7 +472,7 @@ impl Mpeg4VideoEncoder {
             write_p_vop_header(
                 &mut bw,
                 time_inc,
-                self.vop_quant,
+                self.vop_quant_p,
                 self.rounding_type,
                 self.f_code_fwd,
                 vti_resolution,
@@ -422,7 +483,7 @@ impl Mpeg4VideoEncoder {
                 self.width,
                 self.height,
                 reference,
-                self.vop_quant,
+                self.vop_quant_p,
                 self.f_code_fwd,
                 self.rounding_type,
                 self.quarter_sample,
@@ -502,7 +563,7 @@ impl Mpeg4VideoEncoder {
         write_b_vop_header(
             &mut bw,
             time_inc_u,
-            self.vop_quant,
+            self.vop_quant_b,
             self.f_code_fwd,
             self.f_code_fwd,
             vti_resolution,
@@ -527,7 +588,7 @@ impl Mpeg4VideoEncoder {
             prev_forward,
             next_backward,
             grid,
-            self.vop_quant,
+            self.vop_quant_b,
             self.f_code_fwd,
             self.f_code_fwd,
             trb,

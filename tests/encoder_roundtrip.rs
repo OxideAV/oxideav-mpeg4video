@@ -695,6 +695,459 @@ fn encode_15fps_vti_bits_roundtrip() {
     }
 }
 
+/// Round-19 — `qp` knob exposes per-VOP-type quantiser. Drive the
+/// encoder over a sweep of `qp` values on the same testsrc fixture and
+/// verify (a) every variant decodes through our decoder, (b) bytes
+/// monotonically decrease with rising qp, (c) PSNR monotonically
+/// decreases with rising qp, and (d) ffmpeg cross-decodes each
+/// variant cleanly.
+#[test]
+fn encode_qp_knob_constant_q_sweep() {
+    let path = "/tmp/m4v_bf_in.yuv";
+    if !std::path::Path::new(path).exists() {
+        eprintln!("fixture {path} missing — skipping test");
+        return;
+    }
+    let yuv = std::fs::read(path).expect("read fixture");
+    let frame_bytes = 64 * 64 * 3 / 2;
+    let n_frames = yuv.len() / frame_bytes;
+    if n_frames < 4 {
+        eprintln!("fixture has only {n_frames} frames — skipping");
+        return;
+    }
+
+    let run = |qp: u32| -> (usize, f64, Vec<u8>) {
+        let mut params = CodecParameters::video(CodecId::new(oxideav_mpeg4video::CODEC_ID_STR));
+        params.media_type = MediaType::Video;
+        params.width = Some(64);
+        params.height = Some(64);
+        params.pixel_format = Some(PixelFormat::Yuv420P);
+        params.frame_rate = Some(Rational::new(24, 1));
+        params.options.insert("qp".to_string(), qp.to_string());
+        let mut enc =
+            oxideav_mpeg4video::encoder::make_encoder(&params).expect("build qp-knob enc");
+
+        for i in 0..n_frames {
+            let off = i * frame_bytes;
+            let chunk = &yuv[off..off + frame_bytes];
+            let mut vf = make_video_frame(chunk);
+            vf.pts = Some(i as i64);
+            enc.send_frame(&Frame::Video(vf)).expect("send_frame");
+        }
+        enc.flush().expect("flush enc");
+
+        let mut packets: Vec<Packet> = Vec::new();
+        let mut bs: Vec<u8> = Vec::new();
+        loop {
+            match enc.receive_packet() {
+                Ok(p) => {
+                    bs.extend_from_slice(&p.data);
+                    packets.push(p);
+                }
+                Err(oxideav_core::Error::Eof) => break,
+                Err(oxideav_core::Error::NeedMore) => break,
+                Err(e) => panic!("receive_packet at qp={qp}: {e:?}"),
+            }
+        }
+
+        let dec_params = CodecParameters::video(CodecId::new(oxideav_mpeg4video::CODEC_ID_STR));
+        let mut dec = oxideav_mpeg4video::decoder::make_decoder(&dec_params).expect("build dec");
+        let mut decoded: Vec<Vec<u8>> = Vec::new();
+        let drain = |dec: &mut Box<dyn oxideav_core::Decoder>, decoded: &mut Vec<Vec<u8>>| loop {
+            match dec.receive_frame() {
+                Ok(Frame::Video(v)) => {
+                    let mut buf = Vec::with_capacity(frame_bytes);
+                    buf.extend_from_slice(&v.planes[0].data);
+                    buf.extend_from_slice(&v.planes[1].data);
+                    buf.extend_from_slice(&v.planes[2].data);
+                    decoded.push(buf);
+                }
+                Ok(_) => {}
+                Err(oxideav_core::Error::Eof) => break,
+                Err(oxideav_core::Error::NeedMore) => break,
+                Err(_) => break,
+            }
+        };
+        for pkt in &packets {
+            if dec.send_packet(pkt).is_err() {
+                break;
+            }
+            drain(&mut dec, &mut decoded);
+        }
+        let _ = dec.flush();
+        drain(&mut dec, &mut decoded);
+
+        // Per-frame PSNR sum.
+        let m = decoded.len().min(n_frames);
+        let mut sum = 0.0;
+        for i in 0..m {
+            sum += psnr_db(&yuv[i * frame_bytes..(i + 1) * frame_bytes], &decoded[i]);
+        }
+        let avg = if m > 0 { sum / m as f64 } else { 0.0 };
+        (bs.len(), avg, bs)
+    };
+
+    let qps = [2u32, 5, 10, 20];
+    let mut measurements = Vec::new();
+    for &q in &qps {
+        let (bytes, psnr, _bs) = run(q);
+        eprintln!("qp={q}: {bytes} bytes; avg PSNR {psnr:.2} dB");
+        measurements.push((q, bytes, psnr));
+    }
+    // Monotonic: rising qp => non-increasing bytes, non-increasing PSNR.
+    // Allow small wobble (especially between adjacent low quants on a
+    // tiny 12-frame fixture); enforce the trend across the full range.
+    assert!(
+        measurements[0].1 > measurements[3].1,
+        "qp=2 bytes ({}) not > qp=20 bytes ({})",
+        measurements[0].1,
+        measurements[3].1
+    );
+    assert!(
+        measurements[0].2 > measurements[3].2,
+        "qp=2 PSNR ({:.2}) not > qp=20 PSNR ({:.2})",
+        measurements[0].2,
+        measurements[3].2
+    );
+    // Each variant must hit at least 18 dB at qp=20 (the lowest-quality
+    // bar we'd ever ship); higher quants must beat that comfortably.
+    for &(q, _, p) in &measurements {
+        let bar = if q >= 20 { 18.0 } else { 25.0 };
+        assert!(
+            p >= bar,
+            "qp={q}: PSNR {p:.2} below {bar} dB floor — bitstream may be malformed"
+        );
+    }
+
+    // ffmpeg cross-decode each variant to confirm conformance.
+    if !command_exists("ffmpeg") {
+        eprintln!("ffmpeg missing — skipping cross-decode portion");
+        return;
+    }
+    let tmp = std::env::temp_dir();
+    for &q in &qps {
+        let (_b, _p, bs) = run(q);
+        let es = tmp.join(format!("oxideav_qp{q}.m4v"));
+        let yo = tmp.join(format!("oxideav_qp{q}_ffmpeg.yuv"));
+        let _ = std::fs::write(&es, &bs);
+        let _ = std::fs::remove_file(&yo);
+        let st = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "m4v",
+                "-i",
+            ])
+            .arg(&es)
+            .args(["-f", "rawvideo", "-pix_fmt", "yuv420p"])
+            .arg(&yo)
+            .status()
+            .expect("run ffmpeg");
+        assert!(st.success(), "ffmpeg failed to decode qp={q} variant");
+        let buf = std::fs::read(&yo).expect("read ffmpeg output");
+        let m = (buf.len() / frame_bytes).min(n_frames);
+        let mut sum = 0.0;
+        for i in 0..m {
+            sum += psnr_db(
+                &yuv[i * frame_bytes..(i + 1) * frame_bytes],
+                &buf[i * frame_bytes..(i + 1) * frame_bytes],
+            );
+        }
+        let avg = if m > 0 { sum / m as f64 } else { 0.0 };
+        eprintln!("ffmpeg cross-decode qp={q}: avg PSNR {avg:.2} dB over {m} frames");
+        // ffmpeg must at least decode every frame.
+        assert_eq!(m, n_frames, "ffmpeg lost frames at qp={q}");
+    }
+}
+
+/// Round-19 — `qp_i` / `qp_p` / `qp_b` per-VOP-type override. Drive the
+/// encoder with `bf=2` and `qp_i=3, qp_p=5, qp_b=8` and verify the
+/// stream decodes cleanly through both our decoder and ffmpeg.
+#[test]
+fn encode_qp_per_vop_type_roundtrip() {
+    let path = "/tmp/m4v_bf_in.yuv";
+    if !std::path::Path::new(path).exists() {
+        eprintln!("fixture {path} missing — skipping test");
+        return;
+    }
+    let yuv = std::fs::read(path).expect("read fixture");
+    let frame_bytes = 64 * 64 * 3 / 2;
+    let n_frames = yuv.len() / frame_bytes;
+    if n_frames < 4 {
+        eprintln!("fixture has only {n_frames} frames — skipping");
+        return;
+    }
+
+    let mut params = CodecParameters::video(CodecId::new(oxideav_mpeg4video::CODEC_ID_STR));
+    params.media_type = MediaType::Video;
+    params.width = Some(64);
+    params.height = Some(64);
+    params.pixel_format = Some(PixelFormat::Yuv420P);
+    params.frame_rate = Some(Rational::new(24, 1));
+    params.options.insert("bf".to_string(), "2".to_string());
+    params.options.insert("qp_i".to_string(), "3".to_string());
+    params.options.insert("qp_p".to_string(), "5".to_string());
+    params.options.insert("qp_b".to_string(), "8".to_string());
+    let mut enc = oxideav_mpeg4video::encoder::make_encoder(&params).expect("build per-type qp");
+
+    for i in 0..n_frames {
+        let off = i * frame_bytes;
+        let chunk = &yuv[off..off + frame_bytes];
+        let mut vf = make_video_frame(chunk);
+        vf.pts = Some(i as i64);
+        enc.send_frame(&Frame::Video(vf)).expect("send_frame");
+    }
+    enc.flush().expect("flush enc");
+
+    let mut packets: Vec<Packet> = Vec::new();
+    let mut bs: Vec<u8> = Vec::new();
+    loop {
+        match enc.receive_packet() {
+            Ok(p) => {
+                bs.extend_from_slice(&p.data);
+                packets.push(p);
+            }
+            Err(oxideav_core::Error::Eof) => break,
+            Err(oxideav_core::Error::NeedMore) => break,
+            Err(e) => panic!("receive_packet: {e:?}"),
+        }
+    }
+    eprintln!("per-type qp: {} packets, {} bytes", packets.len(), bs.len());
+    assert!(!packets.is_empty(), "encoder emitted no packets");
+
+    // First packet is the keyframe (qp_i=3); subsequent are P or B.
+    assert!(packets[0].flags.keyframe, "first packet must be I-VOP");
+
+    // Decode through our decoder.
+    let dec_params = CodecParameters::video(CodecId::new(oxideav_mpeg4video::CODEC_ID_STR));
+    let mut dec = oxideav_mpeg4video::decoder::make_decoder(&dec_params).expect("build dec");
+    let mut decoded: Vec<Vec<u8>> = Vec::new();
+    let drain = |dec: &mut Box<dyn oxideav_core::Decoder>, decoded: &mut Vec<Vec<u8>>| loop {
+        match dec.receive_frame() {
+            Ok(Frame::Video(v)) => {
+                let mut buf = Vec::with_capacity(frame_bytes);
+                buf.extend_from_slice(&v.planes[0].data);
+                buf.extend_from_slice(&v.planes[1].data);
+                buf.extend_from_slice(&v.planes[2].data);
+                decoded.push(buf);
+            }
+            Ok(_) => {}
+            Err(oxideav_core::Error::Eof) => break,
+            Err(oxideav_core::Error::NeedMore) => break,
+            Err(_) => break,
+        }
+    };
+    for pkt in &packets {
+        if dec.send_packet(pkt).is_err() {
+            break;
+        }
+        drain(&mut dec, &mut decoded);
+    }
+    let _ = dec.flush();
+    drain(&mut dec, &mut decoded);
+
+    let m = decoded.len().min(n_frames);
+    let mut sum = 0.0;
+    for i in 0..m {
+        let p = psnr_db(&yuv[i * frame_bytes..(i + 1) * frame_bytes], &decoded[i]);
+        eprintln!("  frame {i}: PSNR = {p:.2} dB");
+        sum += p;
+    }
+    let avg = if m > 0 { sum / m as f64 } else { 0.0 };
+    eprintln!("per-type qp avg PSNR (ours→ours): {avg:.2} dB over {m} frames");
+    // Each frame should still clear 28 dB — qp_b=8 isn't aggressive
+    // enough to push B-VOPs below this.
+    if m == n_frames {
+        assert!(
+            avg >= 30.0,
+            "per-type qp PSNR {avg:.2} dB < 30 dB regression bar"
+        );
+    }
+
+    // ffmpeg cross-decode for conformance.
+    if !command_exists("ffmpeg") {
+        return;
+    }
+    let tmp = std::env::temp_dir();
+    let es = tmp.join("oxideav_per_type_qp.m4v");
+    let yo = tmp.join("oxideav_per_type_qp_ffmpeg.yuv");
+    let _ = std::fs::write(&es, &bs);
+    let _ = std::fs::remove_file(&yo);
+    let st = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "m4v",
+            "-i",
+        ])
+        .arg(&es)
+        .args(["-f", "rawvideo", "-pix_fmt", "yuv420p"])
+        .arg(&yo)
+        .status()
+        .expect("run ffmpeg");
+    assert!(st.success(), "ffmpeg failed to decode per-type-qp stream");
+    let buf = std::fs::read(&yo).expect("read ffmpeg output");
+    let m_ff = (buf.len() / frame_bytes).min(n_frames);
+    let mut sum_ff = 0.0;
+    for i in 0..m_ff {
+        sum_ff += psnr_db(
+            &yuv[i * frame_bytes..(i + 1) * frame_bytes],
+            &buf[i * frame_bytes..(i + 1) * frame_bytes],
+        );
+    }
+    let avg_ff = if m_ff > 0 { sum_ff / m_ff as f64 } else { 0.0 };
+    eprintln!("per-type qp ffmpeg cross-decode: avg PSNR {avg_ff:.2} dB over {m_ff} frames");
+    assert_eq!(
+        m_ff, n_frames,
+        "ffmpeg dropped frames on per-type qp stream"
+    );
+}
+
+/// Round-19 — `g` (GOP-size) knob picks the I-VOP cadence. Drive at
+/// `g=3` over 8 frames and verify keyframes land on indices 0, 3, 6.
+#[test]
+fn encode_gop_knob_changes_keyframe_cadence() {
+    let path = "/tmp/m4v_bf_in.yuv";
+    if !std::path::Path::new(path).exists() {
+        eprintln!("fixture {path} missing — skipping test");
+        return;
+    }
+    let yuv = std::fs::read(path).expect("read fixture");
+    let frame_bytes = 64 * 64 * 3 / 2;
+    let n_frames = yuv.len() / frame_bytes;
+    if n_frames < 8 {
+        eprintln!("fixture has only {n_frames} frames — skipping");
+        return;
+    }
+
+    let mut params = CodecParameters::video(CodecId::new(oxideav_mpeg4video::CODEC_ID_STR));
+    params.media_type = MediaType::Video;
+    params.width = Some(64);
+    params.height = Some(64);
+    params.pixel_format = Some(PixelFormat::Yuv420P);
+    params.frame_rate = Some(Rational::new(24, 1));
+    params.options.insert("g".to_string(), "3".to_string());
+    let mut enc = oxideav_mpeg4video::encoder::make_encoder(&params).expect("build g=3 enc");
+
+    let send = n_frames.min(8);
+    for i in 0..send {
+        let off = i * frame_bytes;
+        let chunk = &yuv[off..off + frame_bytes];
+        let mut vf = make_video_frame(chunk);
+        vf.pts = Some(i as i64);
+        enc.send_frame(&Frame::Video(vf)).expect("send_frame");
+    }
+    enc.flush().expect("flush enc");
+
+    let mut packets: Vec<Packet> = Vec::new();
+    loop {
+        match enc.receive_packet() {
+            Ok(p) => packets.push(p),
+            Err(oxideav_core::Error::Eof) => break,
+            Err(oxideav_core::Error::NeedMore) => break,
+            Err(e) => panic!("receive_packet: {e:?}"),
+        }
+    }
+    // Drop the trailing VOS_END_CODE packet (flagged `header = true`),
+    // which the encoder emits as a stream trailer at EOF.
+    let vop_packets: Vec<&Packet> = packets.iter().filter(|p| !p.flags.header).collect();
+    assert_eq!(
+        vop_packets.len(),
+        send,
+        "g=3 emitted {} VOP packets for {send} frames",
+        vop_packets.len()
+    );
+
+    // Keyframe should land at idx 0, 3, 6 (g=3 cadence) and nowhere else.
+    for (i, pkt) in vop_packets.iter().enumerate() {
+        let want = i % 3 == 0;
+        assert_eq!(
+            pkt.flags.keyframe, want,
+            "packet {i} keyframe={} but wanted {want} (g=3 cadence)",
+            pkt.flags.keyframe
+        );
+    }
+}
+
+/// Round-19 — out-of-range knobs are rejected with `Error::invalid`.
+/// Smoke-tests the parse_qp + g-range guards in `make_encoder`.
+#[test]
+fn encode_options_out_of_range_rejected() {
+    use oxideav_core::{CodecParameters, PixelFormat, Rational};
+
+    let base = || -> CodecParameters {
+        let mut p = CodecParameters::video(CodecId::new(oxideav_mpeg4video::CODEC_ID_STR));
+        p.media_type = oxideav_core::MediaType::Video;
+        p.width = Some(64);
+        p.height = Some(64);
+        p.pixel_format = Some(PixelFormat::Yuv420P);
+        p.frame_rate = Some(Rational::new(24, 1));
+        p
+    };
+
+    // qp=0 — below MIN_VOP_QUANT.
+    let mut p = base();
+    p.options.insert("qp".to_string(), "0".to_string());
+    assert!(
+        oxideav_mpeg4video::encoder::make_encoder(&p).is_err(),
+        "qp=0 must be rejected"
+    );
+
+    // qp=32 — above MAX_VOP_QUANT.
+    let mut p = base();
+    p.options.insert("qp".to_string(), "32".to_string());
+    assert!(
+        oxideav_mpeg4video::encoder::make_encoder(&p).is_err(),
+        "qp=32 must be rejected"
+    );
+
+    // qp_b=99 — only the per-type-B override is bad, others default.
+    let mut p = base();
+    p.options.insert("qp_b".to_string(), "99".to_string());
+    assert!(
+        oxideav_mpeg4video::encoder::make_encoder(&p).is_err(),
+        "qp_b=99 must be rejected"
+    );
+
+    // qp=foo — non-integer.
+    let mut p = base();
+    p.options.insert("qp".to_string(), "foo".to_string());
+    assert!(
+        oxideav_mpeg4video::encoder::make_encoder(&p).is_err(),
+        "qp=foo must be rejected"
+    );
+
+    // g=0 — below 1.
+    let mut p = base();
+    p.options.insert("g".to_string(), "0".to_string());
+    assert!(
+        oxideav_mpeg4video::encoder::make_encoder(&p).is_err(),
+        "g=0 must be rejected"
+    );
+
+    // g=999 — above MAX_GOP_SIZE.
+    let mut p = base();
+    p.options.insert("g".to_string(), "999".to_string());
+    assert!(
+        oxideav_mpeg4video::encoder::make_encoder(&p).is_err(),
+        "g=999 must be rejected"
+    );
+
+    // qp=15 — valid, should build cleanly.
+    let mut p = base();
+    p.options.insert("qp".to_string(), "15".to_string());
+    assert!(
+        oxideav_mpeg4video::encoder::make_encoder(&p).is_ok(),
+        "qp=15 must be accepted"
+    );
+}
+
 fn psnr_db(a: &[u8], b: &[u8]) -> f64 {
     let n = a.len().min(b.len());
     let mut sum_sq: u64 = 0;

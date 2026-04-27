@@ -74,9 +74,12 @@ decoder accepts as-is. Input is `Yuv420P` only.
   `not_coded` skip MBs emitted when the residual is all-zero and
   MV == (0, 0).
 - **GOP cadence.** I-VOP every `DEFAULT_GOP_SIZE` frames (= 16); all
-  other frames are P-VOPs. Configurable in source.
+  other frames are P-VOPs. Override per-encoder via the `g` codec
+  option (1..=300).
 - **Quantisation.** H.263 quant (`mpeg_quant = 0`), constant
-  `vop_quant = 5`, no dquant.
+  `vop_quant = 5` by default, no dquant. Override per-encoder via
+  the `qp` codec option (1..=31), or split per VOP-type with
+  `qp_i` / `qp_p` / `qp_b`.
 - **Resync markers.** Not emitted (`resync_marker_disable = 1`).
 
 Round-trip PSNR on the synthetic 64×64 moving-gradient test
