@@ -314,7 +314,13 @@ impl Mpeg4VideoEncoder {
         let vti_resolution = (self.frame_rate.num as u32).max(1);
         if is_keyframe {
             write_i_vop_header(&mut bw, time_inc, self.vop_quant, vti_resolution);
-            let pic = encode_i_vop_body_and_reconstruct(&mut bw, v, self.width, self.height, self.vop_quant)?;
+            let pic = encode_i_vop_body_and_reconstruct(
+                &mut bw,
+                v,
+                self.width,
+                self.height,
+                self.vop_quant,
+            )?;
             self.reference = Some(pic);
             self.reference_grid = None;
             self.reference_time = time_inc as i64;
@@ -387,7 +393,13 @@ impl Mpeg4VideoEncoder {
         let vti_resolution = (self.frame_rate.num as u32).max(1);
         if is_keyframe {
             write_i_vop_header(&mut bw, time_inc, self.vop_quant, vti_resolution);
-            let pic = encode_i_vop_body_and_reconstruct(&mut bw, v, self.width, self.height, self.vop_quant)?;
+            let pic = encode_i_vop_body_and_reconstruct(
+                &mut bw,
+                v,
+                self.width,
+                self.height,
+                self.vop_quant,
+            )?;
             self.reference = Some(pic);
             self.reference_grid = None; // I-VOPs have no MV grid.
             self.reference_time = time_inc as i64;
@@ -823,7 +835,9 @@ pub(crate) fn encode_i_vop_body_and_reconstruct(
 
     for mb_y in 0..mb_h {
         for mb_x in 0..mb_w {
-            encode_intra_mb_reconstruct(bw, v, width, height, mb_x, mb_y, vop_quant, &mut grid, &mut pic)?;
+            encode_intra_mb_reconstruct(
+                bw, v, width, height, mb_x, mb_y, vop_quant, &mut grid, &mut pic,
+            )?;
         }
     }
     Ok(pic)

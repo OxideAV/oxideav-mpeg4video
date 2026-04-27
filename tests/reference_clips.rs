@@ -214,7 +214,7 @@ fn parse_vol_gop_clip() {
         .map(|(p, _)| pos + 4 + p)
         .unwrap_or(data.len());
     let mut br = BitReader::new(&data[pos + 4..next]);
-    let vol = parse_vol(&mut br).expect("parse VOL");
+    let _vol = parse_vol(&mut br).expect("parse VOL");
 }
 
 /// End-to-end: decode the first I-VOP out of a tiny all-I ffmpeg clip.

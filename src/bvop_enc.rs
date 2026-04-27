@@ -463,7 +463,8 @@ fn estimate_b_mb(
         let mut pred_blk = [0u8; 64];
         for j in 0..8 {
             for i in 0..8 {
-                src_blk[j * 8 + i] = load_luma_sample(v, width, height, mb_x, mb_y, sub_x + i, sub_y + j);
+                src_blk[j * 8 + i] =
+                    load_luma_sample(v, width, height, mb_x, mb_y, sub_x + i, sub_y + j);
                 pred_blk[j * 8 + i] = pred_y[(sub_y + j) * 16 + (sub_x + i)];
             }
         }

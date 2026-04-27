@@ -272,7 +272,17 @@ pub fn encode_p_vop_body_with_grid(
                 //   CBPY (raw — not bit-inverted for intra)
                 //   six intra blocks (DC VLC + AC walk)
                 bw.write_bits(0, 1);
-                encode_intra_mb_in_p(bw, v, width, height, mb_x, mb_y, vop_quant, &mut pred_grid, &mut pic)?;
+                encode_intra_mb_in_p(
+                    bw,
+                    v,
+                    width,
+                    height,
+                    mb_x,
+                    mb_y,
+                    vop_quant,
+                    &mut pred_grid,
+                    &mut pic,
+                )?;
                 // MV grid: intra MBs contribute (0,0) to the median
                 // predictor of future inter MBs (§7.6.7 step 3) and
                 // are NOT considered `not_coded`. Co-located B-VOP
@@ -507,8 +517,15 @@ fn estimate_and_encode_mb(
     let block_offsets: [(i32, i32); 4] = [(0, 0), (8, 0), (0, 8), (8, 8)];
     for blk in 0..4 {
         let (sub_x, sub_y) = block_offsets[blk];
-        let src_blk =
-            read_luma_block_from_mb_xy(v, width, height, mb_x, mb_y, sub_x as usize, sub_y as usize);
+        let src_blk = read_luma_block_from_mb_xy(
+            v,
+            width,
+            height,
+            mb_x,
+            mb_y,
+            sub_x as usize,
+            sub_y as usize,
+        );
         let (mvx_b, mvy_b, sad_b) = estimate_block_mv_8x8(
             reference,
             &src_blk,
