@@ -44,6 +44,14 @@ against ffmpeg-generated reference clips (I-only and GOP-of-10).
   third-escape signed 12-bit level.
 - **Resync.** Video-packet resync markers (§6.3.5.2) with forward-MB
   number validation. Per-packet predictor state reset.
+- **Data partitioning (§6.2.6 / §6.3.7).** I-VOPs and P-VOPs (and
+  S(GMC)-VOPs) emitted in `data_partitioned_motion_shape_texture()`
+  layout: per-MB header/MV bits in part 1, 19-bit DC marker
+  (`110 1011 0000 0000 0001`) or 17-bit motion marker
+  (`1 1111 0000 0000 0001`), per-MB texture bits in part 2, per-MB AC
+  walks in part 3. Round-21 DP decoder treats one VOP as one video
+  packet; mid-VOP `video_packet_header()` splits in DP mode are a
+  follow-up.
 - **Picture store.** One reference frame, refreshed by each I-VOP and
   each P-VOP. Not-coded VOPs re-emit the previous reference at the
   new pts.
@@ -52,8 +60,7 @@ Out of scope — returns `Error::Unsupported`:
 
 - B-VOPs and S-VOPs (sprites) / GMC.
 - Quarter-pel motion (`quarter_sample`).
-- Interlaced field coding, scalability, data partitioning, reversible
-  VLCs.
+- Interlaced field coding, scalability, reversible VLCs.
 - Non-rectangular shape (binary / grayscale shape coding).
 - `newpred_enable`, complexity-estimation header, reduced-resolution
   VOP.
@@ -107,7 +114,18 @@ Out of scope for the encoder:
 - B-VOPs round-trip is supported via `bf=N`; combined with `gmc`
   the encoder advertises both features in the VOL but does not
   warp B-VOP references through the trajectory.
-- Interlace, scalability, data partitioning, reversible VLCs.
+- **Data partitioning (`dp=1`).** Round-21: per-VOP DP layout
+  (§6.2.5.3 / §6.2.6) for I and P VOPs at half-pel only — VOL flips
+  to ARTS@L1 (PLI `0x91`, vot `10`) + `data_partitioned = 1` +
+  `resync_marker_disable = 0`. Each VOP body becomes one video packet
+  with MV/header bits in part 1, DC marker / motion marker, texture
+  bits in part 2, AC walks in part 3, then spec-conformant
+  `next_start_code()` stuffing (`0` then `1`'s, or full `0x7F` if
+  byte-aligned). Mutually exclusive with `qpel`/`gmc`/`bf>0` for now;
+  RVLC is `reversible_vlc = 0` (round-22 follow-up). ffmpeg
+  cross-decode validated on the synthetic moving-gradient fixture
+  (`tests/dp.rs::dp_ffmpeg_decode`).
+- Interlace, scalability, reversible VLCs.
 - MPEG-4 matrix quant (`mpeg_quant = 1`).
 
 ## Performance

@@ -258,9 +258,6 @@ impl Mpeg4VideoDecoder {
                     let Some(vol) = self.vol.clone() else {
                         return Err(Error::invalid("mpeg4: VOP before VOL"));
                     };
-                    if vol.data_partitioned {
-                        return Err(Error::unsupported("mpeg4 data-partitioned VOL: follow-up"));
-                    }
                     let mut br = BitReader::new(payload);
                     let vop = parse_vop(&mut br, &vol)?;
                     // Interlaced field coding is decoded through the
@@ -314,7 +311,11 @@ impl Mpeg4VideoDecoder {
         }
         match vop.vop_coding_type {
             VopCodingType::I => {
-                let pic = decode_ivop_pic(vol, vop, br)?;
+                let pic = if vol.data_partitioned {
+                    crate::dp::decode_ivop_dp(vol, vop, br)?
+                } else {
+                    decode_ivop_pic(vol, vop, br)?
+                };
                 let cur_time = self.vop_absolute_time(vol, vop);
                 let pts = self.pts_for_vop(vol, cur_time);
                 let frame = pic_to_video_frame(vol, &pic, pts, self.pending_tb);
@@ -338,7 +339,11 @@ impl Mpeg4VideoDecoder {
                     Some(r) => r.clone(),
                     None => reference.clone(),
                 };
-                let (pic, mv_grid) = decode_pvop_pic_with_grid(vol, vop, br, &ref_pic)?;
+                let (pic, mv_grid) = if vol.data_partitioned {
+                    crate::dp::decode_pvop_dp_with_grid(vol, vop, br, &ref_pic)?
+                } else {
+                    decode_pvop_pic_with_grid(vol, vop, br, &ref_pic)?
+                };
                 let cur_time = self.vop_absolute_time(vol, vop);
                 let pts = self.pts_for_vop(vol, cur_time);
                 let frame = pic_to_video_frame(vol, &pic, pts, self.pending_tb);

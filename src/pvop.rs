@@ -356,7 +356,7 @@ pub fn encode_p_vop_body_with_grid(
 /// this, an intra MB later in the picture would predict its DC from a
 /// stale neighbour DC value left behind by the I-VOP — i.e., from a frame
 /// before the most recent inter MB.
-fn reset_pred_grid_mb(grid: &mut PredGrid, mb_x: usize, mb_y: usize) {
+pub(crate) fn reset_pred_grid_mb(grid: &mut PredGrid, mb_x: usize, mb_y: usize) {
     let positions: [(usize, usize); 4] = [
         (mb_x * 2, mb_y * 2),
         (mb_x * 2 + 1, mb_y * 2),
@@ -440,7 +440,12 @@ fn load_block_for_intra_cost(
     }
 }
 
-fn write_recon_to_pic(pic: &mut IVopPicture, mb: &PMbEncoding, mb_x: usize, mb_y: usize) {
+pub(crate) fn write_recon_to_pic(
+    pic: &mut IVopPicture,
+    mb: &PMbEncoding,
+    mb_x: usize,
+    mb_y: usize,
+) {
     let px = mb_x * 16;
     let py = mb_y * 16;
     for j in 0..16 {
@@ -477,7 +482,7 @@ fn write_recon_to_pic(pic: &mut IVopPicture, mb: &PMbEncoding, mb_x: usize, mb_y
 /// MVD components an Inter MB pays — the lambda accounts for the cost
 /// difference in the bitstream.
 #[allow(clippy::too_many_arguments)]
-fn estimate_and_encode_mb(
+pub(crate) fn estimate_and_encode_mb(
     v: &oxideav_core::VideoFrame,
     width: usize,
     height: usize,
@@ -1754,7 +1759,7 @@ pub(crate) fn wrap_mvd(mvd: i32, range: i32) -> i32 {
     v
 }
 
-fn write_mcbpc_inter(bw: &mut BitWriter, cbpc: u8) {
+pub(crate) fn write_mcbpc_inter(bw: &mut BitWriter, cbpc: u8) {
     // Table B-13 row for "Inter, cbpc=0..=3". The decoder's `PMbType::Inter`
     // corresponds to MCBPC values 0..=3 (group=0).
     let (bits, code) = match cbpc {

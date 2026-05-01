@@ -74,6 +74,7 @@ pub mod block;
 pub mod bvop;
 pub mod bvop_enc;
 pub mod decoder;
+pub mod dp;
 pub mod encoder;
 pub mod gmc;
 pub mod headers;

@@ -107,6 +107,17 @@ pub const DEFAULT_QUARTER_SAMPLE: bool = false;
 /// exactly as in round-19.
 pub const DEFAULT_GMC: bool = false;
 
+/// Default `data_partitioned` mode. When `true` the encoder advertises
+/// `data_partitioned = 1` in the VOL and emits each VOP's body using
+/// the `data_partitioned_motion_shape_texture()` layout (§6.2.6 /
+/// §6.3.7) — per-MB header/MV bits in part 1, then a 19-/17-bit marker,
+/// then per-MB texture (CBPY + AC) in part 2. Used by error-resilient
+/// transmission profiles. When `false` (default) the encoder uses the
+/// combined-mode layout (every MB's bits inline), preserving round-20
+/// behaviour. Mutually compatible with QPel and B-frames at the
+/// bitstream level — DP is purely a per-VOP body re-ordering.
+pub const DEFAULT_DATA_PARTITIONED: bool = false;
+
 /// `sprite_warping_accuracy` advertised when GMC is on. Code `0` = 1/2-pel
 /// (s = 2), which matches the encoder's half-pel ME unit and keeps the
 /// trajectory `(du, dv)` representation small. Codes 1/2/3 = 1/4, 1/8,
@@ -177,6 +188,34 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         .map(|s| !matches!(s, "" | "0" | "false" | "False" | "FALSE"))
         .unwrap_or(DEFAULT_GMC);
 
+    // `dp` enables data partitioning (§6.2.6 / §6.3.7). When on, every
+    // VOP body is emitted using `data_partitioned_motion_shape_texture()`
+    // layout: per-MB part 1 (mcbpc + DC for I-VOPs; not_coded + mcbpc +
+    // mcsel + MV for P-VOPs), DC marker (19 bits) or motion marker
+    // (17 bits), per-MB part 2 (cbpy + texture), per-MB AC walks. The
+    // VOL advertises `data_partitioned = 1` + `reversible_vlc = 0`
+    // (RVLC is a follow-up). DP at the spec level requires
+    // `resync_marker_disable = 0` — the encoder still emits one packet
+    // per picture (no mid-VOP video_packet_header() splits yet) but
+    // the VOL bit is set so future encoder passes can introduce splits
+    // without re-flipping it.
+    let data_partitioned = params
+        .options
+        .get("dp")
+        .map(|s| !matches!(s, "" | "0" | "false" | "False" | "FALSE"))
+        .unwrap_or(DEFAULT_DATA_PARTITIONED);
+    if data_partitioned && (gmc_enabled || quarter_sample || max_b_frames > 0) {
+        // The DP encoder body is currently I/P only at half-pel: GMC's
+        // mcsel bit interaction with the motion partition, QPel's MV
+        // unit doubling, and B-VOPs (which fall back to combined-mode
+        // per spec NOTE in §6.2.5.3) all need additional plumbing
+        // before we can advertise them under DP. Reject the combo
+        // explicitly so callers get a clear error.
+        return Err(Error::unsupported(
+            "mpeg4 encoder: data_partitioned=1 currently requires gmc=0, qpel=0, bf=0",
+        ));
+    }
+
     // `qp` sets the default quant for all VOP types; `qp_i`, `qp_p`
     // and `qp_b` override per VOP type. All values are clamped to
     // [MIN_VOP_QUANT, MAX_VOP_QUANT] — out-of-range strings are
@@ -237,6 +276,7 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         max_b_frames,
         quarter_sample,
         gmc_enabled,
+        data_partitioned,
         pending: VecDeque::new(),
         b_queue: VecDeque::new(),
         eof: false,
@@ -282,6 +322,13 @@ struct Mpeg4VideoEncoder {
     /// for the per-MB warp-vs-translational decision and global-motion
     /// estimation.
     gmc_enabled: bool,
+    /// VOL `data_partitioned == 1` flag — see [`crate::dp`] for the layout.
+    /// When `true`, every I/P-VOP body is emitted via
+    /// `dp::encode_i_vop_body_dp_and_reconstruct` /
+    /// `dp::encode_p_vop_body_dp_with_grid` instead of the combined-mode
+    /// emit path. The VOL also flips `resync_marker_disable = 0` so the
+    /// stream is conformant for future per-packet splitting.
+    data_partitioned: bool,
     pending: VecDeque<Packet>,
     /// Display-order B-frame queue — flushed on the next I/P encode.
     b_queue: VecDeque<VideoFrame>,
@@ -402,6 +449,7 @@ impl Mpeg4VideoEncoder {
                 self.max_b_frames > 0,
                 self.quarter_sample,
                 self.gmc_enabled,
+                self.data_partitioned,
             );
             self.headers_emitted = true;
         }
@@ -410,13 +458,23 @@ impl Mpeg4VideoEncoder {
         let vti_resolution = (self.frame_rate.num as u32).max(1);
         if is_keyframe {
             write_i_vop_header(&mut bw, time_inc, self.vop_quant_i, vti_resolution);
-            let pic = encode_i_vop_body_and_reconstruct(
-                &mut bw,
-                v,
-                self.width,
-                self.height,
-                self.vop_quant_i,
-            )?;
+            let pic = if self.data_partitioned {
+                crate::dp::encode_i_vop_body_dp_and_reconstruct(
+                    &mut bw,
+                    v,
+                    self.width,
+                    self.height,
+                    self.vop_quant_i,
+                )?
+            } else {
+                encode_i_vop_body_and_reconstruct(
+                    &mut bw,
+                    v,
+                    self.width,
+                    self.height,
+                    self.vop_quant_i,
+                )?
+            };
             self.reference = Some(pic);
             self.reference_grid = None;
             self.reference_time = time_inc as i64;
@@ -445,23 +503,45 @@ impl Mpeg4VideoEncoder {
                 vti_resolution,
                 trajectory.as_ref(),
             );
-            let (pic, grid) = encode_p_vop_body_with_grid(
-                &mut bw,
-                v,
-                self.width,
-                self.height,
-                reference,
-                self.vop_quant_p,
-                self.f_code_fwd,
-                self.rounding_type,
-                self.quarter_sample,
-                warp.as_ref(),
-            )?;
+            let (pic, grid) = if self.data_partitioned {
+                crate::dp::encode_p_vop_body_dp_with_grid(
+                    &mut bw,
+                    v,
+                    self.width,
+                    self.height,
+                    reference,
+                    self.vop_quant_p,
+                    self.f_code_fwd,
+                    self.rounding_type,
+                )?
+            } else {
+                encode_p_vop_body_with_grid(
+                    &mut bw,
+                    v,
+                    self.width,
+                    self.height,
+                    reference,
+                    self.vop_quant_p,
+                    self.f_code_fwd,
+                    self.rounding_type,
+                    self.quarter_sample,
+                    warp.as_ref(),
+                )?
+            };
             self.reference = Some(pic);
             self.reference_grid = Some(grid);
             self.reference_time = time_inc as i64;
         }
-        bw.align_to_byte_zero();
+        // MPEG-4 §5.2.4 next_start_code() stuffing — `0` then `1`'s to
+        // byte boundary; `0x7F` if already aligned. DP-conformant decoders
+        // (ffmpeg) require this exact pattern at the end of a video
+        // packet so they don't keep parsing into the trailing zeros and
+        // misinterpret them as more MB data.
+        if self.data_partitioned {
+            align_with_one_zero_then_ones(&mut bw);
+        } else {
+            bw.align_to_byte_zero();
+        }
         let bytes = bw.finish();
         let mut pkt = Packet::new(0, self.time_base, bytes);
         pkt.pts = v.pts;
@@ -494,6 +574,7 @@ impl Mpeg4VideoEncoder {
                 self.max_b_frames > 0,
                 self.quarter_sample,
                 self.gmc_enabled,
+                self.data_partitioned,
             );
             self.headers_emitted = true;
         }
@@ -502,13 +583,23 @@ impl Mpeg4VideoEncoder {
         let vti_resolution = (self.frame_rate.num as u32).max(1);
         if is_keyframe {
             write_i_vop_header(&mut bw, time_inc, self.vop_quant_i, vti_resolution);
-            let pic = encode_i_vop_body_and_reconstruct(
-                &mut bw,
-                v,
-                self.width,
-                self.height,
-                self.vop_quant_i,
-            )?;
+            let pic = if self.data_partitioned {
+                crate::dp::encode_i_vop_body_dp_and_reconstruct(
+                    &mut bw,
+                    v,
+                    self.width,
+                    self.height,
+                    self.vop_quant_i,
+                )?
+            } else {
+                encode_i_vop_body_and_reconstruct(
+                    &mut bw,
+                    v,
+                    self.width,
+                    self.height,
+                    self.vop_quant_i,
+                )?
+            };
             self.reference = Some(pic);
             self.reference_grid = None; // I-VOPs have no MV grid.
             self.reference_time = time_inc as i64;
@@ -548,7 +639,14 @@ impl Mpeg4VideoEncoder {
             self.reference_grid = Some(grid);
             self.reference_time = time_inc as i64;
         }
-        bw.align_to_byte_zero();
+        // Spec-conformant `next_start_code()` stuffing — see `emit_i_or_p`
+        // for the full rationale (DP-conformant decoders need this exact
+        // pattern at the end of a video packet).
+        if self.data_partitioned {
+            align_with_one_zero_then_ones(&mut bw);
+        } else {
+            bw.align_to_byte_zero();
+        }
         let bytes = bw.finish();
         let mut pkt = Packet::new(0, self.time_base, bytes);
         pkt.pts = v.pts;
@@ -714,15 +812,23 @@ fn write_vos_vo_vol(
     enable_b_vops: bool,
     quarter_sample: bool,
     gmc_enabled: bool,
+    data_partitioned: bool,
 ) {
     // VOS.
     write_start_code(bw, VOS_START_CODE);
     // profile_and_level_indication — pick the smallest PLI that admits
-    // every feature we actually emit. ASP Level 1 (`0xF1`) accepts B-VOPs,
-    // quarter_sample, AND GMC (§Annex N); Simple Profile Level 1
-    // (`0x01`) is the most-compatible PLI for plain I+P half-pel.
+    // every feature we actually emit:
+    //   * ASP Level 1 (`0xF1`) — B-VOPs / QPel / GMC (Annex N).
+    //   * Advanced Real Time Simple Profile Level 1 (`0x91`) — DP +
+    //     resync markers + reversible VLCs (Table G.1). Enabling DP
+    //     under SP/L1 is rejected by spec-strict decoders, hence this
+    //     bump.
+    //   * Simple Profile Level 1 (`0x01`) — most-compatible default
+    //     for plain I+P half-pel.
     let pli = if enable_b_vops || quarter_sample || gmc_enabled {
         0xF1
+    } else if data_partitioned {
+        0x91
     } else {
         0x01
     };
@@ -744,10 +850,14 @@ fn write_vos_vo_vol(
     bw.write_bits(0, 1); // random_accessible_vol = 0
                          // video_object_type_indication — ASP (4) when B-VOPs OR QPel OR GMC
                          // is on (Annex N requires verid>=2 for QPel and the
-                         // 2-bit `sprite_enable` field for GMC); Simple (1)
-                         // otherwise.
+                         // 2-bit `sprite_enable` field for GMC); Advanced Real
+                         // Time Simple (10) when DP is on (DP is unavailable
+                         // under the bare Simple type per Table 9-7);
+                         // Simple (1) otherwise.
     let vot_indication = if enable_b_vops || quarter_sample || gmc_enabled {
         4
+    } else if data_partitioned {
+        10
     } else {
         1
     };
@@ -819,10 +929,20 @@ fn write_vos_vo_vol(
         bw.write_bits(if quarter_sample { 1 } else { 0 }, 1);
     }
     bw.write_bits(1, 1); // complexity_estimation_disable = 1
-    bw.write_bits(1, 1); // resync_marker_disable = 1
-    bw.write_bits(0, 1); // data_partitioned = 0
-                         // verid>=2 adds newpred_enable + reduced_resolution_vop_enable.
-                         // Both 0 — we don't emit those features.
+                         // resync_marker_disable — must be 0 when DP is on
+                         // (DP is only legal inside a video packet — the
+                         // first packet starts at the VOP header). 1
+                         // otherwise.
+    bw.write_bits(if data_partitioned { 0 } else { 1 }, 1);
+    bw.write_bits(if data_partitioned { 1 } else { 0 }, 1); // data_partitioned
+    if data_partitioned {
+        // reversible_vlc — only emitted when DP is on (§6.2.3). We
+        // currently emit forward-only AC walks so RVLC stays 0 — adding
+        // RVLC encoding is the round-22 follow-up.
+        bw.write_bits(0, 1); // reversible_vlc = 0
+    }
+    // verid>=2 adds newpred_enable + reduced_resolution_vop_enable.
+    // Both 0 — we don't emit those features.
     if needs_verid2 {
         bw.write_bits(0, 1); // newpred_enable = 0
         bw.write_bits(0, 1); // reduced_resolution_vop_enable = 0
@@ -1373,7 +1493,7 @@ fn encode_intra_mb_inner(
     Ok(())
 }
 
-fn write_recon_to_picture(
+pub(crate) fn write_recon_to_picture(
     pic: &mut IVopPicture,
     blk: usize,
     mb_x: usize,
@@ -1406,7 +1526,7 @@ fn write_recon_to_picture(
 // Sample fetch + neighbour-grid bookkeeping
 // -------------------------------------------------------------------------
 
-fn load_block_samples(
+pub(crate) fn load_block_samples(
     v: &VideoFrame,
     width: usize,
     height: usize,
@@ -1448,7 +1568,12 @@ pub(crate) fn block_pel_position(
     }
 }
 
-fn lookup_neighbour_dcs(blk: usize, mb_x: usize, mb_y: usize, grid: &PredGrid) -> (i32, i32, i32) {
+pub(crate) fn lookup_neighbour_dcs(
+    blk: usize,
+    mb_x: usize,
+    mb_y: usize,
+    grid: &PredGrid,
+) -> (i32, i32, i32) {
     let (plane, bx, by, stride) = block_grid_position(blk, mb_x, mb_y, grid);
     let read = |px: isize, py: isize| -> i32 {
         if px < 0 || py < 0 {
@@ -1488,7 +1613,7 @@ fn block_grid_position(
     }
 }
 
-fn update_neighbour(
+pub(crate) fn update_neighbour(
     grid: &mut PredGrid,
     blk: usize,
     mb_x: usize,
@@ -1527,7 +1652,7 @@ fn update_neighbour(
 // MCBPC + CBPY emit (Tables B-10, B-9)
 // -------------------------------------------------------------------------
 
-fn write_mcbpc_intra(bw: &mut BitWriter, cbpc: u8) {
+pub(crate) fn write_mcbpc_intra(bw: &mut BitWriter, cbpc: u8) {
     // Table B-10 — Intra MCBPC values 0..=3 (cbpc).
     let (bits, code) = match cbpc {
         0 => (1, 0b1),
@@ -1542,7 +1667,7 @@ fn write_mcbpc_intra(bw: &mut BitWriter, cbpc: u8) {
 /// Table B-13 rows 4..=7 — Intra MB inside a P-VOP, indexed by `cbpc`.
 /// The decoder's `decompose_inter` maps this to `(PMbType::Intra, cbpc)`.
 /// Codewords mirror the table in `tables/mcbpc.rs::P_ROWS`.
-fn write_mcbpc_p_intra(bw: &mut BitWriter, cbpc: u8) {
+pub(crate) fn write_mcbpc_p_intra(bw: &mut BitWriter, cbpc: u8) {
     let (bits, code) = match cbpc {
         0 => (5, 0b00011),
         1 => (8, 0b00000100),
@@ -1553,7 +1678,7 @@ fn write_mcbpc_p_intra(bw: &mut BitWriter, cbpc: u8) {
     bw.write_bits(code, bits);
 }
 
-fn write_cbpy(bw: &mut BitWriter, cbpy: u8) {
+pub(crate) fn write_cbpy(bw: &mut BitWriter, cbpy: u8) {
     // Table B-9 raw values (mirrors the decoder table in tables/cbpy.rs).
     let (bits, code) = match cbpy {
         0 => (4, 0b0011),
@@ -1581,7 +1706,7 @@ fn write_cbpy(bw: &mut BitWriter, cbpy: u8) {
 // Intra DC VLC encode (Tables B-12 / B-13)
 // -------------------------------------------------------------------------
 
-fn write_intra_dc_diff(bw: &mut BitWriter, block_idx: usize, diff: i32) {
+pub(crate) fn write_intra_dc_diff(bw: &mut BitWriter, block_idx: usize, diff: i32) {
     let (size_codes, size_bits) = if block_idx < 4 {
         // Luma
         (
@@ -1627,7 +1752,7 @@ fn write_intra_dc_diff(bw: &mut BitWriter, block_idx: usize, diff: i32) {
 
 /// Walk `block` in zigzag order, emitting one VLC per non-zero coefficient.
 /// `block` is in natural order (block[ZIGZAG[i]] is scan position i).
-fn write_intra_ac(bw: &mut BitWriter, block: &[i32; 64]) -> Result<()> {
+pub(crate) fn write_intra_ac(bw: &mut BitWriter, block: &[i32; 64]) -> Result<()> {
     // Find the last non-zero AC scan index (we encode AC starting at scan 1).
     let mut last_nz: Option<usize> = None;
     for i in 1..64 {
@@ -1735,7 +1860,7 @@ pub(crate) fn round_div(a: i32, b: i32) -> i32 {
 /// `Q_plus = Q | 1` (i.e. `Q` if odd, `Q-1` if even). This routine picks the
 /// integer level whose reconstruction is closest to `coef`. Ties prefer the
 /// lower-magnitude level (cheaper to code).
-fn quantise_ac_intra_h263(coef: i32, q: i32) -> i32 {
+pub(crate) fn quantise_ac_intra_h263(coef: i32, q: i32) -> i32 {
     if coef == 0 || q <= 0 {
         return 0;
     }

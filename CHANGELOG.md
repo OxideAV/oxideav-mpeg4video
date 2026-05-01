@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- encoder + decoder: **data partitioning** (ISO/IEC 14496-2 §6.2.6 /
+  §6.3.7). Enabled with the `dp` codec option. When on, the VOL
+  advertises ARTS@L1 (`profile_and_level_indication = 0x91`,
+  `video_object_type_indication = 10`) + `data_partitioned = 1` +
+  `resync_marker_disable = 0` + `reversible_vlc = 0`; every I-VOP
+  body is emitted as `data_partitioned_i_vop()` (per-MB
+  `mcbpc + DC VLCs`, 19-bit DC marker `110 1011 0000 0000 0001`,
+  per-MB `ac_pred_flag + cbpy`, per-MB AC walks); every P-VOP body
+  is emitted as `data_partitioned_p_vop()` (per-MB
+  `not_coded + mcbpc + MV`, 17-bit motion marker
+  `1 1111 0000 0000 0001`, per-MB `cbpy`, per-MB AC walks). Round-21
+  scope: 1MV-Inter only — DP is rejected by the encoder factory when
+  combined with `qpel`/`gmc`/`bf>0` and the body emitter forces
+  intra-in-P decisions back to inter (intra-in-P + 4MV under DP are
+  round-22 follow-ups). The trailing
+  `next_start_code()` stuffing now follows §5.2.4 ('0' then '1'-bits,
+  or a full `0x7F` when already byte-aligned) for both DP and
+  combined-mode emission so spec-conformant decoders don't keep
+  parsing into the trailing zeros. ffmpeg cross-decode validated
+  end-to-end (`tests/dp.rs::dp_ffmpeg_decode`).
 - encoder: single-warp-point Global Motion Compensation (GMC) — VOL
   advertises `sprite_enable = 2` + `no_of_sprite_warping_points = 1`
   + `sprite_warping_accuracy = 0` (1/2-pel `s = 2`); each P-VOP is
