@@ -52,6 +52,12 @@ against ffmpeg-generated reference clips (I-only and GOP-of-10).
   walks in part 3. Round-21 DP decoder treats one VOP as one video
   packet; mid-VOP `video_packet_header()` splits in DP mode are a
   follow-up.
+- **Reversible VLC (Table B.23, round 22).** Decoder picks up
+  `reversible_vlc = 1` from the VOL when DP is on and routes every
+  DCT-coefficient AC walk through `crate::rvlc::decode_intra_ac` /
+  `decode_inter_ac` instead of the standard Table B.16/B.17 walker.
+  Forward-direction decode is implemented; reverse-direction error
+  recovery (Annex E.1.4.4 four strategies) is a follow-up.
 - **Picture store.** One reference frame, refreshed by each I-VOP and
   each P-VOP. Not-coded VOPs re-emit the previous reference at the
   new pts.
@@ -60,7 +66,7 @@ Out of scope — returns `Error::Unsupported`:
 
 - B-VOPs and S-VOPs (sprites) / GMC.
 - Quarter-pel motion (`quarter_sample`).
-- Interlaced field coding, scalability, reversible VLCs.
+- Interlaced field coding, scalability.
 - Non-rectangular shape (binary / grayscale shape coding).
 - `newpred_enable`, complexity-estimation header, reduced-resolution
   VOP.
@@ -121,11 +127,23 @@ Out of scope for the encoder:
   with MV/header bits in part 1, DC marker / motion marker, texture
   bits in part 2, AC walks in part 3, then spec-conformant
   `next_start_code()` stuffing (`0` then `1`'s, or full `0x7F` if
-  byte-aligned). Mutually exclusive with `qpel`/`gmc`/`bf>0` for now;
-  RVLC is `reversible_vlc = 0` (round-22 follow-up). ffmpeg
-  cross-decode validated on the synthetic moving-gradient fixture
-  (`tests/dp.rs::dp_ffmpeg_decode`).
-- Interlace, scalability, reversible VLCs.
+  byte-aligned). Mutually exclusive with `qpel`/`gmc`/`bf>0` for
+  now. ffmpeg cross-decode validated on the synthetic moving-gradient
+  fixture (`tests/dp.rs::dp_ffmpeg_decode`).
+- **Reversible VLC (`rvlc=1`, round 22).** Routes every DCT-coefficient
+  AC walk through Table B.23 (intra and inter columns share the same
+  prefix codes; the same prefix decodes to a different `(LAST, RUN,
+  LEVEL)` triplet depending on the block type). Required by the spec
+  to be combined with `dp=1` (§6.2.5: `reversible_vlc` only legal
+  inside `data_partitioned_motion_shape_texture()`). 30-bit RVLC
+  escape `00001 LAST(1) RUN(6) m LEVEL(11) m 0000 sign` covers any
+  triplet not in B.23. Bit overhead vs non-RVLC at the same Q on the
+  synthetic moving-gradient fixture: about +2.2 % bytes. ffmpeg
+  cross-decode validated (`tests/rvlc.rs::rvlc_ffmpeg_decode`,
+  43.5 dB I-VOP PSNR). Reverse-direction error-recovery decode
+  (Annex E.1.4.4 strategies) is a follow-up — round-22 reads the
+  RVLC stream forward only, which is sufficient for clean transport.
+- Interlace, scalability.
 - MPEG-4 matrix quant (`mpeg_quant = 1`).
 
 ## Performance

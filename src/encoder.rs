@@ -124,6 +124,16 @@ pub const DEFAULT_DATA_PARTITIONED: bool = false;
 /// 1/16-pel are valid but require correspondingly finer global ME.
 pub const GMC_SPRITE_WARPING_ACCURACY: u8 = 0;
 
+/// Default `reversible_vlc` mode. When `true` (and `data_partitioned`
+/// is also on, per §6.2.5), every DCT-coefficient AC walk in the
+/// emitted bitstream goes through the Table B.23 RVLC writer
+/// (`crate::rvlc`) instead of the standard Table B.16/B.17 tcoef
+/// writer. Costs slightly more bits but lets a decoder recover from a
+/// mid-block corruption by walking back from the end-of-block marker
+/// (Annex E.1.4.4). When `false` (default), AC walks use the standard
+/// forward-only tcoef tables — preserving round-21 behaviour.
+pub const DEFAULT_REVERSIBLE_VLC: bool = false;
+
 /// Encoder factory used by `register()`.
 pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     let width = params
@@ -216,6 +226,23 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         ));
     }
 
+    // `rvlc` enables Reversible VLC for DCT-coefficient AC walks
+    // (Table B.23, §7.4.1.2). The spec only allows `reversible_vlc =
+    // 1` together with `data_partitioned = 1`, so we reject `rvlc=1
+    // dp=0` at the factory rather than silently disabling. RVLC plus
+    // any feature already disabled under DP (qpel / gmc / bf) is
+    // already rejected by the DP combo check above.
+    let reversible_vlc = params
+        .options
+        .get("rvlc")
+        .map(|s| !matches!(s, "" | "0" | "false" | "False" | "FALSE"))
+        .unwrap_or(DEFAULT_REVERSIBLE_VLC);
+    if reversible_vlc && !data_partitioned {
+        return Err(Error::unsupported(
+            "mpeg4 encoder: rvlc=1 requires dp=1 (per ISO/IEC 14496-2 §6.2.5)",
+        ));
+    }
+
     // `qp` sets the default quant for all VOP types; `qp_i`, `qp_p`
     // and `qp_b` override per VOP type. All values are clamped to
     // [MIN_VOP_QUANT, MAX_VOP_QUANT] — out-of-range strings are
@@ -277,6 +304,7 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         quarter_sample,
         gmc_enabled,
         data_partitioned,
+        reversible_vlc,
         pending: VecDeque::new(),
         b_queue: VecDeque::new(),
         eof: false,
@@ -329,6 +357,13 @@ struct Mpeg4VideoEncoder {
     /// emit path. The VOL also flips `resync_marker_disable = 0` so the
     /// stream is conformant for future per-packet splitting.
     data_partitioned: bool,
+    /// VOL `reversible_vlc == 1` flag — see [`crate::rvlc`]. Only valid
+    /// together with `data_partitioned == 1`; the encoder factory
+    /// rejects any other combination. When `true`, every DCT-coefficient
+    /// AC walk inside the DP body is emitted through the Table B.23
+    /// RVLC writer (`rvlc::write_intra_ac` / `rvlc::write_inter_ac`)
+    /// instead of `encoder::write_intra_ac` / `pvop::write_inter_ac`.
+    reversible_vlc: bool,
     pending: VecDeque<Packet>,
     /// Display-order B-frame queue — flushed on the next I/P encode.
     b_queue: VecDeque<VideoFrame>,
@@ -450,6 +485,7 @@ impl Mpeg4VideoEncoder {
                 self.quarter_sample,
                 self.gmc_enabled,
                 self.data_partitioned,
+                self.reversible_vlc,
             );
             self.headers_emitted = true;
         }
@@ -465,6 +501,7 @@ impl Mpeg4VideoEncoder {
                     self.width,
                     self.height,
                     self.vop_quant_i,
+                    self.reversible_vlc,
                 )?
             } else {
                 encode_i_vop_body_and_reconstruct(
@@ -513,6 +550,7 @@ impl Mpeg4VideoEncoder {
                     self.vop_quant_p,
                     self.f_code_fwd,
                     self.rounding_type,
+                    self.reversible_vlc,
                 )?
             } else {
                 encode_p_vop_body_with_grid(
@@ -575,6 +613,7 @@ impl Mpeg4VideoEncoder {
                 self.quarter_sample,
                 self.gmc_enabled,
                 self.data_partitioned,
+                self.reversible_vlc,
             );
             self.headers_emitted = true;
         }
@@ -590,6 +629,7 @@ impl Mpeg4VideoEncoder {
                     self.width,
                     self.height,
                     self.vop_quant_i,
+                    self.reversible_vlc,
                 )?
             } else {
                 encode_i_vop_body_and_reconstruct(
@@ -813,6 +853,7 @@ fn write_vos_vo_vol(
     quarter_sample: bool,
     gmc_enabled: bool,
     data_partitioned: bool,
+    reversible_vlc: bool,
 ) {
     // VOS.
     write_start_code(bw, VOS_START_CODE);
@@ -936,10 +977,11 @@ fn write_vos_vo_vol(
     bw.write_bits(if data_partitioned { 0 } else { 1 }, 1);
     bw.write_bits(if data_partitioned { 1 } else { 0 }, 1); // data_partitioned
     if data_partitioned {
-        // reversible_vlc — only emitted when DP is on (§6.2.3). We
-        // currently emit forward-only AC walks so RVLC stays 0 — adding
-        // RVLC encoding is the round-22 follow-up.
-        bw.write_bits(0, 1); // reversible_vlc = 0
+        // reversible_vlc — only emitted when DP is on (§6.2.3). When
+        // set, DCT-coefficient AC walks go through the Table B.23 RVLC
+        // tables (`crate::rvlc`) instead of the standard B.16/B.17
+        // tcoef tables.
+        bw.write_bits(if reversible_vlc { 1 } else { 0 }, 1);
     }
     // verid>=2 adds newpred_enable + reduced_resolution_vop_enable.
     // Both 0 — we don't emit those features.

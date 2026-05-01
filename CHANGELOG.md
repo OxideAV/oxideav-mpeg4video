@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- encoder + decoder: **reversible VLC (RVLC)** for DCT coefficients
+  (ISO/IEC 14496-2 Tables B.23–B.25, §7.4.1.2). Enabled with the
+  `rvlc` codec option, which requires `dp=1` (per §6.2.5: RVLC is only
+  legal inside `data_partitioned_motion_shape_texture()`). When on,
+  the VOL flips `reversible_vlc = 1` and every per-MB AC walk inside
+  the DP body — intra (I-VOP and Intra-in-P) AND inter (P-VOP) — is
+  routed through Table B.23 (169 short codewords + 30-bit escape
+  `00001 LAST(1) RUN(6) m LEVEL(11) m 0000 sign`) instead of the
+  standard Tables B.16 / B.17 used by the combined-mode encoder.
+  Both intra and inter blocks share the same prefix codewords; the
+  triplet a prefix decodes to depends on the block type. The shared
+  `0000` pattern between the opening and closing escape markers is
+  reserved (no short codeword starts with `0000`), giving a forward
+  parser a clean way to spot escape boundaries. Self-roundtrip PSNR
+  on the synthetic moving-gradient fixture is 42.5 dB; ffmpeg
+  cross-decode reports 43.5 dB on the I-VOP. Bit overhead vs DP-only
+  at the same Q is about +2.2 % on the same fixture. New module:
+  `src/rvlc.rs` (RVLC encode + forward decode + 12 lib tests + 5
+  integration tests in `tests/rvlc.rs`). Reverse-direction
+  error-recovery decode (Annex E.1.4.4 strategies 1–4) is a future
+  follow-up — round-22 reads RVLC streams forward only, sufficient
+  for clean transport.
 - encoder + decoder: **data partitioning** (ISO/IEC 14496-2 §6.2.6 /
   §6.3.7). Enabled with the `dp` codec option. When on, the VOL
   advertises ARTS@L1 (`profile_and_level_indication = 0x91`,

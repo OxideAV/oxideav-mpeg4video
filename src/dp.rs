@@ -129,12 +129,18 @@ struct IMbDp {
 /// (§6.2.5.3) and return the reconstructed picture so it can serve as
 /// the next P-VOP reference. Mirrors `encoder::encode_i_vop_body_and_reconstruct`
 /// modulo bit ordering.
+///
+/// `reversible_vlc` selects the AC-walk writer: when `true`, the per-MB
+/// AC partition is emitted via [`crate::rvlc::write_intra_ac`] (Table
+/// B.23) instead of [`encoder::write_intra_ac`] (Table B.16). The VOL
+/// header must already advertise `reversible_vlc = 1`.
 pub fn encode_i_vop_body_dp_and_reconstruct(
     bw: &mut BitWriter,
     v: &VideoFrame,
     width: u32,
     height: u32,
     vop_quant: u32,
+    reversible_vlc: bool,
 ) -> Result<IVopPicture> {
     let width = width as usize;
     let height = height as usize;
@@ -196,7 +202,11 @@ pub fn encode_i_vop_body_dp_and_reconstruct(
             if !coded {
                 continue;
             }
-            write_intra_ac(bw, &mb.ac_levels[blk])?;
+            if reversible_vlc {
+                crate::rvlc::write_intra_ac(bw, &mb.ac_levels[blk])?;
+            } else {
+                write_intra_ac(bw, &mb.ac_levels[blk])?;
+            }
         }
     }
 
@@ -430,8 +440,13 @@ pub fn decode_ivop_dp(
                 continue;
             }
             // We disabled AC prediction at encode time — use the default
-            // zigzag scan.
-            decode_intra_ac(br, &mut mb.ac_levels[blk], &ZIGZAG)?;
+            // zigzag scan. Route through RVLC tables when the VOL has
+            // `reversible_vlc = 1`.
+            if vol.reversible_vlc {
+                crate::rvlc::decode_intra_ac(br, &mut mb.ac_levels[blk], &ZIGZAG)?;
+            } else {
+                decode_intra_ac(br, &mut mb.ac_levels[blk], &ZIGZAG)?;
+            }
         }
     }
 
@@ -492,6 +507,11 @@ use crate::pvop::{
 /// here. Skipped MBs (`not_coded = 1`) are emitted exactly like the
 /// combined-mode encoder. The picture is treated as one video packet —
 /// no mid-VOP `video_packet_header()` splits.
+///
+/// `reversible_vlc` selects the inter-AC writer: when `true`, the
+/// per-MB AC partition is emitted via [`crate::rvlc::write_inter_ac`]
+/// (Table B.23) instead of [`pvop::write_inter_ac`] (Table B.17). The
+/// VOL header must already advertise `reversible_vlc = 1`.
 #[allow(clippy::too_many_arguments)]
 pub fn encode_p_vop_body_dp_with_grid(
     bw: &mut BitWriter,
@@ -502,6 +522,7 @@ pub fn encode_p_vop_body_dp_with_grid(
     vop_quant: u32,
     f_code_fwd: u8,
     rounding_type: bool,
+    reversible_vlc: bool,
 ) -> Result<(IVopPicture, MvGrid)> {
     let width = width as usize;
     let height = height as usize;
@@ -630,7 +651,11 @@ pub fn encode_p_vop_body_dp_with_grid(
             if !coded {
                 continue;
             }
-            write_inter_ac(bw, &mb.ac_levels[blk]);
+            if reversible_vlc {
+                crate::rvlc::write_inter_ac(bw, &mb.ac_levels[blk]);
+            } else {
+                write_inter_ac(bw, &mb.ac_levels[blk]);
+            }
         }
     }
 
@@ -776,7 +801,11 @@ pub fn decode_pvop_dp_with_grid(
             if !coded {
                 continue;
             }
-            decode_inter_ac(br, &mut mb.ac_levels[blk], &ZIGZAG)?;
+            if vol.reversible_vlc {
+                crate::rvlc::decode_inter_ac(br, &mut mb.ac_levels[blk], &ZIGZAG)?;
+            } else {
+                decode_inter_ac(br, &mut mb.ac_levels[blk], &ZIGZAG)?;
+            }
         }
     }
 

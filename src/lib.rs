@@ -85,6 +85,7 @@ pub mod mb;
 pub mod mc;
 pub mod pvop;
 pub mod resync;
+pub mod rvlc;
 pub mod simd;
 pub mod start_codes;
 pub mod tables;
