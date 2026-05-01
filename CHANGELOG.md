@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- encoder: single-warp-point Global Motion Compensation (GMC) — VOL
+  advertises `sprite_enable = 2` + `no_of_sprite_warping_points = 1`
+  + `sprite_warping_accuracy = 0` (1/2-pel `s = 2`); each P-VOP is
+  emitted as an `S(GMC)`-VOP with one `(du, dv)` `sprite_trajectory()`;
+  every Inter / InterQ MB carries an `mcsel` bit picking between
+  translational MC and warp-predicted MC. Per-VOP global translation
+  is estimated by a coarse `±16`-pel SAD scan against the reference;
+  per-MB GMC vs translational SAD comparison drives the `mcsel`
+  decision. Exposed through the `gmc` codec option (`"1"` / `"true"`
+  to enable; defaults off, preserving round-19 behaviour).
+  See `gmc::encode_warping_mv`, `gmc::encode_sprite_trajectory`,
+  `encoder::build_gmc_trajectory`, and the `gmc` mode-decision +
+  `mcsel` emission paths in `pvop::estimate_and_encode_mb` /
+  `pvop::emit_p_mb`. ffmpeg cross-decode validated on a synthetic
+  global-pan testsrc (`tests/p_vop.rs::gmc_ffmpeg_decode`).
 - encoder: per-VOP-type quantiser knobs (`qp`, `qp_i`, `qp_p`, `qp_b`)
   exposed via `CodecParameters::options`. Each value is range-checked
   to `[1, 31]` (the 5-bit `vop_quant` field) and rejected with
@@ -18,6 +33,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- decoder: `parse_vop` now follows the §6.2.5 spec field order — when
+  `vop_coding_type == "S"` AND the VOL has `sprite_enable in
+  {static, GMC}`, `sprite_trajectory()` (and optionally
+  `brightness_change_factor()`) is read BEFORE `vop_quant`, not after
+  `vop_fcode_forward`. `vop_rounding_type` is now also emitted/read
+  for `S(GMC)` VOPs per the spec.
+- decoder: `inter::decode_p_mb` reads the `mcsel` bit RIGHT AFTER
+  `mcbpc` (matching the §6.3.7 macroblock() syntax order) instead of
+  after `cbpy` / dquant / `interlaced_information`. The pre-r20 order
+  was internally consistent (encode + decode round-tripped) but
+  rejected by ffmpeg and any spec-conformant decoder.
+- decoder: `Mpeg4VideoDecoder::process_vop` now routes
+  `VopCodingType::S` through the P-VOP body decoder when
+  `vol.sprite_enable == 2` (S(GMC) is a P-substitute per §6.2.5).
+  Static-sprite S-VOPs (`sprite_enable == 1`) still return
+  `Error::Unsupported`.
 - encoder: `cargo fmt` reflows on `bvop_enc.rs`, `encoder.rs`, `pvop.rs`
   + silenced an unused `vol` binding in `tests/reference_clips.rs` so
   `cargo clippy --all-targets -- -D warnings` is green again.

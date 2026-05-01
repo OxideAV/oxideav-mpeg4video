@@ -126,6 +126,12 @@ pub struct PMbEncoding {
     /// per MB, with chroma MV derived as the average of the 4 luma MVs
     /// scaled to chroma per §7.5.9.5.
     pub four_mv: bool,
+    /// True when the MB is emitted as a GMC macroblock (`mcsel = 1`) — the
+    /// 16×16 luma + 2×8×8 chroma blocks are predicted by warping the
+    /// reference through the per-VOP `WarpParams`. No MV is signalled in
+    /// the bitstream for GMC MBs (§7.6.7). Mutually exclusive with
+    /// `four_mv` (the standard's MCBPC layout admits `Inter` + mcsel only).
+    pub gmc: bool,
     /// When true, the MB is emitted as `not_coded` (skipped) — caller can
     /// verify by decoding a 0 residual.
     pub skipped: bool,
@@ -157,6 +163,7 @@ impl Default for PMbEncoding {
             mv_half: (0, 0),
             mv4_half: [(0, 0); 4],
             four_mv: false,
+            gmc: false,
             skipped: false,
             luma_coded: [false; 4],
             chroma_coded: [false; 2],
@@ -200,6 +207,7 @@ pub fn encode_p_vop_body(
         f_code_fwd,
         rounding_type,
         false,
+        None,
     )?;
     Ok(pic)
 }
@@ -211,6 +219,13 @@ pub fn encode_p_vop_body(
 ///   whose co-located P-MB was not coded.
 /// * Direct-mode co-located MV scaling (§7.5.9.5) — the forward/backward
 ///   MVs of direct-mode B-MBs are derived from the P-MB's MV.
+///
+/// `warp` is `Some` when the VOL advertises GMC (`sprite_enable == 2`).
+/// In that case every Inter MB in the body emits an `mcsel` bit; when
+/// the per-MB `mcsel = 1` decision wins, the MB is reconstructed by
+/// warping the reference through `warp` and no MV is written. See
+/// `crate::gmc::warp_predict_luma_block`.
+#[allow(clippy::too_many_arguments)]
 pub fn encode_p_vop_body_with_grid(
     bw: &mut BitWriter,
     v: &oxideav_core::VideoFrame,
@@ -221,6 +236,7 @@ pub fn encode_p_vop_body_with_grid(
     f_code_fwd: u8,
     rounding_type: bool,
     quarter_sample: bool,
+    warp: Option<&crate::gmc::WarpParams>,
 ) -> Result<(IVopPicture, MvGrid)> {
     let width = width as usize;
     let height = height as usize;
@@ -236,6 +252,7 @@ pub fn encode_p_vop_body_with_grid(
     // matching the decoder's `decode_p_vop_body`.
     let mut pred_grid = PredGrid::new(mb_w, mb_h);
 
+    let gmc_enabled = warp.is_some();
     for mb_y in 0..mb_h {
         for mb_x in 0..mb_w {
             // Decision pass — also produces a fully-reconstructed inter MB.
@@ -250,6 +267,7 @@ pub fn encode_p_vop_body_with_grid(
                 rounding_type,
                 &mv_grid,
                 quarter_sample,
+                warp,
             )?;
 
             // Intra-in-P decision (§6.3.7): the inter SAD is the cost we
@@ -300,7 +318,7 @@ pub fn encode_p_vop_body_with_grid(
                     },
                 );
             } else {
-                emit_p_mb(bw, &mb, mb_x, mb_y, &mut mv_grid, f_code_fwd);
+                emit_p_mb(bw, &mb, mb_x, mb_y, &mut mv_grid, f_code_fwd, gmc_enabled);
                 // Stash reconstructed samples into `pic`.
                 write_recon_to_pic(&mut pic, &mb, mb_x, mb_y);
                 // Reset PredGrid for inter MB (mirrors the decoder's
@@ -452,6 +470,13 @@ fn write_recon_to_pic(pic: &mut IVopPicture, mb: &PMbEncoding, mb_x: usize, mb_y
 /// MVD bits 4MV emits (3 extra MVDs ≈ ~24 bits). 4MV improves
 /// compression on content with sub-MB-level motion (8×8 pieces moving
 /// independently) at the cost of three extra MVD pairs per MB.
+///
+/// When `warp` is `Some` (GMC enabled), we also build a GMC predictor
+/// for the MB and switch to it when its luma SAD beats the chosen-mode
+/// (1MV or 4MV) SAD by more than `GMC_LAMBDA`. GMC MBs save the four
+/// MVD components an Inter MB pays — the lambda accounts for the cost
+/// difference in the bitstream.
+#[allow(clippy::too_many_arguments)]
 fn estimate_and_encode_mb(
     v: &oxideav_core::VideoFrame,
     width: usize,
@@ -463,6 +488,7 @@ fn estimate_and_encode_mb(
     rounding: bool,
     mv_grid: &MvGrid,
     quarter_sample: bool,
+    warp: Option<&crate::gmc::WarpParams>,
 ) -> Result<PMbEncoding> {
     // 1. Integer-pel search over the 16×16 luma MB.
     let src_y_block = load_luma_mb(v, width, height, mb_x, mb_y);
@@ -545,9 +571,9 @@ fn estimate_and_encode_mb(
     // 5. Mode decision — favour 1MV unless 4MV beats it by more than the
     //    lambda penalty. 1MV ties win because they're cheaper to code and
     //    avoid splitting the MB's chroma predictor.
-    let four_mv = sad_4mv.saturating_add(FOURMV_LAMBDA) < sad_1mv;
+    let mut four_mv = sad_4mv.saturating_add(FOURMV_LAMBDA) < sad_1mv;
 
-    let (mv_repr, pred_y) = if four_mv {
+    let (mut mv_repr, mut pred_y) = if four_mv {
         // Build the 4MV luma predictor.
         let mut pred = [0u8; 256];
         predict_luma_mb_4mv_any(
@@ -570,18 +596,68 @@ fn estimate_and_encode_mb(
     // sites — `mv4_half` carries the 4 per-block MVs in the active
     // unit (half-pel when `quarter_sample == false`, quarter-pel
     // otherwise).
-    let mv4_half = mv4;
+    let mut mv4_half = mv4;
+
+    // 5b. GMC mode decision (§7.6.7). Available when the VOL has
+    //     `sprite_enable == 2` — i.e. `warp` is `Some`. We build the
+    //     GMC luma predictor by warping the reference through the
+    //     per-VOP `WarpParams` and compare its SAD against the chosen
+    //     translational mode (1MV or 4MV). GMC saves the MVD bits an
+    //     Inter MB pays for the MV component pair (~6-12 bits at
+    //     f_code=1); the lambda below approximates that saving in
+    //     SAD-equivalent units. Notably GMC never wins for the 4MV
+    //     path's intricate sub-MB motion — the warp by definition
+    //     describes a single global translation — so we apply GMC
+    //     only when 4MV did NOT win the prior decision.
+    let mut gmc = false;
+    if let Some(w) = warp {
+        let mut pred_gmc = [0u8; 256];
+        let blk_px = (mb_x * 16) as i32;
+        let blk_py = (mb_y * 16) as i32;
+        crate::gmc::warp_predict_luma_block(
+            w,
+            &reference.y,
+            reference.y_stride,
+            blk_px,
+            blk_py,
+            16,
+            &mut pred_gmc,
+            16,
+        );
+        let sad_gmc = sad_full_mb(&src_y_block, &pred_gmc);
+        let chosen_sad = if four_mv { sad_4mv } else { sad_1mv };
+        // GMC saves ~6-12 bits per MB in MVD; in SAD-equivalent units at
+        // typical Q≈5 a saved bit is worth ~5 SAD points, so a 12-bit
+        // saving ≈ 60 SAD points. We use 64 as a slight bias toward the
+        // translational mode; GMC must materially beat the chosen mode.
+        const GMC_LAMBDA: u32 = 64;
+        if sad_gmc + GMC_LAMBDA < chosen_sad {
+            gmc = true;
+            four_mv = false;
+            mv_repr = (0, 0);
+            mv4_half = [(0, 0); 4];
+            pred_y = pred_gmc;
+        }
+    }
 
     // Stash the chosen-mode luma SAD for the intra-in-P decision in
     // `encode_p_vop_body_with_grid`. We use the SAD against the chosen
-    // mode's predictor (1MV or 4MV), giving the cleanest "this is what
-    // the inter coder is asking the AC pass to handle" signal.
-    let inter_luma_sad = if four_mv { sad_4mv } else { sad_1mv };
+    // mode's predictor (1MV / 4MV / GMC), giving the cleanest "this is
+    // what the inter coder is asking the AC pass to handle" signal.
+    let inter_luma_sad = if gmc {
+        // GMC SAD recomputed from the actual predictor stored in pred_y.
+        sad_full_mb(&src_y_block, &pred_y)
+    } else if four_mv {
+        sad_4mv
+    } else {
+        sad_1mv
+    };
 
     let mut mb = PMbEncoding {
         mv_half: mv_repr,
         mv4_half,
         four_mv,
+        gmc,
         inter_luma_sad,
         ..Default::default()
     };
@@ -609,26 +685,55 @@ fn estimate_and_encode_mb(
     };
     let mut pred_cb = [0u8; 64];
     let mut pred_cr = [0u8; 64];
-    predict_chroma_block(
-        &reference.cb,
-        reference.c_stride,
-        mb_x,
-        mb_y,
-        cmx,
-        cmy,
-        rounding,
-        &mut pred_cb,
-    );
-    predict_chroma_block(
-        &reference.cr,
-        reference.c_stride,
-        mb_x,
-        mb_y,
-        cmx,
-        cmy,
-        rounding,
-        &mut pred_cr,
-    );
+    if gmc {
+        // GMC chroma: warp the chroma planes directly through
+        // `chroma_map`. The decoder mirrors this in
+        // `inter::decode_p_mb` when `gmc_mb` is true.
+        let warp = warp.expect("gmc set without warp");
+        let cx_px = (mb_x * 8) as i32;
+        let cy_px = (mb_y * 8) as i32;
+        crate::gmc::warp_predict_chroma_block(
+            warp,
+            &reference.cb,
+            reference.c_stride,
+            cx_px,
+            cy_px,
+            8,
+            &mut pred_cb,
+            8,
+        );
+        crate::gmc::warp_predict_chroma_block(
+            warp,
+            &reference.cr,
+            reference.c_stride,
+            cx_px,
+            cy_px,
+            8,
+            &mut pred_cr,
+            8,
+        );
+    } else {
+        predict_chroma_block(
+            &reference.cb,
+            reference.c_stride,
+            mb_x,
+            mb_y,
+            cmx,
+            cmy,
+            rounding,
+            &mut pred_cb,
+        );
+        predict_chroma_block(
+            &reference.cr,
+            reference.c_stride,
+            mb_x,
+            mb_y,
+            cmx,
+            cmy,
+            rounding,
+            &mut pred_cr,
+        );
+    }
 
     // 6. Residual + forward DCT + quant, per 8×8 block.
     // Luma blocks: 0=(0,0) 1=(8,0) 2=(0,8) 3=(8,8)
@@ -670,8 +775,11 @@ fn estimate_and_encode_mb(
     // decoder copies the reference verbatim, which must equal what we
     // reconstructed. 4MV MBs cannot be `not_coded` (Inter4MV is its own
     // MCBPC group; the decoder's not_coded path forces 1MV with MV=(0,0)).
+    // GMC MBs likewise cannot be `not_coded` — the skip path is purely
+    // translational with MV=(0,0), but a GMC MB's reference is warped
+    // (§7.6.7).
     let all_zero = !mb.luma_coded.iter().any(|&c| c) && !mb.chroma_coded.iter().any(|&c| c);
-    if !mb.four_mv && all_zero && mvx_1mv == 0 && mvy_1mv == 0 {
+    if !mb.four_mv && !mb.gmc && all_zero && mvx_1mv == 0 && mvy_1mv == 0 {
         // Make sure the reconstructed samples equal the reference region,
         // which they do by construction (residual=0, MV=0). Holds for
         // QPel MV(0,0) as well — the (0,0) qpel position is identical
@@ -1513,6 +1621,7 @@ fn emit_p_mb(
     mb_y: usize,
     mv_grid: &mut MvGrid,
     f_code_fwd: u8,
+    gmc_enabled: bool,
 ) {
     if mb.skipped {
         // §6.3.5: not_coded = 1.
@@ -1524,12 +1633,22 @@ fn emit_p_mb(
 
     // MCBPC (Table B-13). cbpc = bit1=Cb bit0=Cr. For 4MV MBs the
     // mb_type group is `Inter4MV` (rows 16..=19) instead of `Inter`
-    // (rows 0..=3). cbpc bits are unchanged.
+    // (rows 0..=3). cbpc bits are unchanged. GMC MBs use the plain
+    // `Inter` group (rows 0..=3) — the `mcsel` bit emitted next picks
+    // the warp predictor.
     let cbpc = ((mb.chroma_coded[0] as u8) << 1) | (mb.chroma_coded[1] as u8);
     if mb.four_mv {
         write_mcbpc_inter4mv(bw, cbpc);
     } else {
         write_mcbpc_inter(bw, cbpc);
+    }
+
+    // GMC `mcsel` bit (§6.3.7 macroblock() syntax — emitted RIGHT AFTER
+    // mcbpc, before ac_pred / cbpy / dquant / interlaced_information).
+    // Present only when the VOL advertises `sprite_enable == 2` AND the
+    // MB is single-MV Inter / InterQ. 4MV and Intra MBs never carry mcsel.
+    if gmc_enabled && !mb.four_mv {
+        bw.write_bits(if mb.gmc { 1 } else { 0 }, 1);
     }
 
     // CBPY — for inter MBs (incl. Inter4MV) the encoded value is bit-
@@ -1543,6 +1662,26 @@ fn emit_p_mb(
     }
     let cbpy_encoded = cbpy_mask ^ 0xF;
     write_cbpy(bw, cbpy_encoded);
+
+    if mb.gmc {
+        // GMC MBs skip MV emission entirely. The decoder sees the
+        // `mcsel = 1` bit, leaves the per-MB MV at (0,0) for predictor
+        // purposes (§7.6.7) and reconstructs by warping the reference
+        // through the per-VOP `WarpParams`. Drop straight to the
+        // residual walk below.
+        for blk in 0..6 {
+            let coded = if blk < 4 {
+                mb.luma_coded[blk]
+            } else {
+                mb.chroma_coded[blk - 4]
+            };
+            if !coded {
+                continue;
+            }
+            write_inter_ac(bw, &mb.ac_levels[blk]);
+        }
+        return;
+    }
 
     // Motion vectors. 1MV: one MVD pair predicted from median(left, top,
     // top-right) at block index 0. 4MV: four MVD pairs, one per 8×8 luma

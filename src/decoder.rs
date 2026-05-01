@@ -366,7 +366,32 @@ impl Mpeg4VideoDecoder {
                 self.emit_b_frame(frame);
                 Ok(())
             }
-            VopCodingType::S => Err(Error::unsupported("mpeg4 S-VOP (sprite): out of scope")),
+            VopCodingType::S => {
+                // GMC P-substitute (§6.2.5: "An S(GMC)-VOP can be
+                // regarded as a P-VOP"). Reuses the P-VOP body decode
+                // path — the per-MB `mcsel` bit selects the warp
+                // predictor. Static-sprite (`sprite_enable == 1`) S-VOPs
+                // remain out of scope and return Unsupported.
+                if vol.sprite_enable != 2 {
+                    return Err(Error::unsupported(
+                        "mpeg4 S-VOP (static sprite): out of scope",
+                    ));
+                }
+                let Some(reference) = self.prev_ref.as_ref().or(self.next_ref.as_ref()) else {
+                    return Err(Error::invalid("mpeg4 S(GMC)-VOP: no reference frame yet"));
+                };
+                let ref_pic = match self.next_ref.as_ref() {
+                    Some(r) => r.clone(),
+                    None => reference.clone(),
+                };
+                let (pic, mv_grid) = decode_pvop_pic_with_grid(vol, vop, br, &ref_pic)?;
+                let cur_time = self.vop_absolute_time(vol, vop);
+                let pts = self.pts_for_vop(vol, cur_time);
+                let frame = pic_to_video_frame(vol, &pic, pts, self.pending_tb);
+                self.rotate_refs(pic, Some(mv_grid), cur_time);
+                self.emit_reference_frame(frame);
+                Ok(())
+            }
         }
     }
 

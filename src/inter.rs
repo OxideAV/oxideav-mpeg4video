@@ -375,19 +375,38 @@ pub fn decode_p_mb(
         }
     };
     let (mb_type, cbpc) = mcbpc::decompose_inter(mcbpc_v);
+    let is_intra_mb = matches!(mb_type, mcbpc::PMbType::Intra | mcbpc::PMbType::IntraQ);
+    let is_4mv = matches!(
+        mb_type,
+        mcbpc::PMbType::Inter4MV | mcbpc::PMbType::Inter4MVQ
+    );
 
-    // 3. ac_pred_flag — only for Intra/IntraQ MBs in P-VOP.
+    // 3. GMC `mcsel` flag (§6.3.7 macroblock() syntax). Present right
+    // after mcbpc — BEFORE `ac_pred_flag`, `cbpy`, `dquant` and
+    // `interlaced_information`. Emitted only when the VOL advertises
+    // `sprite_enable == 2` AND `derived_mb_type == 0 || 1` (Inter /
+    // InterQ — the spec writes "S(GMC)" but the same logic gates here).
+    // 4MV and Intra MBs never carry mcsel.
+    let gmc_mb = if vol.sprite_enable == 2
+        && matches!(mb_type, mcbpc::PMbType::Inter | mcbpc::PMbType::InterQ)
+    {
+        br.read_u1()? == 1
+    } else {
+        false
+    };
+
+    // 4. ac_pred_flag — only for Intra/IntraQ MBs in P-VOP.
     let ac_pred =
         matches!(mb_type, mcbpc::PMbType::Intra | mcbpc::PMbType::IntraQ) && br.read_u1()? == 1;
 
-    // 4. CBPY. For inter MBs the value is bit-inverted (§7.4.1.2).
+    // 5. CBPY. For inter MBs the value is bit-inverted (§7.4.1.2).
     let cbpy_raw = vlc::decode(br, cbpy::table())?;
     let cbpy = match mb_type {
         mcbpc::PMbType::Intra | mcbpc::PMbType::IntraQ => cbpy_raw,
         _ => cbpy_raw ^ 0xF,
     };
 
-    // 5. dquant if needed.
+    // 6. dquant if needed.
     let mut quant = quant_in;
     if matches!(
         mb_type,
@@ -398,18 +417,13 @@ pub fn decode_p_mb(
         quant = new_q.clamp(1, 31) as u32;
     }
 
-    // 5b. Interlaced information — §6.2.7.3. Present only when the VOP
+    // 7. Interlaced information — §6.2.7.3. Present only when the VOP
     // advertises `interlaced == 1`. The class of the MB determines which
     // sub-fields are emitted:
     //   * Intra MBs — only `dct_type`.
     //   * Single-MV inter MBs — `dct_type` iff cbp != 0, then
     //     `field_prediction` + optional field-ref bits.
     //   * 4MV MBs — only `dct_type` when cbp != 0.
-    let is_intra_mb = matches!(mb_type, mcbpc::PMbType::Intra | mcbpc::PMbType::IntraQ);
-    let is_4mv = matches!(
-        mb_type,
-        mcbpc::PMbType::Inter4MV | mcbpc::PMbType::Inter4MVQ
-    );
     let cbp_nonzero = cbpy != 0 || cbpc != 0;
     let il_info = if vop.interlaced {
         let class = if is_intra_mb {
@@ -423,23 +437,11 @@ pub fn decode_p_mb(
     } else {
         InterlacedInfo::default()
     };
-
-    // 5c. GMC `mcsel` flag (§7.7 amendment). Present only when the VOL
-    // advertises `sprite_enable == 2` AND the MB type is Inter / InterQ
-    // (single-MV). The bit signals that the MB should be reconstructed
-    // by warping the reference through the global transform rather than
-    // by translational MC. `mcsel == 1` macroblocks omit the local MV
-    // component pair from the bitstream. 4MV and Intra MBs never carry
-    // mcsel. Field-predicted MBs also skip mcsel (GMC and field pred are
-    // mutually exclusive paths in the standard).
-    let gmc_mb = if vol.sprite_enable == 2
-        && matches!(mb_type, mcbpc::PMbType::Inter | mcbpc::PMbType::InterQ)
-        && !il_info.field_prediction
-    {
-        br.read_u1()? == 1
-    } else {
-        false
-    };
+    // GMC and field-prediction are spec-disjoint — but the mcsel bit is
+    // already consumed before interlaced_information(). If both happened
+    // to be set, treat the MB as field-predicted (the spec rule wins) by
+    // dropping the gmc_mb flag.
+    let gmc_mb = gmc_mb && !il_info.field_prediction;
 
     // 6. Motion vectors (skip for intra MBs and for GMC-coded MBs).
     let mut motion = MbMotion::default();

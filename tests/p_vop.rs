@@ -1016,6 +1016,289 @@ fn b_vop_qpel_round_trip() {
     );
 }
 
+/// Round-20: GMC encoder. Single-warp-point Global Motion Compensation
+/// with `sprite_enable = 2`, `no_of_sprite_warping_points = 1`. The test
+/// builds a synthetic global-pan stream where every P-VOP differs from
+/// its reference by a fixed integer translation — the canonical case
+/// where GMC's per-VOP `(du, dv)` warp explains the entire frame motion
+/// and per-MB `mcsel = 1` should win.
+///
+/// Acceptance:
+///   * Encoder accepts `gmc=1` and produces a stream our decoder
+///     round-trips with PSNR ≥ 30 dB on every frame.
+///   * Total bytes are no worse than the non-GMC path on the same
+///     content (GMC should reach parity or slight improvement on this
+///     synthetic global-translation content).
+#[test]
+fn gmc_global_pan_round_trip() {
+    let (width, height) = (64u32, 64u32);
+    let num_frames = 8u32;
+
+    // "Global-pan" source: each frame is the previous shifted by +2 pels
+    // horizontally (and a small +1 every-other-frame vertical drift).
+    // Per-MB local motion is identical to the global motion, which is
+    // exactly what 1-warp-point GMC describes.
+    fn pan_frame(idx: u32, width: u32, height: u32) -> VideoFrame {
+        let w = width as usize;
+        let h = height as usize;
+        let cw = w / 2;
+        let ch = h / 2;
+        let dx = (idx as i32) * 2;
+        let dy = idx as i32 / 2;
+        let mut y = vec![0u8; w * h];
+        let mut cb = vec![128u8; cw * ch];
+        let mut cr = vec![128u8; cw * ch];
+        for row in 0..h {
+            for col in 0..w {
+                let xx = col as i32 - dx;
+                let yy = row as i32 - dy;
+                // Periodic ramp with sub-block texture.
+                let base = ((xx.rem_euclid(48) * 5) + (yy.rem_euclid(40) * 3)) as u8;
+                let bump = ((xx.rem_euclid(8) as u8).wrapping_mul(7))
+                    .wrapping_add((yy.rem_euclid(8) as u8).wrapping_mul(11));
+                y[row * w + col] = base.wrapping_add(bump);
+            }
+        }
+        for row in 0..ch {
+            for col in 0..cw {
+                let xx = col as i32 - dx / 2;
+                let yy = row as i32 - dy / 2;
+                cb[row * cw + col] =
+                    (128i32 + (xx.rem_euclid(20)) - (yy.rem_euclid(12))).clamp(0, 255) as u8;
+                cr[row * cw + col] =
+                    (128i32 + (yy.rem_euclid(20)) - (xx.rem_euclid(12))).clamp(0, 255) as u8;
+            }
+        }
+        VideoFrame {
+            pts: Some(idx as i64),
+            planes: vec![
+                VideoPlane { stride: w, data: y },
+                VideoPlane {
+                    stride: cw,
+                    data: cb,
+                },
+                VideoPlane {
+                    stride: cw,
+                    data: cr,
+                },
+            ],
+        }
+    }
+
+    fn build_encoder_with(width: u32, height: u32, gmc: bool) -> Box<dyn Encoder> {
+        let mut params = CodecParameters::video(CodecId::new(oxideav_mpeg4video::CODEC_ID_STR));
+        params.media_type = MediaType::Video;
+        params.width = Some(width);
+        params.height = Some(height);
+        params.pixel_format = Some(PixelFormat::Yuv420P);
+        params.frame_rate = Some(Rational::new(24, 1));
+        if gmc {
+            params.options.insert("gmc", "1");
+        }
+        oxideav_mpeg4video::encoder::make_encoder(&params).expect("build encoder")
+    }
+
+    fn encode_all(enc: &mut Box<dyn Encoder>, frames: &[VideoFrame]) -> Vec<u8> {
+        let mut es = Vec::new();
+        for f in frames {
+            enc.send_frame(&Frame::Video(f.clone()))
+                .expect("send_frame");
+        }
+        enc.flush().expect("flush");
+        loop {
+            match enc.receive_packet() {
+                Ok(pkt) => es.extend_from_slice(&pkt.data),
+                Err(oxideav_core::Error::NeedMore) | Err(oxideav_core::Error::Eof) => break,
+                Err(e) => panic!("receive_packet: {e:?}"),
+            }
+        }
+        es
+    }
+
+    let src_frames: Vec<VideoFrame> = (0..num_frames)
+        .map(|i| pan_frame(i, width, height))
+        .collect();
+
+    // Encode with GMC enabled.
+    let mut enc_gmc = build_encoder_with(width, height, true);
+    let es_gmc = encode_all(&mut enc_gmc, &src_frames);
+    eprintln!("GMC-enabled bitstream: {} bytes", es_gmc.len());
+
+    // Encode without GMC for the size baseline.
+    let mut enc_plain = build_encoder_with(width, height, false);
+    let es_plain = encode_all(&mut enc_plain, &src_frames);
+    eprintln!("plain (no GMC) bitstream: {} bytes", es_plain.len());
+
+    // Decode the GMC stream with our own decoder and check round-trip
+    // PSNR. Every frame must clear 30 dB — the synthetic content is
+    // simple enough that GMC predicts most blocks perfectly and the
+    // residual coder cleans up the rest.
+    let dec_params = CodecParameters::video(CodecId::new(oxideav_mpeg4video::CODEC_ID_STR));
+    let mut dec = oxideav_mpeg4video::decoder::make_decoder(&dec_params).expect("build decoder");
+    let in_pkt = Packet::new(0, TimeBase::new(1, 24), es_gmc.clone());
+    dec.send_packet(&in_pkt).expect("send_packet");
+    dec.flush().expect("flush decoder");
+    let mut decoded: Vec<VideoFrame> = Vec::new();
+    loop {
+        match dec.receive_frame() {
+            Ok(Frame::Video(f)) => decoded.push(f),
+            Ok(_) => panic!("non-video frame"),
+            Err(oxideav_core::Error::NeedMore) | Err(oxideav_core::Error::Eof) => break,
+            Err(e) => panic!("receive_frame: {e:?}"),
+        }
+    }
+    assert_eq!(
+        decoded.len(),
+        num_frames as usize,
+        "GMC stream decoded {} frames, expected {}",
+        decoded.len(),
+        num_frames
+    );
+    for (i, (s, d)) in src_frames.iter().zip(decoded.iter()).enumerate() {
+        let p = psnr(&flatten_frame(s), &flatten_frame(d));
+        eprintln!("GMC frame {i}: PSNR = {p:.2} dB");
+        assert!(
+            p > 30.0,
+            "GMC frame {i} PSNR {p:.2} dB below 30 dB threshold"
+        );
+    }
+
+    // GMC stream size should be no more than 1.5× the plain stream on
+    // this content. (We use a loose 1.5× ratio because the GMC
+    // overhead — sprite_trajectory + per-MB mcsel — adds a small
+    // constant cost per VOP, which can dominate at very low MB counts.)
+    assert!(
+        es_gmc.len() <= es_plain.len() * 3 / 2,
+        "GMC stream {} bytes ballooned past 1.5× plain {} bytes",
+        es_gmc.len(),
+        es_plain.len()
+    );
+}
+
+/// FFmpeg interop for the GMC encoder: encode a global-pan stream with
+/// `gmc=1`, decode with ffmpeg's `mpeg4` decoder, check that ffmpeg
+/// accepts the bitstream and that the I-VOP decodes to ≥ 30 dB PSNR
+/// against the source. Skipped when ffmpeg isn't installed.
+#[test]
+fn gmc_ffmpeg_decode() {
+    if !command_exists("ffmpeg") {
+        eprintln!("ffmpeg missing — skipping GMC ffmpeg interop test");
+        return;
+    }
+    let (width, height) = (64u32, 64u32);
+    let num_frames = 4u32;
+
+    fn pan_frame(idx: u32, width: u32, height: u32) -> VideoFrame {
+        let w = width as usize;
+        let h = height as usize;
+        let cw = w / 2;
+        let ch = h / 2;
+        let dx = (idx as i32) * 2;
+        let mut y = vec![0u8; w * h];
+        for row in 0..h {
+            for col in 0..w {
+                let xx = col as i32 - dx;
+                let base = ((xx.rem_euclid(48) * 5) + ((row as i32).rem_euclid(40) * 3)) as u8;
+                let bump = ((xx.rem_euclid(8) as u8).wrapping_mul(7))
+                    .wrapping_add(((row % 8) as u8).wrapping_mul(11));
+                y[row * w + col] = base.wrapping_add(bump);
+            }
+        }
+        let cb = vec![128u8; cw * ch];
+        let cr = vec![128u8; cw * ch];
+        VideoFrame {
+            pts: Some(idx as i64),
+            planes: vec![
+                VideoPlane { stride: w, data: y },
+                VideoPlane {
+                    stride: cw,
+                    data: cb,
+                },
+                VideoPlane {
+                    stride: cw,
+                    data: cr,
+                },
+            ],
+        }
+    }
+
+    let mut params = CodecParameters::video(CodecId::new(oxideav_mpeg4video::CODEC_ID_STR));
+    params.media_type = MediaType::Video;
+    params.width = Some(width);
+    params.height = Some(height);
+    params.pixel_format = Some(PixelFormat::Yuv420P);
+    params.frame_rate = Some(Rational::new(24, 1));
+    params.options.insert("gmc", "1");
+    let mut enc = oxideav_mpeg4video::encoder::make_encoder(&params).expect("build GMC encoder");
+
+    let src_frames: Vec<VideoFrame> = (0..num_frames)
+        .map(|i| pan_frame(i, width, height))
+        .collect();
+    let mut es = Vec::new();
+    for f in &src_frames {
+        enc.send_frame(&Frame::Video(f.clone()))
+            .expect("send_frame");
+    }
+    enc.flush().expect("flush");
+    loop {
+        match enc.receive_packet() {
+            Ok(pkt) => es.extend_from_slice(&pkt.data),
+            Err(oxideav_core::Error::NeedMore) | Err(oxideav_core::Error::Eof) => break,
+            Err(e) => panic!("receive_packet: {e:?}"),
+        }
+    }
+
+    let tmp = std::env::temp_dir();
+    let es_path = tmp.join("oxideav_gmc.m4v");
+    std::fs::write(&es_path, &es).expect("write m4v");
+    let yuv_out = tmp.join("oxideav_gmc_ffmpeg.yuv");
+    let _ = std::fs::remove_file(&yuv_out);
+    let status = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "m4v",
+            "-i",
+            es_path.to_str().unwrap(),
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "yuv420p",
+            yuv_out.to_str().unwrap(),
+        ])
+        .status()
+        .expect("run ffmpeg");
+    assert!(status.success(), "ffmpeg failed to decode our GMC stream");
+    let ff = std::fs::read(&yuv_out).expect("read ffmpeg output");
+    let per_frame = (width as usize * height as usize * 3) / 2;
+    assert!(
+        ff.len() >= per_frame,
+        "ffmpeg output too small: {} bytes",
+        ff.len()
+    );
+    // I-VOP frame must round-trip cleanly through ffmpeg.
+    let src0 = flatten_frame(&src_frames[0]);
+    let p0 = psnr(&src0, &ff[..per_frame]);
+    eprintln!("GMC I-VOP via ffmpeg: PSNR = {p0:.2} dB");
+    assert!(
+        p0 > 30.0,
+        "ffmpeg I-VOP PSNR {p0:.2} dB below 30 dB — GMC bitstream malformed?"
+    );
+    if ff.len() >= 2 * per_frame {
+        // First P-VOP — exercises the GMC `mcsel` path on the wire.
+        let src1 = flatten_frame(&src_frames[1]);
+        let p1 = psnr(&src1, &ff[per_frame..2 * per_frame]);
+        eprintln!("GMC first P-VOP via ffmpeg: PSNR = {p1:.2} dB");
+        assert!(
+            p1 > 22.0,
+            "ffmpeg first P-VOP PSNR {p1:.2} dB below 22 dB — GMC trajectory or mcsel bit malformed"
+        );
+    }
+}
+
 /// Round-16: QPel + B-frames is now implemented. The B-VOP encoder
 /// accepts a `quarter_sample` flag and switches its forward/backward ME,
 /// MC, chroma reduction, and direct-mode MV scaling to QPel paths

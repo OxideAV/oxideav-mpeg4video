@@ -114,8 +114,12 @@ pub fn parse_vop(br: &mut BitReader<'_>, vol: &VideoObjectLayer) -> Result<Video
     // Only rectangular shape reaches this point (checked in VOL parser).
     debug_assert_eq!(vol.shape, ShapeType::Rectangular);
 
-    // vop_rounding_type — present only for P-VOPs (§6.2.5).
-    let rounding_type = if vop_coding_type == VopCodingType::P {
+    // vop_rounding_type — present for P-VOPs and for S-VOPs in GMC mode
+    // (§6.2.5: `vop_coding_type == "P" || (vop_coding_type == "S" &&
+    // sprite_enable == "GMC")`). S-VOPs in static-sprite mode skip it.
+    let rounding_type = if vop_coding_type == VopCodingType::P
+        || (vop_coding_type == VopCodingType::S && vol.sprite_enable == 2)
+    {
         br.read_u1()? == 1
     } else {
         false
@@ -155,6 +159,32 @@ pub fn parse_vop(br: &mut BitReader<'_>, vol: &VideoObjectLayer) -> Result<Video
         (false, false, false)
     };
 
+    // GMC trajectory (§6.2.5 amendment). When the VOL advertises
+    // `sprite_enable == "static"` or `"GMC"` and `vop_coding_type ==
+    // S`, the trajectory is emitted BEFORE `vop_quant` (per the spec
+    // syntax table in §6.2.5). Round-20 places it here — earlier rounds
+    // had it after `vop_fcode_forward` for P-VOPs by mistake; the
+    // corrected position is what FFmpeg expects on the wire.
+    let sprite_trajectory = if (vol.sprite_enable == 1 || vol.sprite_enable == 2)
+        && vop_coding_type == VopCodingType::S
+        && vol.no_of_sprite_warping_points > 0
+    {
+        Some(decode_sprite_trajectory(br, vol)?)
+    } else {
+        None
+    };
+    // brightness_change_factor() is conditional on
+    // `sprite_brightness_change`; we don't emit GMC streams that toggle
+    // it on, but the decoder reads it for round-trip correctness.
+    let brightness_change_factor = if (vol.sprite_enable == 1 || vol.sprite_enable == 2)
+        && vop_coding_type == VopCodingType::S
+        && vol.sprite_brightness_change
+    {
+        crate::gmc::decode_brightness_change_factor(br)?
+    } else {
+        0
+    };
+
     // vop_quant — quant_precision bits (default 5).
     let vop_quant = br.read_u32(vol.quant_precision as u32)?;
     if vop_quant == 0 {
@@ -170,20 +200,6 @@ pub fn parse_vop(br: &mut BitReader<'_>, vol: &VideoObjectLayer) -> Result<Video
         fcode_fwd = br.read_u32(3)? as u8;
         fcode_bwd = br.read_u32(3)? as u8;
     }
-
-    // GMC trajectory (§7.7.4 amendment). When the VOL uses
-    // `sprite_enable == 2` and the current VOP is a P-VOP, the next
-    // `no_of_sprite_warping_points` trajectory pairs follow the fcode
-    // field and precede the MB-layer. S-VOPs carry the same trajectory
-    // but we don't decode S-VOPs yet.
-    let sprite_trajectory = if vol.sprite_enable == 2
-        && vop_coding_type == VopCodingType::P
-        && vol.no_of_sprite_warping_points > 0
-    {
-        Some(decode_sprite_trajectory(br, vol)?)
-    } else {
-        None
-    };
 
     Ok(VideoObjectPlane {
         vop_coding_type,
@@ -201,6 +217,6 @@ pub fn parse_vop(br: &mut BitReader<'_>, vol: &VideoObjectLayer) -> Result<Video
         interlaced,
         top_field_first,
         alternate_vertical_scan,
-        brightness_change_factor: 0,
+        brightness_change_factor,
     })
 }

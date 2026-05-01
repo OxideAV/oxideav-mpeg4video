@@ -76,6 +76,15 @@ decoder accepts as-is. Input is `Yuv420P` only.
 - **GOP cadence.** I-VOP every `DEFAULT_GOP_SIZE` frames (= 16); all
   other frames are P-VOPs. Override per-encoder via the `g` codec
   option (1..=300).
+- **GMC (Global Motion Compensation, §7.6.7 / §7.7).** Optional —
+  enabled with the `gmc` codec option. When on, the VOL advertises
+  `sprite_enable = 2` + 1 warping point at half-pel accuracy; each
+  P-VOP becomes an `S(GMC)`-VOP carrying one `(du, dv)`
+  `sprite_trajectory()` derived from a coarse `±16`-pel global-
+  translation SAD search; per-MB `mcsel` picks between translational
+  MC and warp prediction. ffmpeg cross-decode validated on synthetic
+  global-pan content. Single-warp-point only — 2/3/4-point
+  affine/perspective warps are a follow-up.
 - **Quantisation.** H.263 quant (`mpeg_quant = 0`), constant
   `vop_quant = 5` by default, no dquant. Override per-encoder via
   the `qp` codec option (1..=31), or split per VOP-type with
@@ -90,7 +99,14 @@ the all-I equivalent.
 Out of scope for the encoder:
 
 - 4-MV mode for P-VOPs (decoder accepts 4MV; encoder is 1-MV).
-- B-VOPs, S-VOPs, sprites / GMC.
+- Multi-point GMC warp (2/3/4-point affine / perspective);
+  `sprite_brightness_change`. Encoder ships single-warp-point
+  translational GMC only — sufficient for camera-pan / dolly-style
+  global motion.
+- Static sprites (`sprite_enable = 1`, S-VOP coding).
+- B-VOPs round-trip is supported via `bf=N`; combined with `gmc`
+  the encoder advertises both features in the VOL but does not
+  warp B-VOP references through the trajectory.
 - Interlace, scalability, data partitioning, reversible VLCs.
 - MPEG-4 matrix quant (`mpeg_quant = 1`).
 

@@ -98,6 +98,21 @@ pub const DEFAULT_MAX_B_FRAMES: u32 = 0;
 /// (the round-1..14 path).
 pub const DEFAULT_QUARTER_SAMPLE: bool = false;
 
+/// Default GMC mode. When `true` the encoder enables single-warp-point
+/// Global Motion Compensation (ASP §7.6.7 / §7.7): the VOL advertises
+/// `sprite_enable = 2` + `no_of_sprite_warping_points = 1`, every P-VOP
+/// header carries one `(du, dv)` `sprite_trajectory()` pair, and each
+/// Inter-MB carries an `mcsel` bit picking between translational MC
+/// and warp-predicted MC. When `false` (default) the encoder behaves
+/// exactly as in round-19.
+pub const DEFAULT_GMC: bool = false;
+
+/// `sprite_warping_accuracy` advertised when GMC is on. Code `0` = 1/2-pel
+/// (s = 2), which matches the encoder's half-pel ME unit and keeps the
+/// trajectory `(du, dv)` representation small. Codes 1/2/3 = 1/4, 1/8,
+/// 1/16-pel are valid but require correspondingly finer global ME.
+pub const GMC_SPRITE_WARPING_ACCURACY: u8 = 0;
+
 /// Encoder factory used by `register()`.
 pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     let width = params
@@ -151,6 +166,16 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         .get("qpel")
         .map(|s| !matches!(s, "" | "0" | "false" | "False" | "FALSE"))
         .unwrap_or(DEFAULT_QUARTER_SAMPLE);
+
+    // `gmc` enables single-warp-point Global Motion Compensation
+    // (§7.6.7 / §7.7). Mutually compatible with QPel and B-frames at the
+    // bitstream level — the VOL advertises ASP + verid=2 anyway when
+    // either of those is on.
+    let gmc_enabled = params
+        .options
+        .get("gmc")
+        .map(|s| !matches!(s, "" | "0" | "false" | "False" | "FALSE"))
+        .unwrap_or(DEFAULT_GMC);
 
     // `qp` sets the default quant for all VOP types; `qp_i`, `qp_p`
     // and `qp_b` override per VOP type. All values are clamped to
@@ -211,6 +236,7 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         f_code_fwd: DEFAULT_F_CODE_FWD,
         max_b_frames,
         quarter_sample,
+        gmc_enabled,
         pending: VecDeque::new(),
         b_queue: VecDeque::new(),
         eof: false,
@@ -248,6 +274,14 @@ struct Mpeg4VideoEncoder {
     /// filter). See `pvop::encode_p_vop_body_with_grid` for the QPel
     /// motion-estimation path.
     quarter_sample: bool,
+    /// VOL `sprite_enable == 2` (single-warp-point GMC) flag. When `true`
+    /// the encoder advertises GMC in the VOL (verid=2 +
+    /// `no_of_sprite_warping_points = 1` + `sprite_warping_accuracy = 0`),
+    /// emits one `(du, dv)` `sprite_trajectory()` per P-VOP, and adds an
+    /// `mcsel` bit to each Inter MB. See `pvop::encode_p_vop_body_with_grid`
+    /// for the per-MB warp-vs-translational decision and global-motion
+    /// estimation.
+    gmc_enabled: bool,
     pending: VecDeque<Packet>,
     /// Display-order B-frame queue — flushed on the next I/P encode.
     b_queue: VecDeque<VideoFrame>,
@@ -367,6 +401,7 @@ impl Mpeg4VideoEncoder {
                 self.vop_quant_i,
                 self.max_b_frames > 0,
                 self.quarter_sample,
+                self.gmc_enabled,
             );
             self.headers_emitted = true;
         }
@@ -391,6 +426,16 @@ impl Mpeg4VideoEncoder {
                 .reference
                 .as_ref()
                 .expect("P-VOP path requires a reference picture");
+            // GMC trajectory + warp derivation. Built once per P-VOP from
+            // a coarse global-translation search; written after fcode in
+            // the P-VOP header and consumed by every Inter MB during the
+            // body encode.
+            let (trajectory, warp) = if self.gmc_enabled {
+                let (t, w) = build_gmc_trajectory(v, self.width, self.height, reference);
+                (Some(t), Some(w))
+            } else {
+                (None, None)
+            };
             write_p_vop_header(
                 &mut bw,
                 time_inc,
@@ -398,6 +443,7 @@ impl Mpeg4VideoEncoder {
                 self.rounding_type,
                 self.f_code_fwd,
                 vti_resolution,
+                trajectory.as_ref(),
             );
             let (pic, grid) = encode_p_vop_body_with_grid(
                 &mut bw,
@@ -409,6 +455,7 @@ impl Mpeg4VideoEncoder {
                 self.f_code_fwd,
                 self.rounding_type,
                 self.quarter_sample,
+                warp.as_ref(),
             )?;
             self.reference = Some(pic);
             self.reference_grid = Some(grid);
@@ -446,6 +493,7 @@ impl Mpeg4VideoEncoder {
                 self.vop_quant_i,
                 self.max_b_frames > 0,
                 self.quarter_sample,
+                self.gmc_enabled,
             );
             self.headers_emitted = true;
         }
@@ -469,6 +517,12 @@ impl Mpeg4VideoEncoder {
             let reference = prev_forward_ref
                 .as_ref()
                 .expect("P-VOP path requires a reference picture");
+            let (trajectory, warp) = if self.gmc_enabled {
+                let (t, w) = build_gmc_trajectory(v, self.width, self.height, reference);
+                (Some(t), Some(w))
+            } else {
+                (None, None)
+            };
             write_p_vop_header(
                 &mut bw,
                 time_inc,
@@ -476,6 +530,7 @@ impl Mpeg4VideoEncoder {
                 self.rounding_type,
                 self.f_code_fwd,
                 vti_resolution,
+                trajectory.as_ref(),
             );
             let (pic, grid) = encode_p_vop_body_with_grid(
                 &mut bw,
@@ -487,6 +542,7 @@ impl Mpeg4VideoEncoder {
                 self.f_code_fwd,
                 self.rounding_type,
                 self.quarter_sample,
+                warp.as_ref(),
             )?;
             self.reference = Some(pic);
             self.reference_grid = Some(grid);
@@ -657,14 +713,15 @@ fn write_vos_vo_vol(
     _q: u32,
     enable_b_vops: bool,
     quarter_sample: bool,
+    gmc_enabled: bool,
 ) {
     // VOS.
     write_start_code(bw, VOS_START_CODE);
     // profile_and_level_indication — pick the smallest PLI that admits
-    // every feature we actually emit. ASP Level 1 (`0xF1`) accepts both
-    // B-VOPs and quarter_sample (§Annex N); Simple Profile Level 1
+    // every feature we actually emit. ASP Level 1 (`0xF1`) accepts B-VOPs,
+    // quarter_sample, AND GMC (§Annex N); Simple Profile Level 1
     // (`0x01`) is the most-compatible PLI for plain I+P half-pel.
-    let pli = if enable_b_vops || quarter_sample {
+    let pli = if enable_b_vops || quarter_sample || gmc_enabled {
         0xF1
     } else {
         0x01
@@ -685,23 +742,23 @@ fn write_vos_vo_vol(
     // Video Object Layer — id 0x20.
     write_start_code(bw, 0x20);
     bw.write_bits(0, 1); // random_accessible_vol = 0
-                         // video_object_type_indication — ASP (4) when B-VOPs OR QPel are on
-                         // (Annex N requires verid>=2 for QPel anyway), Simple (1)
-                         // otherwise. We share the "use ASP" bit between the two
-                         // features since both require the verid=2 VOL syntax.
-    let vot_indication = if enable_b_vops || quarter_sample {
+                         // video_object_type_indication — ASP (4) when B-VOPs OR QPel OR GMC
+                         // is on (Annex N requires verid>=2 for QPel and the
+                         // 2-bit `sprite_enable` field for GMC); Simple (1)
+                         // otherwise.
+    let vot_indication = if enable_b_vops || quarter_sample || gmc_enabled {
         4
     } else {
         1
     };
     bw.write_bits(vot_indication, 8);
-    // `is_object_layer_identifier` is required for QPel (so we can emit
-    // verid=2). For the half-pel + no-B path keep it 0 so the bitstream
-    // is byte-for-byte identical to round-14.
-    let needs_verid2 = quarter_sample;
+    // `is_object_layer_identifier` is required when we need verid=2 to
+    // unlock QPel or GMC syntax. For the half-pel + no-B + no-GMC path
+    // keep it 0 so the bitstream is byte-for-byte identical to round-14.
+    let needs_verid2 = quarter_sample || gmc_enabled;
     if needs_verid2 {
         bw.write_bits(1, 1); // is_object_layer_identifier = 1
-        bw.write_bits(2, 4); // verid = 2 (QPel + newpred + reduced_resolution_vop syntax)
+        bw.write_bits(2, 4); // verid = 2 (QPel + GMC + newpred syntax)
         bw.write_bits(0, 3); // priority = 0
     } else {
         bw.write_bits(0, 1); // is_object_layer_identifier = 0 (verid implicitly 1)
@@ -735,13 +792,24 @@ fn write_vos_vo_vol(
     bw.write_bits(0, 1); // interlaced = 0
     bw.write_bits(1, 1); // obmc_disable = 1
                          // sprite_enable — 1 bit when verid==1, 2 bits when verid>=2
-                         // (per the round-2000 corrigendum that introduced
-                         // GMC). Always 0 in the encoder (no sprite/GMC
-                         // emitted).
+                         // (per the round-2000 corrigendum that introduced GMC).
+                         // GMC sets this to 2; static-sprite mode (1) is not
+                         // emitted by the encoder.
     if needs_verid2 {
-        bw.write_bits(0, 2); // sprite_enable = 0 (verid>=2 → 2 bits)
+        let sprite_enable = if gmc_enabled { 2 } else { 0 };
+        bw.write_bits(sprite_enable, 2);
     } else {
         bw.write_bits(0, 1); // sprite_enable = 0 (verid==1 → 1 bit)
+    }
+    // GMC sprite-trajectory descriptors (§6.2.3 + amendment 1). For
+    // `sprite_enable == 2` we follow the GMC branch: warping-points + accuracy
+    // + brightness-change. The 1-warp-point encoder uses the canonical
+    // 1/2-pel accuracy quantiser (`s = 2`) which matches our half-pel ME.
+    if gmc_enabled {
+        bw.write_bits(1, 6); // no_of_sprite_warping_points = 1
+        bw.write_bits(GMC_SPRITE_WARPING_ACCURACY as u32, 2); // 0 → s=2 (1/2-pel)
+        bw.write_bits(0, 1); // sprite_brightness_change = 0
+                             // (no `low_latency_sprite_enable` for sprite_enable=2)
     }
     bw.write_bits(0, 1); // not_8_bit = 0
     bw.write_bits(0, 1); // mpeg_quant = 0 (use H.263 quant)
@@ -840,6 +908,13 @@ fn write_b_vop_header(
 /// (§6.2.5). `time_inc` is per-picture. `rounding_type` is the half-pel
 /// rounding flag; `f_code_fwd` is the forward motion range code (1..=7).
 ///
+/// When `sprite_trajectory` is `Some`, the encoder emits an **S(GMC)-VOP**
+/// (`vop_coding_type = "S"`) rather than a plain P-VOP, with the
+/// trajectory placed BEFORE `vop_quant` per §6.2.5 spec order. Per the
+/// spec definition (§6.2.5: "An S(GMC)-VOP can be regarded as a
+/// P-VOP"), the body decode is identical to a P-VOP — the per-MB
+/// `mcsel` bit picks between translational MC and the warp predictor.
+///
 /// `vti_resolution` — see `write_i_vop_header`; round-12 fix to honour the
 /// VOL's actual `vop_time_increment_resolution`.
 fn write_p_vop_header(
@@ -849,9 +924,17 @@ fn write_p_vop_header(
     rounding_type: bool,
     f_code_fwd: u8,
     vti_resolution: u32,
+    sprite_trajectory: Option<&crate::gmc::SpriteTrajectory>,
 ) {
     write_start_code(bw, VOP_START_CODE);
-    bw.write_bits(0b01, 2); // vop_coding_type = 01 (P)
+    // GMC P-substitute: vop_coding_type = "S" (binary 11) when a
+    // trajectory is present; plain P (binary 01) otherwise.
+    let coding_type = if sprite_trajectory.is_some() {
+        0b11
+    } else {
+        0b01
+    };
+    bw.write_bits(coding_type, 2);
     bw.write_bits(0, 1); // modulo_time_base = `0` terminator
     bw.write_bits(1, 1); // marker
     let vti_bits = bits_needed(vti_resolution.saturating_sub(1)).max(1);
@@ -859,11 +942,165 @@ fn write_p_vop_header(
     bw.write_bits(1, 1); // marker
 
     bw.write_bits(1, 1); // vop_coded = 1
-    bw.write_bits(if rounding_type { 1 } else { 0 }, 1); // vop_rounding_type
+                         // vop_rounding_type — emitted for P AND for S+GMC per §6.2.5.
+    bw.write_bits(if rounding_type { 1 } else { 0 }, 1);
     bw.write_bits(0, 3); // intra_dc_vlc_thr = 0
+                         // GMC sprite_trajectory comes BEFORE vop_quant in the
+                         // §6.2.5 order. (Pre-r20 the encoder placed it after
+                         // vop_fcode_forward — that emitted byte-decoded
+                         // bitstream which our own decoder accepted, but ffmpeg
+                         // and any spec-conformant decoder rejected.)
+    if let Some(t) = sprite_trajectory {
+        crate::gmc::encode_sprite_trajectory(bw, t);
+        // (sprite_brightness_change is 0 in the VOL — no
+        // brightness_change_factor() bits to emit.)
+    }
     bw.write_bits(vop_quant, 5);
     bw.write_bits(f_code_fwd as u32, 3); // vop_fcode_forward
-                                         // (No fcode_backward for P.)
+                                         // (No fcode_backward for P / S(GMC).)
+}
+
+// -------------------------------------------------------------------------
+// GMC: per-VOP global-translation estimation
+// -------------------------------------------------------------------------
+
+/// Maximum global-translation search range (integer pels) on each axis.
+/// The single-warp-point GMC encoder picks `(du, dv)` = `2 * (dx, dy)` in
+/// 1/2-pel units (s=2), so the bitstream MV magnitude is `±2 *
+/// MAX_GMC_GLOBAL_SEARCH`. The Table 11-32 `warping_mv_code()` accepts
+/// up to ±16383, but a smaller search keeps the coarse pel-domain SAD
+/// fast and matches the per-MB f_code=1 motion range.
+pub(crate) const MAX_GMC_GLOBAL_SEARCH: i32 = 16;
+
+/// Sampling stride (in pels) for the coarse global-translation SAD scan.
+/// We sample every `GMC_SAMPLE_STRIDE`-th pel on each axis to keep the
+/// search O(N²/stride²) rather than O(N²·search_range²). The result is
+/// not bit-exact relative to a full search but typically agrees within
+/// ±1 pel on stationary / panning content — adequate for the
+/// per-MB `mcsel` decision pass that follows.
+const GMC_SAMPLE_STRIDE: usize = 4;
+
+/// Run a coarse per-VOP global-translation estimator: for each candidate
+/// `(dx, dy)` in `[-MAX_GMC_GLOBAL_SEARCH, +MAX_GMC_GLOBAL_SEARCH]`,
+/// compute the strided luma SAD between the source frame and the
+/// reference frame translated by `(dx, dy)`. Return the best
+/// translation as a `SpriteTrajectory` (one `(du, dv)` pair in 1/2-pel
+/// units, i.e. `du = 2 * dx`, `dv = 2 * dy`) and the matching
+/// `WarpParams`.
+///
+/// `width` / `height` are the picture dimensions in luma pels. `s = 2`
+/// (1/2-pel accuracy) is hard-wired to match the encoder's half-pel
+/// motion-estimation grid.
+pub(crate) fn build_gmc_trajectory(
+    v: &VideoFrame,
+    width: u32,
+    height: u32,
+    reference: &IVopPicture,
+) -> (crate::gmc::SpriteTrajectory, crate::gmc::WarpParams) {
+    let width = width as usize;
+    let height = height as usize;
+    let src = &v.planes[0];
+    let mut best_dx = 0i32;
+    let mut best_dy = 0i32;
+    let mut best_sad = u64::MAX;
+    for dy in -MAX_GMC_GLOBAL_SEARCH..=MAX_GMC_GLOBAL_SEARCH {
+        for dx in -MAX_GMC_GLOBAL_SEARCH..=MAX_GMC_GLOBAL_SEARCH {
+            let sad = global_translation_sad(src, width, height, reference, dx, dy);
+            if sad < best_sad {
+                best_sad = sad;
+                best_dx = dx;
+                best_dy = dy;
+            }
+        }
+    }
+    // Half-pel accuracy: du/dv = 2 * pel-shift. (s = 2.)
+    let mut t = crate::gmc::SpriteTrajectory {
+        points: 1,
+        ..Default::default()
+    };
+    t.du[0] = 2 * best_dx;
+    t.dv[0] = 2 * best_dy;
+    let vol = synthesise_gmc_vol(width as u32, height as u32);
+    let warp = crate::gmc::WarpParams::from_trajectory(&t, &vol);
+    (t, warp)
+}
+
+/// Strided luma SAD of source vs reference translated by `(dx, dy)`. Each
+/// out-of-bounds reference pel is replaced by the nearest edge pel
+/// (matches the warp sampler's edge-replication behaviour).
+fn global_translation_sad(
+    src: &oxideav_core::VideoPlane,
+    width: usize,
+    height: usize,
+    reference: &IVopPicture,
+    dx: i32,
+    dy: i32,
+) -> u64 {
+    let ref_h = height as i32;
+    let ref_w = width as i32;
+    let mut total: u64 = 0;
+    let mut y = 0usize;
+    while y < height {
+        let mut x = 0usize;
+        while x < width {
+            let s = src.data[y * src.stride + x] as i32;
+            let rx = (x as i32 + dx).clamp(0, ref_w - 1) as usize;
+            let ry = (y as i32 + dy).clamp(0, ref_h - 1) as usize;
+            let r = reference.y[ry * reference.y_stride + rx] as i32;
+            total += (s - r).unsigned_abs() as u64;
+            x += GMC_SAMPLE_STRIDE;
+        }
+        y += GMC_SAMPLE_STRIDE;
+    }
+    total
+}
+
+/// Build a minimal `VideoObjectLayer` describing the GMC settings the
+/// encoder advertises (verid=2, sprite_enable=2, 1 warp point, half-pel
+/// accuracy). Used only as context for `WarpParams::from_trajectory`.
+fn synthesise_gmc_vol(width: u32, height: u32) -> crate::headers::vol::VideoObjectLayer {
+    use crate::headers::vol::{AspectRatioInfo, ChromaFormat, ShapeType, VideoObjectLayer};
+    VideoObjectLayer {
+        random_accessible_vol: false,
+        video_object_type_indication: 4,
+        is_object_layer_identifier: true,
+        verid: 2,
+        priority: 0,
+        aspect_ratio_info: AspectRatioInfo::Square,
+        vol_control_parameters: true,
+        chroma_format: ChromaFormat::Yuv420,
+        low_delay: true,
+        vbv_parameters_present: false,
+        shape: ShapeType::Rectangular,
+        vop_time_increment_resolution: 24,
+        vop_time_increment_bits: 5,
+        fixed_vop_rate: true,
+        fixed_vop_time_increment: 1,
+        width,
+        height,
+        interlaced: false,
+        obmc_disable: true,
+        sprite_enable: 2,
+        no_of_sprite_warping_points: 1,
+        sprite_warping_accuracy: GMC_SPRITE_WARPING_ACCURACY,
+        sprite_brightness_change: false,
+        low_latency_sprite_enable: false,
+        sprite_rect: None,
+        not_8_bit: false,
+        quant_precision: 5,
+        bits_per_pixel: 8,
+        mpeg_quant: false,
+        intra_quant_matrix: None,
+        non_intra_quant_matrix: None,
+        quarter_sample: false,
+        complexity_estimation_disable: true,
+        resync_marker_disable: true,
+        data_partitioned: false,
+        reversible_vlc: false,
+        newpred_enable: false,
+        reduced_resolution_vop_enable: false,
+        scalability: false,
+    }
 }
 
 // -------------------------------------------------------------------------

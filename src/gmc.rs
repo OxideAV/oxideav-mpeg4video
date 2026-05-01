@@ -36,7 +36,7 @@
 use oxideav_core::{Error, Result};
 
 use crate::headers::vol::VideoObjectLayer;
-use oxideav_core::bits::BitReader;
+use oxideav_core::bits::{BitReader, BitWriter};
 
 /// Maximum `dmv_length` per Table 11-32.
 const MAX_DMV_LENGTH: u32 = 14;
@@ -214,6 +214,110 @@ pub fn decode_sprite_trajectory(
         crate::bits_ext::BitReaderExt::read_marker(br)?;
     }
     Ok(t)
+}
+
+// -------------------------------------------------------------------------
+// Encoder side: warping_mv + sprite_trajectory emission
+// -------------------------------------------------------------------------
+
+/// Encode one signed `du` / `dv` magnitude per the §11.1.6 Table 11-32
+/// `warping_mv_code()` syntax — inverse of [`decode_warping_mv`].
+///
+/// Bit layout (round-20 encoder):
+///   * value 0 — emit 2-bit prefix `00`, no FLC bits.
+///   * value v ≠ 0 — find smallest `length ∈ 1..=14` such that the
+///     value fits inside the FLC range
+///     `[1 - 2^length, 2^length - 1]`. Emit the
+///     length VLC then `length` FLC bits encoding
+///     `(v >= 0) ? v : v - 1 + (1 << length)`.
+///
+/// Length VLCs (mirrors the decoder's `decode_warping_mv`):
+///   length 1, 2  -> "010", "011"   (2-bit prefix `01` + 1 bit)
+///   length 3..=5 -> "100" / "101" / "110"
+///   length 6..=14 -> "111" + (length-6) ones + terminating zero
+pub fn encode_warping_mv(bw: &mut BitWriter, value: i32) {
+    if value == 0 {
+        bw.write_bits(0b00, 2);
+        return;
+    }
+    // Pick the smallest `length` whose FLC range covers `value`. The FLC
+    // range is `[1 - 2^length, 2^length - 1]` (inclusive both ends).
+    let mut length = 1u32;
+    while length <= MAX_DMV_LENGTH {
+        let half = 1i32 << (length - 1);
+        // Positive half covers [1, 2^length - 1] when MSB == 1 — i.e.
+        // FLC = value, value ∈ [half, 2*half - 1] (length bits, MSB=1).
+        // Negative half covers [-(2^length - 1), -1] (we exclude
+        // -2^length to keep the FLC consistent with the decoder).
+        let pos_max = (1i32 << length) - 1;
+        let neg_min = 1 - (1i32 << length);
+        if value >= 1 && value <= pos_max {
+            // Positive: FLC == value (always >= half so MSB == 1).
+            if value >= half {
+                emit_warping_length_prefix(bw, length);
+                bw.write_bits(value as u32, length);
+                return;
+            }
+        } else if value <= -1 && value >= neg_min {
+            // Negative: FLC = value - 1 + (1 << length). Decoder
+            // requires MSB == 0, i.e. FLC < half.
+            let flc = value - 1 + (1i32 << length);
+            if flc < half {
+                emit_warping_length_prefix(bw, length);
+                bw.write_bits(flc as u32, length);
+                return;
+            }
+        }
+        length += 1;
+    }
+    // Out-of-range value — clamp to the largest representable.
+    let clamped = value.clamp(neg_min_at(MAX_DMV_LENGTH), pos_max_at(MAX_DMV_LENGTH));
+    encode_warping_mv(bw, clamped);
+}
+
+#[inline]
+fn pos_max_at(length: u32) -> i32 {
+    (1i32 << length) - 1
+}
+
+#[inline]
+fn neg_min_at(length: u32) -> i32 {
+    1 - (1i32 << length)
+}
+
+/// Emit the length-prefix VLC for `warping_mv_code()` (Table 11-32).
+fn emit_warping_length_prefix(bw: &mut BitWriter, length: u32) {
+    debug_assert!((1..=MAX_DMV_LENGTH).contains(&length));
+    match length {
+        // length 1, 2 — prefix "01" + 1 bit (length-1).
+        1 => bw.write_bits(0b010, 3),
+        2 => bw.write_bits(0b011, 3),
+        // length 3..=5 — 3-bit codes "100", "101", "110".
+        3 => bw.write_bits(0b100, 3),
+        4 => bw.write_bits(0b101, 3),
+        5 => bw.write_bits(0b110, 3),
+        // length 6..=14 — "111" + (length-6) ones + terminating zero.
+        n => {
+            // Prefix "111".
+            bw.write_bits(0b111, 3);
+            for _ in 0..(n - 6) {
+                bw.write_bits(1, 1);
+            }
+            bw.write_bits(0, 1);
+        }
+    }
+}
+
+/// Encode `sprite_trajectory()` (§6.2.6) — `n` `(du, dv)` pairs each
+/// followed by a `marker_bit`. `n` matches the VOL's
+/// `no_of_sprite_warping_points`.
+pub fn encode_sprite_trajectory(bw: &mut BitWriter, t: &SpriteTrajectory) {
+    for i in 0..t.points {
+        encode_warping_mv(bw, t.du[i]);
+        bw.write_bits(1, 1); // marker_bit
+        encode_warping_mv(bw, t.dv[i]);
+        bw.write_bits(1, 1); // marker_bit
+    }
 }
 
 /// Fully derived warp for a single VOP. Holds the four sprite-reference
@@ -813,5 +917,68 @@ mod tests {
         let mut br = BitReader::new(&data);
         let v = decode_warping_mv(&mut br).unwrap();
         assert_eq!(v, -4);
+    }
+
+    /// Encode then decode every legal `warping_mv` value in
+    /// `[-127, 127]`. The decoder must recover the original value.
+    /// This exercises every length VLC from `0` (value=0) up to `7` (large
+    /// magnitudes) and both signs.
+    #[test]
+    fn encode_decode_warping_mv_roundtrip() {
+        for v in -127..=127 {
+            let mut bw = BitWriter::new();
+            encode_warping_mv(&mut bw, v);
+            // Pad to byte boundary so the BitReader has bytes to consume.
+            while !bw.is_byte_aligned() {
+                bw.write_bits(1, 1);
+            }
+            let bytes = bw.finish();
+            let mut br = BitReader::new(&bytes);
+            let decoded = decode_warping_mv(&mut br).expect("decode");
+            assert_eq!(decoded, v, "value {v} did not round-trip");
+        }
+    }
+
+    /// Larger-magnitude round-trip — exercises lengths 8..=14.
+    #[test]
+    fn encode_decode_warping_mv_large_values() {
+        for v in [-2048, -1023, -512, -256, -129, 128, 257, 513, 1024, 4096] {
+            let mut bw = BitWriter::new();
+            encode_warping_mv(&mut bw, v);
+            while !bw.is_byte_aligned() {
+                bw.write_bits(1, 1);
+            }
+            let bytes = bw.finish();
+            let mut br = BitReader::new(&bytes);
+            let decoded = decode_warping_mv(&mut br).expect("decode");
+            assert_eq!(decoded, v, "value {v} did not round-trip");
+        }
+    }
+
+    /// `encode_sprite_trajectory` + `decode_sprite_trajectory` round-trip
+    /// for a single-warp-point trajectory (the round-20 encoder shape).
+    #[test]
+    fn encode_decode_single_point_trajectory() {
+        let vol = mk_vol(64, 64, 1, 3); // single warp, 1/16-pel accuracy.
+        for &du in &[-32i32, -7, -1, 0, 1, 5, 33] {
+            for &dv in &[-9i32, 0, 7, 16] {
+                let t = SpriteTrajectory {
+                    points: 1,
+                    du: [du, 0, 0, 0],
+                    dv: [dv, 0, 0, 0],
+                };
+                let mut bw = BitWriter::new();
+                encode_sprite_trajectory(&mut bw, &t);
+                while !bw.is_byte_aligned() {
+                    bw.write_bits(1, 1);
+                }
+                let bytes = bw.finish();
+                let mut br = BitReader::new(&bytes);
+                let decoded = decode_sprite_trajectory(&mut br, &vol).expect("decode");
+                assert_eq!(decoded.points, 1);
+                assert_eq!(decoded.du[0], du, "du round-trip ({du}, {dv})");
+                assert_eq!(decoded.dv[0], dv, "dv round-trip ({du}, {dv})");
+            }
+        }
     }
 }
