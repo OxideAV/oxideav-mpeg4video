@@ -493,25 +493,60 @@ pub fn decode_ivop_dp(
 // P-VOP DP encode
 // -------------------------------------------------------------------------
 
+use crate::encoder::write_mcbpc_p_intra;
 use crate::inter::{MbMotion, MvGrid};
 use crate::pvop::{
-    estimate_and_encode_mb, reset_pred_grid_mb, wrap_mvd, write_inter_ac, write_mcbpc_inter,
-    write_mv_component, write_recon_to_pic, PMbEncoding,
+    estimate_and_encode_mb_one_mv, intra_cost_proxy, reset_pred_grid_mb, wrap_mvd, write_inter_ac,
+    write_mcbpc_inter, write_mv_component, write_recon_to_pic, PMbEncoding, INTRA_IN_P_BIAS,
+    INTRA_MARGIN,
 };
+
+/// Per-MB DP P-VOP encoding state — either an inter MB carrying motion
+/// information + inter residual, or an intra-in-P MB carrying the same
+/// state an I-VOP intra MB would (DC differentials, AC levels). The
+/// distinction drives part-1 emission (intra MBs skip the MV) and
+/// part-2 emission (intra MBs emit `ac_pred_flag` + 6 intra DC VLCs
+/// after their cbpy, per `data_partitioned_p_vop()` §6.2.5.3 lines
+/// `derived_mb_type >= 3` branches).
+enum PMbDp {
+    /// Inter MB (Inter / Inter+Q in mb_type taxonomy). Emits MCBPC group
+    /// 0..=3, an MV, then inter cbpy + inter AC walks. The DP encoder
+    /// stays in 1MV mode (4MV/GMC are rejected at the factory). Boxed
+    /// to keep the enum's stack footprint small (PMbEncoding embeds the
+    /// 16×16 luma + 2×8×8 chroma reconstruction buffers + 6×64 AC
+    /// arrays, ~2 KiB).
+    Inter(Box<PMbEncoding>),
+    /// Intra-in-P MB (Table B-13 mb_type=3, MCBPC rows 4..=7). Emits
+    /// MCBPC group 4..=7, NO MV, then ac_pred_flag + raw cbpy + 6 intra
+    /// DC differentials in part 2, intra AC walks in part 3. Boxed for
+    /// the same reason as `Inter` (6×64 AC arrays).
+    Intra(Box<IMbDp>),
+}
 
 /// Encode one P-VOP body using `data_partitioned_p_vop()` layout
 /// (§6.2.5.3 / §6.3.7) and return the reconstructed picture + MV grid.
 ///
-/// Round-21 scope: 1MV-Inter only — Intra-in-P, Inter4MV and GMC are
-/// detected upstream (see `make_encoder`'s sanity check) and don't reach
-/// here. Skipped MBs (`not_coded = 1`) are emitted exactly like the
-/// combined-mode encoder. The picture is treated as one video packet —
-/// no mid-VOP `video_packet_header()` splits.
+/// Round-22 scope: 1MV-Inter + Intra-in-P. Inter4MV and GMC are
+/// detected upstream (see `make_encoder`'s sanity check) and don't
+/// reach here. Skipped MBs (`not_coded = 1`) are emitted exactly like
+/// the combined-mode encoder. The picture is treated as one video
+/// packet — no mid-VOP `video_packet_header()` splits.
 ///
-/// `reversible_vlc` selects the inter-AC writer: when `true`, the
-/// per-MB AC partition is emitted via [`crate::rvlc::write_inter_ac`]
-/// (Table B.23) instead of [`pvop::write_inter_ac`] (Table B.17). The
-/// VOL header must already advertise `reversible_vlc = 1`.
+/// Intra-in-P decision matches the combined-mode P-VOP encoder
+/// (`pvop::encode_p_vop_body_with_grid`): the chosen-mode inter SAD
+/// is compared against an intra MAD proxy + `INTRA_IN_P_BIAS +
+/// INTRA_MARGIN`, and the MB is re-encoded as intra when the proxy
+/// shows a clear scene-change / occlusion. Intra MBs route their DC
+/// differentials into the part-2 partition (after `motion_marker`)
+/// and their AC coefficients into the part-3 partition, since intra
+/// MBs carry no motion data; this is the spec-mandated routing for
+/// `derived_mb_type >= 3` in `data_partitioned_p_vop()`.
+///
+/// `reversible_vlc` selects the per-MB AC writer: when `true`, AC
+/// walks emit through [`crate::rvlc::write_intra_ac`] /
+/// [`crate::rvlc::write_inter_ac`] (Table B.23) instead of the plain
+/// Tables B.16 / B.17. The VOL header must already advertise
+/// `reversible_vlc = 1`.
 #[allow(clippy::too_many_arguments)]
 pub fn encode_p_vop_body_dp_with_grid(
     bw: &mut BitWriter,
@@ -531,18 +566,27 @@ pub fn encode_p_vop_body_dp_with_grid(
 
     let mut pic = IVopPicture::new(width, height);
     let mut mv_grid = MvGrid::new(mb_w, mb_h);
+    // PredGrid tracks intra DC predictor state (§7.4.3.1). Intra-in-P
+    // MBs update it; inter / skipped MBs reset their slot to defaults
+    // so a later intra MB reads `dc=1024, is_intra=false` from inter
+    // neighbours (matches `inter::reset_pred_grid_mb` in the decoder).
     let mut pred_grid = PredGrid::new(mb_w, mb_h);
 
-    // Per-MB buffer carrying everything part 1 + part 2 will need.
-    let mut mbs: Vec<PMbEncoding> = Vec::with_capacity(mb_w * mb_h);
+    // Per-MB encoding state (inter or intra). We materialise the full
+    // decision in this pre-pass so part-1 / part-2 / part-3 emit can
+    // walk the MBs in scan order three times without re-running ME.
+    let mut mbs: Vec<PMbDp> = Vec::with_capacity(mb_w * mb_h);
 
     // ---- Pre-pass: estimate, residual-encode, reconstruct each MB.
     for mb_y in 0..mb_h {
         for mb_x in 0..mb_w {
             // 1MV-only mode for DP — we forbid 4MV/GMC at the encoder
-            // factory level. Pass `quarter_sample = false` and `warp =
-            // None` to keep the path purely half-pel translational.
-            let mb = estimate_and_encode_mb(
+            // factory level. `estimate_and_encode_mb_one_mv` skips the
+            // 4MV branch so the encoder's reconstruction always matches
+            // what the DP decoder would compute from the single MV we
+            // emit. Pass `quarter_sample = false` and `warp = None` to
+            // keep the path purely half-pel translational.
+            let inter_mb = estimate_and_encode_mb_one_mv(
                 v,
                 width,
                 height,
@@ -556,28 +600,59 @@ pub fn encode_p_vop_body_dp_with_grid(
                 None,
             )?;
 
-            // Round-21 DP path doesn't emit Intra-in-P MBs through the DP
-            // layout (the spec puts intra DC VLCs inside part 2, which
-            // round-21 doesn't yet write). Force inter even when the
-            // intra MAD proxy beats inter SAD — the loss is small (a
-            // few percent of bits on scene cuts) and keeps the layout
-            // simple. Intra-in-P DP + RVLC are tracked as round-22.
+            // Intra-in-P decision (§6.3.7): mirrors
+            // `pvop::encode_p_vop_body_with_grid`. Skip MBs that the
+            // inter decision marked as `not_coded` — they stay inter
+            // (skipped MBs carry no residual to compare).
+            let intra_cost = intra_cost_proxy(v, width, height, mb_x, mb_y);
+            let inter_cost = inter_mb.inter_luma_sad;
+            let prefer_intra = !inter_mb.skipped
+                && inter_cost
+                    > intra_cost
+                        .saturating_add(INTRA_IN_P_BIAS)
+                        .saturating_add(INTRA_MARGIN);
 
-            // Stash recon → pic, update predictor grids, record MV.
-            write_recon_to_pic(&mut pic, &mb, mb_x, mb_y);
-            reset_pred_grid_mb(&mut pred_grid, mb_x, mb_y);
-            let motion = MbMotion {
-                mv: [mb.mv_half; 4],
-                four_mv: false,
-                not_coded: mb.skipped,
-            };
-            mv_grid.set(mb_x, mb_y, motion);
-
-            mbs.push(mb);
+            if prefer_intra {
+                // Re-encode as intra. `compute_intra_mb_dp` runs the
+                // same DCT + quant + DC-prediction recipe the I-VOP
+                // DP path uses, and updates the predictor grid as the
+                // decoder will see it. Reconstruction goes into `pic`
+                // (so future MBs / VOPs can reference it).
+                let intra_mb =
+                    compute_intra_mb_dp(v, width, height, mb_x, mb_y, vop_quant, &mut pred_grid);
+                for blk in 0..6 {
+                    stamp_intra_block_recon(&intra_mb, blk, mb_x, mb_y, vop_quant, &mut pic);
+                }
+                // Intra MBs contribute (0,0) to the MV grid for the
+                // next MB's median predictor (§7.6.7 step 3) and are
+                // NOT considered `not_coded`. Mirrors the combined-
+                // mode encoder's intra-in-P MV-grid update.
+                mv_grid.set(
+                    mb_x,
+                    mb_y,
+                    MbMotion {
+                        mv: [(0, 0); 4],
+                        four_mv: false,
+                        not_coded: false,
+                    },
+                );
+                mbs.push(PMbDp::Intra(Box::new(intra_mb)));
+            } else {
+                // Stash recon → pic, update predictor grids, record MV.
+                write_recon_to_pic(&mut pic, &inter_mb, mb_x, mb_y);
+                reset_pred_grid_mb(&mut pred_grid, mb_x, mb_y);
+                let motion = MbMotion {
+                    mv: [inter_mb.mv_half; 4],
+                    four_mv: false,
+                    not_coded: inter_mb.skipped,
+                };
+                mv_grid.set(mb_x, mb_y, motion);
+                mbs.push(PMbDp::Inter(Box::new(inter_mb)));
+            }
         }
     }
 
-    // ---- Part 1 emit: per-MB { not_coded, [mcbpc, MV if !not_coded] }.
+    // ---- Part 1 emit: per-MB { not_coded, [mcbpc, MV if inter+!not_coded] }.
     // We rebuild a fresh predictor grid for the median MV predictor —
     // emission walks the MBs in scan order and feeds the just-emitted
     // MV into the grid for the next MB's prediction (mirrors the
@@ -586,75 +661,147 @@ pub fn encode_p_vop_body_dp_with_grid(
     for (mb_idx, mb) in mbs.iter().enumerate() {
         let mb_x = mb_idx % mb_w;
         let mb_y = mb_idx / mb_w;
-        if mb.skipped {
-            bw.write_bits(1, 1); // not_coded = 1
-                                 // Skipped MBs contribute (0,0) to the grid for future
-                                 // predictors.
-            emit_grid.set(mb_x, mb_y, MbMotion::default());
-            continue;
+        match mb {
+            PMbDp::Inter(inter) => {
+                if inter.skipped {
+                    bw.write_bits(1, 1); // not_coded = 1
+                                         // Skipped MBs contribute (0,0) to the grid for future
+                                         // predictors.
+                    emit_grid.set(mb_x, mb_y, MbMotion::default());
+                    continue;
+                }
+                bw.write_bits(0, 1); // not_coded = 0
+                let cbpc = ((inter.chroma_coded[0] as u8) << 1) | (inter.chroma_coded[1] as u8);
+                write_mcbpc_inter(bw, cbpc);
+                // (mcsel is a no-op when GMC isn't enabled, and DP rejects GMC.)
+                // 1MV motion vector — predicted by the median over (left, top,
+                // top-right) on the in-progress emit grid.
+                let (px, py) =
+                    crate::inter::predict_mv_full(&emit_grid, mb_x, mb_y, 0, false, 0, 0);
+                let (mvx, mvy) = inter.mv_half;
+                let dx = mvx - px;
+                let dy = mvy - py;
+                let range = 32i32 << (f_code_fwd.saturating_sub(1) as i32);
+                let dx = wrap_mvd(dx, range);
+                let dy = wrap_mvd(dy, range);
+                write_mv_component(bw, dx, f_code_fwd);
+                write_mv_component(bw, dy, f_code_fwd);
+                emit_grid.set(
+                    mb_x,
+                    mb_y,
+                    MbMotion {
+                        mv: [(mvx, mvy); 4],
+                        four_mv: false,
+                        not_coded: false,
+                    },
+                );
+            }
+            PMbDp::Intra(intra) => {
+                // Intra-in-P (Table B-13 rows 4..=7). Emit not_coded=0
+                // + Intra MCBPC. NO motion vector — the spec gates the
+                // motion_coding() call on `derived_mb_type < 2 ||
+                // derived_mb_type == 2` (i.e. Inter / Inter+Q /
+                // Inter4MV); Intra MBs (mb_type 3, IntraQ 4) skip it.
+                bw.write_bits(0, 1);
+                write_mcbpc_p_intra(bw, intra.cbpc);
+                // Intra MBs contribute (0,0) to future MV predictors.
+                emit_grid.set(
+                    mb_x,
+                    mb_y,
+                    MbMotion {
+                        mv: [(0, 0); 4],
+                        four_mv: false,
+                        not_coded: false,
+                    },
+                );
+            }
         }
-        bw.write_bits(0, 1); // not_coded = 0
-        let cbpc = ((mb.chroma_coded[0] as u8) << 1) | (mb.chroma_coded[1] as u8);
-        write_mcbpc_inter(bw, cbpc);
-        // (mcsel is a no-op when GMC isn't enabled, and DP rejects GMC.)
-        // 1MV motion vector — predicted by the median over (left, top,
-        // top-right) on the in-progress emit grid.
-        let (px, py) = crate::inter::predict_mv_full(&emit_grid, mb_x, mb_y, 0, false, 0, 0);
-        let (mvx, mvy) = mb.mv_half;
-        let dx = mvx - px;
-        let dy = mvy - py;
-        let range = 32i32 << (f_code_fwd.saturating_sub(1) as i32);
-        let dx = wrap_mvd(dx, range);
-        let dy = wrap_mvd(dy, range);
-        write_mv_component(bw, dx, f_code_fwd);
-        write_mv_component(bw, dy, f_code_fwd);
-        emit_grid.set(
-            mb_x,
-            mb_y,
-            MbMotion {
-                mv: [(mvx, mvy); 4],
-                four_mv: false,
-                not_coded: false,
-            },
-        );
     }
 
     // ---- Motion marker.
     bw.write_bits(MOTION_MARKER, MOTION_MARKER_BITS);
 
-    // ---- Part 2 emit: per-MB { cbpy if !not_coded }.
+    // ---- Part 2 emit: per-MB { ac_pred_flag if intra, cbpy,
+    //                            6 intra DC VLCs if intra }.
     for mb in &mbs {
-        if mb.skipped {
-            continue;
-        }
-        // CBPY for inter MBs is bit-inverted (decoder XORs with 0xF).
-        let mut mask: u8 = 0;
-        for (i, &c) in mb.luma_coded.iter().enumerate() {
-            if c {
-                mask |= 1 << (3 - i);
+        match mb {
+            PMbDp::Inter(inter) => {
+                if inter.skipped {
+                    continue;
+                }
+                // CBPY for inter MBs is bit-inverted (decoder XORs with 0xF).
+                let mut mask: u8 = 0;
+                for (i, &c) in inter.luma_coded.iter().enumerate() {
+                    if c {
+                        mask |= 1 << (3 - i);
+                    }
+                }
+                write_cbpy(bw, mask ^ 0xF);
+            }
+            PMbDp::Intra(intra) => {
+                // ac_pred_flag = 0 (encoder never predicts ACs — same
+                // policy as the I-VOP DP path).
+                bw.write_bits(0, 1);
+                // Intra cbpy uses the RAW Table B-9 value as the coded
+                // mask (matches our combined-mode I-VOP path in
+                // `encoder::write_cbpy`). The DP I-VOP path also emits
+                // the raw value; we stay consistent here.
+                write_cbpy(bw, intra.cbpy);
+                // No dquant — the DP encoder uses constant quant
+                // (mb_type stays = 3, the "Intra" group, never Intra+Q).
+                // Six intra DC differentials (Y0..Y3, Cb, Cr) — same
+                // VLC layout the I-VOP DP path uses, since
+                // `intra_dc_vlc_thr = 0` ⇒ `use_intra_dc_vlc = true`
+                // for every quant we emit (threshold 99 vs quant ≤ 31).
+                for (blk, (diff, _recon)) in intra.dc.iter().enumerate() {
+                    write_intra_dc_diff(bw, blk, *diff);
+                }
             }
         }
-        write_cbpy(bw, mask ^ 0xF);
     }
 
     // ---- Part 3 emit: per-MB { AC walks for each coded block }.
+    //
+    // Inter MBs: `pvop::write_inter_ac` (Table B-17) or RVLC variant.
+    // Intra MBs: `encoder::write_intra_ac` (Table B-16) or RVLC variant.
     for mb in &mbs {
-        if mb.skipped {
-            continue;
-        }
-        for blk in 0..6 {
-            let coded = if blk < 4 {
-                mb.luma_coded[blk]
-            } else {
-                mb.chroma_coded[blk - 4]
-            };
-            if !coded {
-                continue;
+        match mb {
+            PMbDp::Inter(inter) => {
+                if inter.skipped {
+                    continue;
+                }
+                for blk in 0..6 {
+                    let coded = if blk < 4 {
+                        inter.luma_coded[blk]
+                    } else {
+                        inter.chroma_coded[blk - 4]
+                    };
+                    if !coded {
+                        continue;
+                    }
+                    if reversible_vlc {
+                        crate::rvlc::write_inter_ac(bw, &inter.ac_levels[blk]);
+                    } else {
+                        write_inter_ac(bw, &inter.ac_levels[blk]);
+                    }
+                }
             }
-            if reversible_vlc {
-                crate::rvlc::write_inter_ac(bw, &mb.ac_levels[blk]);
-            } else {
-                write_inter_ac(bw, &mb.ac_levels[blk]);
+            PMbDp::Intra(intra) => {
+                for blk in 0..6 {
+                    let coded = if blk < 4 {
+                        intra.luma_coded[blk]
+                    } else {
+                        intra.chroma_coded[blk - 4]
+                    };
+                    if !coded {
+                        continue;
+                    }
+                    if reversible_vlc {
+                        crate::rvlc::write_intra_ac(bw, &intra.ac_levels[blk])?;
+                    } else {
+                        write_intra_ac(bw, &intra.ac_levels[blk])?;
+                    }
+                }
             }
         }
     }
@@ -667,9 +814,9 @@ pub fn encode_p_vop_body_dp_with_grid(
 // -------------------------------------------------------------------------
 
 /// Decode one P-VOP body emitted under `data_partitioned_p_vop()`.
-/// Round-21 scope mirrors the encoder: 1MV-Inter only, no GMC, no
-/// Intra-in-P, no dquant, no interlace. Treats the entire picture as
-/// one video packet.
+/// Round-22 scope mirrors the encoder: 1MV-Inter + Intra-in-P, no GMC,
+/// no dquant, no interlace. Treats the entire picture as one video
+/// packet.
 pub fn decode_pvop_dp_with_grid(
     vol: &VideoObjectLayer,
     vop: &VideoObjectPlane,
@@ -678,6 +825,7 @@ pub fn decode_pvop_dp_with_grid(
 ) -> Result<(IVopPicture, MvGrid)> {
     use crate::block::decode_inter_ac;
     use crate::inter::decode_mv_component;
+    use crate::iq::INTRA_DC_VLC_THR_TABLE;
     use crate::mc::luma_mv_to_chroma;
     use crate::pvop::{predict_chroma_block, predict_luma_mb};
 
@@ -687,22 +835,42 @@ pub fn decode_pvop_dp_with_grid(
 
     let mut pic = IVopPicture::new(vol.width as usize, vol.height as usize);
     let mut mv_grid = MvGrid::new(mb_w, mb_h);
+    // Intra DC predictor grid — mirrors the combined-mode decoder
+    // (`inter::reset_pred_grid_mb`). Inter / skipped MBs reset their
+    // slot so a later intra MB reads `dc=1024, is_intra=false` from
+    // inter neighbours.
+    let mut pred_grid = PredGrid::new(mb_w, mb_h);
 
     let quant = vop.vop_quant;
     let f_code = vop.vop_fcode_forward.max(1);
     let rounding = vop.rounding_type;
+    let thr = INTRA_DC_VLC_THR_TABLE[vop.intra_dc_vlc_thr as usize] as u32;
+    let use_intra_dc_vlc = quant < thr.max(1);
 
-    struct PMbState {
-        not_coded: bool,
-        cbpc: u8,
-        mv: (i32, i32),
-        cbpy_inv: u8, // raw VLC value (inter MBs invert with ^0xF)
-        ac_levels: [[i32; 64]; 6],
+    /// Per-MB carrier flowing through parts 1 → 2 → 3 → reconstruct.
+    /// `Skipped` is `not_coded = 1` (no residual, copy reference at
+    /// MV(0,0)). `Inter` carries the inter motion + residual state;
+    /// `Intra` carries the intra DC differentials + residual state.
+    enum PMbState {
+        Skipped,
+        Inter {
+            cbpc: u8,
+            mv: (i32, i32),
+            cbpy_inv: u8, // raw VLC value (inter MBs invert with ^0xF)
+            ac_levels: [[i32; 64]; 6],
+        },
+        Intra {
+            cbpc: u8,
+            ac_pred: bool,
+            cbpy: u8, // raw VLC value (intra MBs use it directly)
+            dc_diff: [i32; 6],
+            ac_levels: [[i32; 64]; 6],
+        },
     }
 
     let mut mbs: Vec<PMbState> = Vec::with_capacity(mb_total);
 
-    // ---- Part 1: per-MB { not_coded, [mcbpc + MV] }.
+    // ---- Part 1: per-MB { not_coded, [mcbpc + (MV if inter)] }.
     for mb_idx in 0..mb_total {
         let mb_x = mb_idx % mb_w;
         let mb_y = mb_idx / mb_w;
@@ -716,13 +884,7 @@ pub fn decode_pvop_dp_with_grid(
                     ..MbMotion::default()
                 },
             );
-            mbs.push(PMbState {
-                not_coded: true,
-                cbpc: 0,
-                mv: (0, 0),
-                cbpy_inv: 0,
-                ac_levels: [[0i32; 64]; 6],
-            });
+            mbs.push(PMbState::Skipped);
             continue;
         }
         let mcbpc_v = loop {
@@ -732,36 +894,65 @@ pub fn decode_pvop_dp_with_grid(
             }
         };
         let (mb_type, cbpc) = mcbpc::decompose_inter(mcbpc_v);
-        // Round-21 DP decoder rejects anything beyond 1MV Inter — that's
-        // what our encoder emits. Future rounds widen the matrix.
-        if !matches!(mb_type, mcbpc::PMbType::Inter) {
-            return Err(Error::unsupported(format!(
-                "mpeg4 DP P: only Inter mb_type supported (got {:?})",
-                mb_type
-            )));
+        match mb_type {
+            mcbpc::PMbType::Inter => {
+                // (No mcsel — GMC is rejected at encoder factory time.)
+                // Motion vector with median predictor (slice_first_mb =
+                // (0,0) since this packet starts at MB 0).
+                let (px, py) = crate::inter::predict_mv_full(&mv_grid, mb_x, mb_y, 0, false, 0, 0);
+                let mvx = decode_mv_component(br, f_code, px)?;
+                let mvy = decode_mv_component(br, f_code, py)?;
+                mv_grid.set(
+                    mb_x,
+                    mb_y,
+                    MbMotion {
+                        mv: [(mvx, mvy); 4],
+                        four_mv: false,
+                        not_coded: false,
+                    },
+                );
+                mbs.push(PMbState::Inter {
+                    cbpc,
+                    mv: (mvx, mvy),
+                    cbpy_inv: 0,
+                    ac_levels: [[0i32; 64]; 6],
+                });
+            }
+            mcbpc::PMbType::Intra => {
+                // Intra-in-P (Table B-13 mb_type = 3). No motion vector
+                // in part 1 — the spec's `data_partitioned_p_vop()`
+                // gates `motion_coding()` on `derived_mb_type < 2 ||
+                // == 2`. cbpy + ac_pred_flag + DC VLCs land in part 2.
+                // Intra MBs contribute (0,0) to the median predictor
+                // for future inter MBs (§7.6.7 step 3).
+                mv_grid.set(
+                    mb_x,
+                    mb_y,
+                    MbMotion {
+                        mv: [(0, 0); 4],
+                        four_mv: false,
+                        not_coded: false,
+                    },
+                );
+                mbs.push(PMbState::Intra {
+                    cbpc,
+                    ac_pred: false,
+                    cbpy: 0,
+                    dc_diff: [0; 6],
+                    ac_levels: [[0i32; 64]; 6],
+                });
+            }
+            other => {
+                // Round-22 DP decoder rejects InterQ / IntraQ /
+                // Inter4MV / Inter4MV+Q — none are emitted by our
+                // encoder (DP holds vop_quant constant and rejects
+                // 4MV / GMC at the factory).
+                return Err(Error::unsupported(format!(
+                    "mpeg4 DP P: unsupported mb_type {:?}",
+                    other
+                )));
+            }
         }
-        // (No mcsel — GMC is rejected at encoder factory time.)
-        // Motion vector with median predictor (slice_first_mb = (0,0)
-        // since this packet starts at MB 0).
-        let (px, py) = crate::inter::predict_mv_full(&mv_grid, mb_x, mb_y, 0, false, 0, 0);
-        let mvx = decode_mv_component(br, f_code, px)?;
-        let mvy = decode_mv_component(br, f_code, py)?;
-        mv_grid.set(
-            mb_x,
-            mb_y,
-            MbMotion {
-                mv: [(mvx, mvy); 4],
-                four_mv: false,
-                not_coded: false,
-            },
-        );
-        mbs.push(PMbState {
-            not_coded: false,
-            cbpc,
-            mv: (mvx, mvy),
-            cbpy_inv: 0,
-            ac_levels: [[0i32; 64]; 6],
-        });
     }
 
     // ---- Motion marker.
@@ -770,124 +961,250 @@ pub fn decode_pvop_dp_with_grid(
         return Err(Error::invalid("mpeg4 DP P: motion_marker mismatch"));
     }
 
-    // ---- Part 2: per-MB { cbpy }.
+    // ---- Part 2: per-MB { [ac_pred_flag if intra], cbpy,
+    //                       [6 intra DC VLCs if intra && use_intra_dc_vlc] }.
     for mb in mbs.iter_mut() {
-        if mb.not_coded {
-            continue;
-        }
-        mb.cbpy_inv = vlc::decode(br, cbpy_tab::table())? as u8;
-    }
-
-    // ---- Part 3: per-MB { AC walks }.
-    for mb in mbs.iter_mut() {
-        if mb.not_coded {
-            continue;
-        }
-        // Inter MBs invert the cbpy VLC value to get the coded mask.
-        let cbpy = mb.cbpy_inv ^ 0xF;
-        let luma_coded = [
-            (cbpy >> 3) & 1 != 0,
-            (cbpy >> 2) & 1 != 0,
-            (cbpy >> 1) & 1 != 0,
-            cbpy & 1 != 0,
-        ];
-        let chroma_coded = [(mb.cbpc >> 1) & 1 != 0, mb.cbpc & 1 != 0];
-        for blk in 0..6 {
-            let coded = if blk < 4 {
-                luma_coded[blk]
-            } else {
-                chroma_coded[blk - 4]
-            };
-            if !coded {
-                continue;
+        match mb {
+            PMbState::Skipped => continue,
+            PMbState::Inter { cbpy_inv, .. } => {
+                *cbpy_inv = vlc::decode(br, cbpy_tab::table())? as u8;
             }
-            if vol.reversible_vlc {
-                crate::rvlc::decode_inter_ac(br, &mut mb.ac_levels[blk], &ZIGZAG)?;
-            } else {
-                decode_inter_ac(br, &mut mb.ac_levels[blk], &ZIGZAG)?;
+            PMbState::Intra {
+                ac_pred,
+                cbpy,
+                dc_diff,
+                ..
+            } => {
+                *ac_pred = br.read_u1()? == 1;
+                *cbpy = vlc::decode(br, cbpy_tab::table())? as u8;
+                // No dquant (mb_type stays = 3 in our encoder).
+                if use_intra_dc_vlc {
+                    for blk in 0..6 {
+                        dc_diff[blk] = decode_intra_dc_diff(br, blk)?;
+                    }
+                }
             }
         }
     }
 
-    // ---- Reconstruct each MB: copy reference (with MV) + add residual.
+    // ---- Part 3: per-MB { AC walks for each coded block }.
+    for mb in mbs.iter_mut() {
+        match mb {
+            PMbState::Skipped => continue,
+            PMbState::Inter {
+                cbpc,
+                cbpy_inv,
+                ac_levels,
+                ..
+            } => {
+                // Inter MBs invert the cbpy VLC value to get the coded mask.
+                let cbpy_mask = *cbpy_inv ^ 0xF;
+                let luma_coded = [
+                    (cbpy_mask >> 3) & 1 != 0,
+                    (cbpy_mask >> 2) & 1 != 0,
+                    (cbpy_mask >> 1) & 1 != 0,
+                    cbpy_mask & 1 != 0,
+                ];
+                let chroma_coded = [(*cbpc >> 1) & 1 != 0, *cbpc & 1 != 0];
+                for blk in 0..6 {
+                    let coded = if blk < 4 {
+                        luma_coded[blk]
+                    } else {
+                        chroma_coded[blk - 4]
+                    };
+                    if !coded {
+                        continue;
+                    }
+                    if vol.reversible_vlc {
+                        crate::rvlc::decode_inter_ac(br, &mut ac_levels[blk], &ZIGZAG)?;
+                    } else {
+                        decode_inter_ac(br, &mut ac_levels[blk], &ZIGZAG)?;
+                    }
+                }
+            }
+            PMbState::Intra {
+                cbpc,
+                cbpy,
+                ac_levels,
+                ..
+            } => {
+                // Intra MBs use the raw cbpy as the coded mask.
+                let luma_coded = [
+                    (*cbpy >> 3) & 1 != 0,
+                    (*cbpy >> 2) & 1 != 0,
+                    (*cbpy >> 1) & 1 != 0,
+                    *cbpy & 1 != 0,
+                ];
+                let chroma_coded = [(*cbpc >> 1) & 1 != 0, *cbpc & 1 != 0];
+                for blk in 0..6 {
+                    let coded = if blk < 4 {
+                        luma_coded[blk]
+                    } else {
+                        chroma_coded[blk - 4]
+                    };
+                    if !coded {
+                        continue;
+                    }
+                    if vol.reversible_vlc {
+                        crate::rvlc::decode_intra_ac(br, &mut ac_levels[blk], &ZIGZAG)?;
+                    } else {
+                        decode_intra_ac(br, &mut ac_levels[blk], &ZIGZAG)?;
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- Reconstruct each MB.
     for (mb_idx, mb) in mbs.iter().enumerate() {
         let mb_x = mb_idx % mb_w;
         let mb_y = mb_idx / mb_w;
-        if mb.not_coded {
-            // Copy 16×16 luma + 8×8 chroma at MV(0,0).
-            copy_skipped_mb(&mut pic, reference, mb_x, mb_y);
-            continue;
-        }
-        let (mvx, mvy) = mb.mv;
-        let cbpy = mb.cbpy_inv ^ 0xF;
-        let luma_coded = [
-            (cbpy >> 3) & 1 != 0,
-            (cbpy >> 2) & 1 != 0,
-            (cbpy >> 1) & 1 != 0,
-            cbpy & 1 != 0,
-        ];
-        let chroma_coded = [(mb.cbpc >> 1) & 1 != 0, mb.cbpc & 1 != 0];
-        // Build luma MB predictor + add residual block-by-block.
-        let mut pred_y = [0u8; 256];
-        predict_luma_mb(reference, mb_x, mb_y, mvx, mvy, rounding, &mut pred_y);
-        let q = quant as i32;
-        for blk in 0..4 {
-            let (sub_x, sub_y) = match blk {
-                0 => (0usize, 0usize),
-                1 => (8, 0),
-                2 => (0, 8),
-                3 => (8, 8),
-                _ => unreachable!(),
-            };
-            let mut block_pred = [0u8; 64];
-            for j in 0..8 {
-                for i in 0..8 {
-                    block_pred[j * 8 + i] = pred_y[(sub_y + j) * 16 + (sub_x + i)];
-                }
+        match mb {
+            PMbState::Skipped => {
+                // Copy 16×16 luma + 8×8 chroma at MV(0,0). Intra
+                // predictor neighbour for this MB stays at the
+                // default `is_intra=false, dc=1024` (no work needed:
+                // PredGrid is already initialised that way and we
+                // never write to a skipped MB's slot).
+                copy_skipped_mb(&mut pic, reference, mb_x, mb_y);
             }
-            let recon =
-                add_inter_residual_block(&block_pred, &mb.ac_levels[blk], q, luma_coded[blk]);
-            // Stamp reconstructed luma into pic.
-            let px = mb_x * 16 + sub_x;
-            let py = mb_y * 16 + sub_y;
-            for j in 0..8 {
-                for i in 0..8 {
-                    pic.y[(py + j) * pic.y_stride + (px + i)] = recon[j * 8 + i];
+            PMbState::Inter {
+                cbpc,
+                mv,
+                cbpy_inv,
+                ac_levels,
+            } => {
+                let (mvx, mvy) = *mv;
+                let cbpy_mask = *cbpy_inv ^ 0xF;
+                let luma_coded = [
+                    (cbpy_mask >> 3) & 1 != 0,
+                    (cbpy_mask >> 2) & 1 != 0,
+                    (cbpy_mask >> 1) & 1 != 0,
+                    cbpy_mask & 1 != 0,
+                ];
+                let chroma_coded = [(*cbpc >> 1) & 1 != 0, *cbpc & 1 != 0];
+                // Build luma MB predictor + add residual block-by-block.
+                let mut pred_y = [0u8; 256];
+                predict_luma_mb(reference, mb_x, mb_y, mvx, mvy, rounding, &mut pred_y);
+                let q = quant as i32;
+                for blk in 0..4 {
+                    let (sub_x, sub_y) = match blk {
+                        0 => (0usize, 0usize),
+                        1 => (8, 0),
+                        2 => (0, 8),
+                        3 => (8, 8),
+                        _ => unreachable!(),
+                    };
+                    let mut block_pred = [0u8; 64];
+                    for j in 0..8 {
+                        for i in 0..8 {
+                            block_pred[j * 8 + i] = pred_y[(sub_y + j) * 16 + (sub_x + i)];
+                        }
+                    }
+                    let recon =
+                        add_inter_residual_block(&block_pred, &ac_levels[blk], q, luma_coded[blk]);
+                    let px = mb_x * 16 + sub_x;
+                    let py = mb_y * 16 + sub_y;
+                    for j in 0..8 {
+                        for i in 0..8 {
+                            pic.y[(py + j) * pic.y_stride + (px + i)] = recon[j * 8 + i];
+                        }
+                    }
                 }
+                // Chroma — single MV downscaled per §7.5.4.
+                let (cmx, cmy) = (luma_mv_to_chroma(mvx), luma_mv_to_chroma(mvy));
+                let mut pred_cb = [0u8; 64];
+                let mut pred_cr = [0u8; 64];
+                predict_chroma_block(
+                    &reference.cb,
+                    reference.c_stride,
+                    mb_x,
+                    mb_y,
+                    cmx,
+                    cmy,
+                    rounding,
+                    &mut pred_cb,
+                );
+                predict_chroma_block(
+                    &reference.cr,
+                    reference.c_stride,
+                    mb_x,
+                    mb_y,
+                    cmx,
+                    cmy,
+                    rounding,
+                    &mut pred_cr,
+                );
+                let recon_cb =
+                    add_inter_residual_block(&pred_cb, &ac_levels[4], q, chroma_coded[0]);
+                let recon_cr =
+                    add_inter_residual_block(&pred_cr, &ac_levels[5], q, chroma_coded[1]);
+                let cx = mb_x * 8;
+                let cy = mb_y * 8;
+                for j in 0..8 {
+                    for i in 0..8 {
+                        pic.cb[(cy + j) * pic.c_stride + (cx + i)] = recon_cb[j * 8 + i];
+                        pic.cr[(cy + j) * pic.c_stride + (cx + i)] = recon_cr[j * 8 + i];
+                    }
+                }
+                // Inter MBs reset the intra DC predictor slot (so a
+                // later intra MB sees `is_intra=false`).
+                crate::pvop::reset_pred_grid_mb(&mut pred_grid, mb_x, mb_y);
             }
-        }
-        // Chroma — single MV downscaled per §7.5.4.
-        let (cmx, cmy) = (luma_mv_to_chroma(mvx), luma_mv_to_chroma(mvy));
-        let mut pred_cb = [0u8; 64];
-        let mut pred_cr = [0u8; 64];
-        predict_chroma_block(
-            &reference.cb,
-            reference.c_stride,
-            mb_x,
-            mb_y,
-            cmx,
-            cmy,
-            rounding,
-            &mut pred_cb,
-        );
-        predict_chroma_block(
-            &reference.cr,
-            reference.c_stride,
-            mb_x,
-            mb_y,
-            cmx,
-            cmy,
-            rounding,
-            &mut pred_cr,
-        );
-        let recon_cb = add_inter_residual_block(&pred_cb, &mb.ac_levels[4], q, chroma_coded[0]);
-        let recon_cr = add_inter_residual_block(&pred_cr, &mb.ac_levels[5], q, chroma_coded[1]);
-        let cx = mb_x * 8;
-        let cy = mb_y * 8;
-        for j in 0..8 {
-            for i in 0..8 {
-                pic.cb[(cy + j) * pic.c_stride + (cx + i)] = recon_cb[j * 8 + i];
-                pic.cr[(cy + j) * pic.c_stride + (cx + i)] = recon_cr[j * 8 + i];
+            PMbState::Intra {
+                cbpc,
+                cbpy,
+                dc_diff,
+                ac_levels,
+                ac_pred: _,
+            } => {
+                // Intra-in-P reconstruction. Mirror the I-VOP DP
+                // decoder's per-block recipe: predict DC from the
+                // PredGrid, apply the differential, dequantise ACs,
+                // IDCT, write to picture.
+                let q = quant as i32;
+                let q_plus = if q & 1 == 1 { q } else { q - 1 };
+                let luma_coded = [
+                    (*cbpy >> 3) & 1 != 0,
+                    (*cbpy >> 2) & 1 != 0,
+                    (*cbpy >> 1) & 1 != 0,
+                    *cbpy & 1 != 0,
+                ];
+                let chroma_coded = [(*cbpc >> 1) & 1 != 0, *cbpc & 1 != 0];
+                for blk in 0..6 {
+                    let (left, top_left, top) = lookup_neighbour_dcs(blk, mb_x, mb_y, &pred_grid);
+                    let (predicted_dc_pel, _dir) = choose_dc_predictor(left, top_left, top);
+                    let scale = dc_scaler(blk, quant) as i32;
+                    let pred_units = (predicted_dc_pel + scale / 2) / scale;
+                    let units = pred_units + dc_diff[blk];
+                    let recon_dc = (units * scale).clamp(0, 2047);
+                    update_neighbour(&mut pred_grid, blk, mb_x, mb_y, recon_dc, quant as u8);
+                    let coded = if blk < 4 {
+                        luma_coded[blk]
+                    } else {
+                        chroma_coded[blk - 4]
+                    };
+                    let mut coeffs = if coded { ac_levels[blk] } else { [0i32; 64] };
+                    for i in 1..64 {
+                        let l = coeffs[i];
+                        if l == 0 {
+                            continue;
+                        }
+                        let abs = l.abs();
+                        let mut val = 2 * q * abs + q_plus;
+                        if l < 0 {
+                            val = -val;
+                        }
+                        coeffs[i] = val.clamp(-2048, 2047);
+                    }
+                    coeffs[0] = recon_dc;
+                    let mut f = [0.0f32; 64];
+                    for i in 0..64 {
+                        f[i] = coeffs[i] as f32;
+                    }
+                    crate::block::idct8x8(&mut f);
+                    write_recon_to_picture(&mut pic, blk, mb_x, mb_y, &f);
+                }
             }
         }
     }

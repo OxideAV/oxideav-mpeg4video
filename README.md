@@ -49,9 +49,12 @@ against ffmpeg-generated reference clips (I-only and GOP-of-10).
   layout: per-MB header/MV bits in part 1, 19-bit DC marker
   (`110 1011 0000 0000 0001`) or 17-bit motion marker
   (`1 1111 0000 0000 0001`), per-MB texture bits in part 2, per-MB AC
-  walks in part 3. Round-21 DP decoder treats one VOP as one video
-  packet; mid-VOP `video_packet_header()` splits in DP mode are a
-  follow-up.
+  walks in part 3. P-VOPs may mix Inter and Intra-in-P MBs in any
+  order — intra MBs skip the MV in part 1, then drop their
+  `ac_pred_flag` + raw cbpy + 6 intra DC differentials into part 2
+  (after `motion_marker`), and their intra AC walks into part 3. The
+  current DP decoder treats one VOP as one video packet; mid-VOP
+  `video_packet_header()` splits in DP mode are a follow-up.
 - **Reversible VLC (Table B.23, round 22).** Decoder picks up
   `reversible_vlc = 1` from the VOL when DP is on and routes every
   DCT-coefficient AC walk through `crate::rvlc::decode_intra_ac` /
@@ -120,16 +123,23 @@ Out of scope for the encoder:
 - B-VOPs round-trip is supported via `bf=N`; combined with `gmc`
   the encoder advertises both features in the VOL but does not
   warp B-VOP references through the trajectory.
-- **Data partitioning (`dp=1`).** Round-21: per-VOP DP layout
+- **Data partitioning (`dp=1`).** Per-VOP DP layout
   (§6.2.5.3 / §6.2.6) for I and P VOPs at half-pel only — VOL flips
   to ARTS@L1 (PLI `0x91`, vot `10`) + `data_partitioned = 1` +
   `resync_marker_disable = 0`. Each VOP body becomes one video packet
   with MV/header bits in part 1, DC marker / motion marker, texture
   bits in part 2, AC walks in part 3, then spec-conformant
   `next_start_code()` stuffing (`0` then `1`'s, or full `0x7F` if
-  byte-aligned). Mutually exclusive with `qpel`/`gmc`/`bf>0` for
-  now. ffmpeg cross-decode validated on the synthetic moving-gradient
-  fixture (`tests/dp.rs::dp_ffmpeg_decode`).
+  byte-aligned). P-VOPs may carry mixed Inter + Intra-in-P MBs
+  (Table B-13 mb_type=3) — the spec routes the intra MB's DC values
+  into part 2 (after `motion_marker`) alongside the per-MB
+  `ac_pred_flag`/`cbpy`, and the intra AC walks into part 3, exactly
+  as the combined-mode encoder does in non-DP mode. Mutually exclusive
+  with `qpel`/`gmc`/`bf>0` for now. ffmpeg cross-decode validated on
+  the synthetic moving-gradient fixture
+  (`tests/dp.rs::dp_ffmpeg_decode`) and on a synthetic scene-change
+  clip with mixed intra+inter MBs
+  (`tests/dp.rs::dp_p_vop_intra_in_p_scene_change_roundtrip`).
 - **Reversible VLC (`rvlc=1`, round 22).** Routes every DCT-coefficient
   AC walk through Table B.23 (intra and inter columns share the same
   prefix codes; the same prefix decodes to a different `(LAST, RUN,

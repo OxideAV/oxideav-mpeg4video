@@ -403,3 +403,194 @@ fn dp_rejects_unsupported_combos() {
         );
     }
 }
+
+/// Build a high-contrast checker pattern with a "phase" parameter — two
+/// visually unrelated frames so a hard switch between them simulates a
+/// scene change. Mirrors `make_scene` in `tests/p_vop.rs` so this test
+/// exercises the same intra-in-P decision path under DP layout.
+fn make_scene(phase: u32, width: u32, height: u32) -> VideoFrame {
+    let w = width as usize;
+    let h = height as usize;
+    let cw = w / 2;
+    let ch = h / 2;
+    let mut y = vec![0u8; w * h];
+    let cb = vec![128u8; cw * ch];
+    let cr = vec![128u8; cw * ch];
+    for row in 0..h {
+        for col in 0..w {
+            let v = match phase {
+                0 => ((col * 5) ^ (row * 11)) as u8,
+                _ => 255u8.wrapping_sub(((col * 13) ^ (row * 7)) as u8),
+            };
+            y[row * w + col] = v;
+        }
+    }
+    VideoFrame {
+        pts: Some(0),
+        planes: vec![
+            VideoPlane { stride: w, data: y },
+            VideoPlane {
+                stride: cw,
+                data: cb,
+            },
+            VideoPlane {
+                stride: cw,
+                data: cr,
+            },
+        ],
+    }
+}
+
+/// Encode an 8-frame scene-change clip under DP, verify the encoder
+/// picked at least one Intra-in-P MB (Table B-13 rows 4..=7) inside the
+/// post-cut P-VOP, then roundtrip through (a) our decoder and (b)
+/// ffmpeg. The intra MB syntax inside `data_partitioned_p_vop()`
+/// (§6.2.5.3) puts intra DC values into part 2 (after motion_marker)
+/// and intra AC walks into part 3 — this test covers the spec-mandated
+/// routing for `derived_mb_type >= 3` MBs in a DP P-VOP body.
+#[test]
+fn dp_p_vop_intra_in_p_scene_change_roundtrip() {
+    let (width, height) = (32u32, 32u32);
+    let num_frames = 8u32;
+    let mut src: Vec<VideoFrame> = Vec::with_capacity(num_frames as usize);
+    for i in 0..num_frames {
+        let phase = if i < 4 { 0 } else { 1 };
+        let mut f = make_scene(phase, width, height);
+        f.pts = Some(i as i64);
+        src.push(f);
+    }
+
+    let mut enc = build_encoder_dp(width, height);
+    for f in &src {
+        enc.send_frame(&Frame::Video(f.clone()))
+            .expect("send_frame");
+    }
+    enc.flush().expect("flush");
+    let mut packets: Vec<Packet> = Vec::new();
+    loop {
+        match enc.receive_packet() {
+            Ok(p) => packets.push(p),
+            Err(oxideav_core::Error::NeedMore) | Err(oxideav_core::Error::Eof) => break,
+            Err(e) => panic!("receive_packet: {e:?}"),
+        }
+    }
+    assert!(packets.len() >= num_frames as usize);
+
+    // Find the post-cut P-VOP (frame 4 packet) and verify at least one
+    // Intra-in-P MCBPC codeword (Table B-13 rows 4..=7) appears in its
+    // body. Codewords:
+    //   row 4 (Intra, cbpc=0): 5 bits = 0b00011
+    //   row 5 (Intra, cbpc=1): 8 bits = 0b00000100
+    //   row 6 (Intra, cbpc=2): 8 bits = 0b00000011
+    //   row 7 (Intra, cbpc=3): 7 bits = 0b0000011
+    // We do a coarse "8 leading zero bits in a row" scan as a proxy for
+    // any of the longer Intra rows (5 / 6 / 7 all start with 5+ zeros
+    // and don't appear in any Inter row 0..=3 / 16..=19). The
+    // self-roundtrip + ffmpeg check below validates the syntax exactly.
+    let cut_pkt = &packets[4];
+    let mut intra_seen = false;
+    for byte_idx in 0..cut_pkt.data.len().saturating_sub(2) {
+        // Look at any 16-bit window for `00000011` or `00000100` (the
+        // Intra row 4..=7 prefixes) at any bit alignment.
+        let w16 = ((cut_pkt.data[byte_idx] as u16) << 8) | cut_pkt.data[byte_idx + 1] as u16;
+        for bit_off in 0..9u32 {
+            let win8 = ((w16 >> (8 - bit_off)) & 0xFF) as u8;
+            if win8 == 0b00000011 || win8 == 0b00000100 {
+                intra_seen = true;
+                break;
+            }
+        }
+        if intra_seen {
+            break;
+        }
+    }
+    assert!(
+        intra_seen,
+        "post-cut DP P-VOP packet contains no Intra-in-P MCBPC prefix"
+    );
+
+    // Self-roundtrip through our decoder.
+    let mut es = Vec::new();
+    for pkt in &packets {
+        es.extend_from_slice(&pkt.data);
+    }
+    let dec_params = CodecParameters::video(CodecId::new(oxideav_mpeg4video::CODEC_ID_STR));
+    let mut dec = oxideav_mpeg4video::decoder::make_decoder(&dec_params).expect("build decoder");
+    let in_pkt = Packet::new(0, TimeBase::new(1, 24), es.clone());
+    dec.send_packet(&in_pkt).expect("send_packet");
+    dec.flush().expect("flush decoder");
+    let mut decoded: Vec<VideoFrame> = Vec::new();
+    loop {
+        match dec.receive_frame() {
+            Ok(Frame::Video(f)) => decoded.push(f),
+            Ok(_) => {}
+            Err(oxideav_core::Error::NeedMore) | Err(oxideav_core::Error::Eof) => break,
+            Err(e) => panic!("receive_frame: {e:?}"),
+        }
+    }
+    assert_eq!(
+        decoded.len(),
+        num_frames as usize,
+        "DP intra-in-P self-roundtrip dropped frames"
+    );
+    // PSNR per frame — the cut frame stays high because intra-in-P
+    // recovers the post-cut content exactly (no MC drift).
+    for (i, (s, d)) in src.iter().zip(decoded.iter()).enumerate() {
+        let p = psnr(&flatten_frame(s), &flatten_frame(d));
+        eprintln!("DP intra-in-P frame {i}: PSNR = {p:.2} dB");
+        assert!(
+            p > 25.0,
+            "DP intra-in-P frame {i} PSNR {p:.2} dB below 25 dB"
+        );
+    }
+
+    // ffmpeg cross-decode — the spec-conformant DP P-VOP body with
+    // mixed intra+inter MBs must roundtrip cleanly.
+    if !command_exists("ffmpeg") {
+        eprintln!("ffmpeg missing — skipping DP intra-in-P ffmpeg interop test");
+        return;
+    }
+    let tmp = std::env::temp_dir();
+    let es_path = tmp.join("oxideav_dp_intra_p_scene.m4v");
+    std::fs::write(&es_path, &es).expect("write m4v");
+    let yuv_out = tmp.join("oxideav_dp_intra_p_scene_ffmpeg.yuv");
+    let _ = std::fs::remove_file(&yuv_out);
+    let status = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "m4v",
+            "-i",
+            es_path.to_str().unwrap(),
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "yuv420p",
+            yuv_out.to_str().unwrap(),
+        ])
+        .status()
+        .expect("run ffmpeg");
+    assert!(
+        status.success(),
+        "ffmpeg failed to decode our DP intra-in-P scene-change stream"
+    );
+    let ff = std::fs::read(&yuv_out).expect("read ffmpeg output");
+    let per_frame = (width as usize * height as usize * 3) / 2;
+    assert!(
+        ff.len() >= per_frame * num_frames as usize,
+        "ffmpeg DP intra-in-P output too small: {} bytes for {} frames",
+        ff.len(),
+        num_frames
+    );
+    let src4 = flatten_frame(&src[4]);
+    let ff4 = &ff[4 * per_frame..5 * per_frame];
+    let p4 = psnr(&src4, ff4);
+    eprintln!("ffmpeg DP intra-in-P cut-frame PSNR = {p4:.2} dB");
+    assert!(
+        p4 > 25.0,
+        "ffmpeg DP intra-in-P cut-frame PSNR {p4:.2} below 25 dB — intra-in-P syntax mismatch"
+    );
+}

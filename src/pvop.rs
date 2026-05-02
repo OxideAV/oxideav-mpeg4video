@@ -98,7 +98,7 @@ const FOURMV_LAMBDA: u32 = 96;
 /// MAD is content-driven (500-3000 for textured content). On a scene
 /// cut, inter SAD jumps to ~3000-8000 while intra MAD stays at the
 /// content baseline, easily clearing this threshold.
-const INTRA_IN_P_BIAS: u32 = 384;
+pub(crate) const INTRA_IN_P_BIAS: u32 = 384;
 
 /// Minimum intra cost advantage (in SAD units) required to switch to
 /// intra. The intra cost we compute is a luma-only Mean-Absolute-
@@ -106,7 +106,7 @@ const INTRA_IN_P_BIAS: u32 = 384;
 /// actual intra residual. The bias above already protects against false
 /// positives; this margin protects against close calls where the proxy
 /// and the actual cost might disagree.
-const INTRA_MARGIN: u32 = 128;
+pub(crate) const INTRA_MARGIN: u32 = 128;
 
 /// Encoder-side representation of one P-VOP macroblock after motion
 /// estimation. All MVs are in luma half-pel units.
@@ -380,7 +380,7 @@ pub(crate) fn reset_pred_grid_mb(grid: &mut PredGrid, mb_x: usize, mb_y: usize) 
 /// We only sum the four luma blocks so the value is on the same scale
 /// as `inter_luma_sad` (the chosen-mode 16×16 luma SAD). Chroma is
 /// usually low-variance and would only blur the comparison.
-fn intra_cost_proxy(
+pub(crate) fn intra_cost_proxy(
     v: &oxideav_core::VideoFrame,
     width: usize,
     height: usize,
@@ -495,6 +495,75 @@ pub(crate) fn estimate_and_encode_mb(
     quarter_sample: bool,
     warp: Option<&crate::gmc::WarpParams>,
 ) -> Result<PMbEncoding> {
+    estimate_and_encode_mb_inner(
+        v,
+        width,
+        height,
+        reference,
+        mb_x,
+        mb_y,
+        vop_quant,
+        rounding,
+        mv_grid,
+        quarter_sample,
+        warp,
+        false,
+    )
+}
+
+/// Like [`estimate_and_encode_mb`] but forces 1MV mode (skips the 4MV
+/// mode-decision branch). Used by the DP P-VOP encoder, which rejects
+/// 4MV at the factory and never emits Inter4MV MCBPC codewords. Without
+/// this, `estimate_and_encode_mb` could pick 4MV for a high-residual
+/// MB, build the predictor from four sub-MVs, and the DP emit path
+/// would only write the block-0 MV — the decoder would reconstruct
+/// from a 1MV predictor and drift away from the encoder's recon. See
+/// `data_partitioned_p_vop()` §6.2.5.3 / `dp::encode_p_vop_body_dp_with_grid`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn estimate_and_encode_mb_one_mv(
+    v: &oxideav_core::VideoFrame,
+    width: usize,
+    height: usize,
+    reference: &IVopPicture,
+    mb_x: usize,
+    mb_y: usize,
+    vop_quant: u32,
+    rounding: bool,
+    mv_grid: &MvGrid,
+    quarter_sample: bool,
+    warp: Option<&crate::gmc::WarpParams>,
+) -> Result<PMbEncoding> {
+    estimate_and_encode_mb_inner(
+        v,
+        width,
+        height,
+        reference,
+        mb_x,
+        mb_y,
+        vop_quant,
+        rounding,
+        mv_grid,
+        quarter_sample,
+        warp,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn estimate_and_encode_mb_inner(
+    v: &oxideav_core::VideoFrame,
+    width: usize,
+    height: usize,
+    reference: &IVopPicture,
+    mb_x: usize,
+    mb_y: usize,
+    vop_quant: u32,
+    rounding: bool,
+    mv_grid: &MvGrid,
+    quarter_sample: bool,
+    warp: Option<&crate::gmc::WarpParams>,
+    force_one_mv: bool,
+) -> Result<PMbEncoding> {
     // 1. Integer-pel search over the 16×16 luma MB.
     let src_y_block = load_luma_mb(v, width, height, mb_x, mb_y);
     let (int_x, int_y) = diamond_search_integer(reference, &src_y_block, mb_x, mb_y);
@@ -575,8 +644,12 @@ pub(crate) fn estimate_and_encode_mb(
 
     // 5. Mode decision — favour 1MV unless 4MV beats it by more than the
     //    lambda penalty. 1MV ties win because they're cheaper to code and
-    //    avoid splitting the MB's chroma predictor.
-    let mut four_mv = sad_4mv.saturating_add(FOURMV_LAMBDA) < sad_1mv;
+    //    avoid splitting the MB's chroma predictor. When `force_one_mv`
+    //    is true (DP path), the 4MV branch is suppressed entirely — the
+    //    DP encoder rejects Inter4MV MCBPC codewords and only writes one
+    //    MV per MB, so picking 4MV here would desync encoder/decoder
+    //    reconstruction (§6.2.5.3 `data_partitioned_p_vop()`).
+    let mut four_mv = !force_one_mv && sad_4mv.saturating_add(FOURMV_LAMBDA) < sad_1mv;
 
     let (mut mv_repr, mut pred_y) = if four_mv {
         // Build the 4MV luma predictor.

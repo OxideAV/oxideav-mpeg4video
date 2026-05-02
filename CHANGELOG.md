@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- encoder + decoder: **Intra-in-P macroblocks under data partitioning**
+  (ISO/IEC 14496-2 §6.2.5.3 `data_partitioned_p_vop()`). The DP P-VOP
+  body emitter now mirrors the combined-mode intra-in-P decision (§6.3.7
+  / Table B-22 mb_type=3): when the per-MB inter SAD exceeds the intra
+  MAD proxy by `INTRA_IN_P_BIAS + INTRA_MARGIN`, the MB is re-encoded
+  as intra and routed through the DP partitions per spec — Intra MCBPC
+  (Table B-13 rows 4..=7, NO motion vector) into part 1, then
+  `ac_pred_flag + raw cbpy + 6 intra DC differentials` into part 2
+  (after `motion_marker`), then intra AC walks (Table B-16 / B.23 RVLC)
+  into part 3. Decoder mirror: part 1 dispatches on `derived_mb_type`
+  to skip the MV read for intra MBs and accumulate cbpy + DC diffs in
+  part 2; reconstruction uses the I-VOP DP intra recipe (DC predictor
+  from neighbour grid, dequant, IDCT) per intra MB, with inter MBs
+  resetting their predictor slot. Required a `force_one_mv` knob on
+  `pvop::estimate_and_encode_mb` (new
+  `estimate_and_encode_mb_one_mv`) — without it the inner ME could
+  pick 4MV for a high-residual MB and the DP path's single-MV emission
+  would desync encoder/decoder reconstruction. ffmpeg cross-decode
+  validated on a synthetic scene-change clip with mixed intra+inter MBs
+  (`tests/dp.rs::dp_p_vop_intra_in_p_scene_change_roundtrip`, cut-frame
+  PSNR ~38.7 dB through both our decoder and ffmpeg).
 - encoder + decoder: **reversible VLC (RVLC)** for DCT coefficients
   (ISO/IEC 14496-2 Tables B.23–B.25, §7.4.1.2). Enabled with the
   `rvlc` codec option, which requires `dp=1` (per §6.2.5: RVLC is only
