@@ -296,6 +296,214 @@ fn rvlc_bit_overhead_is_modest() {
     );
 }
 
+/// Error-recovery acceptance test (round 24, task #175).
+///
+/// Demonstrates the headline RVLC benefit: when the AC-coefficient
+/// region of the bitstream takes deliberate bit-level damage, the RVLC
+/// path recovers MORE pixel area (= more blocks whose coefficients
+/// match the original exactly) than the standard Tcoef path does. The
+/// reason: with RVLC we can walk backward from the END of the damaged
+/// region by parsing the bit-reversed buffer (Annex E.1.4.4 strategy
+/// 1/3). Standard Tcoef has no reverse-decode property — it can only
+/// walk forward, and a parser that walks past damaged bytes typically
+/// emits garbage coefficients without raising any error, since the
+/// table is dense and most random bit patterns parse as valid VLCs.
+///
+/// The test builds a synthetic K-block AC partition twice (RVLC +
+/// standard Tcoef) over the SAME coefficient stream, corrupts a byte
+/// in the middle, then measures how many blocks each path can
+/// reproduce BIT-EXACTLY (= blocks whose decoded coefficient array
+/// equals the original). This is the most defensible "pixel area
+/// recovered" metric because any deviation in coefficients leads to
+/// wrong pels.
+///
+/// Pass condition: RVLC recovers strictly more bit-exact blocks than
+/// standard Tcoef.
+#[test]
+fn rvlc_corruption_recovery_beats_baseline() {
+    use oxideav_core::bits::{BitReader, BitWriter};
+    use oxideav_mpeg4video::block;
+    use oxideav_mpeg4video::headers::vol::ZIGZAG;
+    use oxideav_mpeg4video::rvlc;
+
+    // Build K test blocks with non-trivial coefficient patterns. A mix
+    // of low- and high-frequency taps spreads codeword lengths across
+    // the table.
+    let k_blocks = 16usize;
+    let make_block = |seed: usize| -> [i32; 64] {
+        let mut b = [0i32; 64];
+        b[ZIGZAG[1]] = ((seed % 5) as i32) + 1;
+        b[ZIGZAG[3]] = -(((seed * 7) % 4) as i32) - 1;
+        if seed % 3 == 0 {
+            b[ZIGZAG[8]] = 2;
+        }
+        if seed % 4 == 0 {
+            b[ZIGZAG[16]] = -1;
+        }
+        b[ZIGZAG[20 + (seed % 10)]] = 1; // last-non-zero
+        b
+    };
+    let originals: Vec<[i32; 64]> = (0..k_blocks).map(make_block).collect();
+
+    // ------------------------------------------------------------------
+    // Encode K blocks under each codec table; capture per-block bit lengths.
+    // ------------------------------------------------------------------
+    let mut bw_rvlc = BitWriter::new();
+    let mut block_lens_rvlc: Vec<u64> = Vec::new();
+    let mut prev_pos = 0u64;
+    for orig in originals.iter().take(k_blocks) {
+        rvlc::write_intra_ac(&mut bw_rvlc, orig).expect("rvlc encode");
+        let pos = bw_rvlc.bit_position();
+        block_lens_rvlc.push(pos - prev_pos);
+        prev_pos = pos;
+    }
+    let total_bits_rvlc = bw_rvlc.bit_position();
+    let bytes_rvlc = bw_rvlc.finish();
+
+    let mut bw_std = BitWriter::new();
+    let mut prev_pos = 0u64;
+    let mut block_lens_std: Vec<u64> = Vec::new();
+    for orig in originals.iter().take(k_blocks) {
+        oxideav_mpeg4video::encoder::write_intra_ac(&mut bw_std, orig).expect("std encode");
+        let pos = bw_std.bit_position();
+        block_lens_std.push(pos - prev_pos);
+        prev_pos = pos;
+    }
+    let total_bits_std = bw_std.bit_position();
+    let bytes_std = bw_std.finish();
+
+    eprintln!(
+        "synthetic AC partition: RVLC = {} bits ({} bytes), std = {} bits ({} bytes)",
+        total_bits_rvlc,
+        bytes_rvlc.len(),
+        total_bits_std,
+        bytes_std.len()
+    );
+
+    // ------------------------------------------------------------------
+    // Corrupt a window of bytes covering the byte that contains the
+    // middle of the partition. Both streams take damage in the same
+    // RELATIVE region (around byte index `len/2`). A multi-byte
+    // window guarantees the damage spans at least one codeword
+    // boundary so the parser cannot just step over it.
+    // ------------------------------------------------------------------
+    fn corrupt(bytes: &[u8]) -> Vec<u8> {
+        let mut out = bytes.to_vec();
+        let mid = out.len() / 2;
+        for off in 0..3.min(out.len() - mid) {
+            out[mid + off] ^= 0xA5;
+        }
+        out
+    }
+    let corrupt_rvlc = corrupt(&bytes_rvlc);
+    let corrupt_std = corrupt(&bytes_std);
+
+    // ------------------------------------------------------------------
+    // Forward decode + bit-exact comparison against the original blocks.
+    // We count a block as "recovered" only when the decoded coefficient
+    // array matches the original exactly. A best-effort walker that
+    // emits garbage coefficients past the damage point gets credited
+    // with zero past the damage.
+    // ------------------------------------------------------------------
+    fn forward_recover_rvlc(bytes: &[u8], total_bits: u64, originals: &[[i32; 64]]) -> Vec<bool> {
+        let mut br = BitReader::new(bytes);
+        let mut ok = vec![false; originals.len()];
+        for (k, orig) in originals.iter().enumerate() {
+            if br.bit_position() >= total_bits {
+                break;
+            }
+            let mut decoded = [0i32; 64];
+            match rvlc::try_decode_intra_ac(&mut br, &mut decoded, &ZIGZAG) {
+                Ok(_) => ok[k] = decoded == *orig,
+                Err(_) => break,
+            }
+        }
+        ok
+    }
+    fn forward_recover_std(bytes: &[u8], total_bits: u64, originals: &[[i32; 64]]) -> Vec<bool> {
+        let mut br = BitReader::new(bytes);
+        let mut ok = vec![false; originals.len()];
+        for (k, orig) in originals.iter().enumerate() {
+            if br.bit_position() >= total_bits {
+                break;
+            }
+            let mut decoded = [0i32; 64];
+            match block::decode_intra_ac(&mut br, &mut decoded, &ZIGZAG) {
+                Ok(_) => ok[k] = decoded == *orig,
+                Err(_) => break,
+            }
+        }
+        ok
+    }
+
+    // ------------------------------------------------------------------
+    // Reverse decode for RVLC: bit-reverse the corrupted bytes, walk
+    // forward through the reversed buffer block-by-block from the END
+    // (= forward through the reversed buffer, but indexed from the
+    // END of `originals`). Bit-exact comparison again.
+    // ------------------------------------------------------------------
+    fn reverse_recover_rvlc(
+        bytes: &[u8],
+        total_bits: u64,
+        block_lens: &[u64],
+        originals: &[[i32; 64]],
+    ) -> Vec<bool> {
+        let rev = rvlc::bit_reverse_buffer(bytes, total_bits as usize);
+        let mut br = BitReader::new(&rev);
+        let mut ok = vec![false; originals.len()];
+        // Iterate from the LAST original block backward — block_lens
+        // is in forward emission order so iterate in reverse.
+        for (idx_from_end, &nb) in block_lens.iter().rev().enumerate() {
+            let k = originals.len() - 1 - idx_from_end;
+            let mut decoded = [0i32; 64];
+            match rvlc::decode_intra_ac_reverse(&mut br, nb, &mut decoded, &ZIGZAG) {
+                Ok(_) => ok[k] = decoded == originals[k],
+                Err(_) => break,
+            }
+        }
+        ok
+    }
+
+    let fwd_rvlc = forward_recover_rvlc(&corrupt_rvlc, total_bits_rvlc, &originals);
+    let fwd_std = forward_recover_std(&corrupt_std, total_bits_std, &originals);
+    let rev_rvlc =
+        reverse_recover_rvlc(&corrupt_rvlc, total_bits_rvlc, &block_lens_rvlc, &originals);
+
+    // Combined per-block recovery: RVLC = forward OR reverse; std = forward only.
+    let combined_rvlc: Vec<bool> = fwd_rvlc
+        .iter()
+        .zip(rev_rvlc.iter())
+        .map(|(f, r)| *f || *r)
+        .collect();
+    let combined_std = fwd_std.clone();
+
+    let n_rvlc = combined_rvlc.iter().filter(|x| **x).count();
+    let n_std = combined_std.iter().filter(|x| **x).count();
+
+    eprintln!(
+        "recovery: RVLC fwd {} + rev {} → combined {}/{} bit-exact; \
+         std fwd {}/{} bit-exact",
+        fwd_rvlc.iter().filter(|x| **x).count(),
+        rev_rvlc.iter().filter(|x| **x).count(),
+        n_rvlc,
+        k_blocks,
+        n_std,
+        k_blocks
+    );
+    eprintln!("  RVLC fwd mask: {:?}", fwd_rvlc);
+    eprintln!("  RVLC rev mask: {:?}", rev_rvlc);
+    eprintln!("  std  fwd mask: {:?}", fwd_std);
+
+    assert!(
+        n_rvlc > n_std,
+        "RVLC recovered {} bit-exact blocks vs std {} (k = {}); \
+         expected RVLC > std",
+        n_rvlc,
+        n_std,
+        k_blocks
+    );
+}
+
 /// ffmpeg cross-decode: hand our DP+RVLC ES to ffmpeg and assert
 /// (a) ffmpeg accepts the stream and (b) the decoded I-VOP matches our
 /// source within 30 dB PSNR (same bar as the DP-only test).

@@ -55,12 +55,23 @@ against ffmpeg-generated reference clips (I-only and GOP-of-10).
   (after `motion_marker`), and their intra AC walks into part 3. The
   current DP decoder treats one VOP as one video packet; mid-VOP
   `video_packet_header()` splits in DP mode are a follow-up.
-- **Reversible VLC (Table B.23, round 22).** Decoder picks up
+- **Reversible VLC (Table B.23, round 22 + 24).** Decoder picks up
   `reversible_vlc = 1` from the VOL when DP is on and routes every
   DCT-coefficient AC walk through `crate::rvlc::decode_intra_ac` /
   `decode_inter_ac` instead of the standard Table B.16/B.17 walker.
-  Forward-direction decode is implemented; reverse-direction error
-  recovery (Annex E.1.4.4 four strategies) is a follow-up.
+  Round 24 added a **reverse-direction decoder** (Annex E.1.4.4) —
+  `crate::rvlc::{decode_intra_ac_reverse, decode_inter_ac_reverse,
+  bit_reverse_buffer, try_decode_intra_ac, try_decode_inter_ac}`. The
+  property that makes reverse decode work: bit-reversing every short
+  RVLC codeword (prefix + sign-as-LSB) yields a SECOND valid prefix
+  code over the same 169-symbol set; the reverse parser walks this
+  second table on a bit-reversed copy of the AC partition. The 30-bit
+  RVLC escape `00001 LAST(1) RUN(6) m LEVEL(11) m 0000 sign` reverses
+  to `sign 0000 m LEVEL_rev(11) m RUN_rev(6) LAST 10000` — also
+  parseable in the reversed buffer. Strategy 1-4 picker
+  (forward/reverse merging at the per-MB granularity) is a follow-up;
+  the round-24 acceptance test exercises the underlying recovery
+  property at the per-block granularity.
 - **Picture store.** One reference frame, refreshed by each I-VOP and
   each P-VOP. Not-coded VOPs re-emit the previous reference at the
   new pts.
@@ -140,19 +151,24 @@ Out of scope for the encoder:
   (`tests/dp.rs::dp_ffmpeg_decode`) and on a synthetic scene-change
   clip with mixed intra+inter MBs
   (`tests/dp.rs::dp_p_vop_intra_in_p_scene_change_roundtrip`).
-- **Reversible VLC (`rvlc=1`, round 22).** Routes every DCT-coefficient
-  AC walk through Table B.23 (intra and inter columns share the same
-  prefix codes; the same prefix decodes to a different `(LAST, RUN,
-  LEVEL)` triplet depending on the block type). Required by the spec
-  to be combined with `dp=1` (§6.2.5: `reversible_vlc` only legal
-  inside `data_partitioned_motion_shape_texture()`). 30-bit RVLC
-  escape `00001 LAST(1) RUN(6) m LEVEL(11) m 0000 sign` covers any
-  triplet not in B.23. Bit overhead vs non-RVLC at the same Q on the
-  synthetic moving-gradient fixture: about +2.2 % bytes. ffmpeg
-  cross-decode validated (`tests/rvlc.rs::rvlc_ffmpeg_decode`,
-  43.5 dB I-VOP PSNR). Reverse-direction error-recovery decode
-  (Annex E.1.4.4 strategies) is a follow-up — round-22 reads the
-  RVLC stream forward only, which is sufficient for clean transport.
+- **Reversible VLC (`rvlc=1`, rounds 22 + 24).** Routes every
+  DCT-coefficient AC walk through Table B.23 (intra and inter columns
+  share the same prefix codes; the same prefix decodes to a different
+  `(LAST, RUN, LEVEL)` triplet depending on the block type). Required
+  by the spec to be combined with `dp=1` (§6.2.5: `reversible_vlc`
+  only legal inside `data_partitioned_motion_shape_texture()`).
+  30-bit RVLC escape `00001 LAST(1) RUN(6) m LEVEL(11) m 0000 sign`
+  covers any triplet not in B.23. Bit overhead vs non-RVLC at the
+  same Q on the synthetic moving-gradient fixture: about +2.2 %
+  bytes. ffmpeg cross-decode validated
+  (`tests/rvlc.rs::rvlc_ffmpeg_decode`, 43.5 dB I-VOP PSNR).
+  **Round-24 added the reverse decoder** powering Annex E.1.4.4
+  recovery — see the decoder section above. The acceptance test
+  `tests/rvlc.rs::rvlc_corruption_recovery_beats_baseline` builds a
+  16-block AC partition twice (RVLC + standard Tcoef), corrupts a
+  3-byte window in the middle of each, and counts blocks recovered
+  bit-exactly: standard Tcoef recovers 7/16 (forward only, stops at
+  the damage), RVLC recovers 14/16 (forward 7 + reverse 7).
 - Interlace, scalability.
 - MPEG-4 matrix quant (`mpeg_quant = 1`).
 

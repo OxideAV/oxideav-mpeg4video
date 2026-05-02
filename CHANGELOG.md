@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- decoder: **RVLC reverse-direction decoder + best-effort recovery
+  walkers** (ISO/IEC 14496-2 Annex E.1.4.4). Five new public functions
+  in `src/rvlc.rs`: `bit_reverse_buffer`, `decode_intra_ac_reverse`,
+  `decode_inter_ac_reverse`, `try_decode_intra_ac`, `try_decode_inter_ac`.
+  The reverse decoder rests on a property the spec hints at but doesn't
+  spell out: bit-reversing every short B.23 codeword (prefix +
+  sign-as-LSB) yields a SECOND valid prefix code over the same
+  169-symbol set — verified by the new
+  `tests::reverse_table_is_prefix_code` lib test (no two reverse
+  codewords coincide; no reverse codeword is a prefix of another). The
+  reverse parser walks this second table over a bit-reversed copy of
+  the AC partition; the 30-bit RVLC escape `00001 LAST(1) RUN(6) m
+  LEVEL(11) m 0000 sign` reverses to `sign 0000 m LEVEL_rev(11) m
+  RUN_rev(6) LAST 10000` and is recognized by its `s0000` opening
+  signature. Acceptance test
+  `tests/rvlc.rs::rvlc_corruption_recovery_beats_baseline` builds the
+  same 16-block AC coefficient stream under both the RVLC writer and
+  the standard B.16 Tcoef writer, corrupts a 3-byte window in the
+  middle of each, and counts blocks recovered bit-exactly: standard
+  Tcoef stops at the damage and recovers 7/16 forward + 0/16 reverse;
+  RVLC recovers 7/16 forward + 7/16 reverse = 14/16. Eleven new tests
+  total (10 lib + 1 integration). Strategy 1-4 picker (§E.1.4.4.2.1
+  per-MB N1/N2 + L1/L2 merging) is a future follow-up; the round-24
+  drop ships the underlying primitives that picker would use.
 - encoder + decoder: **Intra-in-P macroblocks under data partitioning**
   (ISO/IEC 14496-2 §6.2.5.3 `data_partitioned_p_vop()`). The DP P-VOP
   body emitter now mirrors the combined-mode intra-in-P decision (§6.3.7

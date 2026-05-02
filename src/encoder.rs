@@ -1794,7 +1794,11 @@ pub(crate) fn write_intra_dc_diff(bw: &mut BitWriter, block_idx: usize, diff: i3
 
 /// Walk `block` in zigzag order, emitting one VLC per non-zero coefficient.
 /// `block` is in natural order (block[ZIGZAG[i]] is scan position i).
-pub(crate) fn write_intra_ac(bw: &mut BitWriter, block: &[i32; 64]) -> Result<()> {
+///
+/// Exposed publicly so the round-24 RVLC error-recovery test can build
+/// matched RVLC and standard-Tcoef AC partitions for the same coefficient
+/// stream and compare each path's resilience to bit-level damage.
+pub fn write_intra_ac(bw: &mut BitWriter, block: &[i32; 64]) -> Result<()> {
     // Find the last non-zero AC scan index (we encode AC starting at scan 1).
     let mut last_nz: Option<usize> = None;
     for i in 1..64 {

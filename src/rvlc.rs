@@ -419,8 +419,14 @@ pub fn write_inter_ac(bw: &mut BitWriter, block: &[i32; 64]) {
 }
 
 // -------------------------------------------------------------------------
-// Decode side (forward only — error-recovery reverse decode is a future
-// follow-up; for our purposes the decoder needs to consume what we emit).
+// Decode side
+//
+// Forward decode is the path the production decoder uses on a clean
+// bitstream. Reverse decode is exposed as a standalone helper for
+// error-recovery use cases (Annex E.1.4.4): when a corruption is
+// detected mid-AC-partition the recovery code can walk backward from a
+// known end point to recover the trailing MBs that the forward parser
+// could not reach.
 // -------------------------------------------------------------------------
 
 /// One decoded RVLC symbol = `(last, run, signed_level)`.
@@ -549,6 +555,373 @@ pub fn decode_inter_ac(
         i += 1;
         if i > 63 {
             return Ok(Some(i - 1));
+        }
+    }
+}
+
+// -------------------------------------------------------------------------
+// Reverse-decode side — Annex E.1.4.4 backward walk.
+//
+// The fundamental RVLC property (as the spec puts it: "designed such that
+// they can be instantaneously decoded both in forward and reverse
+// directions") shows up in the table itself: when each of the 169 short
+// codewords (prefix + sign as LSB) is bit-reversed, the resulting set is
+// ALSO a valid prefix code (verified in `tests::reverse_table_is_prefix_code`).
+// The bit-reversed codewords don't generally map to the same triplet —
+// they form their own table indexed by which ORIGINAL codeword bit-reversed
+// to this pattern. So a backward parser on the original bit stream =
+// forward parser on a bit-reversed copy of the same bit stream, looking
+// up entries through the `reverse_table()` below which maps
+// bit-reversed-codeword -> original-table-index.
+//
+// The 30-bit RVLC escape `00001 LAST(1) RUN(6) m LEVEL(11) m 0000 sign`
+// also bit-reverses to a recognizable pattern: `sign 0000 m LEVEL_rev(11)
+// m RUN_rev(6) LAST 10000`. Reading the reversed buffer forward we see
+// the sign first, then `0000` (the original closing prefix), then the
+// reversed-FLC fields, ending in `10000` (= `00001` reversed, the
+// original opening). The reverse parser detects an escape opening on
+// the reversed buffer when it sees the byte sequence `0` (sign) +
+// `0000` (closing prefix-as-MSB) — equivalently, a 5-bit pattern of
+// `s0000`. To distinguish this from short codewords we check that the
+// 4 bits AFTER the sign are all zero, the same `0000` reservation that
+// makes the forward parser unambiguous.
+
+/// One reverse-table entry: bit-reversed (prefix + sign) codeword and
+/// the original forward-table index it came from.
+#[derive(Clone, Copy, Debug)]
+struct RvlcReverseEntry {
+    /// Total bits = prefix bits + 1 (sign).
+    bits: u8,
+    /// Bit-reversed full codeword (sign-as-MSB), MSB-first in the low `bits`.
+    code_rev: u32,
+    /// Index into the forward [`table()`] whose original codeword this
+    /// is the bit-reverse of.
+    fwd_index: usize,
+    /// Original sign bit (= LSB of original codeword = MSB of bit-reversed
+    /// codeword). 0 = positive level, 1 = negative.
+    sign: u8,
+}
+
+/// Returns the bit-reversed-codeword view of [`table()`]. The set is
+/// itself a valid prefix code (proven by the prefix-uniqueness check
+/// in [`tests::reverse_table_is_prefix_code`]).
+fn reverse_table() -> &'static [RvlcReverseEntry] {
+    static CELL: OnceLock<Vec<RvlcReverseEntry>> = OnceLock::new();
+    CELL.get_or_init(|| {
+        let mut v = Vec::with_capacity(table().len() * 2);
+        for (idx, e) in table().iter().enumerate() {
+            let total_bits = e.prefix_bits as u32 + 1;
+            for sign in 0u32..=1 {
+                let full = (e.prefix_code << 1) | sign;
+                let rev = bit_reverse(full, total_bits);
+                v.push(RvlcReverseEntry {
+                    bits: total_bits as u8,
+                    code_rev: rev,
+                    fwd_index: idx,
+                    sign: sign as u8,
+                });
+            }
+        }
+        v
+    })
+    .as_slice()
+}
+
+/// Bit-reverse the low `bits` of `value`, MSB-first.
+fn bit_reverse(value: u32, bits: u32) -> u32 {
+    let mut out = 0u32;
+    for i in 0..bits {
+        if (value >> i) & 1 == 1 {
+            out |= 1 << (bits - 1 - i);
+        }
+    }
+    out
+}
+
+/// Bit-reverse an entire byte-aligned bit slice. The caller passes the
+/// number of meaningful bits in `bytes` — the result has those bits
+/// laid out in reverse order, also MSB-first byte-packed. If
+/// `n_bits % 8 != 0`, the trailing bits of the last input byte are
+/// ignored, and the output is zero-padded on its trailing byte.
+///
+/// This is the one operation needed to set up reverse decode on a
+/// known-length AC partition: bit-reverse the whole partition, then
+/// [`BitReader::new`] + [`decode_intra_ac_reverse`] / [`decode_inter_ac_reverse`].
+pub fn bit_reverse_buffer(bytes: &[u8], n_bits: usize) -> Vec<u8> {
+    let n_out_bytes = n_bits.div_ceil(8);
+    let mut out = vec![0u8; n_out_bytes];
+    for src_bit in 0..n_bits {
+        let dst_bit = n_bits - 1 - src_bit;
+        let src_byte = src_bit / 8;
+        let src_off = 7 - (src_bit % 8); // MSB-first
+        let bit = (bytes[src_byte] >> src_off) & 1;
+        if bit == 1 {
+            let dst_byte = dst_bit / 8;
+            let dst_off = 7 - (dst_bit % 8);
+            out[dst_byte] |= 1 << dst_off;
+        }
+    }
+    out
+}
+
+/// Decode one RVLC symbol from the bit-reversed bit stream — i.e. one
+/// step of the backward walk on the original. Mirrors [`decode_symbol`]
+/// but consults [`reverse_table()`].
+fn decode_symbol_reverse(br: &mut BitReader<'_>, is_intra: bool) -> Result<DecodedSym> {
+    let max_bits = 16u32;
+    let remaining = br.bits_remaining() as u32;
+    let peek_bits = max_bits.min(remaining);
+    if peek_bits == 0 {
+        return Err(Error::invalid("mpeg4 rvlc reverse: no bits available"));
+    }
+    let peeked = br.peek_u32(peek_bits)?;
+    let peeked_full = peeked << (max_bits - peek_bits);
+
+    // Detect bit-reversed escape: `s0000...` — sign bit, then the
+    // `0000` reserved closing prefix appears AFTER the sign in the
+    // reversed buffer. A 5-bit window of the form `?0000` matches.
+    if peek_bits >= 5 {
+        let top5 = peeked_full >> (max_bits - 5);
+        // sign is the MSB; the next 4 bits must be `0000`.
+        if top5 & 0b01111 == 0 {
+            return decode_escape_body_reverse(br);
+        }
+    }
+
+    // Linear scan of bit-reversed short codewords.
+    for e in reverse_table() {
+        let bits = e.bits as u32;
+        if bits > peek_bits {
+            continue;
+        }
+        let code = peeked_full >> (max_bits - bits);
+        if code == e.code_rev {
+            br.consume(bits)?;
+            let fwd = &table()[e.fwd_index];
+            let (last, run, abs) = if is_intra { fwd.intra } else { fwd.inter };
+            let level = if e.sign == 1 {
+                -(abs as i32)
+            } else {
+                abs as i32
+            };
+            return Ok((last, run, level));
+        }
+    }
+    Err(Error::invalid("mpeg4 rvlc reverse: no matching codeword"))
+}
+
+/// Decode the body of a bit-reversed escape sequence — assumes nothing
+/// has been consumed yet. The reversed escape layout is:
+/// `sign 0000 m LEVEL_rev(11) m RUN_rev(6) LAST 00001_rev=10000`.
+fn decode_escape_body_reverse(br: &mut BitReader<'_>) -> Result<DecodedSym> {
+    // First bit = original sign (was LSB of original codeword).
+    let sign = br.read_u1()? as i32;
+    // Next 4 bits = `0000` (was the closing prefix, MSB→LSB).
+    let close = br.read_u32(ESCAPE_CLOSE_PREFIX_BITS)?;
+    if close != ESCAPE_CLOSE_PREFIX {
+        return Err(Error::invalid(
+            "mpeg4 rvlc reverse: bad reversed closing prefix",
+        ));
+    }
+    // Marker (was the LEVEL closing marker).
+    let m1 = br.read_u1()?;
+    if m1 != 1 {
+        return Err(Error::invalid(
+            "mpeg4 rvlc reverse: missing reversed marker after `0000`",
+        ));
+    }
+    // 11 bits of LEVEL, but in reversed bit order — bit-reverse to
+    // recover the original unsigned magnitude.
+    let level_rev = br.read_u32(11)?;
+    let abs = bit_reverse(level_rev, 11) as i32;
+    if abs == 0 {
+        return Err(Error::invalid(
+            "mpeg4 rvlc reverse: escape LEVEL=0 forbidden",
+        ));
+    }
+    // Marker (was the LEVEL opening marker).
+    let m2 = br.read_u1()?;
+    if m2 != 1 {
+        return Err(Error::invalid(
+            "mpeg4 rvlc reverse: missing reversed marker after LEVEL",
+        ));
+    }
+    // 6 bits of RUN, reversed.
+    let run_rev = br.read_u32(6)?;
+    let run = bit_reverse(run_rev, 6) as u8;
+    // 1 bit LAST.
+    let last = br.read_u1()? == 1;
+    // Final 5 bits = `10000` (= `00001` reversed) — the original opening.
+    let open_rev = br.read_u32(ESCAPE_OPEN_BITS)?;
+    let expected_open_rev = bit_reverse(ESCAPE_OPEN, ESCAPE_OPEN_BITS);
+    if open_rev != expected_open_rev {
+        return Err(Error::invalid(
+            "mpeg4 rvlc reverse: bad reversed opening prefix",
+        ));
+    }
+    let level = if sign == 1 { -abs } else { abs };
+    Ok((last, run, level))
+}
+
+/// Decode one intra block's AC coefficients in REVERSE order — the
+/// caller has bit-reversed the block's AC bits and `br` is positioned
+/// at the start of the reversed buffer (the original's LAST bit). The
+/// caller passes `n_bits` = the exact number of bits the original
+/// block's AC walk emitted, so the reverse parser doesn't run into
+/// trailing padding zeros. Returns the index of the last non-zero AC
+/// scan position (= the highest scan position written to), or `None`
+/// when the reversed buffer is empty.
+///
+/// The reverse parser reads triplets in reverse emission order until
+/// `n_bits` are exhausted, then re-orders them and walks scan positions
+/// the same way the forward writer did.
+pub fn decode_intra_ac_reverse(
+    br: &mut BitReader<'_>,
+    n_bits: u64,
+    block: &mut [i32; 64],
+    scan: &[usize; 64],
+) -> Result<Option<usize>> {
+    let start = br.bit_position();
+    let mut triplets: Vec<DecodedSym> = Vec::new();
+    while (br.bit_position() - start) < n_bits {
+        let sym = decode_symbol_reverse(br, true)?;
+        triplets.push(sym);
+        if (br.bit_position() - start) >= n_bits {
+            break;
+        }
+    }
+    if triplets.is_empty() {
+        return Ok(None);
+    }
+    // Reverse to get original emission order (first-coefficient first).
+    triplets.reverse();
+    // Walk scan positions exactly the way the forward writer did.
+    let mut i = 1usize;
+    let mut last_pos = None;
+    for (last, run, level) in triplets {
+        i = i.saturating_add(run as usize);
+        if i > 63 {
+            return Err(Error::invalid("mpeg4 rvlc reverse intra: AC run overflow"));
+        }
+        block[scan[i]] = level;
+        last_pos = Some(i);
+        if last {
+            break;
+        }
+        i += 1;
+    }
+    Ok(last_pos)
+}
+
+/// Inter-block companion of [`decode_intra_ac_reverse`]; scan position
+/// starts at 0 (inter blocks have no separately-coded DC).
+pub fn decode_inter_ac_reverse(
+    br: &mut BitReader<'_>,
+    n_bits: u64,
+    block: &mut [i32; 64],
+    scan: &[usize; 64],
+) -> Result<Option<usize>> {
+    let start = br.bit_position();
+    let mut triplets: Vec<DecodedSym> = Vec::new();
+    while (br.bit_position() - start) < n_bits {
+        let sym = decode_symbol_reverse(br, false)?;
+        triplets.push(sym);
+        if (br.bit_position() - start) >= n_bits {
+            break;
+        }
+    }
+    if triplets.is_empty() {
+        return Ok(None);
+    }
+    triplets.reverse();
+    let mut i = 0usize;
+    let mut last_pos = None;
+    for (last, run, level) in triplets {
+        i = i.saturating_add(run as usize);
+        if i > 63 {
+            return Err(Error::invalid("mpeg4 rvlc reverse inter: AC run overflow"));
+        }
+        block[scan[i]] = level;
+        last_pos = Some(i);
+        if last {
+            break;
+        }
+        i += 1;
+    }
+    Ok(last_pos)
+}
+
+/// Best-effort recovery walker for an intra AC block. Tries forward
+/// decode through [`decode_intra_ac`]; on error returns the partial
+/// state along with `Err`. The caller can decide whether to also
+/// invoke a reverse walk on a downstream slice.
+///
+/// Returns `Ok(last_pos)` on full success and `Err((bits_consumed,
+/// partial_last_pos))` on failure — `bits_consumed` reports how many
+/// bits the forward walker had advanced past the start of the buffer
+/// before it faulted.
+pub fn try_decode_intra_ac(
+    br: &mut BitReader<'_>,
+    block: &mut [i32; 64],
+    scan: &[usize; 64],
+) -> std::result::Result<Option<usize>, (u64, Option<usize>)> {
+    let start_bits = br.bit_position();
+    let mut i: usize = 1;
+    let mut last_pos: Option<usize> = None;
+    loop {
+        if i > 63 {
+            return Err((br.bit_position() - start_bits, last_pos));
+        }
+        let sym = match decode_symbol(br, true) {
+            Ok(s) => s,
+            Err(_) => return Err((br.bit_position() - start_bits, last_pos)),
+        };
+        i = i.saturating_add(sym.1 as usize);
+        if i > 63 {
+            return Err((br.bit_position() - start_bits, last_pos));
+        }
+        block[scan[i]] = sym.2;
+        last_pos = Some(i);
+        if sym.0 {
+            return Ok(last_pos);
+        }
+        i += 1;
+        if i > 63 {
+            return Ok(last_pos);
+        }
+    }
+}
+
+/// Best-effort recovery walker for an inter AC block — the inter
+/// counterpart to [`try_decode_intra_ac`]. Scan starts at 0.
+pub fn try_decode_inter_ac(
+    br: &mut BitReader<'_>,
+    block: &mut [i32; 64],
+    scan: &[usize; 64],
+) -> std::result::Result<Option<usize>, (u64, Option<usize>)> {
+    let start_bits = br.bit_position();
+    let mut i: usize = 0;
+    let mut last_pos: Option<usize> = None;
+    loop {
+        if i > 63 {
+            return Err((br.bit_position() - start_bits, last_pos));
+        }
+        let sym = match decode_symbol(br, false) {
+            Ok(s) => s,
+            Err(_) => return Err((br.bit_position() - start_bits, last_pos)),
+        };
+        i = i.saturating_add(sym.1 as usize);
+        if i > 63 {
+            return Err((br.bit_position() - start_bits, last_pos));
+        }
+        block[scan[i]] = sym.2;
+        last_pos = Some(i);
+        if sym.0 {
+            return Ok(last_pos);
+        }
+        i += 1;
+        if i > 63 {
+            return Ok(last_pos);
         }
     }
 }
@@ -741,5 +1114,219 @@ mod tests {
         assert_eq!(last, Some(63));
         assert_eq!(decoded[ZIGZAG[1]], 1);
         assert_eq!(decoded[ZIGZAG[63]], 100);
+    }
+
+    /// The bit-reversed view of every short codeword forms a valid
+    /// prefix code on its own. This is the foundation that lets the
+    /// reverse parser walk a bit-reversed buffer the same way the
+    /// forward parser walks the original. Verifies (a) no two
+    /// reverse-codewords coincide, (b) no reverse-codeword is a prefix
+    /// of another. Together these mean each reverse-codeword can be
+    /// instantaneously decoded.
+    #[test]
+    fn reverse_table_is_prefix_code() {
+        let r = reverse_table();
+        // Both signs of 169 short forward entries = 338 reverse codewords.
+        assert_eq!(r.len(), table().len() * 2);
+        // (1) Pairwise uniqueness as `(bits, code_rev)`.
+        for i in 0..r.len() {
+            for j in (i + 1)..r.len() {
+                assert!(
+                    !(r[i].bits == r[j].bits && r[i].code_rev == r[j].code_rev),
+                    "reverse entries {i} and {j} share the same codeword"
+                );
+            }
+        }
+        // (2) No reverse-codeword is a prefix of another.
+        for i in 0..r.len() {
+            for j in 0..r.len() {
+                if i == j {
+                    continue;
+                }
+                if r[j].bits > r[i].bits {
+                    let prefix = r[j].code_rev >> (r[j].bits as u32 - r[i].bits as u32);
+                    assert!(
+                        prefix != r[i].code_rev,
+                        "reverse entry {i} is a prefix of {j}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `bit_reverse_buffer` is its own inverse on byte-aligned inputs.
+    #[test]
+    fn bit_reverse_buffer_is_involutive() {
+        let original = vec![0b10110100u8, 0b01010001, 0b11110000];
+        let n_bits = original.len() * 8;
+        let rev = bit_reverse_buffer(&original, n_bits);
+        let back = bit_reverse_buffer(&rev, n_bits);
+        assert_eq!(back, original);
+    }
+
+    /// One short triplet emitted forward, then the buffer is bit-reversed
+    /// and decoded backward — the same triplet falls out.
+    #[test]
+    fn reverse_short_intra_roundtrip() {
+        let mut bw = BitWriter::new();
+        emit_symbol(&mut bw, true, false, 0, 1); // entry 0
+        let bits = bw.bit_position() as usize;
+        let bytes = bw.finish();
+        let rev = bit_reverse_buffer(&bytes, bits);
+        let mut br = BitReader::new(&rev);
+        let sym = decode_symbol_reverse(&mut br, true).expect("reverse decode");
+        assert_eq!(sym, (false, 0, 1));
+    }
+
+    /// Same but for a negative-sign short codeword — the sign bit, which
+    /// is the LSB of the original codeword, becomes the MSB of the
+    /// reversed one and is read first by the reverse parser.
+    #[test]
+    fn reverse_short_negative_roundtrip() {
+        let mut bw = BitWriter::new();
+        emit_symbol(&mut bw, true, false, 0, -1);
+        let bits = bw.bit_position() as usize;
+        let bytes = bw.finish();
+        let rev = bit_reverse_buffer(&bytes, bits);
+        let mut br = BitReader::new(&rev);
+        let sym = decode_symbol_reverse(&mut br, true).expect("reverse decode");
+        assert_eq!(sym, (false, 0, -1));
+    }
+
+    /// Round-trip a 30-bit RVLC escape through the reverse parser. The
+    /// triplet `(LAST=1, RUN=63, LEVEL=+2047)` exercises the reversed-
+    /// FLC path for both RUN (6 bits) and LEVEL (11 bits).
+    #[test]
+    fn reverse_escape_roundtrip() {
+        let mut bw = BitWriter::new();
+        emit_symbol(&mut bw, true, true, 63, 2047);
+        let bits = bw.bit_position() as usize;
+        assert_eq!(bits, ESCAPE_TOTAL_BITS as usize);
+        let bytes = bw.finish();
+        let rev = bit_reverse_buffer(&bytes, bits);
+        let mut br = BitReader::new(&rev);
+        let sym = decode_symbol_reverse(&mut br, true).expect("reverse decode");
+        assert_eq!(sym, (true, 63, 2047));
+    }
+
+    /// Negative escape — sign bit through the reverse path.
+    #[test]
+    fn reverse_escape_negative_roundtrip() {
+        let mut bw = BitWriter::new();
+        emit_symbol(&mut bw, true, false, 5, -100);
+        let bits = bw.bit_position() as usize;
+        let bytes = bw.finish();
+        let rev = bit_reverse_buffer(&bytes, bits);
+        let mut br = BitReader::new(&rev);
+        let sym = decode_symbol_reverse(&mut br, true).expect("reverse decode");
+        assert_eq!(sym, (false, 5, -100));
+    }
+
+    /// Encode a full intra AC block forward, bit-reverse the buffer,
+    /// and decode the block in reverse direction. Coefficients land at
+    /// the same scan positions with the same values.
+    #[test]
+    fn reverse_intra_block_roundtrip() {
+        let mut block = [0i32; 64];
+        block[ZIGZAG[1]] = 5;
+        block[ZIGZAG[3]] = -2;
+        block[ZIGZAG[7]] = 1;
+        let mut bw = BitWriter::new();
+        write_intra_ac(&mut bw, &block).expect("encode");
+        let bits = bw.bit_position();
+        let bytes = bw.finish();
+        let rev = bit_reverse_buffer(&bytes, bits as usize);
+        let mut br = BitReader::new(&rev);
+        let mut decoded = [0i32; 64];
+        let last = decode_intra_ac_reverse(&mut br, bits, &mut decoded, &ZIGZAG).expect("reverse");
+        assert_eq!(last, Some(7));
+        assert_eq!(decoded[ZIGZAG[1]], 5);
+        assert_eq!(decoded[ZIGZAG[3]], -2);
+        assert_eq!(decoded[ZIGZAG[7]], 1);
+    }
+
+    /// Inter block — DC index 0 is allowed. Reverse-decode reaches the
+    /// same coefficients as the forward path.
+    #[test]
+    fn reverse_inter_block_roundtrip() {
+        let mut block = [0i32; 64];
+        block[ZIGZAG[0]] = 3;
+        block[ZIGZAG[2]] = -1;
+        block[ZIGZAG[10]] = 1;
+        let mut bw = BitWriter::new();
+        write_inter_ac(&mut bw, &block);
+        let bits = bw.bit_position();
+        let bytes = bw.finish();
+        let rev = bit_reverse_buffer(&bytes, bits as usize);
+        let mut br = BitReader::new(&rev);
+        let mut decoded = [0i32; 64];
+        let last = decode_inter_ac_reverse(&mut br, bits, &mut decoded, &ZIGZAG).expect("reverse");
+        assert_eq!(last, Some(10));
+        assert_eq!(decoded[ZIGZAG[0]], 3);
+        assert_eq!(decoded[ZIGZAG[2]], -1);
+        assert_eq!(decoded[ZIGZAG[10]], 1);
+    }
+
+    /// Forward + backward decode together cover the full block with
+    /// matching coefficients on both sides — verifies the property
+    /// that drives the recovery test (mid-stream corruption can be
+    /// repaired by walking from both ends).
+    #[test]
+    fn forward_and_reverse_agree_on_full_block() {
+        let mut block = [0i32; 64];
+        // Spread coefficients across the whole scan.
+        for (i, lvl) in [(1, 7), (3, -4), (8, 2), (16, -1), (32, 3), (50, 1)] {
+            block[ZIGZAG[i]] = lvl;
+        }
+        let mut bw = BitWriter::new();
+        write_intra_ac(&mut bw, &block).expect("encode");
+        let bits = bw.bit_position();
+        let bytes = bw.finish();
+
+        // Forward
+        let mut br_f = BitReader::new(&bytes);
+        let mut fwd = [0i32; 64];
+        let last_f = decode_intra_ac(&mut br_f, &mut fwd, &ZIGZAG).expect("fwd");
+        // Reverse
+        let rev = bit_reverse_buffer(&bytes, bits as usize);
+        let mut br_r = BitReader::new(&rev);
+        let mut bwd = [0i32; 64];
+        let last_r = decode_intra_ac_reverse(&mut br_r, bits, &mut bwd, &ZIGZAG).expect("rev");
+        assert_eq!(last_f, last_r);
+        assert_eq!(fwd, bwd);
+    }
+
+    /// Recovery walker tolerates a truncated buffer — returns `Err`
+    /// with the partial last_pos and bits consumed, lets the caller
+    /// decide what to do.
+    #[test]
+    fn try_decode_intra_ac_reports_partial_progress() {
+        let mut block = [0i32; 64];
+        block[ZIGZAG[1]] = 5;
+        block[ZIGZAG[3]] = -2;
+        block[ZIGZAG[7]] = 1;
+        let mut bw = BitWriter::new();
+        write_intra_ac(&mut bw, &block).expect("encode");
+        let bits = bw.bit_position() as usize;
+        let bytes = bw.finish();
+        // Truncate the last 8 bits — the third coefficient won't decode.
+        let truncated_bits = bits.saturating_sub(8);
+        let truncated_bytes = (truncated_bits / 8).max(1);
+        let truncated = &bytes[..truncated_bytes];
+        let mut br = BitReader::new(truncated);
+        let mut decoded = [0i32; 64];
+        let r = try_decode_intra_ac(&mut br, &mut decoded, &ZIGZAG);
+        // We expect partial progress — at least the first two coefficients.
+        match r {
+            Ok(Some(_)) | Err((_, Some(_))) => {
+                // Acceptable — at least one coefficient got through.
+                assert!(
+                    decoded[ZIGZAG[1]] != 0,
+                    "expected first coefficient to land"
+                );
+            }
+            Err((_, None)) => panic!("recovery walker reported zero progress"),
+            Ok(None) => panic!("recovery walker returned None on a non-empty block"),
+        }
     }
 }
