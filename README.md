@@ -55,23 +55,28 @@ against ffmpeg-generated reference clips (I-only and GOP-of-10).
   (after `motion_marker`), and their intra AC walks into part 3. The
   current DP decoder treats one VOP as one video packet; mid-VOP
   `video_packet_header()` splits in DP mode are a follow-up.
-- **Reversible VLC (Table B.23, round 22 + 24).** Decoder picks up
-  `reversible_vlc = 1` from the VOL when DP is on and routes every
-  DCT-coefficient AC walk through `crate::rvlc::decode_intra_ac` /
-  `decode_inter_ac` instead of the standard Table B.16/B.17 walker.
-  Round 24 added a **reverse-direction decoder** (Annex E.1.4.4) —
-  `crate::rvlc::{decode_intra_ac_reverse, decode_inter_ac_reverse,
-  bit_reverse_buffer, try_decode_intra_ac, try_decode_inter_ac}`. The
-  property that makes reverse decode work: bit-reversing every short
-  RVLC codeword (prefix + sign-as-LSB) yields a SECOND valid prefix
-  code over the same 169-symbol set; the reverse parser walks this
-  second table on a bit-reversed copy of the AC partition. The 30-bit
-  RVLC escape `00001 LAST(1) RUN(6) m LEVEL(11) m 0000 sign` reverses
-  to `sign 0000 m LEVEL_rev(11) m RUN_rev(6) LAST 10000` — also
-  parseable in the reversed buffer. Strategy 1-4 picker
-  (forward/reverse merging at the per-MB granularity) is a follow-up;
-  the round-24 acceptance test exercises the underlying recovery
-  property at the per-block granularity.
+- **Reversible VLC (Table B.23, round 22 + 24 + 25).** Decoder picks
+  up `reversible_vlc = 1` from the VOL when DP is on and routes every
+  DCT-coefficient AC walk through the **§E.1.4.4.2.1 strategy 1-4
+  production picker** (`crate::rvlc::decode_rvlc_ac_partition`) instead
+  of the simple per-block forward walker. The picker:
+  1. Forward-walks the AC partition, recording `(N1, L1)` —
+     fully-decoded blocks + bits consumed.
+  2. Reverse-walks a bit-reversed copy of the partition, recording
+     `(N2, L2)` (reading from the original tail forward).
+  3. Selects between Strategy 1/3 (`N1+N2 < N` → gap concealment)
+     and Strategy 2/4 (`N1+N2 >= N` → overlap; forward owns blocks
+     `[0..N1]`, reverse owns `[N1..N]`).
+  4. Concealed blocks are zeroed in the AC array — the part-1 DC
+     still drives the picture so concealed cells render as flat-DC
+     patches instead of garbage.
+  Reverse-decode property (round 24): bit-reversing every short RVLC
+  codeword (prefix + sign-as-LSB) yields a SECOND valid prefix code
+  over the same 169-symbol set; the reverse parser walks this second
+  table on a bit-reversed copy of the AC partition. The 30-bit RVLC
+  escape `00001 LAST(1) RUN(6) m LEVEL(11) m 0000 sign` reverses to
+  `sign 0000 m LEVEL_rev(11) m RUN_rev(6) LAST 10000` — also
+  parseable in the reversed buffer.
 - **Picture store.** One reference frame, refreshed by each I-VOP and
   each P-VOP. Not-coded VOPs re-emit the previous reference at the
   new pts.

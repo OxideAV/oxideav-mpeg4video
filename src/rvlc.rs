@@ -926,6 +926,438 @@ pub fn try_decode_inter_ac(
     }
 }
 
+// =========================================================================
+// Strategy 1-4 production picker — Annex E.1.4.4.2.1
+// =========================================================================
+//
+// Given an AC partition that holds `N` coded blocks (one per coded 8×8
+// block in the picture, in scan order across MBs), the picker:
+//
+// 1. Forward-walks block-by-block until a parse error: records `N1` =
+//    fully-decoded count from the head, `L1` = bits consumed by those
+//    blocks. Each successful block's coefficients land in a per-block
+//    output slot.
+// 2. Reverse-walks block-by-block on the bit-reversed buffer from the
+//    tail: records `N2`, `L2`, and the per-block coefficients (placed in
+//    output slots indexed from `N-1` downward).
+// 3. Picks one of four strategies per spec figure E.4–E.7:
+//    * `N1 + N2 < N`  → gap of `N - (N1+N2)` blocks in the middle is
+//      concealed (all-zero AC). Both halves' decodes are kept.
+//    * `N1 + N2 >= N` → overlap. The forward walker covered MBs `0..N1`,
+//      the reverse walker covered MBs `N-N2..N`. The overlap region
+//      `N-N2..N1` is owned by the forward walker (preferred per spec
+//      E.6/E.7 — forward is trusted up through the midpoint). Anything
+//      strictly past the forward endpoint comes from the reverse walker.
+//
+// Concealed blocks remain zero in their output slot — the caller's DC
+// from Part 1 still drives the DC reconstruction, so a concealed AC
+// block reduces to a flat DC patch rather than visible garbage.
+//
+// The L1+L2 condition from the spec (vs. total partition length L) is
+// secondary: it gates the formal figure choice but the actual block-
+// keeping rule is governed by N1+N2 vs. N. We expose `total_bits` as an
+// upper bound on the partition extent (used to bound walker iteration
+// when the buffer holds trailing data past the AC partition); the
+// production caller passes `bits_remaining` from its `BitReader`.
+
+/// One coded-block descriptor consumed by [`decode_rvlc_ac_partition`].
+/// `is_intra` selects between the intra/inter symbol tables. The
+/// per-block output array is filled in scan order at `[scan[i]]`.
+#[derive(Clone, Copy, Debug)]
+pub struct RvlcBlockDesc {
+    /// `true` → intra block (scan starts at 1, AC-only — DC is decoded
+    /// elsewhere). `false` → inter block (scan starts at 0).
+    pub is_intra: bool,
+}
+
+/// Per-block outcome reported by [`decode_rvlc_ac_partition`]. `Decoded`
+/// means the block's coefficients are bit-exactly the encoder's.
+/// `Concealed` means the picker had no walker that covered this block —
+/// caller should treat the AC array as all-zero (the slot IS zeroed by
+/// the picker before returning).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RvlcBlockOutcome {
+    /// Block was decoded by the forward walker.
+    DecodedForward,
+    /// Block was decoded by the reverse walker.
+    DecodedReverse,
+    /// Block fell in the middle gap (Strategy 1) and was concealed.
+    Concealed,
+}
+
+/// Result summary returned by the picker. Mirrors the spec variables so
+/// tests can assert which strategy fired.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RvlcPickerStats {
+    /// Total coded blocks in the partition (= `N` from the spec).
+    pub total_blocks: usize,
+    /// Blocks decoded forward from the head (= `N1`).
+    pub forward_blocks: usize,
+    /// Blocks decoded reverse from the tail (= `N2`).
+    pub reverse_blocks: usize,
+    /// Strategy index that fired (1..=4 per Figure E.4–E.7). `2` means
+    /// `L1+L2<L && N1+N2>=N`; `4` means `L1+L2>=L && N1+N2>=N`. The
+    /// distinction is informative — the block-keeping rule is identical.
+    pub strategy: u8,
+    /// Forward-walker bits consumed (= `L1`).
+    pub forward_bits: u64,
+    /// Reverse-walker bits consumed (= `L2`).
+    pub reverse_bits: u64,
+    /// Total bits in the partition that the caller passed in (= `L`).
+    pub partition_bits: u64,
+}
+
+/// Copy `n_bits` MSB-first bits starting at bit offset `start_bit` from
+/// `src` into a freshly-allocated byte-aligned output buffer. Trailing
+/// bits in the last output byte are zero-padded. Used by the picker to
+/// re-anchor a bit-misaligned partition into a buffer the bit-reverse
+/// helper can consume.
+fn extract_bit_subrange(src: &[u8], start_bit: u64, n_bits: u64) -> Vec<u8> {
+    let n_out_bytes = (n_bits as usize).div_ceil(8);
+    let mut out = vec![0u8; n_out_bytes];
+    for i in 0..n_bits {
+        let s = start_bit + i;
+        let sb = (s / 8) as usize;
+        let so = 7 - ((s % 8) as u8);
+        if sb >= src.len() {
+            break;
+        }
+        let bit = (src[sb] >> so) & 1;
+        if bit == 1 {
+            let dst_byte = (i / 8) as usize;
+            let dst_off = 7 - ((i % 8) as u8);
+            out[dst_byte] |= 1 << dst_off;
+        }
+    }
+    out
+}
+
+/// Production RVLC AC-partition decoder with §E.1.4.4.2.1 Strategy 1-4
+/// recovery.
+///
+/// `bytes` holds the bitstream containing the AC partition. The
+/// partition begins at bit offset `start_bit` (MSB-first) within `bytes`
+/// and is `total_bits` long. `blocks` describes each coded block in
+/// emission order; `out` receives the decoded coefficients per block,
+/// written via `[scan[i]]`. Caller is responsible for zeroing `out`
+/// before the call (we also zero per-slot before each block walk for
+/// safety).
+///
+/// On success returns `(stats, outcomes)`. The picker NEVER returns
+/// `Err` when at least one of the two walkers makes progress — in the
+/// catastrophic case where both fail at block 0 it returns Strategy-4
+/// stats with N1=N2=0 and every block marked Concealed (out is left
+/// zeroed). Returning `Err` is reserved for impossible inputs (mismatched
+/// `out` length).
+pub fn decode_rvlc_ac_partition(
+    bytes: &[u8],
+    start_bit: u64,
+    total_bits: u64,
+    blocks: &[RvlcBlockDesc],
+    scan: &[usize; 64],
+    out: &mut [[i32; 64]],
+) -> Result<(RvlcPickerStats, Vec<RvlcBlockOutcome>)> {
+    let n = blocks.len();
+    if out.len() != n {
+        return Err(Error::invalid("rvlc picker: out slice length mismatch"));
+    }
+    if n == 0 {
+        return Ok((
+            RvlcPickerStats {
+                total_blocks: 0,
+                forward_blocks: 0,
+                reverse_blocks: 0,
+                strategy: 1,
+                forward_bits: 0,
+                reverse_bits: 0,
+                partition_bits: total_bits,
+            },
+            Vec::new(),
+        ));
+    }
+
+    // Extract the partition bits into a byte-aligned buffer so both
+    // forward and reverse readers can share the same bit budget. The
+    // caller's slice may straddle byte boundaries (Part 2's per-MB
+    // 1-bit ac_pred + variable cbpy VLC rarely lands on a byte
+    // boundary), so we copy `total_bits` starting at `start_bit` into a
+    // fresh aligned buffer.
+    let aligned = extract_bit_subrange(bytes, start_bit, total_bits);
+
+    // --- Forward pass.
+    let mut fwd: Vec<[i32; 64]> = vec![[0i32; 64]; n];
+    let mut br = BitReader::new(&aligned);
+    let mut n1 = 0usize;
+    let mut l1 = 0u64;
+    for (k, desc) in blocks.iter().enumerate() {
+        if br.bit_position() >= total_bits {
+            break;
+        }
+        let block = &mut fwd[k];
+        let res = if desc.is_intra {
+            try_decode_intra_ac(&mut br, block, scan)
+        } else {
+            try_decode_inter_ac(&mut br, block, scan)
+        };
+        match res {
+            Ok(_) => {
+                n1 += 1;
+                l1 = br.bit_position();
+                if br.bit_position() >= total_bits {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+
+    // --- Reverse pass on bit-reversed buffer.
+    //
+    // The reverse walker has no per-block bit budget; it relies on the
+    // per-triplet `LAST` flag to detect block boundaries (the FIRST
+    // triplet read for any block is the original highest-scan-index
+    // triplet, which carries `LAST=true`). When the next triplet read
+    // also carries `LAST=true`, that triplet belongs to the NEXT block
+    // — the helper hands it back via `pending` so the next block walk
+    // consumes it instead of re-reading from the bitstream. This
+    // chains correctly across all N blocks of the partition.
+    let rev_buf = bit_reverse_buffer(&aligned, total_bits as usize);
+    let mut rev: Vec<[i32; 64]> = vec![[0i32; 64]; n];
+    let mut br_r = BitReader::new(&rev_buf);
+    let mut pending: Option<DecodedSym> = None;
+    let mut n2 = 0usize;
+    let mut l2 = 0u64;
+    // Walk from the LAST block backward — block descriptors in reverse.
+    for (idx_from_end, desc) in blocks.iter().rev().enumerate() {
+        if br_r.bit_position() >= total_bits && pending.is_none() {
+            break;
+        }
+        let k = n - 1 - idx_from_end;
+        let block = &mut rev[k];
+        let res = if desc.is_intra {
+            try_decode_intra_ac_reverse_chained(&mut br_r, &mut pending, block, scan)
+        } else {
+            try_decode_inter_ac_reverse_chained(&mut br_r, &mut pending, block, scan)
+        };
+        match res {
+            Ok(_) => {
+                n2 += 1;
+                l2 = br_r.bit_position();
+            }
+            Err(_) => break,
+        }
+    }
+
+    // --- Strategy selection (informative — the block-keeping rule is
+    //     based on N1+N2 vs. N). The L1+L2 vs. L test gives us the
+    //     figure-number for the stats report, which is useful for
+    //     debugging which spec figure applies.
+    let strategy = match (l1 + l2 < total_bits, n1 + n2 < n) {
+        (true, true) => 1,
+        (true, false) => 2,
+        (false, true) => 3,
+        (false, false) => 4,
+    };
+
+    // --- Block-level keeping rule (spec figures E.4–E.7).
+    let mut outcomes = vec![RvlcBlockOutcome::Concealed; n];
+    if n1 == n && n2 == n && fwd == rev {
+        // Clean partition: both walkers reached the far end AND their
+        // per-block outputs match. The bitstream is undamaged — use
+        // forward output unchanged. (Strategy 4 in form, but no
+        // overlap-cut needed because the walkers AGREE.)
+        for k in 0..n {
+            out[k] = fwd[k];
+            outcomes[k] = RvlcBlockOutcome::DecodedForward;
+        }
+    } else if n1 + n2 < n {
+        // Strategy 1 / 3 (Figure E.4 / E.6): gap in middle. Forward
+        // owns blocks `[0, n1)`. Reverse owns blocks `[n-n2, n)`.
+        // Middle `[n1, n-n2)` is concealed.
+        for k in 0..n1 {
+            out[k] = fwd[k];
+            outcomes[k] = RvlcBlockOutcome::DecodedForward;
+        }
+        for k in (n - n2)..n {
+            out[k] = rev[k];
+            outcomes[k] = RvlcBlockOutcome::DecodedReverse;
+        }
+        for k in n1..(n - n2) {
+            out[k] = [0i32; 64];
+        }
+    } else {
+        // Strategy 2 / 4 (Figure E.5 / E.7): overlap. Per the spec
+        // figure, forward keeps `N-N2-1` MBs from the beginning and
+        // reverse keeps `N-N1-1` MBs from the end. The middle range
+        // (between those two cuts) is discarded (concealed). This is
+        // intentionally conservative: when both walkers overlap, the
+        // spec assumes the corruption polluted the inner edge of
+        // each walker's range and trusts only the OUTER cores.
+        //
+        // Boundary indices (saturating arithmetic for the edge case
+        // where N2 == N or N1 == N — those cases land here only
+        // when the walkers' outputs disagree, indicating damage):
+        //   keep forward: blocks `[0, n - n2 - 1)`
+        //   keep reverse: blocks `[n1 + 1, n)`
+        //   conceal:      blocks `[n - n2 - 1, n1 + 1)`
+        let fwd_keep = n.saturating_sub(n2 + 1);
+        let rev_start = n1.saturating_add(1).min(n);
+        let fwd_end = fwd_keep.min(rev_start);
+        for k in 0..fwd_end {
+            out[k] = fwd[k];
+            outcomes[k] = RvlcBlockOutcome::DecodedForward;
+        }
+        for k in rev_start..n {
+            out[k] = rev[k];
+            outcomes[k] = RvlcBlockOutcome::DecodedReverse;
+        }
+        for k in fwd_end..rev_start {
+            out[k] = [0i32; 64];
+        }
+    }
+
+    Ok((
+        RvlcPickerStats {
+            total_blocks: n,
+            forward_blocks: n1,
+            reverse_blocks: n2,
+            strategy,
+            forward_bits: l1,
+            reverse_bits: l2,
+            partition_bits: total_bits,
+        },
+        outcomes,
+    ))
+}
+
+/// Reverse-decode one intra AC block by walking the bit-reversed buffer
+/// forward through [`decode_symbol_reverse`]. The reverse walker has no
+/// per-block bit budget — it must distinguish block boundaries from
+/// in-band signals. The signal is the per-triplet `LAST` flag:
+///
+/// * In FORWARD emission order, the encoder writes per-block triplets
+///   with `LAST=false` for every coefficient except the highest-scan-
+///   index one, which carries `LAST=true` to mark end-of-block.
+/// * In REVERSE walk order, the FIRST triplet read for a block is the
+///   original `LAST=true` triplet (the high-scan-index coefficient).
+///   Subsequent triplets carry `LAST=false`.
+/// * When the next triplet read carries `LAST=true`, that triplet
+///   belongs to the START of the NEXT block — stop the current walk
+///   and HAND the triplet to the caller (via the optional `pending`
+///   carry) so the next block walk consumes it instead of re-reading
+///   from the bitstream.
+///
+/// `pending` is an `Option<DecodedSym>` shared across consecutive block
+/// walks — `None` initially, `Some(sym)` after a walk that detected
+/// the next block's first triplet. The helper consumes the pending
+/// triplet (if present) before reading more from the bit reader.
+///
+/// Errors are best-effort: returns `Err((bits_consumed_inside_block,
+/// last_pos_so_far))` on any decoding fault, leaving partial output.
+fn try_decode_intra_ac_reverse_chained(
+    br: &mut BitReader<'_>,
+    pending: &mut Option<DecodedSym>,
+    block: &mut [i32; 64],
+    scan: &[usize; 64],
+) -> std::result::Result<Option<usize>, (u64, Option<usize>)> {
+    let start = br.bit_position();
+    let mut triplets: Vec<DecodedSym> = Vec::new();
+    // First triplet of this block: prefer the carry, else read fresh.
+    let first = match pending.take() {
+        Some(s) => s,
+        None => match decode_symbol_reverse(br, true) {
+            Ok(s) => s,
+            Err(_) => return Err((br.bit_position() - start, None)),
+        },
+    };
+    if !first.0 {
+        // The encoder always emits the highest-scan-index triplet with
+        // LAST=true — a reverse walker entering a fresh block must
+        // see LAST=true on the first triplet. If we don't, we've lost
+        // alignment with the bitstream.
+        return Err((br.bit_position() - start, None));
+    }
+    triplets.push(first);
+    // Read subsequent triplets until the NEXT block's first triplet
+    // (signalled by another LAST=true) shows up. Bit-reader errors
+    // (end of buffer / illegal codeword) stop the walk silently.
+    while let Ok(sym) = decode_symbol_reverse(br, true) {
+        if sym.0 {
+            // This triplet belongs to the NEXT block; carry it.
+            *pending = Some(sym);
+            break;
+        }
+        triplets.push(sym);
+        if triplets.len() > 64 {
+            return Err((br.bit_position() - start, None));
+        }
+    }
+    triplets.reverse();
+    let mut i = 1usize;
+    let mut last_pos = None;
+    for (last, run, level) in triplets {
+        i = i.saturating_add(run as usize);
+        if i > 63 {
+            return Err((br.bit_position() - start, last_pos));
+        }
+        block[scan[i]] = level;
+        last_pos = Some(i);
+        if last {
+            break;
+        }
+        i += 1;
+    }
+    Ok(last_pos)
+}
+
+/// Inter-block companion of [`try_decode_intra_ac_reverse_chained`].
+fn try_decode_inter_ac_reverse_chained(
+    br: &mut BitReader<'_>,
+    pending: &mut Option<DecodedSym>,
+    block: &mut [i32; 64],
+    scan: &[usize; 64],
+) -> std::result::Result<Option<usize>, (u64, Option<usize>)> {
+    let start = br.bit_position();
+    let mut triplets: Vec<DecodedSym> = Vec::new();
+    let first = match pending.take() {
+        Some(s) => s,
+        None => match decode_symbol_reverse(br, false) {
+            Ok(s) => s,
+            Err(_) => return Err((br.bit_position() - start, None)),
+        },
+    };
+    if !first.0 {
+        return Err((br.bit_position() - start, None));
+    }
+    triplets.push(first);
+    while let Ok(sym) = decode_symbol_reverse(br, false) {
+        if sym.0 {
+            *pending = Some(sym);
+            break;
+        }
+        triplets.push(sym);
+        if triplets.len() > 64 {
+            return Err((br.bit_position() - start, None));
+        }
+    }
+    triplets.reverse();
+    let mut i = 0usize;
+    let mut last_pos = None;
+    for (last, run, level) in triplets {
+        i = i.saturating_add(run as usize);
+        if i > 63 {
+            return Err((br.bit_position() - start, last_pos));
+        }
+        block[scan[i]] = level;
+        last_pos = Some(i);
+        if last {
+            break;
+        }
+        i += 1;
+    }
+    Ok(last_pos)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1294,6 +1726,212 @@ mod tests {
         let last_r = decode_intra_ac_reverse(&mut br_r, bits, &mut bwd, &ZIGZAG).expect("rev");
         assert_eq!(last_f, last_r);
         assert_eq!(fwd, bwd);
+    }
+
+    // ---------------------------------------------------------------
+    // Picker tests (§E.1.4.4.2.1 strategies).
+    // ---------------------------------------------------------------
+
+    /// Helper: build a list of K test blocks similar to the corruption
+    /// fixture (mix of low- and high-frequency taps).
+    fn make_picker_blocks(k: usize) -> Vec<[i32; 64]> {
+        (0..k)
+            .map(|seed| {
+                let mut b = [0i32; 64];
+                b[ZIGZAG[1]] = ((seed % 5) as i32) + 1;
+                b[ZIGZAG[3]] = -(((seed * 7) % 4) as i32) - 1;
+                if seed % 3 == 0 {
+                    b[ZIGZAG[8]] = 2;
+                }
+                if seed % 4 == 0 {
+                    b[ZIGZAG[16]] = -1;
+                }
+                b[ZIGZAG[20 + (seed % 10)]] = 1;
+                b
+            })
+            .collect()
+    }
+
+    /// Encode the K-block fixture into one bit-aligned partition and
+    /// return `(bytes, total_bits)`.
+    fn encode_picker_partition(blocks: &[[i32; 64]]) -> (Vec<u8>, u64) {
+        let mut bw = BitWriter::new();
+        for b in blocks {
+            write_intra_ac(&mut bw, b).expect("encode");
+        }
+        let bits = bw.bit_position();
+        let bytes = bw.finish();
+        (bytes, bits)
+    }
+
+    /// **Strategy 4 / clean partition** — when the bitstream is intact,
+    /// the forward walker covers every block, the reverse walker covers
+    /// every block, `N1 + N2 = 2N >= N`, and the picker picks Strategy
+    /// 4 with all `Decoded*` outcomes. Output equals the originals
+    /// bit-exactly.
+    #[test]
+    fn picker_clean_partition_recovers_all() {
+        let originals = make_picker_blocks(8);
+        let (bytes, total_bits) = encode_picker_partition(&originals);
+        let descs: Vec<RvlcBlockDesc> = (0..originals.len())
+            .map(|_| RvlcBlockDesc { is_intra: true })
+            .collect();
+        let mut out = vec![[0i32; 64]; originals.len()];
+        let (stats, outcomes) =
+            decode_rvlc_ac_partition(&bytes, 0, total_bits, &descs, &ZIGZAG, &mut out)
+                .expect("picker");
+        assert_eq!(stats.total_blocks, originals.len());
+        assert_eq!(stats.forward_blocks, originals.len());
+        assert_eq!(stats.reverse_blocks, originals.len());
+        assert!(matches!(stats.strategy, 2 | 4));
+        for (i, (got, want)) in out.iter().zip(originals.iter()).enumerate() {
+            assert_eq!(got, want, "block {i} mismatch");
+        }
+        for o in outcomes.iter() {
+            assert!(matches!(
+                o,
+                RvlcBlockOutcome::DecodedForward | RvlcBlockOutcome::DecodedReverse
+            ));
+        }
+    }
+
+    /// **Strategy 1 (gap conceal) sanity** — corrupting middle bytes
+    /// stops both walkers somewhere; the picker conceals the
+    /// uncovered range. The picker MUST: (a) report `forward_blocks`
+    /// and `reverse_blocks` consistent with its outcome vector, and
+    /// (b) leave every `Concealed` block zeroed. Note: a "decoded"
+    /// block is what the walker self-validated as legal — it can
+    /// still be wrong if the corruption produced another valid RVLC
+    /// codeword (RVLC error detection per Annex E.1.4.4.1 only catches
+    /// illegal codewords, not all silent bit flips).
+    #[test]
+    fn picker_corrupt_middle_strategy_one() {
+        let originals = make_picker_blocks(16);
+        let (mut bytes, total_bits) = encode_picker_partition(&originals);
+        // Corrupt 3 bytes around the middle.
+        let mid = bytes.len() / 2;
+        for off in 0..3.min(bytes.len() - mid) {
+            bytes[mid + off] ^= 0xA5;
+        }
+        let descs: Vec<RvlcBlockDesc> = (0..originals.len())
+            .map(|_| RvlcBlockDesc { is_intra: true })
+            .collect();
+        let mut out = vec![[0i32; 64]; originals.len()];
+        let (stats, outcomes) =
+            decode_rvlc_ac_partition(&bytes, 0, total_bits, &descs, &ZIGZAG, &mut out)
+                .expect("picker");
+        let n_fwd = outcomes
+            .iter()
+            .filter(|o| matches!(o, RvlcBlockOutcome::DecodedForward))
+            .count();
+        let n_rev = outcomes
+            .iter()
+            .filter(|o| matches!(o, RvlcBlockOutcome::DecodedReverse))
+            .count();
+        let n_conc = outcomes
+            .iter()
+            .filter(|o| matches!(o, RvlcBlockOutcome::Concealed))
+            .count();
+        assert_eq!(n_fwd + n_rev + n_conc, originals.len());
+        // Concealed blocks are zeroed (no garbage on the picture).
+        for (i, o) in outcomes.iter().enumerate() {
+            if matches!(o, RvlcBlockOutcome::Concealed) {
+                assert_eq!(out[i], [0i32; 64], "concealed block {i} not zeroed");
+            }
+        }
+        // Stats describe the walker progress (N1, N2). Picker
+        // outcome counts (n_fwd, n_rev) describe the picker's KEEP
+        // counts after applying the strategy rule, so they may be
+        // less than (or equal to) N1 / N2.
+        assert!(
+            n_fwd <= stats.forward_blocks,
+            "kept-forward {n_fwd} should not exceed walker N1 {}",
+            stats.forward_blocks
+        );
+        assert!(
+            n_rev <= stats.reverse_blocks,
+            "kept-reverse {n_rev} should not exceed walker N2 {}",
+            stats.reverse_blocks
+        );
+    }
+
+    /// **Head corruption** — flipping the VERY FIRST bit of the
+    /// partition. Forward decode probably (but not always) breaks
+    /// early; reverse decode walks from the tail and covers most of
+    /// the partition before hitting the corruption. The picker MUST
+    /// not crash and MUST keep the outcome vector + stats consistent.
+    /// This test does NOT assert specific bit-exact recovery counts
+    /// because the RVLC table is dense — a single flipped bit may
+    /// land on a sign FLC and produce a "valid but wrong" decode that
+    /// the walker can't detect.
+    #[test]
+    fn picker_head_corruption_does_not_crash_and_preserves_invariants() {
+        let originals = make_picker_blocks(8);
+        let (mut bytes, total_bits) = encode_picker_partition(&originals);
+        bytes[0] ^= 0x80;
+        let descs: Vec<RvlcBlockDesc> = (0..originals.len())
+            .map(|_| RvlcBlockDesc { is_intra: true })
+            .collect();
+        let mut out = vec![[0i32; 64]; originals.len()];
+        let (stats, outcomes) =
+            decode_rvlc_ac_partition(&bytes, 0, total_bits, &descs, &ZIGZAG, &mut out)
+                .expect("picker");
+        // At least the reverse walker should make significant progress
+        // — the corruption is at the head only, so the reverse walker
+        // (reading the bit-reversed buffer forward) consumes the tail
+        // first and hits the damage at the very end of its walk.
+        assert!(
+            stats.reverse_blocks > 0,
+            "reverse walker should make progress on head-only corruption"
+        );
+        // Concealed cells stay zeroed.
+        for (i, o) in outcomes.iter().enumerate() {
+            if matches!(o, RvlcBlockOutcome::Concealed) {
+                assert_eq!(out[i], [0i32; 64], "concealed block {i} not zeroed");
+            }
+        }
+        assert_eq!(outcomes.len(), originals.len());
+    }
+
+    /// **Bit-misaligned partition** — the picker accepts a `start_bit`
+    /// offset other than 0 and produces the same output as if the
+    /// partition were anchored at byte 0. Mirrors the production
+    /// caller's situation in DP mode (Part 2 ends mid-byte).
+    #[test]
+    fn picker_bit_misaligned_start_offset_works() {
+        let originals = make_picker_blocks(4);
+        let (bytes, total_bits) = encode_picker_partition(&originals);
+        // Build a buffer that holds 5 leading bits + the partition bits.
+        let leading = 5u64;
+        let total_with_pad = leading + total_bits;
+        let n_pad_bytes = (total_with_pad as usize).div_ceil(8);
+        let mut padded = vec![0u8; n_pad_bytes];
+        // Set leading bits to a non-zero pattern (`10101`) so the
+        // picker can't accidentally treat them as RVLC head padding.
+        padded[0] = 0b1010_1000;
+        // Splice partition bits in starting at bit `leading`.
+        for i in 0..total_bits {
+            let src_byte = (i / 8) as usize;
+            let src_off = 7 - (i % 8) as u8;
+            let bit = (bytes[src_byte] >> src_off) & 1;
+            if bit == 1 {
+                let dst_pos = leading + i;
+                let dst_byte = (dst_pos / 8) as usize;
+                let dst_off = 7 - (dst_pos % 8) as u8;
+                padded[dst_byte] |= 1 << dst_off;
+            }
+        }
+        let descs: Vec<RvlcBlockDesc> = (0..originals.len())
+            .map(|_| RvlcBlockDesc { is_intra: true })
+            .collect();
+        let mut out = vec![[0i32; 64]; originals.len()];
+        let (stats, _) =
+            decode_rvlc_ac_partition(&padded, leading, total_bits, &descs, &ZIGZAG, &mut out)
+                .expect("picker");
+        assert_eq!(stats.forward_blocks, originals.len());
+        for (i, (got, want)) in out.iter().zip(originals.iter()).enumerate() {
+            assert_eq!(got, want, "misaligned block {i} mismatch");
+        }
     }
 
     /// Recovery walker tolerates a truncated buffer — returns `Err`

@@ -88,6 +88,38 @@ use crate::mb::{IVopPicture, PredGrid};
 use crate::tables::{cbpy as cbpy_tab, mcbpc, vlc};
 
 // -------------------------------------------------------------------------
+// Helpers
+// -------------------------------------------------------------------------
+
+/// Drain `n_bits` from `br` into a fresh byte-aligned buffer (MSB-first
+/// bit layout, trailing bits zero-padded). Used by the RVLC strategy
+/// picker to anchor a bit-misaligned AC partition into a buffer that
+/// `bit_reverse_buffer` can consume. After this call the BitReader is
+/// positioned `n_bits` further into its underlying stream.
+fn drain_to_aligned_buffer(br: &mut BitReader<'_>, n_bits: u64) -> Vec<u8> {
+    let n_out_bytes = (n_bits as usize).div_ceil(8);
+    let mut out = vec![0u8; n_out_bytes];
+    let mut remaining = n_bits;
+    let mut byte_idx = 0usize;
+    while remaining >= 8 {
+        // Best-effort — if the reader runs short the result stays zero.
+        let b = br.read_u32(8).unwrap_or(0) as u8;
+        out[byte_idx] = b;
+        byte_idx += 1;
+        remaining -= 8;
+    }
+    if remaining > 0 {
+        let tail = br.read_u32(remaining as u32).unwrap_or(0);
+        // Tail is right-aligned in the low `remaining` bits; shift it
+        // up so the partition's last bits sit at the high end of the
+        // last output byte.
+        let shift = 8 - remaining as u32;
+        out[byte_idx] = ((tail << shift) & 0xFF) as u8;
+    }
+    out
+}
+
+// -------------------------------------------------------------------------
 // Marker bit patterns (§6.3.7)
 // -------------------------------------------------------------------------
 
@@ -421,30 +453,80 @@ pub fn decode_ivop_dp(
     }
 
     // ---- Part 3: per-MB { AC walks for each coded block }.
-    for mb in mbs.iter_mut() {
-        let cbpc = mb.cbpc;
-        let luma_coded = [
-            (mb.cbpy >> 3) & 1 != 0,
-            (mb.cbpy >> 2) & 1 != 0,
-            (mb.cbpy >> 1) & 1 != 0,
-            mb.cbpy & 1 != 0,
-        ];
-        let chroma_coded = [(cbpc >> 1) & 1 != 0, cbpc & 1 != 0];
-        for blk in 0..6 {
-            let coded = if blk < 4 {
-                luma_coded[blk]
-            } else {
-                chroma_coded[blk - 4]
-            };
-            if !coded {
-                continue;
+    //
+    // When `reversible_vlc = 1` we route the partition through the
+    // §E.1.4.4.2.1 strategy 1-4 picker: forward + reverse walkers cover
+    // both halves of the partition and the picker selects between
+    // overlap (Strategy 2/4) and gap-conceal (Strategy 1/3). When
+    // `reversible_vlc = 0` we keep the simple per-block forward walker.
+    if vol.reversible_vlc {
+        // Build a flat block descriptor list mirroring the per-MB coded
+        // mask. Each entry is `(mb_idx, blk_idx)` so we can scatter the
+        // picker's output back into the per-MB state vector.
+        let mut descs: Vec<crate::rvlc::RvlcBlockDesc> = Vec::new();
+        let mut slots: Vec<(usize, usize)> = Vec::new();
+        for (mb_idx, mb) in mbs.iter().enumerate() {
+            let cbpc = mb.cbpc;
+            let luma_coded = [
+                (mb.cbpy >> 3) & 1 != 0,
+                (mb.cbpy >> 2) & 1 != 0,
+                (mb.cbpy >> 1) & 1 != 0,
+                mb.cbpy & 1 != 0,
+            ];
+            let chroma_coded = [(cbpc >> 1) & 1 != 0, cbpc & 1 != 0];
+            for blk in 0..6 {
+                let coded = if blk < 4 {
+                    luma_coded[blk]
+                } else {
+                    chroma_coded[blk - 4]
+                };
+                if !coded {
+                    continue;
+                }
+                descs.push(crate::rvlc::RvlcBlockDesc { is_intra: true });
+                slots.push((mb_idx, blk));
             }
-            // We disabled AC prediction at encode time — use the default
-            // zigzag scan. Route through RVLC tables when the VOL has
-            // `reversible_vlc = 1`.
-            if vol.reversible_vlc {
-                crate::rvlc::decode_intra_ac(br, &mut mb.ac_levels[blk], &ZIGZAG)?;
-            } else {
+        }
+        let mut out_blocks: Vec<[i32; 64]> = vec![[0i32; 64]; descs.len()];
+        // Drain the AC partition into a fresh byte-aligned buffer by
+        // reading the remaining bits out of the BitReader. The DP I-VOP
+        // encoder emits the entire picture as one video packet, so
+        // everything past Part 2 belongs to the AC partition.
+        let total_bits = br.bits_remaining();
+        let aligned = drain_to_aligned_buffer(br, total_bits);
+        let (_stats, _outcomes) = crate::rvlc::decode_rvlc_ac_partition(
+            &aligned,
+            0,
+            total_bits,
+            &descs,
+            &ZIGZAG,
+            &mut out_blocks,
+        )?;
+        // Scatter results back into per-MB AC slots.
+        for ((mb_idx, blk), coeffs) in slots.into_iter().zip(out_blocks) {
+            mbs[mb_idx].ac_levels[blk] = coeffs;
+        }
+    } else {
+        for mb in mbs.iter_mut() {
+            let cbpc = mb.cbpc;
+            let luma_coded = [
+                (mb.cbpy >> 3) & 1 != 0,
+                (mb.cbpy >> 2) & 1 != 0,
+                (mb.cbpy >> 1) & 1 != 0,
+                mb.cbpy & 1 != 0,
+            ];
+            let chroma_coded = [(cbpc >> 1) & 1 != 0, cbpc & 1 != 0];
+            for blk in 0..6 {
+                let coded = if blk < 4 {
+                    luma_coded[blk]
+                } else {
+                    chroma_coded[blk - 4]
+                };
+                if !coded {
+                    continue;
+                }
+                // We disabled AC prediction at encode time — use the
+                // default zigzag scan.
                 decode_intra_ac(br, &mut mb.ac_levels[blk], &ZIGZAG)?;
             }
         }
@@ -988,66 +1070,134 @@ pub fn decode_pvop_dp_with_grid(
     }
 
     // ---- Part 3: per-MB { AC walks for each coded block }.
-    for mb in mbs.iter_mut() {
-        match mb {
-            PMbState::Skipped => continue,
-            PMbState::Inter {
-                cbpc,
-                cbpy_inv,
-                ac_levels,
-                ..
-            } => {
-                // Inter MBs invert the cbpy VLC value to get the coded mask.
-                let cbpy_mask = *cbpy_inv ^ 0xF;
-                let luma_coded = [
-                    (cbpy_mask >> 3) & 1 != 0,
-                    (cbpy_mask >> 2) & 1 != 0,
-                    (cbpy_mask >> 1) & 1 != 0,
-                    cbpy_mask & 1 != 0,
-                ];
-                let chroma_coded = [(*cbpc >> 1) & 1 != 0, *cbpc & 1 != 0];
-                for blk in 0..6 {
-                    let coded = if blk < 4 {
-                        luma_coded[blk]
-                    } else {
-                        chroma_coded[blk - 4]
-                    };
-                    if !coded {
-                        continue;
+    //
+    // RVLC path: route the AC partition through the §E.1.4.4.2.1
+    // strategy 1-4 picker (forward + reverse walkers, then merge by
+    // strategy). Non-RVLC path: simple per-block forward walker.
+    if vol.reversible_vlc {
+        // Build a flat block descriptor list across all coded blocks
+        // (intra + inter) in emission order. Each `(mb_idx, blk_idx)`
+        // entry tells us where to scatter the picker's output.
+        let mut descs: Vec<crate::rvlc::RvlcBlockDesc> = Vec::new();
+        let mut slots: Vec<(usize, usize)> = Vec::new();
+        for (mb_idx, mb) in mbs.iter().enumerate() {
+            match mb {
+                PMbState::Skipped => continue,
+                PMbState::Inter { cbpc, cbpy_inv, .. } => {
+                    let cbpy_mask = *cbpy_inv ^ 0xF;
+                    let luma_coded = [
+                        (cbpy_mask >> 3) & 1 != 0,
+                        (cbpy_mask >> 2) & 1 != 0,
+                        (cbpy_mask >> 1) & 1 != 0,
+                        cbpy_mask & 1 != 0,
+                    ];
+                    let chroma_coded = [(*cbpc >> 1) & 1 != 0, *cbpc & 1 != 0];
+                    for blk in 0..6 {
+                        let coded = if blk < 4 {
+                            luma_coded[blk]
+                        } else {
+                            chroma_coded[blk - 4]
+                        };
+                        if !coded {
+                            continue;
+                        }
+                        descs.push(crate::rvlc::RvlcBlockDesc { is_intra: false });
+                        slots.push((mb_idx, blk));
                     }
-                    if vol.reversible_vlc {
-                        crate::rvlc::decode_inter_ac(br, &mut ac_levels[blk], &ZIGZAG)?;
-                    } else {
-                        decode_inter_ac(br, &mut ac_levels[blk], &ZIGZAG)?;
+                }
+                PMbState::Intra { cbpc, cbpy, .. } => {
+                    let luma_coded = [
+                        (*cbpy >> 3) & 1 != 0,
+                        (*cbpy >> 2) & 1 != 0,
+                        (*cbpy >> 1) & 1 != 0,
+                        *cbpy & 1 != 0,
+                    ];
+                    let chroma_coded = [(*cbpc >> 1) & 1 != 0, *cbpc & 1 != 0];
+                    for blk in 0..6 {
+                        let coded = if blk < 4 {
+                            luma_coded[blk]
+                        } else {
+                            chroma_coded[blk - 4]
+                        };
+                        if !coded {
+                            continue;
+                        }
+                        descs.push(crate::rvlc::RvlcBlockDesc { is_intra: true });
+                        slots.push((mb_idx, blk));
                     }
                 }
             }
-            PMbState::Intra {
-                cbpc,
-                cbpy,
-                ac_levels,
-                ..
-            } => {
-                // Intra MBs use the raw cbpy as the coded mask.
-                let luma_coded = [
-                    (*cbpy >> 3) & 1 != 0,
-                    (*cbpy >> 2) & 1 != 0,
-                    (*cbpy >> 1) & 1 != 0,
-                    *cbpy & 1 != 0,
-                ];
-                let chroma_coded = [(*cbpc >> 1) & 1 != 0, *cbpc & 1 != 0];
-                for blk in 0..6 {
-                    let coded = if blk < 4 {
-                        luma_coded[blk]
-                    } else {
-                        chroma_coded[blk - 4]
-                    };
-                    if !coded {
-                        continue;
+        }
+        let mut out_blocks: Vec<[i32; 64]> = vec![[0i32; 64]; descs.len()];
+        let total_bits = br.bits_remaining();
+        let aligned = drain_to_aligned_buffer(br, total_bits);
+        let (_stats, _outcomes) = crate::rvlc::decode_rvlc_ac_partition(
+            &aligned,
+            0,
+            total_bits,
+            &descs,
+            &ZIGZAG,
+            &mut out_blocks,
+        )?;
+        for ((mb_idx, blk), coeffs) in slots.into_iter().zip(out_blocks) {
+            match &mut mbs[mb_idx] {
+                PMbState::Skipped => unreachable!(),
+                PMbState::Inter { ac_levels, .. } => ac_levels[blk] = coeffs,
+                PMbState::Intra { ac_levels, .. } => ac_levels[blk] = coeffs,
+            }
+        }
+    } else {
+        for mb in mbs.iter_mut() {
+            match mb {
+                PMbState::Skipped => continue,
+                PMbState::Inter {
+                    cbpc,
+                    cbpy_inv,
+                    ac_levels,
+                    ..
+                } => {
+                    let cbpy_mask = *cbpy_inv ^ 0xF;
+                    let luma_coded = [
+                        (cbpy_mask >> 3) & 1 != 0,
+                        (cbpy_mask >> 2) & 1 != 0,
+                        (cbpy_mask >> 1) & 1 != 0,
+                        cbpy_mask & 1 != 0,
+                    ];
+                    let chroma_coded = [(*cbpc >> 1) & 1 != 0, *cbpc & 1 != 0];
+                    for blk in 0..6 {
+                        let coded = if blk < 4 {
+                            luma_coded[blk]
+                        } else {
+                            chroma_coded[blk - 4]
+                        };
+                        if !coded {
+                            continue;
+                        }
+                        decode_inter_ac(br, &mut ac_levels[blk], &ZIGZAG)?;
                     }
-                    if vol.reversible_vlc {
-                        crate::rvlc::decode_intra_ac(br, &mut ac_levels[blk], &ZIGZAG)?;
-                    } else {
+                }
+                PMbState::Intra {
+                    cbpc,
+                    cbpy,
+                    ac_levels,
+                    ..
+                } => {
+                    let luma_coded = [
+                        (*cbpy >> 3) & 1 != 0,
+                        (*cbpy >> 2) & 1 != 0,
+                        (*cbpy >> 1) & 1 != 0,
+                        *cbpy & 1 != 0,
+                    ];
+                    let chroma_coded = [(*cbpc >> 1) & 1 != 0, *cbpc & 1 != 0];
+                    for blk in 0..6 {
+                        let coded = if blk < 4 {
+                            luma_coded[blk]
+                        } else {
+                            chroma_coded[blk - 4]
+                        };
+                        if !coded {
+                            continue;
+                        }
                         decode_intra_ac(br, &mut ac_levels[blk], &ZIGZAG)?;
                     }
                 }

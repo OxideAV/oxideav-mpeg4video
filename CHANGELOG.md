@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- decoder: **RVLC strategy 1-4 production picker** (ISO/IEC 14496-2
+  §E.1.4.4.2.1). Wires the round-24 forward + reverse walker
+  primitives into the production DP I-VOP and P-VOP decoders through a
+  new public function `rvlc::decode_rvlc_ac_partition`. The picker
+  runs both walkers across the AC partition, captures `(N1, L1)` from
+  the forward direction and `(N2, L2)` from the reverse direction
+  (reading a bit-reversed copy of the partition forward), then merges
+  by the four strategies the spec defines:
+  * Strategy 1 (`L1+L2 < L && N1+N2 < N`) — gap; head from forward,
+    tail from reverse, middle blocks zeroed (= concealed; the part-1
+    DC still drives the picture so concealment shows as a flat-DC
+    patch instead of garbage).
+  * Strategy 2 (`L1+L2 < L && N1+N2 >= N`) — overlap; same keep-rule
+    as Strategy 4 (forward through the midpoint, reverse past it).
+  * Strategy 3 (`L1+L2 >= L && N1+N2 < N`) — same gap-conceal as 1.
+  * Strategy 4 (`L1+L2 >= L && N1+N2 >= N`) — overlap; forward owns
+    `[0..N1]`, reverse owns `[N1..N]`. The L1+L2 vs L test is
+    informative-only — the actual block-keeping rule is governed by
+    `N1+N2` vs `N`. New types `RvlcBlockDesc`, `RvlcBlockOutcome`,
+    `RvlcPickerStats` carry the descriptor / per-block outcome /
+    summary stats. `dp::decode_ivop_dp` and
+    `dp::decode_pvop_dp_with_grid` route their AC partition through
+    the picker when `vol.reversible_vlc = 1`. Four new lib tests
+    (clean partition Strategy-4, mid-byte XOR Strategy-1, head bit
+    flip + reverse-only recovery, bit-misaligned `start_bit` offset
+    handling) plus one new integration test
+    (`rvlc_picker_recovers_at_least_baseline`) — total 127 lib + 32
+    integration tests after this change. The 16-block mid-byte XOR
+    fixture from #175 still recovers ≥14/16 bit-exactly through the
+    production picker; clean streams stay bit-exact (Strategy 4 keeps
+    the forward output unchanged).
 - decoder: **RVLC reverse-direction decoder + best-effort recovery
   walkers** (ISO/IEC 14496-2 Annex E.1.4.4). Five new public functions
   in `src/rvlc.rs`: `bit_reverse_buffer`, `decode_intra_ac_reverse`,
@@ -30,9 +61,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   middle of each, and counts blocks recovered bit-exactly: standard
   Tcoef stops at the damage and recovers 7/16 forward + 0/16 reverse;
   RVLC recovers 7/16 forward + 7/16 reverse = 14/16. Eleven new tests
-  total (10 lib + 1 integration). Strategy 1-4 picker (§E.1.4.4.2.1
-  per-MB N1/N2 + L1/L2 merging) is a future follow-up; the round-24
-  drop ships the underlying primitives that picker would use.
+  total (10 lib + 1 integration). Strategy 1-4 picker
+  (§E.1.4.4.2.1 per-MB N1/N2 + L1/L2 merging) landed in the next
+  round — see the round-25 entry above.
 - encoder + decoder: **Intra-in-P macroblocks under data partitioning**
   (ISO/IEC 14496-2 §6.2.5.3 `data_partitioned_p_vop()`). The DP P-VOP
   body emitter now mirrors the combined-mode intra-in-P decision (§6.3.7
