@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3](https://github.com/OxideAV/oxideav-mpeg4video/compare/v0.1.2...v0.1.3) - 2026-05-03
+
+### Other
+
+- drop duplicate semver_check key
+- replace never-match regex with semver_check = false
+- migrate to centralized OxideAV/.github reusable workflows
+- RVLC strategy 1-4 production picker (Annex E.1.4.4.2.1)
+- RVLC reverse-direction decoder + per-block error recovery
+- encoder + decoder: Intra-in-P macroblocks under data partitioning
+- encoder + decoder reversible VLC (Tables B.23-B.25)
+- encoder + decoder data partitioning (§6.2.6 / §6.3.7)
+- encoder single-warp-point GMC
+- round-19 encoder qp + g codec options
+- cargo fmt cleanup + silence unused vol binding
+- adopt slim VideoFrame shape
+- adopt slim VideoFrame shape
+- quarter-pel motion estimation + MC (§7.6.2.2)
+- quarter-pel motion estimation (§7.6.2.2 / §7.5.4)
+- intra-MB-in-P fallback for scene changes
+- 4MV mode decision + per-block ME + Inter4MV bitstream
+- 4MV-direct + DIRECT_BONUS sweep + vti_bits fix
+- wire B-MB cbpb residual emit + dbquant=0 sidechannel
+- pin release-plz to patch-only bumps
+
 ### Added
 
 - decoder: **RVLC strategy 1-4 production picker** (ISO/IEC 14496-2
