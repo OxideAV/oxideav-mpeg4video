@@ -594,3 +594,224 @@ fn dp_p_vop_intra_in_p_scene_change_roundtrip() {
         "ffmpeg DP intra-in-P cut-frame PSNR {p4:.2} below 25 dB — intra-in-P syntax mismatch"
     );
 }
+
+/// Build a frame whose 8×8 luma blocks each translate by a *different*
+/// per-block offset frame-to-frame. The 1MV mode can only pick a single
+/// MV per 16×16 MB so it cannot match all four sub-blocks; the encoder's
+/// 4MV mode-decision (§7.5.7 / §7.6.7) wins and emits Inter4MV MCBPC
+/// codewords (Table B-13 rows 16..=19) with four MVDs per MB. Mirrors
+/// `make_subblock_motion_frame` in `tests/p_vop.rs`.
+fn make_subblock_motion_frame(
+    idx: u32,
+    width: u32,
+    height: u32,
+    base_pattern: &[u8],
+) -> VideoFrame {
+    let w = width as usize;
+    let h = height as usize;
+    let cw = w / 2;
+    let ch = h / 2;
+    let mut y = vec![0u8; w * h];
+    let cb = vec![128u8; cw * ch];
+    let cr = vec![128u8; cw * ch];
+    for by in 0..(h / 8) {
+        for bx in 0..(w / 8) {
+            let dx = ((bx + idx as usize * 2) % 4) as i32 - 2;
+            let dy = ((by + idx as usize * 3) % 4) as i32 - 2;
+            for j in 0..8usize {
+                for i in 0..8usize {
+                    let sx = (bx * 8 + i) as i32 + dx;
+                    let sy = (by * 8 + j) as i32 + dy;
+                    let sx = sx.rem_euclid(w as i32) as usize;
+                    let sy = sy.rem_euclid(h as i32) as usize;
+                    y[(by * 8 + j) * w + bx * 8 + i] = base_pattern[sy * w + sx];
+                }
+            }
+        }
+    }
+    VideoFrame {
+        pts: Some(idx as i64),
+        planes: vec![
+            VideoPlane { stride: w, data: y },
+            VideoPlane {
+                stride: cw,
+                data: cb,
+            },
+            VideoPlane {
+                stride: cw,
+                data: cr,
+            },
+        ],
+    }
+}
+
+/// Encode a 4-frame sub-MB-motion clip under DP, verify the encoder
+/// picked at least one Inter4MV MCBPC codeword (Table B-13 rows
+/// 16..=19) inside a P-VOP body, then roundtrip through (a) our DP
+/// decoder and (b) ffmpeg. The Inter4MV MB syntax inside
+/// `data_partitioned_p_vop()` (§6.3.7) puts FOUR MVDs per MB into part 1
+/// (instead of one) — the motion partition's marker still appears
+/// downstream because the per-MB MCBPC + 4 MV components are
+/// uniqueness-disjoint from the 17-bit `motion_marker` pattern. This
+/// test exercises the spec-mandated routing for Inter4MV MBs in a DP
+/// P-VOP body.
+#[test]
+fn dp_p_vop_inter4mv_roundtrip() {
+    let (width, height) = (32u32, 32u32);
+    let num_frames = 4u32;
+    // Build a static base pattern (deterministic checker-style noise) so
+    // the per-block "translation" actually has visible content to track.
+    let w = width as usize;
+    let h = height as usize;
+    let mut base = vec![0u8; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            base[y * w + x] = ((x * 7) ^ (y * 13) ^ (x * y / 4)) as u8;
+        }
+    }
+    let src: Vec<VideoFrame> = (0..num_frames)
+        .map(|i| make_subblock_motion_frame(i, width, height, &base))
+        .collect();
+
+    let mut enc = build_encoder_dp(width, height);
+    for f in &src {
+        enc.send_frame(&Frame::Video(f.clone()))
+            .expect("send_frame");
+    }
+    enc.flush().expect("flush");
+    let mut packets: Vec<Packet> = Vec::new();
+    loop {
+        match enc.receive_packet() {
+            Ok(p) => packets.push(p),
+            Err(oxideav_core::Error::NeedMore) | Err(oxideav_core::Error::Eof) => break,
+            Err(e) => panic!("receive_packet: {e:?}"),
+        }
+    }
+    assert!(packets.len() >= num_frames as usize);
+
+    // Inter4MV MCBPC codewords (Table B-13 rows 16..=19):
+    //   row 16 (Inter4MV, cbpc=0): 3 bits = 0b010
+    //   row 17 (Inter4MV, cbpc=1): 7 bits = 0b0000101
+    //   row 18 (Inter4MV, cbpc=2): 7 bits = 0b0000100
+    //   row 19 (Inter4MV, cbpc=3): 8 bits = 0b00000101
+    // The cbpc=0 prefix `010` is also a sub-pattern of plenty of other
+    // codewords, so we look for the longer row-17/18/19 prefixes which
+    // share `0000010` as their leading 7 bits — distinct from any Inter
+    // (rows 0..=3) or Intra (rows 4..=7) prefix in B-13.
+    let mut inter4mv_seen = false;
+    for pkt in &packets[1..] {
+        // Look for `0000010` at any bit alignment in the P-VOP packets.
+        for byte_idx in 0..pkt.data.len().saturating_sub(2) {
+            let w16 = ((pkt.data[byte_idx] as u16) << 8) | pkt.data[byte_idx + 1] as u16;
+            for bit_off in 0..9u32 {
+                let win7 = ((w16 >> (9 - bit_off)) & 0x7F) as u8;
+                if win7 == 0b0000010 {
+                    inter4mv_seen = true;
+                    break;
+                }
+            }
+            if inter4mv_seen {
+                break;
+            }
+        }
+        if inter4mv_seen {
+            break;
+        }
+    }
+    assert!(
+        inter4mv_seen,
+        "no Inter4MV MCBPC prefix found in DP P-VOP packets — \
+         the encoder did not exercise Inter4MV"
+    );
+
+    // Self-roundtrip through our decoder.
+    let mut es = Vec::new();
+    for pkt in &packets {
+        es.extend_from_slice(&pkt.data);
+    }
+    let dec_params = CodecParameters::video(CodecId::new(oxideav_mpeg4video::CODEC_ID_STR));
+    let mut dec = oxideav_mpeg4video::decoder::make_decoder(&dec_params).expect("build decoder");
+    let in_pkt = Packet::new(0, TimeBase::new(1, 24), es.clone());
+    dec.send_packet(&in_pkt).expect("send_packet");
+    dec.flush().expect("flush decoder");
+    let mut decoded: Vec<VideoFrame> = Vec::new();
+    loop {
+        match dec.receive_frame() {
+            Ok(Frame::Video(f)) => decoded.push(f),
+            Ok(_) => {}
+            Err(oxideav_core::Error::NeedMore) | Err(oxideav_core::Error::Eof) => break,
+            Err(e) => panic!("receive_frame: {e:?}"),
+        }
+    }
+    assert_eq!(
+        decoded.len(),
+        num_frames as usize,
+        "DP Inter4MV self-roundtrip dropped frames"
+    );
+    let mut min_psnr = f64::INFINITY;
+    for (i, (s, d)) in src.iter().zip(decoded.iter()).enumerate() {
+        let p = psnr(&flatten_frame(s), &flatten_frame(d));
+        eprintln!("DP Inter4MV frame {i}: PSNR = {p:.2} dB");
+        min_psnr = min_psnr.min(p);
+    }
+    assert!(
+        min_psnr > 25.0,
+        "DP Inter4MV self-roundtrip min-PSNR {min_psnr:.2} dB below 25 dB"
+    );
+
+    // Hard-asserted ffmpeg cross-decode.
+    if !command_exists("ffmpeg") {
+        panic!("ffmpeg required for DP Inter4MV cross-decode test");
+    }
+    let tmp = std::env::temp_dir();
+    let es_path = tmp.join("oxideav_dp_inter4mv.m4v");
+    std::fs::write(&es_path, &es).expect("write m4v");
+    let yuv_out = tmp.join("oxideav_dp_inter4mv_ffmpeg.yuv");
+    let _ = std::fs::remove_file(&yuv_out);
+    let status = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "m4v",
+            "-i",
+            es_path.to_str().unwrap(),
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "yuv420p",
+            yuv_out.to_str().unwrap(),
+        ])
+        .status()
+        .expect("run ffmpeg");
+    assert!(
+        status.success(),
+        "ffmpeg failed to decode our DP Inter4MV stream"
+    );
+    let ff = std::fs::read(&yuv_out).expect("read ffmpeg output");
+    let per_frame = (width as usize * height as usize * 3) / 2;
+    assert!(
+        ff.len() >= per_frame * num_frames as usize,
+        "ffmpeg DP Inter4MV output too small: {} bytes for {} frames",
+        ff.len(),
+        num_frames
+    );
+    // The I-VOP is bit-near-exact; the post-I P-VOPs carry the Inter4MV
+    // motion. Validate every frame so a regression in any of part-1
+    // (4 MVs) / part-2 (cbpy) / part-3 (AC walks) shows up.
+    let mut ff_min = f64::INFINITY;
+    for (i, src_frame) in src.iter().enumerate() {
+        let s = flatten_frame(src_frame);
+        let f = &ff[i * per_frame..(i + 1) * per_frame];
+        let p = psnr(&s, f);
+        eprintln!("ffmpeg DP Inter4MV frame {i}: PSNR = {p:.2} dB");
+        ff_min = ff_min.min(p);
+    }
+    assert!(
+        ff_min > 25.0,
+        "ffmpeg DP Inter4MV min-PSNR {ff_min:.2} dB below 25 dB — \
+         Inter4MV under DP decoded incorrectly by ffmpeg"
+    );
+}

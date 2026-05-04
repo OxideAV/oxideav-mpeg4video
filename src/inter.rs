@@ -30,7 +30,10 @@ use crate::interlaced::{
 };
 use crate::iq::{dc_scaler, INTRA_DC_VLC_THR_TABLE};
 use crate::mb::{IVopPicture, PredGrid};
-use crate::mc::{luma_mv_to_chroma, luma_qmv_to_chroma, predict_block, predict_block_qpel};
+use crate::mc::{
+    luma_4mv_sum_to_chroma, luma_mv_to_chroma, luma_qmv_to_chroma, predict_block,
+    predict_block_qpel,
+};
 use crate::tables::{cbpy, mcbpc, mv as mv_tab, vlc};
 use oxideav_core::bits::BitReader;
 
@@ -284,15 +287,32 @@ pub fn predict_mv(
         _ => unreachable!(),
     };
 
-    // Substitute defaults per §7.6.2:
-    //   If MV1 alone is unavailable: MV1 = MV2 = MV3 = 0.
-    //   Else if MV2 unavailable but MV1 available: MV2 = MV3 = MV1.
-    //   Else if MV3 unavailable: MV3 = (0,0).
-    let (mv1, mv2, mv3) = match (mv1, mv2, mv3) {
-        (None, _, _) => ((0, 0), (0, 0), (0, 0)),
-        (Some(a), None, _) => (a, a, a),
-        (Some(a), Some(b), None) => (a, b, (0, 0)),
-        (Some(a), Some(b), Some(c)) => (a, b, c),
+    // Substitute defaults per ISO/IEC 14496-2 §7.6.2:
+    //   1. If candidate `MVi` is in a transparent neighbour: invalid.
+    //   2. If exactly ONE candidate is invalid: set it to (0, 0).
+    //   3. If exactly TWO candidates are invalid: set them to the
+    //      remaining valid one.
+    //   4. If ALL THREE are invalid: set them all to (0, 0).
+    //
+    // The earlier arm `(Some(a), None, _) => (a, a, a)` collapsed cases
+    // 2 and 3 incorrectly (set all 3 to `a` when only mv2 was invalid),
+    // dragging the median predictor toward the left-neighbour MV
+    // instead of taking median(a, 0, mv3). This skewed the predictor
+    // for any 4MV MB whose top-edge candidates were missing, which is
+    // exactly the case that bit ffmpeg cross-decode of our 4MV streams.
+    let count_valid = mv1.is_some() as u8 + mv2.is_some() as u8 + mv3.is_some() as u8;
+    let (mv1, mv2, mv3) = match count_valid {
+        3 => (mv1.unwrap(), mv2.unwrap(), mv3.unwrap()),
+        2 => (
+            mv1.unwrap_or((0, 0)),
+            mv2.unwrap_or((0, 0)),
+            mv3.unwrap_or((0, 0)),
+        ),
+        1 => {
+            let v = mv1.or(mv2).or(mv3).unwrap();
+            (v, v, v)
+        }
+        _ => ((0, 0), (0, 0), (0, 0)),
     };
 
     // Component-wise median.
@@ -748,9 +768,24 @@ pub fn decode_p_mb(
         }
     };
     let (cmx, cmy) = if four_mv {
+        // 4MV chroma per ISO/IEC 14496-2 §7.6.5 + Table 7-10:
+        // MVDCHR = sum(MV) routed through the sixteenth-pel modifier
+        // table. The earlier `luma_mv_to_chroma(sum/4)` shortcut
+        // disagreed with the spec at the ±1/16 boundary (e.g. sum=14
+        // round to chroma half-pel = 2 per spec, not 1 per shortcut).
+        // QPel 4MV first reduces each component through
+        // `luma_qmv_to_chroma` before summing — the 4MV-of-QPel chroma
+        // path remains the simple (sum/4)-then-`to_chroma` because the
+        // spec says "in quarter sample mode the vectors are divided by
+        // 2 before summation" and Table 7-10 is defined for half-pel
+        // luma inputs only.
         let sx: i32 = motion.mv.iter().map(|(x, _)| *x).sum();
         let sy: i32 = motion.mv.iter().map(|(_, y)| *y).sum();
-        (to_chroma(sx / 4), to_chroma(sy / 4))
+        if vol.quarter_sample {
+            (to_chroma(sx / 4), to_chroma(sy / 4))
+        } else {
+            (luma_4mv_sum_to_chroma(sx), luma_4mv_sum_to_chroma(sy))
+        }
     } else {
         (to_chroma(motion.mv[0].0), to_chroma(motion.mv[0].1))
     };

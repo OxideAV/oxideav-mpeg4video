@@ -7,32 +7,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.1.3](https://github.com/OxideAV/oxideav-mpeg4video/compare/v0.1.2...v0.1.3) - 2026-05-03
+### Fixed
 
-### Other
-
-- drop duplicate semver_check key
-- replace never-match regex with semver_check = false
-- migrate to centralized OxideAV/.github reusable workflows
-- RVLC strategy 1-4 production picker (Annex E.1.4.4.2.1)
-- RVLC reverse-direction decoder + per-block error recovery
-- encoder + decoder: Intra-in-P macroblocks under data partitioning
-- encoder + decoder reversible VLC (Tables B.23-B.25)
-- encoder + decoder data partitioning (§6.2.6 / §6.3.7)
-- encoder single-warp-point GMC
-- round-19 encoder qp + g codec options
-- cargo fmt cleanup + silence unused vol binding
-- adopt slim VideoFrame shape
-- adopt slim VideoFrame shape
-- quarter-pel motion estimation + MC (§7.6.2.2)
-- quarter-pel motion estimation (§7.6.2.2 / §7.5.4)
-- intra-MB-in-P fallback for scene changes
-- 4MV mode decision + per-block ME + Inter4MV bitstream
-- 4MV-direct + DIRECT_BONUS sweep + vti_bits fix
-- wire B-MB cbpb residual emit + dbquant=0 sidechannel
-- pin release-plz to patch-only bumps
+- encoder/decoder: **§7.6.2 fig 7-6 MV-predictor neighbour-substitution
+  rules.** The `predict_mv` 4MV path collapsed cases 2 and 3 of the
+  spec's "set invalid candidate to zero / fill in with the valid one"
+  rules: when *only* MV2 was invalid (rule 2: MV2 = 0), we instead
+  set MV1 = MV2 = MV3 = MV1 (rule 3 — applies only when TWO are
+  invalid). Likewise the `(None, _, _)` arm collapsed all four
+  "MV1-invalid" cases into rule-4 zero-fill. The bug was self-
+  consistent (encoder and decoder shared the same `predict_mv`) so
+  self-roundtrips always passed; ffmpeg cross-decode of any 4MV
+  stream that triggered rule 2 (e.g. first-MB-of-first-row 4MV with
+  no top neighbour) drifted on the post-I P-VOP and accumulated 16
+  dB+ losses by frame 3. Rewritten to count valid candidates and
+  apply the correct rule (1/2/3/4) directly. The combined-mode 4MV
+  test `tests/p_vop.rs::p_vop_4mv_subblock_motion_roundtrip` already
+  covered the encode→our-decode round-trip; the new
+  `tests/dp.rs::dp_p_vop_inter4mv_roundtrip` is the first hard-
+  asserted ffmpeg cross-decode of a multi-frame 4MV stream and would
+  have caught this bug had it existed at the time of round 13.
+- encoder/decoder: **§7.6.5 + Table 7-10 4MV chroma MV derivation.**
+  The 4MV chroma branch previously short-circuited as
+  `luma_mv_to_chroma(sum / 4)` (the K=1 single-MV reduction applied
+  to the 4MV average). For K=4 the spec routes `MVDCHR` through the
+  Table 7-10 sixteenth-pel modifier table, which disagrees with the
+  shortcut at the ±1/16-sample boundary (e.g. `sum=14` → spec
+  chroma_half_pel=2, shortcut=1). New helper
+  `mc::luma_4mv_sum_to_chroma` implements the spec table directly;
+  both the P-VOP encoder (`pvop::estimate_and_encode_mb_inner`) and
+  the P-VOP decoder (`inter::decode_p_mb`) now use it for the
+  half-pel-luma 4MV path. QPel 4MV stays on the average-then-reduce
+  path because the spec halves the QPel components before summation.
 
 ### Added
+
+- encoder: **Inter4MV under data partitioning (§6.3.7).** The DP P-VOP
+  body emitter (`dp::encode_p_vop_body_dp_with_grid`) now picks
+  between 1MV-Inter / Inter4MV / Intra-in-P with the same
+  SAD+lambda heuristic the combined-mode encoder uses, instead of
+  forcing 1MV. Per-MB part 1 emits Table B-13 rows 16..=19 (Inter4MV
+  MCBPC) followed by four MVDs (median predictor commits each MV to
+  the in-MB grid before predicting the next sub-block, per §7.6.2
+  fig 7-6). Per-MB part 2 (cbpy) and part 3 (AC walks) reuse the
+  combined-mode emitters. The DP decoder's part-1 motion-decode
+  branch grew an `Inter4MV` arm that mirrors the encoder. The
+  `PMbState::Inter` carrier now stores `mv4: [(i32,i32); 4]` plus
+  `four_mv: bool` so the reconstruct path can dispatch between
+  `predict_luma_mb` (1MV) and `predict_luma_mb_4mv` (4MV) and pick
+  the correct chroma-MV derivation. New hard-asserted ffmpeg
+  cross-decode test `tests/dp.rs::dp_p_vop_inter4mv_roundtrip`
+  verifies an Inter4MV MCBPC prefix appears in the post-I P-VOP and
+  that ffmpeg decodes every frame within 25 dB of source (~38 dB on
+  the synthetic per-block-motion fixture). Mutually exclusive with
+  GMC / QPel / B-frames is unchanged.
+- encoder: **Profile bump to ASP@L1 for `dp=1`.** The DP path
+  previously advertised ARTS@L1 (PLI `0x91`, vot `10`), but per
+  ISO/IEC 14496-2 Annex G the ARTS profile lacks Inter4MV; ASP@L1
+  (`0xF1`, vot `4`, verid `2`) is the smallest profile that admits
+  DP + Inter4MV simultaneously. The `verid=2` bump pulls in
+  `quarter_sample`, `newpred_enable` and `reduced_resolution_vop_enable`
+  bits in the VOL — all emitted as 0 for the DP path.
 
 - decoder: **RVLC strategy 1-4 production picker** (ISO/IEC 14496-2
   §E.1.4.4.2.1). Wires the round-24 forward + reverse walker
@@ -195,6 +230,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - encoder: `cargo fmt` reflows on `bvop_enc.rs`, `encoder.rs`, `pvop.rs`
   + silenced an unused `vol` binding in `tests/reference_clips.rs` so
   `cargo clippy --all-targets -- -D warnings` is green again.
+
+## [0.1.3](https://github.com/OxideAV/oxideav-mpeg4video/compare/v0.1.2...v0.1.3) - 2026-05-03
+
+### Other
+
+- drop duplicate semver_check key
+- replace never-match regex with semver_check = false
+- migrate to centralized OxideAV/.github reusable workflows
+- RVLC strategy 1-4 production picker (Annex E.1.4.4.2.1)
+- RVLC reverse-direction decoder + per-block error recovery
+- encoder + decoder: Intra-in-P macroblocks under data partitioning
+- encoder + decoder reversible VLC (Tables B.23-B.25)
+- encoder + decoder data partitioning (§6.2.6 / §6.3.7)
+- encoder single-warp-point GMC
+- round-19 encoder qp + g codec options
+- cargo fmt cleanup + silence unused vol binding
+- adopt slim VideoFrame shape
+- adopt slim VideoFrame shape
+- quarter-pel motion estimation + MC (§7.6.2.2)
+- quarter-pel motion estimation (§7.6.2.2 / §7.5.4)
+- intra-MB-in-P fallback for scene changes
+- 4MV mode decision + per-block ME + Inter4MV bitstream
+- 4MV-direct + DIRECT_BONUS sweep + vti_bits fix
+- wire B-MB cbpb residual emit + dbquant=0 sidechannel
+- pin release-plz to patch-only bumps
 
 ## [0.1.2](https://github.com/OxideAV/oxideav-mpeg4video/compare/v0.1.1...v0.1.2) - 2026-04-25
 

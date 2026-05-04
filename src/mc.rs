@@ -171,31 +171,104 @@ fn predict_block_interior(
     }
 }
 
-/// Compute the chroma motion vector from the luma vector per §7.6.2.1.
-/// MPEG-4 uses a "round to nearest half-pel" rule: the chroma component is
-/// the luma component divided by 2 with the resulting fractional part
-/// requantised to the half-pel grid.
-///
-/// Implementation per FFmpeg `chroma_4mv_motion_lowres`-style logic:
-///   chroma = (luma >> 1) | (luma & 1)
-/// equivalently `(luma + sign(luma)) / 2` with halfpel preserved.
+/// Compute the chroma motion vector from a single luma vector (1MV mode)
+/// per ISO/IEC 14496-2 §7.6.2.1 / §7.6.5 Table 7-13. The chroma component
+/// is the luma component divided by 2 with the fractional part requantised
+/// to the half-pel grid.
 ///
 /// We work in luma half-pel units throughout. Returned value is in chroma
 /// half-pel units.
+///
+/// Worked examples (luma_mv → chroma_mv, both in their respective half-pel units):
+///   0 → 0,  1 → 1,  2 → 1,  3 → 1,  4 → 2,  5 → 3,  6 → 3,  7 → 3,  8 → 4
+///   −1 → −1, −2 → −1, −3 → −1, −4 → −2, −5 → −3, −6 → −3, −7 → −3, −8 → −4
 pub fn luma_mv_to_chroma(luma_mv_half: i32) -> i32 {
-    // Derivation from FFmpeg `mpeg_motion_internal` (1MV H.263 path):
-    //   chroma_int_offset = luma_mv >> 2          (signed, floor)
-    //   chroma_half_bit   = 1 iff (luma_mv & 3) != 0
-    //   chroma_mv_half    = chroma_int_offset * 2 + chroma_half_bit
-    //
-    // Worked examples (luma_mv → chroma_mv, both in their respective half-pel units):
-    //   0 → 0,  1 → 1,  2 → 1,  3 → 1,  4 → 2,  5 → 3,  6 → 3,  7 → 3,  8 → 4
-    //   −1 → −1, −2 → −1, −3 → −1, −4 → −2, −5 → −3, −6 → −3, −7 → −3, −8 → −4
-    //
-    // For non-negative luma the values match Table 7-15 of the spec.
     let int_part = luma_mv_half >> 2;
     let half_bit = if luma_mv_half & 3 != 0 { 1 } else { 0 };
     int_part * 2 + half_bit
+}
+
+/// Compute the chroma motion vector for the 4MV mode (Inter4MV) per
+/// ISO/IEC 14496-2 §7.6.5 + Table 7-10. Takes the SUM of the four
+/// luma motion vector components (in luma half-pel units) and returns
+/// the chroma motion vector (in chroma half-pel units).
+///
+/// Algorithm (§7.6.5):
+/// 1. `MVDCHR_sixteenth = sum * 4 / K = sum` for K=4 (in 1/16 chroma
+///    sample units; the integer-arithmetic path falls out because each
+///    luma half-pel = 1/4 chroma full-pel = 4/16 chroma sample, and
+///    `(sum * 4 / 16) / (2K=8)` = `sum * 4 / (16 * 8)` per luma block,
+///    multiplied by K=4 luma blocks summed = `sum * 4 / 32 * 16/K` —
+///    after the K cancellation `MVDCHR_sixteenth = sum` for K=4).
+/// 2. Split `MVDCHR_sixteenth` into integer + fractional parts in 1/2
+///    chroma sample units: `int = MVDCHR_sixteenth / 16`, `frac =
+///    MVDCHR_sixteenth mod 16` (sign-aware).
+/// 3. Map `frac` through Table 7-10 to a half-sample modifier in
+///    {0, 1, 2}.
+/// 4. Final chroma MV (in chroma half-pel) = `int * 2 + sign(int) *
+///    table_modifier`. Sign handling: work on `abs(MVDCHR_sixteenth)`,
+///    then re-apply the sign at the end. Spec text says the modifier
+///    pulls toward the nearest half-sample, which is symmetric about
+///    zero, so the sign-on-abs convention matches Table 7-10.
+///
+/// Worked examples (sum → chroma_mv_half, K=4):
+///   sum=0 → 0,  sum=4 → 1,  sum=8 → 1,  sum=12 → 1,  sum=14 → 2,
+///   sum=16 → 2,  sum=20 → 3,  sum=24 → 3,  sum=32 → 4.
+///   Negatives: sum=-4 → -1,  sum=-14 → -2,  sum=-16 → -2.
+pub fn luma_4mv_sum_to_chroma(sum_luma_half: i32) -> i32 {
+    // Table 7-10: sixteenth pixel position → resulting position (in 1/2
+    // chroma sample units). Index by (abs(sum) % 16).
+    const TABLE_7_10: [i32; 16] = [0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2];
+    let abs_sum = sum_luma_half.unsigned_abs() as i32;
+    let int_part = abs_sum / 16;
+    let frac_idx = (abs_sum % 16) as usize;
+    let modifier = TABLE_7_10[frac_idx];
+    let abs_chroma_half = int_part * 2 + modifier;
+    if sum_luma_half < 0 {
+        -abs_chroma_half
+    } else {
+        abs_chroma_half
+    }
+}
+
+#[cfg(test)]
+mod chroma_mv_tests {
+    use super::{luma_4mv_sum_to_chroma, luma_mv_to_chroma};
+
+    #[test]
+    fn luma_4mv_sum_to_chroma_table_7_10() {
+        // Verify the worked examples from the docstring + symmetry.
+        assert_eq!(luma_4mv_sum_to_chroma(0), 0);
+        assert_eq!(luma_4mv_sum_to_chroma(4), 1);
+        assert_eq!(luma_4mv_sum_to_chroma(8), 1);
+        assert_eq!(luma_4mv_sum_to_chroma(12), 1);
+        assert_eq!(luma_4mv_sum_to_chroma(14), 2);
+        assert_eq!(luma_4mv_sum_to_chroma(15), 2);
+        assert_eq!(luma_4mv_sum_to_chroma(16), 2);
+        assert_eq!(luma_4mv_sum_to_chroma(20), 3);
+        assert_eq!(luma_4mv_sum_to_chroma(32), 4);
+        // Negative symmetry.
+        assert_eq!(luma_4mv_sum_to_chroma(-4), -1);
+        assert_eq!(luma_4mv_sum_to_chroma(-14), -2);
+        assert_eq!(luma_4mv_sum_to_chroma(-16), -2);
+    }
+
+    #[test]
+    fn luma_4mv_4x_uniform_matches_1mv_chroma() {
+        // When all 4 luma MVs are equal, chroma should match the 1MV
+        // path applied to that single value. Spec §7.6.5 / Table 7-10
+        // is the K=4 generalisation of Table 7-13 (K=1) — uniform 4MV
+        // should reduce to 1MV. Verify on a few values.
+        for mv in [-4, -2, -1, 0, 1, 2, 3, 4, 6, 8, 12, 16, 20].iter() {
+            let sum = mv * 4;
+            let chroma_4mv = luma_4mv_sum_to_chroma(sum);
+            let chroma_1mv = luma_mv_to_chroma(*mv);
+            assert_eq!(
+                chroma_4mv, chroma_1mv,
+                "mv={mv} sum={sum}: 4MV={chroma_4mv} != 1MV={chroma_1mv}"
+            );
+        }
+    }
 }
 
 /// Quarter-pel 8-tap filter coefficients (§7.6.2.2).

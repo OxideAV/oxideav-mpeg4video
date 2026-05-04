@@ -578,9 +578,9 @@ pub fn decode_ivop_dp(
 use crate::encoder::write_mcbpc_p_intra;
 use crate::inter::{MbMotion, MvGrid};
 use crate::pvop::{
-    estimate_and_encode_mb_one_mv, intra_cost_proxy, reset_pred_grid_mb, wrap_mvd, write_inter_ac,
-    write_mcbpc_inter, write_mv_component, write_recon_to_pic, PMbEncoding, INTRA_IN_P_BIAS,
-    INTRA_MARGIN,
+    estimate_and_encode_mb, intra_cost_proxy, reset_pred_grid_mb, wrap_mvd, write_inter_ac,
+    write_mcbpc_inter, write_mcbpc_inter4mv, write_mv_component, write_recon_to_pic, PMbEncoding,
+    INTRA_IN_P_BIAS, INTRA_MARGIN,
 };
 
 /// Per-MB DP P-VOP encoding state — either an inter MB carrying motion
@@ -591,12 +591,14 @@ use crate::pvop::{
 /// after their cbpy, per `data_partitioned_p_vop()` §6.2.5.3 lines
 /// `derived_mb_type >= 3` branches).
 enum PMbDp {
-    /// Inter MB (Inter / Inter+Q in mb_type taxonomy). Emits MCBPC group
-    /// 0..=3, an MV, then inter cbpy + inter AC walks. The DP encoder
-    /// stays in 1MV mode (4MV/GMC are rejected at the factory). Boxed
-    /// to keep the enum's stack footprint small (PMbEncoding embeds the
-    /// 16×16 luma + 2×8×8 chroma reconstruction buffers + 6×64 AC
-    /// arrays, ~2 KiB).
+    /// Inter MB (Inter / Inter+Q / Inter4MV in mb_type taxonomy). Emits
+    /// either MCBPC group 0..=3 (Inter, one MV) or group 16..=19
+    /// (Inter4MV, four MVs), then inter cbpy + inter AC walks. The DP
+    /// encoder picks 1MV vs 4MV per the same SAD+lambda criterion the
+    /// combined-mode P-VOP encoder uses. GMC is rejected at the factory.
+    /// Boxed to keep the enum's stack footprint small (PMbEncoding
+    /// embeds the 16×16 luma + 2×8×8 chroma reconstruction buffers +
+    /// 6×64 AC arrays, ~2 KiB).
     Inter(Box<PMbEncoding>),
     /// Intra-in-P MB (Table B-13 mb_type=3, MCBPC rows 4..=7). Emits
     /// MCBPC group 4..=7, NO MV, then ac_pred_flag + raw cbpy + 6 intra
@@ -608,11 +610,15 @@ enum PMbDp {
 /// Encode one P-VOP body using `data_partitioned_p_vop()` layout
 /// (§6.2.5.3 / §6.3.7) and return the reconstructed picture + MV grid.
 ///
-/// Round-22 scope: 1MV-Inter + Intra-in-P. Inter4MV and GMC are
-/// detected upstream (see `make_encoder`'s sanity check) and don't
-/// reach here. Skipped MBs (`not_coded = 1`) are emitted exactly like
-/// the combined-mode encoder. The picture is treated as one video
-/// packet — no mid-VOP `video_packet_header()` splits.
+/// Scope: 1MV-Inter + Inter4MV + Intra-in-P. GMC is rejected at the
+/// encoder factory and doesn't reach here. Inter4MV is picked
+/// automatically when the chosen-mode SAD wins by more than the
+/// `FOURMV_LAMBDA` bit-cost penalty (§7.5.7), exactly like the
+/// combined-mode encoder; the per-MB MCBPC switches to Table B-13
+/// rows 16..=19 (`Inter4MV`) and four MVDs are emitted in part 1
+/// instead of one. Skipped MBs (`not_coded = 1`) are emitted exactly
+/// like the combined-mode encoder. The picture is treated as one
+/// video packet — no mid-VOP `video_packet_header()` splits.
 ///
 /// Intra-in-P decision matches the combined-mode P-VOP encoder
 /// (`pvop::encode_p_vop_body_with_grid`): the chosen-mode inter SAD
@@ -662,13 +668,14 @@ pub fn encode_p_vop_body_dp_with_grid(
     // ---- Pre-pass: estimate, residual-encode, reconstruct each MB.
     for mb_y in 0..mb_h {
         for mb_x in 0..mb_w {
-            // 1MV-only mode for DP — we forbid 4MV/GMC at the encoder
-            // factory level. `estimate_and_encode_mb_one_mv` skips the
-            // 4MV branch so the encoder's reconstruction always matches
-            // what the DP decoder would compute from the single MV we
-            // emit. Pass `quarter_sample = false` and `warp = None` to
-            // keep the path purely half-pel translational.
-            let inter_mb = estimate_and_encode_mb_one_mv(
+            // 1MV / 4MV mode-decision path. `estimate_and_encode_mb`
+            // runs the same SAD+lambda heuristic the combined-mode
+            // P-VOP encoder uses; the chosen mode lands in `four_mv`
+            // and the per-block MVs in `mv4_half`. GMC is rejected
+            // upstream (warp = None), QPel is rejected upstream
+            // (quarter_sample = false), so the predictor is purely
+            // half-pel translational across both 1MV and 4MV.
+            let inter_mb = estimate_and_encode_mb(
                 v,
                 width,
                 height,
@@ -721,12 +728,22 @@ pub fn encode_p_vop_body_dp_with_grid(
                 mbs.push(PMbDp::Intra(Box::new(intra_mb)));
             } else {
                 // Stash recon → pic, update predictor grids, record MV.
+                // For 4MV MBs, all four per-block MVs go into the grid so
+                // the next MB's median predictor (§7.5.7) sees them.
                 write_recon_to_pic(&mut pic, &inter_mb, mb_x, mb_y);
                 reset_pred_grid_mb(&mut pred_grid, mb_x, mb_y);
-                let motion = MbMotion {
-                    mv: [inter_mb.mv_half; 4],
-                    four_mv: false,
-                    not_coded: inter_mb.skipped,
+                let motion = if inter_mb.four_mv {
+                    MbMotion {
+                        mv: inter_mb.mv4_half,
+                        four_mv: true,
+                        not_coded: false,
+                    }
+                } else {
+                    MbMotion {
+                        mv: [inter_mb.mv_half; 4],
+                        four_mv: false,
+                        not_coded: inter_mb.skipped,
+                    }
                 };
                 mv_grid.set(mb_x, mb_y, motion);
                 mbs.push(PMbDp::Inter(Box::new(inter_mb)));
@@ -754,29 +771,60 @@ pub fn encode_p_vop_body_dp_with_grid(
                 }
                 bw.write_bits(0, 1); // not_coded = 0
                 let cbpc = ((inter.chroma_coded[0] as u8) << 1) | (inter.chroma_coded[1] as u8);
-                write_mcbpc_inter(bw, cbpc);
+                if inter.four_mv {
+                    // Inter4MV MCBPC (Table B-13 rows 16..=19). The
+                    // decoder's `decompose_inter` reads group 4 as
+                    // `PMbType::Inter4MV` and switches to the 4MV
+                    // motion-decode branch.
+                    write_mcbpc_inter4mv(bw, cbpc);
+                } else {
+                    write_mcbpc_inter(bw, cbpc);
+                }
                 // (mcsel is a no-op when GMC isn't enabled, and DP rejects GMC.)
-                // 1MV motion vector — predicted by the median over (left, top,
+                // 1MV: one MVD predicted by the median over (left, top,
                 // top-right) on the in-progress emit grid.
-                let (px, py) =
-                    crate::inter::predict_mv_full(&emit_grid, mb_x, mb_y, 0, false, 0, 0);
-                let (mvx, mvy) = inter.mv_half;
-                let dx = mvx - px;
-                let dy = mvy - py;
+                // 4MV: four MVDs, one per 8×8 block. Per §7.6.2 fig 7-6,
+                // block k's median predictor may reference blocks 0..k-1
+                // of THIS MB, so we commit each freshly-emitted MV to the
+                // emit grid before predicting the next block (mirrors the
+                // combined-mode `emit_p_mb` 4MV path).
                 let range = 32i32 << (f_code_fwd.saturating_sub(1) as i32);
-                let dx = wrap_mvd(dx, range);
-                let dy = wrap_mvd(dy, range);
-                write_mv_component(bw, dx, f_code_fwd);
-                write_mv_component(bw, dy, f_code_fwd);
-                emit_grid.set(
-                    mb_x,
-                    mb_y,
-                    MbMotion {
-                        mv: [(mvx, mvy); 4],
-                        four_mv: false,
+                if inter.four_mv {
+                    let mut committed = MbMotion {
+                        mv: [(0, 0); 4],
+                        four_mv: true,
                         not_coded: false,
-                    },
-                );
+                    };
+                    for blk in 0..4 {
+                        emit_grid.set(mb_x, mb_y, committed);
+                        let (px, py) =
+                            crate::inter::predict_mv_full(&emit_grid, mb_x, mb_y, blk, true, 0, 0);
+                        let (mvx, mvy) = inter.mv4_half[blk];
+                        let dx = wrap_mvd(mvx - px, range);
+                        let dy = wrap_mvd(mvy - py, range);
+                        write_mv_component(bw, dx, f_code_fwd);
+                        write_mv_component(bw, dy, f_code_fwd);
+                        committed.mv[blk] = (mvx, mvy);
+                    }
+                    emit_grid.set(mb_x, mb_y, committed);
+                } else {
+                    let (px, py) =
+                        crate::inter::predict_mv_full(&emit_grid, mb_x, mb_y, 0, false, 0, 0);
+                    let (mvx, mvy) = inter.mv_half;
+                    let dx = wrap_mvd(mvx - px, range);
+                    let dy = wrap_mvd(mvy - py, range);
+                    write_mv_component(bw, dx, f_code_fwd);
+                    write_mv_component(bw, dy, f_code_fwd);
+                    emit_grid.set(
+                        mb_x,
+                        mb_y,
+                        MbMotion {
+                            mv: [(mvx, mvy); 4],
+                            four_mv: false,
+                            not_coded: false,
+                        },
+                    );
+                }
             }
             PMbDp::Intra(intra) => {
                 // Intra-in-P (Table B-13 rows 4..=7). Emit not_coded=0
@@ -931,13 +979,18 @@ pub fn decode_pvop_dp_with_grid(
 
     /// Per-MB carrier flowing through parts 1 → 2 → 3 → reconstruct.
     /// `Skipped` is `not_coded = 1` (no residual, copy reference at
-    /// MV(0,0)). `Inter` carries the inter motion + residual state;
+    /// MV(0,0)). `Inter` carries the inter motion + residual state
+    /// (1MV when `four_mv = false`, four per-block MVs when `true`);
     /// `Intra` carries the intra DC differentials + residual state.
     enum PMbState {
         Skipped,
         Inter {
             cbpc: u8,
-            mv: (i32, i32),
+            /// Per-block luma MVs. For 1MV MBs all four entries hold the
+            /// single MV; for Inter4MV MBs they hold the four per-block
+            /// MVs in block order 0=(0,0) 1=(8,0) 2=(0,8) 3=(8,8).
+            mv4: [(i32, i32); 4],
+            four_mv: bool,
             cbpy_inv: u8, // raw VLC value (inter MBs invert with ^0xF)
             ac_levels: [[i32; 64]; 6],
         },
@@ -995,7 +1048,37 @@ pub fn decode_pvop_dp_with_grid(
                 );
                 mbs.push(PMbState::Inter {
                     cbpc,
-                    mv: (mvx, mvy),
+                    mv4: [(mvx, mvy); 4],
+                    four_mv: false,
+                    cbpy_inv: 0,
+                    ac_levels: [[0i32; 64]; 6],
+                });
+            }
+            mcbpc::PMbType::Inter4MV => {
+                // Inter4MV (Table B-13 rows 16..=19, group `value >> 2 == 4`).
+                // Decode four MVDs in block order. Per §7.6.2 fig 7-6
+                // each block's predictor may reference the prior blocks
+                // of THIS MB, so commit each freshly-decoded MV into
+                // the grid before predicting the next block. Mirrors
+                // `inter::decode_p_mb`'s 4MV path.
+                let mut motion = MbMotion {
+                    mv: [(0, 0); 4],
+                    four_mv: true,
+                    not_coded: false,
+                };
+                for blk in 0..4 {
+                    mv_grid.set(mb_x, mb_y, motion);
+                    let (px, py) =
+                        crate::inter::predict_mv_full(&mv_grid, mb_x, mb_y, blk, true, 0, 0);
+                    let mvx = decode_mv_component(br, f_code, px)?;
+                    let mvy = decode_mv_component(br, f_code, py)?;
+                    motion.mv[blk] = (mvx, mvy);
+                }
+                mv_grid.set(mb_x, mb_y, motion);
+                mbs.push(PMbState::Inter {
+                    cbpc,
+                    mv4: motion.mv,
+                    four_mv: true,
                     cbpy_inv: 0,
                     ac_levels: [[0i32; 64]; 6],
                 });
@@ -1220,11 +1303,11 @@ pub fn decode_pvop_dp_with_grid(
             }
             PMbState::Inter {
                 cbpc,
-                mv,
+                mv4,
+                four_mv,
                 cbpy_inv,
                 ac_levels,
             } => {
-                let (mvx, mvy) = *mv;
                 let cbpy_mask = *cbpy_inv ^ 0xF;
                 let luma_coded = [
                     (cbpy_mask >> 3) & 1 != 0,
@@ -1233,9 +1316,23 @@ pub fn decode_pvop_dp_with_grid(
                     cbpy_mask & 1 != 0,
                 ];
                 let chroma_coded = [(*cbpc >> 1) & 1 != 0, *cbpc & 1 != 0];
-                // Build luma MB predictor + add residual block-by-block.
+                // Build luma MB predictor. 1MV: one MV applied to all
+                // four luma blocks via `predict_luma_mb`. 4MV: each 8×8
+                // block uses its own MV per `predict_luma_mb_4mv`.
                 let mut pred_y = [0u8; 256];
-                predict_luma_mb(reference, mb_x, mb_y, mvx, mvy, rounding, &mut pred_y);
+                if *four_mv {
+                    crate::pvop::predict_luma_mb_4mv(
+                        reference,
+                        mb_x,
+                        mb_y,
+                        *mv4,
+                        rounding,
+                        &mut pred_y,
+                    );
+                } else {
+                    let (mvx, mvy) = mv4[0];
+                    predict_luma_mb(reference, mb_x, mb_y, mvx, mvy, rounding, &mut pred_y);
+                }
                 let q = quant as i32;
                 for blk in 0..4 {
                     let (sub_x, sub_y) = match blk {
@@ -1261,8 +1358,16 @@ pub fn decode_pvop_dp_with_grid(
                         }
                     }
                 }
-                // Chroma — single MV downscaled per §7.5.4.
-                let (cmx, cmy) = (luma_mv_to_chroma(mvx), luma_mv_to_chroma(mvy));
+                // Chroma — 1MV uses the single luma MV scaled per §7.5.4;
+                // 4MV uses the average of the four luma MVs (§7.5.9.5).
+                let (cmx, cmy) = if *four_mv {
+                    let sx: i32 = mv4.iter().map(|(x, _)| *x).sum();
+                    let sy: i32 = mv4.iter().map(|(_, y)| *y).sum();
+                    (luma_mv_to_chroma(sx / 4), luma_mv_to_chroma(sy / 4))
+                } else {
+                    let (mvx, mvy) = mv4[0];
+                    (luma_mv_to_chroma(mvx), luma_mv_to_chroma(mvy))
+                };
                 let mut pred_cb = [0u8; 64];
                 let mut pred_cr = [0u8; 64];
                 predict_chroma_block(

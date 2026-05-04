@@ -63,7 +63,10 @@ use crate::encoder::{block_pel_position, encode_intra_mb_in_p, fdct8x8};
 use crate::headers::vol::ZIGZAG;
 use crate::inter::{MbMotion, MvGrid};
 use crate::mb::{IVopPicture, PredGrid};
-use crate::mc::{luma_mv_to_chroma, luma_qmv_to_chroma, predict_block, predict_block_qpel};
+use crate::mc::{
+    luma_4mv_sum_to_chroma, luma_mv_to_chroma, luma_qmv_to_chroma, predict_block,
+    predict_block_qpel,
+};
 use crate::tables::{mv as mv_tab, tcoef};
 use oxideav_core::bits::BitWriter;
 
@@ -495,75 +498,7 @@ pub(crate) fn estimate_and_encode_mb(
     quarter_sample: bool,
     warp: Option<&crate::gmc::WarpParams>,
 ) -> Result<PMbEncoding> {
-    estimate_and_encode_mb_inner(
-        v,
-        width,
-        height,
-        reference,
-        mb_x,
-        mb_y,
-        vop_quant,
-        rounding,
-        mv_grid,
-        quarter_sample,
-        warp,
-        false,
-    )
-}
-
-/// Like [`estimate_and_encode_mb`] but forces 1MV mode (skips the 4MV
-/// mode-decision branch). Used by the DP P-VOP encoder, which rejects
-/// 4MV at the factory and never emits Inter4MV MCBPC codewords. Without
-/// this, `estimate_and_encode_mb` could pick 4MV for a high-residual
-/// MB, build the predictor from four sub-MVs, and the DP emit path
-/// would only write the block-0 MV — the decoder would reconstruct
-/// from a 1MV predictor and drift away from the encoder's recon. See
-/// `data_partitioned_p_vop()` §6.2.5.3 / `dp::encode_p_vop_body_dp_with_grid`.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn estimate_and_encode_mb_one_mv(
-    v: &oxideav_core::VideoFrame,
-    width: usize,
-    height: usize,
-    reference: &IVopPicture,
-    mb_x: usize,
-    mb_y: usize,
-    vop_quant: u32,
-    rounding: bool,
-    mv_grid: &MvGrid,
-    quarter_sample: bool,
-    warp: Option<&crate::gmc::WarpParams>,
-) -> Result<PMbEncoding> {
-    estimate_and_encode_mb_inner(
-        v,
-        width,
-        height,
-        reference,
-        mb_x,
-        mb_y,
-        vop_quant,
-        rounding,
-        mv_grid,
-        quarter_sample,
-        warp,
-        true,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn estimate_and_encode_mb_inner(
-    v: &oxideav_core::VideoFrame,
-    width: usize,
-    height: usize,
-    reference: &IVopPicture,
-    mb_x: usize,
-    mb_y: usize,
-    vop_quant: u32,
-    rounding: bool,
-    mv_grid: &MvGrid,
-    quarter_sample: bool,
-    warp: Option<&crate::gmc::WarpParams>,
-    force_one_mv: bool,
-) -> Result<PMbEncoding> {
+    let force_one_mv = false;
     // 1. Integer-pel search over the 16×16 luma MB.
     let src_y_block = load_luma_mb(v, width, height, mb_x, mb_y);
     let (int_x, int_y) = diamond_search_integer(reference, &src_y_block, mb_x, mb_y);
@@ -754,10 +689,19 @@ fn estimate_and_encode_mb_inner(
             luma_mv_to_chroma(luma)
         }
     };
+    // 4MV chroma per ISO/IEC 14496-2 §7.6.5 + Table 7-10 (`luma_4mv_sum_to_chroma`).
+    // QPel-of-4MV stays on the average-then-`to_chroma` path because
+    // Table 7-10 is defined for half-pel luma inputs only (the spec
+    // halves QPel components before summation). Decoder mirrors the
+    // same branch — see `inter::decode_p_mb`.
     let (cmx, cmy) = if four_mv {
         let sx: i32 = mv4_half.iter().map(|(x, _)| *x).sum();
         let sy: i32 = mv4_half.iter().map(|(_, y)| *y).sum();
-        (to_chroma(sx / 4), to_chroma(sy / 4))
+        if quarter_sample {
+            (to_chroma(sx / 4), to_chroma(sy / 4))
+        } else {
+            (luma_4mv_sum_to_chroma(sx), luma_4mv_sum_to_chroma(sy))
+        }
     } else {
         (to_chroma(mvx_1mv), to_chroma(mvy_1mv))
     };
@@ -1848,7 +1792,7 @@ pub(crate) fn write_mcbpc_inter(bw: &mut BitWriter, cbpc: u8) {
 /// Table B-13 row for "Inter4MV, cbpc=0..=3" (values 16..=19).
 /// `decompose_inter` decodes group `value >> 2 == 4` as `PMbType::Inter4MV`,
 /// triggering the four-MV decode path in `inter::decode_p_mb`.
-fn write_mcbpc_inter4mv(bw: &mut BitWriter, cbpc: u8) {
+pub(crate) fn write_mcbpc_inter4mv(bw: &mut BitWriter, cbpc: u8) {
     let (bits, code) = match cbpc {
         0 => (3, 0b010),
         1 => (7, 0b0000101),

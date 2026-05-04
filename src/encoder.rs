@@ -215,10 +215,11 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         .map(|s| !matches!(s, "" | "0" | "false" | "False" | "FALSE"))
         .unwrap_or(DEFAULT_DATA_PARTITIONED);
     if data_partitioned && (gmc_enabled || quarter_sample || max_b_frames > 0) {
-        // The DP encoder body is currently I/P only at half-pel: GMC's
+        // The DP encoder body covers I + P at half-pel, including
+        // 1MV-Inter / Inter4MV / Intra-in-P / not_coded MBs. GMC's
         // mcsel bit interaction with the motion partition, QPel's MV
         // unit doubling, and B-VOPs (which fall back to combined-mode
-        // per spec NOTE in §6.2.5.3) all need additional plumbing
+        // per spec NOTE in §6.2.5.3) still need additional plumbing
         // before we can advertise them under DP. Reject the combo
         // explicitly so callers get a clear error.
         return Err(Error::unsupported(
@@ -859,17 +860,13 @@ fn write_vos_vo_vol(
     write_start_code(bw, VOS_START_CODE);
     // profile_and_level_indication — pick the smallest PLI that admits
     // every feature we actually emit:
-    //   * ASP Level 1 (`0xF1`) — B-VOPs / QPel / GMC (Annex N).
-    //   * Advanced Real Time Simple Profile Level 1 (`0x91`) — DP +
-    //     resync markers + reversible VLCs (Table G.1). Enabling DP
-    //     under SP/L1 is rejected by spec-strict decoders, hence this
-    //     bump.
+    //   * ASP Level 1 (`0xF1`) — B-VOPs / QPel / GMC (Annex N), AND DP
+    //     (ARTS profile lacks Inter4MV; ASP is the smallest profile
+    //     that admits DP + 4MV simultaneously per Table G.1 / Annex G).
     //   * Simple Profile Level 1 (`0x01`) — most-compatible default
     //     for plain I+P half-pel.
-    let pli = if enable_b_vops || quarter_sample || gmc_enabled {
+    let pli = if enable_b_vops || quarter_sample || gmc_enabled || data_partitioned {
         0xF1
-    } else if data_partitioned {
-        0x91
     } else {
         0x01
     };
@@ -889,24 +886,22 @@ fn write_vos_vo_vol(
     // Video Object Layer — id 0x20.
     write_start_code(bw, 0x20);
     bw.write_bits(0, 1); // random_accessible_vol = 0
-                         // video_object_type_indication — ASP (4) when B-VOPs OR QPel OR GMC
-                         // is on (Annex N requires verid>=2 for QPel and the
-                         // 2-bit `sprite_enable` field for GMC); Advanced Real
-                         // Time Simple (10) when DP is on (DP is unavailable
-                         // under the bare Simple type per Table 9-7);
-                         // Simple (1) otherwise.
-    let vot_indication = if enable_b_vops || quarter_sample || gmc_enabled {
+                         // video_object_type_indication — ASP (4) covers
+                         // every "advanced" feature we ship: B-VOPs,
+                         // QPel, GMC and DP+Inter4MV. The bare Simple
+                         // (1) profile is reserved for plain I+P
+                         // half-pel without DP.
+    let vot_indication = if enable_b_vops || quarter_sample || gmc_enabled || data_partitioned {
         4
-    } else if data_partitioned {
-        10
     } else {
         1
     };
     bw.write_bits(vot_indication, 8);
     // `is_object_layer_identifier` is required when we need verid=2 to
-    // unlock QPel or GMC syntax. For the half-pel + no-B + no-GMC path
-    // keep it 0 so the bitstream is byte-for-byte identical to round-14.
-    let needs_verid2 = quarter_sample || gmc_enabled;
+    // unlock QPel / GMC / DP-with-4MV syntax. For the half-pel + no-B +
+    // no-GMC + no-DP path keep it 0 so the bitstream is byte-for-byte
+    // identical to round-14.
+    let needs_verid2 = quarter_sample || gmc_enabled || data_partitioned;
     if needs_verid2 {
         bw.write_bits(1, 1); // is_object_layer_identifier = 1
         bw.write_bits(2, 4); // verid = 2 (QPel + GMC + newpred syntax)
