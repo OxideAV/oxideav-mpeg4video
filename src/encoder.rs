@@ -107,6 +107,14 @@ pub const DEFAULT_QUARTER_SAMPLE: bool = false;
 /// exactly as in round-19.
 pub const DEFAULT_GMC: bool = false;
 
+/// Default number of GMC warp points. `1` = pure global translation
+/// (round-20 behaviour). `2` = conformal (rotation + scale + translate).
+/// `3` = affine (general 2D linear + translate). `4` = perspective
+/// (full 8-DOF projective transform). Values 2..=4 require the multi-
+/// warp encoder path (`build_multi_warp_trajectory`). Override via
+/// the `gmc_warp_points` codec option (1..=4); ignored when `gmc=0`.
+pub const DEFAULT_GMC_WARP_POINTS: u8 = 1;
+
 /// Default `data_partitioned` mode. When `true` the encoder advertises
 /// `data_partitioned = 1` in the VOL and emits each VOP's body using
 /// the `data_partitioned_motion_shape_texture()` layout (§6.2.6 /
@@ -197,6 +205,33 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         .get("gmc")
         .map(|s| !matches!(s, "" | "0" | "false" | "False" | "FALSE"))
         .unwrap_or(DEFAULT_GMC);
+
+    // `gmc_warp_points` (1..=4) — only meaningful when `gmc=1`. 1 keeps the
+    // round-20 single-warp behaviour; 2/3/4 unlock conformal / affine /
+    // perspective warps via per-corner pel-domain ME (see
+    // `build_multi_warp_trajectory`). Out-of-range values are rejected at
+    // factory time so callers get a clear error.
+    let gmc_warp_points = match params.options.get("gmc_warp_points") {
+        Some(s) => {
+            let v: u8 = s.parse().map_err(|_| {
+                Error::invalid(format!(
+                    "mpeg4 encoder: option gmc_warp_points={s} not an integer"
+                ))
+            })?;
+            if !(1..=4).contains(&v) {
+                return Err(Error::invalid(format!(
+                    "mpeg4 encoder: option gmc_warp_points={v} outside [1, 4]"
+                )));
+            }
+            v
+        }
+        None => DEFAULT_GMC_WARP_POINTS,
+    };
+    if gmc_warp_points > 1 && !gmc_enabled {
+        return Err(Error::invalid(
+            "mpeg4 encoder: gmc_warp_points>1 requires gmc=1",
+        ));
+    }
 
     // `dp` enables data partitioning (§6.2.6 / §6.3.7). When on, every
     // VOP body is emitted using `data_partitioned_motion_shape_texture()`
@@ -304,6 +339,7 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         max_b_frames,
         quarter_sample,
         gmc_enabled,
+        gmc_warp_points,
         data_partitioned,
         reversible_vlc,
         pending: VecDeque::new(),
@@ -351,6 +387,15 @@ struct Mpeg4VideoEncoder {
     /// for the per-MB warp-vs-translational decision and global-motion
     /// estimation.
     gmc_enabled: bool,
+    /// Number of GMC warp points (1..=4). Controls the warp's degrees of
+    /// freedom: 1 = pure translation, 2 = conformal (rotation/scale +
+    /// translation), 3 = affine (general 2D linear + translation),
+    /// 4 = perspective (full 8-DOF projective). The encoder advertises
+    /// this value in the VOL `no_of_sprite_warping_points` field and emits
+    /// `n` `(du, dv)` pairs per `sprite_trajectory()`. See
+    /// [`build_multi_warp_trajectory`] for the per-corner pel-domain
+    /// estimator. Ignored when `gmc_enabled == false`.
+    gmc_warp_points: u8,
     /// VOL `data_partitioned == 1` flag — see [`crate::dp`] for the layout.
     /// When `true`, every I/P-VOP body is emitted via
     /// `dp::encode_i_vop_body_dp_and_reconstruct` /
@@ -485,6 +530,7 @@ impl Mpeg4VideoEncoder {
                 self.max_b_frames > 0,
                 self.quarter_sample,
                 self.gmc_enabled,
+                self.gmc_warp_points,
                 self.data_partitioned,
                 self.reversible_vlc,
             );
@@ -527,7 +573,13 @@ impl Mpeg4VideoEncoder {
             // the P-VOP header and consumed by every Inter MB during the
             // body encode.
             let (trajectory, warp) = if self.gmc_enabled {
-                let (t, w) = build_gmc_trajectory(v, self.width, self.height, reference);
+                let (t, w) = build_gmc_trajectory(
+                    v,
+                    self.width,
+                    self.height,
+                    reference,
+                    self.gmc_warp_points,
+                );
                 (Some(t), Some(w))
             } else {
                 (None, None)
@@ -613,6 +665,7 @@ impl Mpeg4VideoEncoder {
                 self.max_b_frames > 0,
                 self.quarter_sample,
                 self.gmc_enabled,
+                self.gmc_warp_points,
                 self.data_partitioned,
                 self.reversible_vlc,
             );
@@ -650,7 +703,13 @@ impl Mpeg4VideoEncoder {
                 .as_ref()
                 .expect("P-VOP path requires a reference picture");
             let (trajectory, warp) = if self.gmc_enabled {
-                let (t, w) = build_gmc_trajectory(v, self.width, self.height, reference);
+                let (t, w) = build_gmc_trajectory(
+                    v,
+                    self.width,
+                    self.height,
+                    reference,
+                    self.gmc_warp_points,
+                );
                 (Some(t), Some(w))
             } else {
                 (None, None)
@@ -844,6 +903,7 @@ fn bits_needed(max_value: u32) -> u32 {
 /// happily consumes. Layer geometry is encoded at the picture's natural
 /// resolution; the `frame_rate` is encoded as
 /// `vop_time_increment_resolution = num`, `fixed_vop_time_increment = den`.
+#[allow(clippy::too_many_arguments)]
 fn write_vos_vo_vol(
     bw: &mut BitWriter,
     width: u32,
@@ -853,6 +913,7 @@ fn write_vos_vo_vol(
     enable_b_vops: bool,
     quarter_sample: bool,
     gmc_enabled: bool,
+    gmc_warp_points: u8,
     data_partitioned: bool,
     reversible_vlc: bool,
 ) {
@@ -952,7 +1013,8 @@ fn write_vos_vo_vol(
     // + brightness-change. The 1-warp-point encoder uses the canonical
     // 1/2-pel accuracy quantiser (`s = 2`) which matches our half-pel ME.
     if gmc_enabled {
-        bw.write_bits(1, 6); // no_of_sprite_warping_points = 1
+        let n_points = gmc_warp_points.clamp(1, 4) as u32;
+        bw.write_bits(n_points, 6); // no_of_sprite_warping_points
         bw.write_bits(GMC_SPRITE_WARPING_ACCURACY as u32, 2); // 0 → s=2 (1/2-pel)
         bw.write_bits(0, 1); // sprite_brightness_change = 0
                              // (no `low_latency_sprite_enable` for sprite_enable=2)
@@ -1148,21 +1210,31 @@ const GMC_SAMPLE_STRIDE: usize = 4;
 /// `width` / `height` are the picture dimensions in luma pels. `s = 2`
 /// (1/2-pel accuracy) is hard-wired to match the encoder's half-pel
 /// motion-estimation grid.
+///
+/// `n_points` selects the warp shape (1 = pure translation, 2 =
+/// conformal, 3 = affine, 4 = perspective). For n>=2 we delegate to
+/// [`build_multi_warp_trajectory`] which estimates per-corner motion
+/// vectors and inverts the §7.7.4 cumulative-delta encoding.
 pub(crate) fn build_gmc_trajectory(
     v: &VideoFrame,
     width: u32,
     height: u32,
     reference: &IVopPicture,
+    n_points: u8,
 ) -> (crate::gmc::SpriteTrajectory, crate::gmc::WarpParams) {
-    let width = width as usize;
-    let height = height as usize;
+    let n_points = n_points.clamp(1, 4);
+    if n_points >= 2 {
+        return build_multi_warp_trajectory(v, width, height, reference, n_points);
+    }
+    let width_us = width as usize;
+    let height_us = height as usize;
     let src = &v.planes[0];
     let mut best_dx = 0i32;
     let mut best_dy = 0i32;
     let mut best_sad = u64::MAX;
     for dy in -MAX_GMC_GLOBAL_SEARCH..=MAX_GMC_GLOBAL_SEARCH {
         for dx in -MAX_GMC_GLOBAL_SEARCH..=MAX_GMC_GLOBAL_SEARCH {
-            let sad = global_translation_sad(src, width, height, reference, dx, dy);
+            let sad = global_translation_sad(src, width_us, height_us, reference, dx, dy);
             if sad < best_sad {
                 best_sad = sad;
                 best_dx = dx;
@@ -1177,10 +1249,157 @@ pub(crate) fn build_gmc_trajectory(
     };
     t.du[0] = 2 * best_dx;
     t.dv[0] = 2 * best_dy;
-    let vol = synthesise_gmc_vol(width as u32, height as u32);
+    let vol = synthesise_gmc_vol(width, height, 1);
     let warp = crate::gmc::WarpParams::from_trajectory(&t, &vol);
     (t, warp)
 }
+
+/// Multi-warp-point GMC estimator (n=2/3/4). Per §7.7.4 the spec
+/// reference points are the picture corners:
+/// * point 0 → (0, 0)
+/// * point 1 → (W, 0)
+/// * point 2 → (0, H)
+/// * point 3 → (W, H)
+///
+/// We estimate per-corner pel-domain motion vectors `D_k = (dx_k, dy_k)`
+/// by running a coarse SAD search over a small window centred on each
+/// corner of the source frame against the reference (with edge
+/// replication), then convert to the spec's cumulative-delta encoding:
+/// * du[0] = 2 * dx_0                  (s = 2)
+/// * du[1] = 2 * (dx_1 - dx_0)         (delta from point 0 to point 1)
+/// * du[2] = 2 * (dx_2 - dx_0)         (delta from point 0 to point 2)
+/// * du[3] = 2 * (dx_3 - dx_1 - dx_2 + dx_0)
+///   (delta from sum to reach point 3)
+///
+/// (Same for `dv`.)
+///
+/// The corner SAD windows use luma blocks of size `CORNER_BLOCK` taken
+/// from the source frame; the warp sampler later replicates edge pels
+/// for out-of-bounds reads, so corner blocks that extend past the
+/// reference rectangle still produce a meaningful SAD.
+pub(crate) fn build_multi_warp_trajectory(
+    v: &VideoFrame,
+    width: u32,
+    height: u32,
+    reference: &IVopPicture,
+    n_points: u8,
+) -> (crate::gmc::SpriteTrajectory, crate::gmc::WarpParams) {
+    let n = n_points.clamp(2, 4);
+    let w = width as i32;
+    let h = height as i32;
+    let block = CORNER_BLOCK as i32;
+    // Corner anchor points — top-left of each corner SAD window in
+    // SOURCE-FRAME coordinates. We bias the windows inward by `block/2`
+    // so each window straddles the corner pixel rather than running off
+    // the picture entirely.
+    //
+    // Corner indexing matches §7.7.4: 0 = TL, 1 = TR, 2 = BL, 3 = BR.
+    let half = block / 2;
+    let corners: [(i32, i32); 4] = [
+        (-half, -half),       // (0, 0)
+        (w - half, -half),    // (W, 0)
+        (-half, h - half),    // (0, H)
+        (w - half, h - half), // (W, H)
+    ];
+    // Per-corner pel-domain MV (before scaling to du/dv). For n=2/3 we
+    // only use the first n corners; corner 3's MV is left at (0,0) and
+    // ignored downstream.
+    let mut corner_mv = [(0i32, 0i32); 4];
+    for (k, &(cx, cy)) in corners.iter().enumerate() {
+        if k as u8 >= n {
+            break;
+        }
+        corner_mv[k] = corner_motion_search(v, reference, cx, cy);
+    }
+
+    // Encode per the §7.7.4 cumulative-delta scheme. Half-pel accuracy
+    // (s = 2) means du/dv = 2 * pel-shift.
+    let mut t = crate::gmc::SpriteTrajectory {
+        points: n as usize,
+        ..Default::default()
+    };
+    t.du[0] = 2 * corner_mv[0].0;
+    t.dv[0] = 2 * corner_mv[0].1;
+    if n >= 2 {
+        t.du[1] = 2 * (corner_mv[1].0 - corner_mv[0].0);
+        t.dv[1] = 2 * (corner_mv[1].1 - corner_mv[0].1);
+    }
+    if n >= 3 {
+        t.du[2] = 2 * (corner_mv[2].0 - corner_mv[0].0);
+        t.dv[2] = 2 * (corner_mv[2].1 - corner_mv[0].1);
+    }
+    if n == 4 {
+        t.du[3] = 2 * (corner_mv[3].0 - corner_mv[1].0 - corner_mv[2].0 + corner_mv[0].0);
+        t.dv[3] = 2 * (corner_mv[3].1 - corner_mv[1].1 - corner_mv[2].1 + corner_mv[0].1);
+    }
+    let vol = synthesise_gmc_vol(width, height, n);
+    let warp = crate::gmc::WarpParams::from_trajectory(&t, &vol);
+    (t, warp)
+}
+
+/// Per-corner pel-domain ME — runs a brute-force `±MAX_GMC_GLOBAL_SEARCH`
+/// integer-pel SAD over a `CORNER_BLOCK × CORNER_BLOCK` source window
+/// against the reference (with edge replication). Returns the best
+/// `(dx, dy)` pel translation. Used by [`build_multi_warp_trajectory`].
+fn corner_motion_search(
+    v: &VideoFrame,
+    reference: &IVopPicture,
+    src_x0: i32,
+    src_y0: i32,
+) -> (i32, i32) {
+    let block = CORNER_BLOCK as i32;
+    let src = &v.planes[0];
+    let src_h = (src.data.len() / src.stride) as i32;
+    let src_w = src.stride as i32;
+    let ref_h = (reference.y.len() / reference.y_stride) as i32;
+    let ref_w = reference.y_stride as i32;
+    let read_src = |x: i32, y: i32| -> i32 {
+        let xc = x.clamp(0, src_w - 1) as usize;
+        let yc = y.clamp(0, src_h - 1) as usize;
+        src.data[yc * src.stride + xc] as i32
+    };
+    let read_ref = |x: i32, y: i32| -> i32 {
+        let xc = x.clamp(0, ref_w - 1) as usize;
+        let yc = y.clamp(0, ref_h - 1) as usize;
+        reference.y[yc * reference.y_stride + xc] as i32
+    };
+    let mut best_dx = 0i32;
+    let mut best_dy = 0i32;
+    let mut best_sad = u64::MAX;
+    for dy in -MAX_GMC_GLOBAL_SEARCH..=MAX_GMC_GLOBAL_SEARCH {
+        for dx in -MAX_GMC_GLOBAL_SEARCH..=MAX_GMC_GLOBAL_SEARCH {
+            let mut sad: u64 = 0;
+            let mut j = 0i32;
+            while j < block {
+                let mut i = 0i32;
+                while i < block {
+                    let s = read_src(src_x0 + i, src_y0 + j);
+                    let r = read_ref(src_x0 + i + dx, src_y0 + j + dy);
+                    sad += (s - r).unsigned_abs() as u64;
+                    i += CORNER_SAMPLE_STRIDE as i32;
+                }
+                j += CORNER_SAMPLE_STRIDE as i32;
+            }
+            if sad < best_sad {
+                best_sad = sad;
+                best_dx = dx;
+                best_dy = dy;
+            }
+        }
+    }
+    (best_dx, best_dy)
+}
+
+/// Side length (in pels) of the per-corner SAD window used by
+/// [`corner_motion_search`]. 32 pels gives enough texture to lock onto
+/// the corner motion while keeping the search cost modest
+/// (32×32×33×33 ≈ 1.1M ops per corner, dominated by the 33×33 search
+/// grid). Sampled every `CORNER_SAMPLE_STRIDE` pels in each axis.
+const CORNER_BLOCK: usize = 32;
+
+/// Sampling stride inside each corner window. Mirrors `GMC_SAMPLE_STRIDE`'s
+/// use in the global-translation path.
+const CORNER_SAMPLE_STRIDE: usize = 4;
 
 /// Strided luma SAD of source vs reference translated by `(dx, dy)`. Each
 /// out-of-bounds reference pel is replaced by the nearest edge pel
@@ -1213,9 +1432,13 @@ fn global_translation_sad(
 }
 
 /// Build a minimal `VideoObjectLayer` describing the GMC settings the
-/// encoder advertises (verid=2, sprite_enable=2, 1 warp point, half-pel
-/// accuracy). Used only as context for `WarpParams::from_trajectory`.
-fn synthesise_gmc_vol(width: u32, height: u32) -> crate::headers::vol::VideoObjectLayer {
+/// encoder advertises (verid=2, sprite_enable=2, `n_points` warp points,
+/// half-pel accuracy). Used only as context for `WarpParams::from_trajectory`.
+fn synthesise_gmc_vol(
+    width: u32,
+    height: u32,
+    n_points: u8,
+) -> crate::headers::vol::VideoObjectLayer {
     use crate::headers::vol::{AspectRatioInfo, ChromaFormat, ShapeType, VideoObjectLayer};
     VideoObjectLayer {
         random_accessible_vol: false,
@@ -1238,7 +1461,7 @@ fn synthesise_gmc_vol(width: u32, height: u32) -> crate::headers::vol::VideoObje
         interlaced: false,
         obmc_disable: true,
         sprite_enable: 2,
-        no_of_sprite_warping_points: 1,
+        no_of_sprite_warping_points: n_points.clamp(1, 4),
         sprite_warping_accuracy: GMC_SPRITE_WARPING_ACCURACY,
         sprite_brightness_change: false,
         low_latency_sprite_enable: false,

@@ -103,12 +103,14 @@ decoder accepts as-is. Input is `Yuv420P` only.
 - **P-VOP.** Integer-pel diamond motion search (±7 pel) then half-pel
   refinement, automatic 1MV / 4MV / Intra-in-P mode decision per
   §7.5.7 + §6.3.7 (Inter4MV picked when its luma SAD beats 1MV by
-  more than the `FOURMV_LAMBDA` MVD-bit lambda; Intra-in-P picked on
-  scene-change-style high-residual MBs). 4MV emits Table B-13 rows
-  16..=19 (`Inter4MV`) with four MVDs per MB and the per-block
-  median predictor that may reference earlier sub-blocks of the same
-  MB (§7.6.2 fig 7-6). Median-predicted MVD (Table B-12), inter
-  texture coding with H.263 quant and Table B-17 tcoef walk.
+  more than the `FOURMV_LAMBDA` MVD-bit lambda; Intra-in-P picked
+  when the inter-mode cost — luma SAD plus the MVD bit cost the inter
+  mode would pay against the median predictor — exceeds the per-MB
+  intra MAD proxy plus `INTRA_IN_P_BIAS + INTRA_MARGIN`). 4MV emits
+  Table B-13 rows 16..=19 (`Inter4MV`) with four MVDs per MB and the
+  per-block median predictor that may reference earlier sub-blocks of
+  the same MB (§7.6.2 fig 7-6). Median-predicted MVD (Table B-12),
+  inter texture coding with H.263 quant and Table B-17 tcoef walk.
   `not_coded` skip MBs emitted when the residual is all-zero and
   MV == (0, 0).
 - **GOP cadence.** I-VOP every `DEFAULT_GOP_SIZE` frames (= 16); all
@@ -116,13 +118,19 @@ decoder accepts as-is. Input is `Yuv420P` only.
   option (1..=300).
 - **GMC (Global Motion Compensation, §7.6.7 / §7.7).** Optional —
   enabled with the `gmc` codec option. When on, the VOL advertises
-  `sprite_enable = 2` + 1 warping point at half-pel accuracy; each
-  P-VOP becomes an `S(GMC)`-VOP carrying one `(du, dv)`
-  `sprite_trajectory()` derived from a coarse `±16`-pel global-
-  translation SAD search; per-MB `mcsel` picks between translational
-  MC and warp prediction. ffmpeg cross-decode validated on synthetic
-  global-pan content. Single-warp-point only — 2/3/4-point
-  affine/perspective warps are a follow-up.
+  `sprite_enable = 2` + 1..=4 warping points at half-pel accuracy;
+  each P-VOP becomes an `S(GMC)`-VOP carrying `n` `(du, dv)`
+  `sprite_trajectory()` pairs; per-MB `mcsel` picks between
+  translational MC and warp prediction. The warp-point count is
+  controlled by the `gmc_warp_points` codec option (1..=4, default 1):
+  1 = pure translation (round-20 path, coarse `±16`-pel global SAD),
+  2 = conformal (rotation/scale), 3 = affine, 4 = perspective. The
+  multi-warp estimator runs a per-corner `±16`-pel SAD over a `32×32`
+  source window at each picture corner and inverts the §7.7.4
+  cumulative-delta encoding to derive the trajectory. ffmpeg cross-
+  decode validated on synthetic global-pan content for n=1/2/3 (n=4
+  decodes correctly through our own decoder; ffmpeg's mpeg4 decoder
+  rejects `no_of_sprite_warping_points = 4` per `mpeg4videodec.c`).
 - **Quantisation.** H.263 quant (`mpeg_quant = 0`), constant
   `vop_quant = 5` by default, no dquant. Override per-encoder via
   the `qp` codec option (1..=31), or split per VOP-type with
@@ -136,10 +144,9 @@ the all-I equivalent.
 
 Out of scope for the encoder:
 
-- Multi-point GMC warp (2/3/4-point affine / perspective);
-  `sprite_brightness_change`. Encoder ships single-warp-point
-  translational GMC only — sufficient for camera-pan / dolly-style
-  global motion.
+- `sprite_brightness_change` (the VOL bit is 0; brightness deltas are
+  not estimated). Multi-point GMC warps (2/3/4-point) are SUPPORTED
+  via `gmc_warp_points` (round-22 addition).
 - Static sprites (`sprite_enable = 1`, S-VOP coding).
 - B-VOPs round-trip is supported via `bf=N`; combined with `gmc`
   the encoder advertises both features in the VOL but does not

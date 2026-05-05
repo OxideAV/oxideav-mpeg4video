@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- encoder: **Multi-warp-point GMC (2/3/4-point, §7.7.4 + §7.7.5).** New
+  `gmc_warp_points` codec option (1..=4) controls the warp's degrees
+  of freedom: 1 = pure translation (round-20 path), 2 = conformal,
+  3 = affine, 4 = perspective. The estimator runs a per-corner ±16-pel
+  SAD over a 32×32 source window at each picture corner (TL, TR, BL,
+  BR) and inverts the §7.7.4 cumulative-delta encoding to derive
+  `(du[i], dv[i])` for `i = 0..n`:
+  * `du[0] = 2 * dx_0`
+  * `du[1] = 2 * (dx_1 - dx_0)`
+  * `du[2] = 2 * (dx_2 - dx_0)`
+  * `du[3] = 2 * (dx_3 - dx_1 - dx_2 + dx_0)`
+
+  Decoder side already supported all four warp counts via the
+  production `WarpParams::from_trajectory` perspective derivation;
+  this round closes the encoder gap. ffmpeg cross-decode validated
+  for n=2/3 (n=4 decodes correctly through our own decoder; ffmpeg's
+  mpeg4 decoder rejects `no_of_sprite_warping_points = 4` per a long-
+  standing limitation in `libavcodec/mpeg4videodec.c`). New tests:
+  `tests/p_vop.rs::gmc_multi_warp_self_roundtrip` (n=2/3/4 ≥ 30 dB
+  PSNR per frame), `tests/p_vop.rs::gmc_multi_warp_ffmpeg_decode`
+  (n=2/3 through ffmpeg ≥ 30 dB on the I-VOP), and
+  `tests/p_vop.rs::gmc_warp_points_option_validates_range` (option
+  parsing).
+- encoder: **Intra-in-P MVD-bit accounting in the mode-decision
+  lambda (§6.3.7).** The intra-in-P picker now adds the MVD bit cost
+  the inter mode would pay (in SAD-equivalent units, scaled by
+  `MVD_BIT_TO_SAD = 5` to match `FOURMV_LAMBDA` / `GMC_LAMBDA`
+  conventions) to the inter cost proxy before comparing against the
+  intra MAD proxy. The MVD bit estimator (`pvop::mvd_savings_for_intra_in_p`)
+  re-runs the encoder's "commit-then-predict" 4MV loop on a temporary
+  `MvGrid` clone so the predictor accounting matches what
+  `emit_p_mb` would produce on the wire — without this, the encoder
+  ignored the MVD cost entirely and could pick inter-MB even when the
+  median predictor diverged hard from the actual MV (closing the
+  encoder/decoder symmetry gap noted in the round task). GMC and
+  skipped MBs get no MVD credit (no MVD on the wire). New regression
+  test `tests/p_vop.rs::intra_in_p_mvd_search_does_not_regress_stable_content`
+  asserts the lambda doesn't over-trigger intra on stable content.
+  Existing scene-change test
+  `tests/p_vop.rs::p_vop_intra_in_p_scene_change_psnr` continues to
+  pass at ≥ 38 dB through ffmpeg.
+
 ## [0.1.4](https://github.com/OxideAV/oxideav-mpeg4video/compare/v0.1.3...v0.1.4) - 2026-05-05
 
 ### Other

@@ -277,10 +277,30 @@ pub fn encode_p_vop_body_with_grid(
             // would pay coding this MB as inter. An MAD-based intra cost
             // proxy is computed against the source-MB DC mean. Switch
             // to intra when intra clearly wins (inter SAD exceeds the
-            // intra proxy plus `INTRA_IN_P_BIAS + INTRA_MARGIN`).
+            // intra proxy plus `INTRA_IN_P_BIAS + INTRA_MARGIN` and the
+            // MVD-bit credit for inter; see [`mvd_savings_for_intra_in_p`]).
+            //
+            // GMC MBs do not carry an MVD on the wire (§7.6.7) — the
+            // mcsel bit substitutes for the per-MB MV decode — so they
+            // get no MVD credit. Skipped MBs (`not_coded`) likewise pay
+            // no MVD. The credit only applies to MBs that would actually
+            // emit MVDs in inter mode.
             let intra_cost = intra_cost_proxy(v, width, height, mb_x, mb_y);
             let inter_cost = inter_cost_proxy(&mb);
-            let prefer_intra = inter_cost
+            let mvd_credit = if mb.gmc || mb.skipped {
+                0
+            } else {
+                mvd_savings_for_intra_in_p(&mb, mb_x, mb_y, &mv_grid, f_code_fwd)
+            };
+            // Add the inter mode's MVD bit cost (in SAD-equivalent units)
+            // to its coding-cost proxy: intra-in-P saves those bits, so
+            // they should make intra strictly more attractive when the MV
+            // predictor diverges from the actual MV. This closes the
+            // encoder/decoder symmetry gap noted in the round task —
+            // previously the encoder ignored MVD bits when picking
+            // intra-in-P, while the decoder still parsed them correctly.
+            let inter_cost_adj = inter_cost.saturating_add(mvd_credit);
+            let prefer_intra = inter_cost_adj
                 > intra_cost
                     .saturating_add(INTRA_IN_P_BIAS)
                     .saturating_add(INTRA_MARGIN);
@@ -418,6 +438,72 @@ pub(crate) fn intra_cost_proxy(
 /// inter; per-block DC for intra).
 fn inter_cost_proxy(mb: &PMbEncoding) -> u32 {
     mb.inter_luma_sad
+}
+
+/// Estimated MVD bit cost for the chosen inter mode, expressed in
+/// SAD-equivalent units (so it can be added to `inter_cost_proxy` and
+/// compared against the intra MAD proxy directly).
+///
+/// The intra-in-P decision currently runs against an unadjusted SAD
+/// proxy: per the §6.3.7 mode menu, an intra-in-P MB pays its own
+/// MCBPC + 6 DC VLCs but skips the MVD pair(s). The inter mode pays
+/// exactly that MVD pair (1 pair for 1MV, 4 pairs for Inter4MV),
+/// median-predicted from the surrounding MV grid. When the predictor is
+/// poor (e.g. first row of a packet, scene-change boundary) those MVD
+/// bits dominate and intra becomes cheaper — but the unadjusted SAD
+/// proxy hides that.
+///
+/// Bit accounting:
+/// * 1MV: 1 MVD pair = `mvd_pair_bits(dx, dy, f_code)`.
+/// * 4MV: 4 MVD pairs (one per 8×8 sub-block), each predicted from the
+///   IN-MB grid as updated by previous sub-blocks (§7.6.2 fig 7-6).
+///   We replay the encoder's "commit-then-predict" loop using a
+///   temporary `MvGrid` clone so the predictor lookups match what
+///   `emit_p_mb` would produce on the wire.
+///
+/// Conversion: at the encoder's default Q=5, a single residual bit
+/// roughly costs `MVD_BIT_TO_SAD` SAD points to the inter side
+/// (empirically tuned, mirrors the `FOURMV_LAMBDA` / `GMC_LAMBDA`
+/// scaling used elsewhere in this file).
+pub(crate) fn mvd_savings_for_intra_in_p(
+    mb: &PMbEncoding,
+    mb_x: usize,
+    mb_y: usize,
+    mv_grid: &MvGrid,
+    f_code_fwd: u8,
+) -> u32 {
+    /// SAD-points-per-bit conversion at Q≈5 (matches `FOURMV_LAMBDA`
+    /// and `GMC_LAMBDA` derivations).
+    const MVD_BIT_TO_SAD: u32 = 5;
+    let range = 32i32 << (f_code_fwd.saturating_sub(1) as i32);
+    let bits = if mb.four_mv {
+        // Replay the 4MV commit-then-predict loop on a temporary grid
+        // clone so the predictor accounting matches the bitstream.
+        let mut tmp = mv_grid.clone();
+        let mut committed = MbMotion {
+            mv: [(0, 0); 4],
+            four_mv: true,
+            not_coded: false,
+        };
+        let mut total: u32 = 0;
+        for blk in 0..4 {
+            tmp.set(mb_x, mb_y, committed);
+            let (px, py) = crate::inter::predict_mv_full(&tmp, mb_x, mb_y, blk, true, 0, 0);
+            let (mvx, mvy) = mb.mv4_half[blk];
+            let dx = wrap_mvd(mvx - px, range);
+            let dy = wrap_mvd(mvy - py, range);
+            total += mvd_pair_bits(dx, dy, f_code_fwd);
+            committed.mv[blk] = (mvx, mvy);
+        }
+        total
+    } else {
+        let (px, py) = crate::inter::predict_mv_full(mv_grid, mb_x, mb_y, 0, false, 0, 0);
+        let (mvx, mvy) = mb.mv_half;
+        let dx = wrap_mvd(mvx - px, range);
+        let dy = wrap_mvd(mvy - py, range);
+        mvd_pair_bits(dx, dy, f_code_fwd)
+    };
+    bits.saturating_mul(MVD_BIT_TO_SAD)
 }
 
 /// Load one 8×8 source block (for intra-cost computation). Mirrors
@@ -1825,6 +1911,42 @@ fn write_cbpy(bw: &mut BitWriter, cbpy: u8) {
         _ => unreachable!("cbpy out of range: {cbpy}"),
     };
     bw.write_bits(code, bits);
+}
+
+/// Return the bit cost of one motion-vector component without emitting
+/// any bits. Mirrors the bit accounting inside [`write_mv_component`]
+/// for the rate-distortion-style intra-in-P MVD search.
+///
+/// `diff` is in half-pel units and assumed to be already wrapped into
+/// `[-32*f, 32*f-1]`. Returns the number of bits the encoder would
+/// write: magnitude VLC (Table B-12) + sign bit + `r_size` residual
+/// bits (`r_size = f_code - 1`).
+pub(crate) fn mv_component_bits(diff: i32, f_code: u8) -> u32 {
+    let r_size = (f_code.saturating_sub(1)) as u32;
+    let f = 1i32 << r_size;
+    let abs = diff.unsigned_abs() as i32;
+    let mc_abs = if abs == 0 {
+        0i32
+    } else {
+        let n = abs - 1;
+        n / f + 1
+    };
+    let mc_clamped = mc_abs.clamp(0, 32) as usize;
+    let row = mv_tab_row(mc_clamped);
+    let mut bits = row.0 as u32;
+    if mc_clamped != 0 {
+        bits += 1; // sign
+        if f != 1 {
+            bits += r_size;
+        }
+    }
+    bits
+}
+
+/// Bit cost of an MVD pair `(dx, dy)` given `f_code`. Convenience wrapper
+/// over [`mv_component_bits`].
+pub(crate) fn mvd_pair_bits(dx: i32, dy: i32, f_code: u8) -> u32 {
+    mv_component_bits(dx, f_code) + mv_component_bits(dy, f_code)
 }
 
 /// Write one motion-vector component per §7.6.3.
