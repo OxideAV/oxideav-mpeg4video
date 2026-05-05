@@ -138,7 +138,9 @@ fn has_start_code(data: &[u8]) -> bool {
 }
 
 /// Register this codec's decoder + I/P-VOP encoder with a registry,
-/// including the container tags it claims.
+/// including the container tags it claims. Prefer the unified
+/// [`register`] entry point when you have a
+/// [`oxideav_core::RuntimeContext`] in hand.
 ///
 /// The codec is registered twice:
 ///   * First registration — decoder + encoder + the unambiguous ISO
@@ -147,7 +149,7 @@ fn has_start_code(data: &[u8]) -> bool {
 ///     DIV3-family FourCCs with `probe_is_mpeg4_part2` so DIV3 files
 ///     that actually hold ISO Part 2 bytes resolve here, while files
 ///     that hold MS-MPEG4 bytes lose to `oxideav-msmpeg4`'s probe.
-pub fn register(reg: &mut CodecRegistry) {
+pub fn register_codecs(reg: &mut CodecRegistry) {
     let caps = CodecCapabilities::video("mpeg4video_sw")
         .with_lossy(true)
         .with_intra_only(false)
@@ -194,6 +196,33 @@ pub fn register(reg: &mut CodecRegistry) {
         CodecTag::fourcc(b"MPG3"),
         CodecTag::fourcc(b"AP41"),
     ]));
+}
+
+/// Unified registration entry point — installs MPEG-4 Part 2 video
+/// into the codec sub-registry of the supplied
+/// [`oxideav_core::RuntimeContext`].
+pub fn register(ctx: &mut oxideav_core::RuntimeContext) {
+    register_codecs(&mut ctx.codecs);
+}
+
+#[cfg(test)]
+mod register_tests {
+    use super::*;
+
+    #[test]
+    fn register_via_runtime_context_installs_codec_factory() {
+        let mut ctx = oxideav_core::RuntimeContext::new();
+        register(&mut ctx);
+        let id = CodecId::new(CODEC_ID_STR);
+        assert!(
+            ctx.codecs.has_decoder(&id),
+            "decoder factory not installed via RuntimeContext"
+        );
+        assert!(
+            ctx.codecs.has_encoder(&id),
+            "encoder factory not installed via RuntimeContext"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -251,7 +280,7 @@ mod lib_tests {
     #[test]
     fn registered_tag_claims_route_correctly() {
         let mut reg = CodecRegistry::new();
-        register(&mut reg);
+        register_codecs(&mut reg);
         // XVID: unambiguous ISO FourCC, resolves to mpeg4video.
         let xvid = CodecTag::fourcc(b"XVID");
         assert_eq!(
