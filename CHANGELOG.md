@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4](https://github.com/OxideAV/oxideav-mpeg4video/compare/v0.1.3...v0.1.4) - 2026-05-05
+
+### Other
+
+- install ffmpeg via reusable workflow's extra_packages_* inputs
+- Inter4MV under data partitioning + spec-correct 4MV chroma + predict_mv fix
+
 ### Fixed
 
 - encoder/decoder: **§7.6.2 fig 7-6 MV-predictor neighbour-substitution
