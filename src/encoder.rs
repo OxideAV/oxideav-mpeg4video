@@ -279,6 +279,26 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         ));
     }
 
+    // `sprite_static` — enables static-sprite mode (§6.2.5 / §7.7).
+    // When on, the VOL advertises `sprite_enable = 1` with a sprite
+    // canvas equal to the VOP dimensions and `low_latency_sprite_enable
+    // = 1`. Frame 0 is encoded as the sprite canvas (I-VOP body). All
+    // subsequent frames become S-VOPs with `vop_coded = 0` — the
+    // decoder re-emits the sprite canvas for those frames. This is the
+    // simplest static-sprite path (no piece updates, no crop/pan
+    // sprite_trajectory). Mutually exclusive with gmc / dp / qpel /
+    // bf>0 (each uses a different VOP coding path).
+    let static_sprite = params
+        .options
+        .get("sprite_static")
+        .map(|s| !matches!(s, "" | "0" | "false" | "False" | "FALSE"))
+        .unwrap_or(false);
+    if static_sprite && (gmc_enabled || data_partitioned || quarter_sample || max_b_frames > 0) {
+        return Err(Error::unsupported(
+            "mpeg4 encoder: sprite_static=1 is mutually exclusive with gmc, dp, qpel, bf>0",
+        ));
+    }
+
     // `qp` sets the default quant for all VOP types; `qp_i`, `qp_p`
     // and `qp_b` override per VOP type. All values are clamped to
     // [MIN_VOP_QUANT, MAX_VOP_QUANT] — out-of-range strings are
@@ -353,6 +373,7 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         reference_grid: None,
         reference_time: 0,
         rounding_type: false,
+        static_sprite,
     }))
 }
 
@@ -432,6 +453,10 @@ struct Mpeg4VideoEncoder {
     /// we toggle this between P-VOPs (starts at 0 after an I-VOP, alternates
     /// afterwards) — it matches the half-pel rounding inside `mc.rs`.
     rounding_type: bool,
+    /// `sprite_static` mode — `sprite_enable = 1` in the VOL. Frame 0 is
+    /// encoded as the sprite canvas (I-VOP body); all subsequent frames
+    /// become S-VOPs with `vop_coded = 0` (decoder re-emits the canvas).
+    static_sprite: bool,
 }
 
 impl Encoder for Mpeg4VideoEncoder {
@@ -533,12 +558,28 @@ impl Mpeg4VideoEncoder {
                 self.gmc_warp_points,
                 self.data_partitioned,
                 self.reversible_vlc,
+                self.static_sprite,
             );
             self.headers_emitted = true;
         }
         // Display time in VOL time-base ticks = original frame pts.
         let time_inc = display_time_inc(v, self.display_index);
         let vti_resolution = (self.frame_rate.num as u32).max(1);
+        // Static sprite path: frame 0 is the sprite canvas (I-VOP); all
+        // subsequent frames are S-VOPs with vop_coded=0 that instruct
+        // the decoder to re-emit the sprite canvas.
+        if self.static_sprite && self.vop_count > 0 {
+            write_static_sprite_s_vop_not_coded(&mut bw, time_inc, vti_resolution);
+            bw.align_to_byte_zero();
+            let bytes = bw.finish();
+            let mut pkt = Packet::new(0, self.time_base, bytes);
+            pkt.pts = v.pts;
+            pkt.dts = v.pts;
+            pkt.flags.keyframe = false;
+            self.pending.push_back(pkt);
+            self.vop_count += 1;
+            return Ok(());
+        }
         if is_keyframe {
             write_i_vop_header(&mut bw, time_inc, self.vop_quant_i, vti_resolution);
             let pic = if self.data_partitioned {
@@ -668,6 +709,7 @@ impl Mpeg4VideoEncoder {
                 self.gmc_warp_points,
                 self.data_partitioned,
                 self.reversible_vlc,
+                self.static_sprite,
             );
             self.headers_emitted = true;
         }
@@ -916,6 +958,7 @@ fn write_vos_vo_vol(
     gmc_warp_points: u8,
     data_partitioned: bool,
     reversible_vlc: bool,
+    static_sprite: bool,
 ) {
     // VOS.
     write_start_code(bw, VOS_START_CODE);
@@ -926,7 +969,8 @@ fn write_vos_vo_vol(
     //     that admits DP + 4MV simultaneously per Table G.1 / Annex G).
     //   * Simple Profile Level 1 (`0x01`) — most-compatible default
     //     for plain I+P half-pel.
-    let pli = if enable_b_vops || quarter_sample || gmc_enabled || data_partitioned {
+    let pli = if enable_b_vops || quarter_sample || gmc_enabled || data_partitioned || static_sprite
+    {
         0xF1
     } else {
         0x01
@@ -952,17 +996,18 @@ fn write_vos_vo_vol(
                          // QPel, GMC and DP+Inter4MV. The bare Simple
                          // (1) profile is reserved for plain I+P
                          // half-pel without DP.
-    let vot_indication = if enable_b_vops || quarter_sample || gmc_enabled || data_partitioned {
-        4
-    } else {
-        1
-    };
+    let vot_indication =
+        if enable_b_vops || quarter_sample || gmc_enabled || data_partitioned || static_sprite {
+            4
+        } else {
+            1
+        };
     bw.write_bits(vot_indication, 8);
     // `is_object_layer_identifier` is required when we need verid=2 to
     // unlock QPel / GMC / DP-with-4MV syntax. For the half-pel + no-B +
     // no-GMC + no-DP path keep it 0 so the bitstream is byte-for-byte
     // identical to round-14.
-    let needs_verid2 = quarter_sample || gmc_enabled || data_partitioned;
+    let needs_verid2 = quarter_sample || gmc_enabled || data_partitioned || static_sprite;
     if needs_verid2 {
         bw.write_bits(1, 1); // is_object_layer_identifier = 1
         bw.write_bits(2, 4); // verid = 2 (QPel + GMC + newpred syntax)
@@ -1000,24 +1045,53 @@ fn write_vos_vo_vol(
     bw.write_bits(1, 1); // obmc_disable = 1
                          // sprite_enable — 1 bit when verid==1, 2 bits when verid>=2
                          // (per the round-2000 corrigendum that introduced GMC).
-                         // GMC sets this to 2; static-sprite mode (1) is not
-                         // emitted by the encoder.
+                         // GMC sets this to 2; static-sprite mode (1) requires
+                         // verid>=2 for the 2-bit field so the sprite_rect fields
+                         // can be emitted.
     if needs_verid2 {
-        let sprite_enable = if gmc_enabled { 2 } else { 0 };
+        let sprite_enable = if gmc_enabled {
+            2u32
+        } else if static_sprite {
+            1u32
+        } else {
+            0u32
+        };
         bw.write_bits(sprite_enable, 2);
     } else {
-        bw.write_bits(0, 1); // sprite_enable = 0 (verid==1 → 1 bit)
+        // verid==1: 1-bit sprite_enable; static_sprite needs verid>=2 so
+        // it's caught by the factory mutual-exclusion check above.
+        bw.write_bits(0, 1); // sprite_enable = 0
     }
-    // GMC sprite-trajectory descriptors (§6.2.3 + amendment 1). For
-    // `sprite_enable == 2` we follow the GMC branch: warping-points + accuracy
-    // + brightness-change. The 1-warp-point encoder uses the canonical
-    // 1/2-pel accuracy quantiser (`s = 2`) which matches our half-pel ME.
+    // Sprite/GMC descriptor block (§6.2.3). Present when sprite_enable
+    // is 1 or 2.
     if gmc_enabled {
+        // sprite_enable == 2 (GMC) branch: warping-points + accuracy +
+        // brightness-change (no low_latency_sprite_enable for GMC).
         let n_points = gmc_warp_points.clamp(1, 4) as u32;
         bw.write_bits(n_points, 6); // no_of_sprite_warping_points
         bw.write_bits(GMC_SPRITE_WARPING_ACCURACY as u32, 2); // 0 → s=2 (1/2-pel)
         bw.write_bits(0, 1); // sprite_brightness_change = 0
-                             // (no `low_latency_sprite_enable` for sprite_enable=2)
+    } else if static_sprite {
+        // sprite_enable == 1 (static sprite) branch (§6.2.3 Table 6-7).
+        // For the basic low-latency path we use 0 warp points (identity
+        // sprite positioning) and `low_latency_sprite_enable = 1`.
+        // sprite_rect (Table 6-7): width, height, left, top — each a
+        // 13-bit value followed by a marker bit. Per §6.2.3 the order
+        // in the bitstream is: sprite_width, sprite_height,
+        // sprite_left_coordinate, sprite_top_coordinate. For the
+        // same-size sprite (canvas == VOP) left=0, top=0.
+        bw.write_bits(width, 13); // sprite_width = VOP width
+        bw.write_bits(1, 1); // marker
+        bw.write_bits(height, 13); // sprite_height = VOP height
+        bw.write_bits(1, 1); // marker
+        bw.write_bits(0, 13); // sprite_left_coordinate = 0
+        bw.write_bits(1, 1); // marker
+        bw.write_bits(0, 13); // sprite_top_coordinate = 0
+        bw.write_bits(1, 1); // marker
+        bw.write_bits(0, 6); // no_of_sprite_warping_points = 0
+        bw.write_bits(0, 2); // sprite_warping_accuracy = 0 (1/2-pel; unused when points=0)
+        bw.write_bits(0, 1); // sprite_brightness_change = 0
+        bw.write_bits(1, 1); // low_latency_sprite_enable = 1
     }
     bw.write_bits(0, 1); // not_8_bit = 0
     bw.write_bits(0, 1); // mpeg_quant = 0 (use H.263 quant)
@@ -1177,6 +1251,33 @@ fn write_p_vop_header(
     bw.write_bits(vop_quant, 5);
     bw.write_bits(f_code_fwd as u32, 3); // vop_fcode_forward
                                          // (No fcode_backward for P / S(GMC).)
+}
+
+/// Emit a static-sprite S-VOP with `vop_coded = 0` (§6.2.5). The
+/// decoder re-emits the sprite canvas (most recently decoded I-VOP) for
+/// this frame. This is the simplest static-sprite path — no piece
+/// updates, no sprite_trajectory (0 warp points in the VOL).
+///
+/// Header layout for sprite S-VOP with vop_coded=0:
+///   start_code       0x000001B6
+///   vop_coding_type  "S" (binary 11)
+///   modulo_time_base (sequence of 1-bits + terminating 0)
+///   marker_bit
+///   vop_time_increment
+///   marker_bit
+///   vop_coded        0  ← early exit for the decoder
+///
+/// `vti_resolution` — `vop_time_increment_resolution` from the VOL header
+/// (== frame_rate.num).
+fn write_static_sprite_s_vop_not_coded(bw: &mut BitWriter, time_inc: u32, vti_resolution: u32) {
+    write_start_code(bw, VOP_START_CODE);
+    bw.write_bits(0b11, 2); // vop_coding_type = "S"
+    bw.write_bits(0, 1); // modulo_time_base = `0` terminator
+    bw.write_bits(1, 1); // marker
+    let vti_bits = bits_needed(vti_resolution.saturating_sub(1)).max(1);
+    bw.write_bits(time_inc % vti_resolution.max(1), vti_bits);
+    bw.write_bits(1, 1); // marker
+    bw.write_bits(0, 1); // vop_coded = 0
 }
 
 // -------------------------------------------------------------------------

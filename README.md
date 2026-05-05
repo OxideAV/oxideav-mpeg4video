@@ -83,7 +83,10 @@ against ffmpeg-generated reference clips (I-only and GOP-of-10).
 
 Out of scope — returns `Error::Unsupported`:
 
-- B-VOPs and S-VOPs (sprites) / GMC.
+- B-VOPs decoded; S-VOPs decoded as P-VOP body when `sprite_enable=2`
+  (GMC). Static-sprite S-VOPs with `vop_coded=1` (piece updates) still
+  return `Error::Unsupported`; `vop_coded=0` is handled by the
+  not-coded re-emit path.
 - Quarter-pel motion (`quarter_sample`).
 - Interlaced field coding, scalability.
 - Non-rectangular shape (binary / grayscale shape coding).
@@ -131,6 +134,23 @@ decoder accepts as-is. Input is `Yuv420P` only.
   decode validated on synthetic global-pan content for n=1/2/3 (n=4
   decodes correctly through our own decoder; ffmpeg's mpeg4 decoder
   rejects `no_of_sprite_warping_points = 4` per `mpeg4videodec.c`).
+  Cross-validated on a 256×256 30-frame zoom-in fixture (conformal n=2
+  and affine n=3 both clear ≥ 28 dB PSNR per frame).
+- **Intra-in-P MVD-bit accounting (§6.3.7).** The intra-in-P picker
+  adds the MVD bit cost the inter mode would pay (scaled by
+  `MVD_BIT_TO_SAD = 5`) to the inter cost proxy before comparing against
+  the intra MAD proxy. The MVD bit estimator (`pvop::mvd_savings_for_intra_in_p`)
+  re-runs the encoder's commit-then-predict loop on a temporary
+  `MvGrid` clone so the predictor accounting matches what `emit_p_mb`
+  would produce on the wire.
+- **Static sprite VOP (§6.2.5 / §7.7, basic path).** Enabled with the
+  `sprite_static` codec option. The VOL advertises `sprite_enable = 1`
+  with a same-size sprite canvas and `low_latency_sprite_enable = 1`
+  (0 warp points, no brightness change). Frame 0 is encoded as the
+  sprite canvas (I-VOP body). All subsequent frames become S-VOPs with
+  `vop_coded = 0` — the decoder re-emits the sprite canvas. Mutually
+  exclusive with `gmc`, `dp`, `qpel`, `bf>0`. Static-sprite S-VOPs
+  with `vop_coded = 1` (piece updates) are deferred.
 - **Quantisation.** H.263 quant (`mpeg_quant = 0`), constant
   `vop_quant = 5` by default, no dquant. Override per-encoder via
   the `qp` codec option (1..=31), or split per VOP-type with
@@ -140,14 +160,15 @@ decoder accepts as-is. Input is `Yuv420P` only.
 Round-trip PSNR on the synthetic 64×64 moving-gradient test
 (`tests/p_vop.rs`): around 43 dB on the I-VOP, around 41.6 dB on the
 15th P-VOP of a GOP of 16. P-VOP total byte count is around 21 % of
-the all-I equivalent.
+the all-I equivalent. At QP=3 on 256×256@24fps, PSNR_Y ≥ 35 dB on
+all frames (validated by `tests/p_vop.rs::psnr_y_at_4mbit_s_target`).
 
 Out of scope for the encoder:
 
 - `sprite_brightness_change` (the VOL bit is 0; brightness deltas are
   not estimated). Multi-point GMC warps (2/3/4-point) are SUPPORTED
   via `gmc_warp_points` (round-22 addition).
-- Static sprites (`sprite_enable = 1`, S-VOP coding).
+- Static-sprite S-VOPs with `vop_coded = 1` (piece updates).
 - B-VOPs round-trip is supported via `bf=N`; combined with `gmc`
   the encoder advertises both features in the VOL but does not
   warp B-VOP references through the trajectory.

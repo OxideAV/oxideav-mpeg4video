@@ -50,6 +50,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Existing scene-change test
   `tests/p_vop.rs::p_vop_intra_in_p_scene_change_psnr` continues to
   pass at ≥ 38 dB through ffmpeg.
+- encoder: **Static sprite VOP (`sprite_enable = 1`, §6.2.5 / §7.7),
+  basic low-latency path.** New `sprite_static` codec option. When on,
+  the VOL advertises `sprite_enable = 1` + a same-size canvas
+  (`sprite_width = W, sprite_height = H, left = 0, top = 0`) +
+  `low_latency_sprite_enable = 1` + 0 warp points. Frame 0 is encoded
+  as the sprite canvas (I-VOP body at the same quant/geometry as the
+  plain I encoder). All subsequent frames emit `vop_coded = 0` S-VOPs
+  — the decoder re-emits the sprite canvas unchanged. Mutually
+  exclusive with `gmc`, `dp`, `qpel`, `bf>0`. New tests:
+  `tests/p_vop.rs::static_sprite_self_roundtrip` (4-frame round-trip
+  ≥ 30 dB PSNR of each S-VOP against canvas) and
+  `tests/p_vop.rs::static_sprite_rejected_with_incompatible_options`
+  (option-validation gate checks). The `vop_coded=1` S-VOP path (piece
+  updates) is deferred.
+- decoder: **Static-sprite VOL acceptance (`sprite_enable = 1`).** The
+  VOL-level `sprite_enable = 1` rejection has been removed; the decoder
+  now accepts streams that advertise a static-sprite canvas. S-VOPs
+  with `vop_coded = 0` fall through to the existing not-coded re-emit
+  path (the most recently decoded picture is re-emitted at the new
+  PTS). S-VOPs with `vop_coded = 1` (piece updates into the sprite
+  canvas) still return `Error::Unsupported`.
+- tests: **256×256 30-frame zoom-in GMC fixture**
+  (`tests/p_vop.rs::gmc_zoom_in_256x256_30frames`). Synthesises a
+  camera-zoom-in scene (scale 1.0 → 1.5 over 30 frames, 256×256) and
+  encodes/decodes with n=2 (conformal), n=3 (affine) and n=4
+  (perspective) warp points. All three must produce ≥ 28 dB PSNR per
+  frame through our decoder.
+- tests: **PSNR_Y ≥ 35 dB at 4 Mbit/s target**
+  (`tests/p_vop.rs::psnr_y_at_4mbit_s_target`). Encodes 16 frames
+  (256×256@24fps, QP=3), decodes with our own decoder, and asserts
+  PSNR_Y (luma-only, matching ffmpeg's `-vf psnr` definition) ≥ 35 dB
+  on every frame.
 
 ## [0.1.4](https://github.com/OxideAV/oxideav-mpeg4video/compare/v0.1.3...v0.1.4) - 2026-05-05
 

@@ -282,17 +282,6 @@ impl Mpeg4VideoDecoder {
         vop: &VideoObjectPlane,
         br: &mut BitReader<'_>,
     ) -> Result<()> {
-        // Static-sprite VOLs (`sprite_enable == 1`) carry an initial
-        // I-VOP that represents the entire sprite canvas (potentially
-        // bigger than the VOP rectangle), then a stream of S-VOPs that
-        // re-use the sprite via trajectory + optional piece updates.
-        // Neither the canvas-I-VOP sizing nor the S-VOP reconstruction
-        // path is implemented yet — reject cleanly at the VOP layer.
-        if vol.sprite_enable == 1 {
-            return Err(Error::unsupported(
-                "mpeg4 static-sprite (sprite_enable=1) VOP decode: follow-up",
-            ));
-        }
         if !vop.vop_coded {
             // "Not coded" VOP (§6.2.5): the decoder must re-emit the most
             // recently decoded picture at the new pts. The reference itself
@@ -372,14 +361,21 @@ impl Mpeg4VideoDecoder {
                 Ok(())
             }
             VopCodingType::S => {
+                // Static-sprite (`sprite_enable == 1`) S-VOPs with
+                // vop_coded=1 (piece updates) are not yet implemented.
+                // vop_coded=0 is handled above in the not-coded path.
+                if vol.sprite_enable == 1 {
+                    return Err(Error::unsupported(
+                        "mpeg4 static-sprite S-VOP with vop_coded=1 (piece updates): follow-up",
+                    ));
+                }
                 // GMC P-substitute (§6.2.5: "An S(GMC)-VOP can be
                 // regarded as a P-VOP"). Reuses the P-VOP body decode
                 // path — the per-MB `mcsel` bit selects the warp
-                // predictor. Static-sprite (`sprite_enable == 1`) S-VOPs
-                // remain out of scope and return Unsupported.
+                // predictor.
                 if vol.sprite_enable != 2 {
                     return Err(Error::unsupported(
-                        "mpeg4 S-VOP (static sprite): out of scope",
+                        "mpeg4 S-VOP (reserved sprite_enable): out of scope",
                     ));
                 }
                 let Some(reference) = self.prev_ref.as_ref().or(self.next_ref.as_ref()) else {
