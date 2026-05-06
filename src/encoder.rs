@@ -299,6 +299,26 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         ));
     }
 
+    // `mpeg_quant` enables MPEG-4 matrix quantisation (§7.4.4.3) instead of
+    // the default H.263 quantisation (§7.4.4.2). When on, the VOL advertises
+    // `mpeg_quant = 1` (with `load_intra_quant_matrix = 0` and
+    // `load_non_intra_quant_matrix = 0` — we use the spec defaults from
+    // Tables 7-1 and 7-2). Every block — intra DC scaler aside — is then
+    // quantised with the matrix path and reconstructed with the matching
+    // mismatch-control rule on inter blocks. Mutually exclusive with `dp`
+    // for now (the DP encoder has its own quant glue we have not extended
+    // to the matrix path).
+    let mpeg_quant = params
+        .options
+        .get("mpeg_quant")
+        .map(|s| !matches!(s, "" | "0" | "false" | "False" | "FALSE"))
+        .unwrap_or(false);
+    if mpeg_quant && data_partitioned {
+        return Err(Error::unsupported(
+            "mpeg4 encoder: mpeg_quant=1 + dp=1 not yet wired (use mpeg_quant=0 for DP)",
+        ));
+    }
+
     // `qp` sets the default quant for all VOP types; `qp_i`, `qp_p`
     // and `qp_b` override per VOP type. All values are clamped to
     // [MIN_VOP_QUANT, MAX_VOP_QUANT] — out-of-range strings are
@@ -374,6 +394,7 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         reference_time: 0,
         rounding_type: false,
         static_sprite,
+        mpeg_quant,
     }))
 }
 
@@ -431,6 +452,16 @@ struct Mpeg4VideoEncoder {
     /// RVLC writer (`rvlc::write_intra_ac` / `rvlc::write_inter_ac`)
     /// instead of `encoder::write_intra_ac` / `pvop::write_inter_ac`.
     reversible_vlc: bool,
+    /// VOL `mpeg_quant == 1` flag (§7.4.4.3). When `true`, every block
+    /// (intra DC scaler aside) is forward-quantised through the MPEG-4
+    /// matrix path (`iq::quantise_ac_intra_mpeg4` /
+    /// `quantise_ac_inter_mpeg4`) using the spec defaults (Tables 7-1
+    /// and 7-2). The VOL emits `mpeg_quant = 1` plus two `0` bits
+    /// (`load_intra_quant_matrix = 0` and `load_non_intra_quant_matrix
+    /// = 0`) so the decoder side falls back to the same defaults.
+    /// Mutually exclusive with `dp` (the DP encoder's quant glue is
+    /// H.263-only for now).
+    mpeg_quant: bool,
     pending: VecDeque<Packet>,
     /// Display-order B-frame queue — flushed on the next I/P encode.
     b_queue: VecDeque<VideoFrame>,
@@ -559,6 +590,7 @@ impl Mpeg4VideoEncoder {
                 self.data_partitioned,
                 self.reversible_vlc,
                 self.static_sprite,
+                self.mpeg_quant,
             );
             self.headers_emitted = true;
         }
@@ -598,6 +630,7 @@ impl Mpeg4VideoEncoder {
                     self.width,
                     self.height,
                     self.vop_quant_i,
+                    QuantMode::from_flag(self.mpeg_quant),
                 )?
             };
             self.reference = Some(pic);
@@ -658,6 +691,7 @@ impl Mpeg4VideoEncoder {
                     self.rounding_type,
                     self.quarter_sample,
                     warp.as_ref(),
+                    QuantMode::from_flag(self.mpeg_quant),
                 )?
             };
             self.reference = Some(pic);
@@ -710,6 +744,7 @@ impl Mpeg4VideoEncoder {
                 self.data_partitioned,
                 self.reversible_vlc,
                 self.static_sprite,
+                self.mpeg_quant,
             );
             self.headers_emitted = true;
         }
@@ -734,6 +769,7 @@ impl Mpeg4VideoEncoder {
                     self.width,
                     self.height,
                     self.vop_quant_i,
+                    QuantMode::from_flag(self.mpeg_quant),
                 )?
             };
             self.reference = Some(pic);
@@ -776,6 +812,7 @@ impl Mpeg4VideoEncoder {
                 self.rounding_type,
                 self.quarter_sample,
                 warp.as_ref(),
+                QuantMode::from_flag(self.mpeg_quant),
             )?;
             self.reference = Some(pic);
             self.reference_grid = Some(grid);
@@ -890,6 +927,7 @@ impl Mpeg4VideoEncoder {
             trb,
             trd,
             self.quarter_sample,
+            QuantMode::from_flag(self.mpeg_quant),
         )?;
         bw.align_to_byte_zero();
         let bytes = bw.finish();
@@ -959,6 +997,7 @@ fn write_vos_vo_vol(
     data_partitioned: bool,
     reversible_vlc: bool,
     static_sprite: bool,
+    mpeg_quant: bool,
 ) {
     // VOS.
     write_start_code(bw, VOS_START_CODE);
@@ -1094,9 +1133,20 @@ fn write_vos_vo_vol(
         bw.write_bits(1, 1); // low_latency_sprite_enable = 1
     }
     bw.write_bits(0, 1); // not_8_bit = 0
-    bw.write_bits(0, 1); // mpeg_quant = 0 (use H.263 quant)
-                         // quarter_sample — verid>=2 only. `1` selects QPel motion
-                         // (§7.6.2.2 8-tap filter); `0` keeps half-pel.
+                         // mpeg_quant — `0` selects H.263 quant (default), `1`
+                         // selects MPEG-4 matrix quantisation (§7.4.4.3). When
+                         // 1, two extra flag bits follow:
+                         //   load_intra_quant_matrix     (1 bit)
+                         //   load_non_intra_quant_matrix (1 bit)
+                         // We emit both as `0` so the decoder uses the spec
+                         // defaults from Tables 7-1 and 7-2.
+    bw.write_bits(if mpeg_quant { 1 } else { 0 }, 1);
+    if mpeg_quant {
+        bw.write_bits(0, 1); // load_intra_quant_matrix = 0 (use Table 7-1 default)
+        bw.write_bits(0, 1); // load_non_intra_quant_matrix = 0 (use Table 7-2 default)
+    }
+    // quarter_sample — verid>=2 only. `1` selects QPel motion
+    // (§7.6.2.2 8-tap filter); `0` keeps half-pel.
     if needs_verid2 {
         bw.write_bits(if quarter_sample { 1 } else { 0 }, 1);
     }
@@ -1588,6 +1638,29 @@ fn synthesise_gmc_vol(
 // I-VOP body: per-MB encoding
 // -------------------------------------------------------------------------
 
+/// Selects which forward-quant path the encoder uses for AC coefficients.
+/// Mirrors the VOL `mpeg_quant` flag (§7.4.4.3 vs §7.4.4.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum QuantMode {
+    /// `mpeg_quant = 0` — the H.263 dead-zone quant rule (Table-free, fast).
+    #[default]
+    H263,
+    /// `mpeg_quant = 1` — MPEG-4 matrix quant (Tables 7-1 and 7-2 by
+    /// default; custom matrices are not yet emitted by the encoder).
+    Mpeg4,
+}
+
+impl QuantMode {
+    /// Construct the matching mode from a `mpeg_quant` boolean flag.
+    pub fn from_flag(mpeg_quant: bool) -> Self {
+        if mpeg_quant {
+            Self::Mpeg4
+        } else {
+            Self::H263
+        }
+    }
+}
+
 /// Encode an I-VOP body AND return the reconstructed picture so it can be
 /// used as the MC reference for subsequent P-VOPs. Uses the shared decoder
 /// path so the reconstruction is bit-exact relative to what the decoder
@@ -1598,6 +1671,7 @@ pub(crate) fn encode_i_vop_body_and_reconstruct(
     width: u32,
     height: u32,
     vop_quant: u32,
+    quant_mode: QuantMode,
 ) -> Result<IVopPicture> {
     let width = width as usize;
     let height = height as usize;
@@ -1615,7 +1689,7 @@ pub(crate) fn encode_i_vop_body_and_reconstruct(
     for mb_y in 0..mb_h {
         for mb_x in 0..mb_w {
             encode_intra_mb_reconstruct(
-                bw, v, width, height, mb_x, mb_y, vop_quant, &mut grid, &mut pic,
+                bw, v, width, height, mb_x, mb_y, vop_quant, &mut grid, &mut pic, quant_mode,
             )?;
         }
     }
@@ -1650,6 +1724,7 @@ fn encode_intra_mb_reconstruct(
     quant: u32,
     grid: &mut PredGrid,
     pic: &mut IVopPicture,
+    quant_mode: QuantMode,
 ) -> Result<()> {
     encode_intra_mb_inner(
         bw,
@@ -1662,6 +1737,7 @@ fn encode_intra_mb_reconstruct(
         grid,
         Some(pic),
         IntraMcbpcKind::IVop,
+        quant_mode,
     )
 }
 
@@ -1685,6 +1761,7 @@ pub(crate) fn encode_intra_mb_in_p(
     quant: u32,
     grid: &mut PredGrid,
     pic: &mut IVopPicture,
+    quant_mode: QuantMode,
 ) -> Result<()> {
     encode_intra_mb_inner(
         bw,
@@ -1697,6 +1774,7 @@ pub(crate) fn encode_intra_mb_in_p(
         grid,
         Some(pic),
         IntraMcbpcKind::PVop,
+        quant_mode,
     )
 }
 
@@ -1711,6 +1789,7 @@ fn encode_intra_mb_inner(
     grid: &mut PredGrid,
     mut pic: Option<&mut IVopPicture>,
     mcbpc_kind: IntraMcbpcKind,
+    quant_mode: QuantMode,
 ) -> Result<()> {
     // Read all six 8×8 sample blocks from the source frame (with edge
     // replication for the bottom-right partial macroblocks if any).
@@ -1743,21 +1822,34 @@ fn encode_intra_mb_inner(
     //     rounding gives the closest level.
     let mut dc_units = [0i32; 6];
     let mut ac_levels = [[0i32; 64]; 6];
+    let intra_matrix = crate::headers::vol::DEFAULT_INTRA_QUANT_MATRIX;
     for blk in 0..6 {
         let scale = dc_scaler(blk, quant) as i32;
-        // Quantise DC. Round-to-nearest.
+        // Quantise DC. Round-to-nearest. DC is always handled by the DC
+        // scaler, regardless of `quant_mode` (§7.4.3.1: DC is independent
+        // of mpeg_quant).
         let dc_pel = dct[blk][0];
         let dc_q = round_div(dc_pel, scale).clamp(-2048, 2047);
         dc_units[blk] = dc_q;
-        // Quantise ACs.  H.263 dequant for intra is
-        //   recon(l != 0) = (2*Q*|l| + Q_plus) * sign(l)
-        //   recon(0)      = 0
-        // where Q_plus = Q if Q is odd, Q-1 if Q is even (§7.4.4.2). The
-        // forward step picks the level whose reconstruction is closest to
-        // the input coefficient.
-        for i in 1..64 {
-            let l = quantise_ac_intra_h263(dct[blk][i], quant as i32).clamp(-2047, 2047);
-            ac_levels[blk][i] = l;
+        // Quantise ACs. H.263 path matches `iq::dequantise_intra_h263`;
+        // MPEG-quant path matches `iq::dequantise_intra_mpeg4` with the
+        // default Table 7-1 matrix. Both pickers find the level whose
+        // reconstruction is closest to the input coefficient.
+        match quant_mode {
+            QuantMode::H263 => {
+                for i in 1..64 {
+                    let l = quantise_ac_intra_h263(dct[blk][i], quant as i32).clamp(-2047, 2047);
+                    ac_levels[blk][i] = l;
+                }
+            }
+            QuantMode::Mpeg4 => {
+                for i in 1..64 {
+                    let l =
+                        crate::iq::quantise_ac_intra_mpeg4(dct[blk][i], i, quant, &intra_matrix)
+                            .clamp(-2047, 2047);
+                    ac_levels[blk][i] = l;
+                }
+            }
         }
     }
 
@@ -1820,25 +1912,34 @@ fn encode_intra_mb_inner(
         update_neighbour(grid, blk, mb_x, mb_y, recon_dc, quant as u8);
 
         // Optionally reconstruct the 8×8 block into `pic`. Mirrors the
-        // decoder's reconstruct_intra_block path: dequantise the ACs under
-        // the H.263 rule, install the reconstructed pel-domain DC, IDCT,
-        // and clip to u8.
+        // decoder's reconstruct_intra_block path: dequantise the ACs
+        // under the matching `quant_mode` rule, install the reconstructed
+        // pel-domain DC, IDCT, and clip to u8.
         if let Some(pic_mut) = pic.as_deref_mut() {
             let mut coeffs = ac_levels[blk];
-            // H.263 intra dequant matches `iq::dequantise_intra_h263`.
-            let q = quant as i32;
-            let q_plus = if q & 1 == 1 { q } else { q - 1 };
-            for i in 1..64 {
-                let l = coeffs[i];
-                if l == 0 {
-                    continue;
+            match quant_mode {
+                QuantMode::H263 => {
+                    let q = quant as i32;
+                    let q_plus = if q & 1 == 1 { q } else { q - 1 };
+                    for i in 1..64 {
+                        let l = coeffs[i];
+                        if l == 0 {
+                            continue;
+                        }
+                        let abs = l.abs();
+                        let mut val = 2 * q * abs + q_plus;
+                        if l < 0 {
+                            val = -val;
+                        }
+                        coeffs[i] = val.clamp(-2048, 2047);
+                    }
                 }
-                let abs = l.abs();
-                let mut val = 2 * q * abs + q_plus;
-                if l < 0 {
-                    val = -val;
+                QuantMode::Mpeg4 => {
+                    for i in 1..64 {
+                        coeffs[i] =
+                            crate::iq::reconstruct_intra_mpeg4(coeffs[i], i, quant, &intra_matrix);
+                    }
                 }
-                coeffs[i] = val.clamp(-2048, 2047);
             }
             coeffs[0] = recon_dc.clamp(-2048, 2047);
             let mut f = [0.0f32; 64];

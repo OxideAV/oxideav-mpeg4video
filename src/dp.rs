@@ -687,6 +687,9 @@ pub fn encode_p_vop_body_dp_with_grid(
                 &mv_grid,
                 false,
                 None,
+                // DP encoder is H.263-quant only; the factory rejects
+                // `mpeg_quant=1 + dp=1` upstream so this constant is safe.
+                crate::encoder::QuantMode::H263,
             )?;
 
             // Intra-in-P decision (§6.3.7): mirrors

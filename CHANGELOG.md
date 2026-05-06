@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- encoder: **MPEG-4 matrix quantisation (`mpeg_quant = 1`, §7.4.4.3,
+  round 39).** New `mpeg_quant` codec option enables MPEG-4 matrix
+  quantisation in place of the default H.263 quant rule. The VOL
+  emits `mpeg_quant = 1` plus two `0` bits
+  (`load_intra_quant_matrix = 0` and `load_non_intra_quant_matrix =
+  0`) so the decoder side falls back to the spec-default Tables 7-1
+  and 7-2. Forward-quant routines `quantise_ac_intra_mpeg4` /
+  `quantise_ac_inter_mpeg4` (in `src/iq.rs`) invert the §7.4.4.3
+  equations (17) and (18) and pick the closest integer level under
+  rounding-toward-zero behaviour; reconstruction routines
+  `reconstruct_intra_mpeg4` / `reconstruct_inter_mpeg4` mirror the
+  decoder's dequant rule. Inter blocks apply the §7.4.4.7 mismatch-
+  control toggle on coeff[63] when the reconstructed-coefficient sum
+  is even (matching `dequantise_inter_mpeg4`). All blocks of a VOP
+  use the matrix path consistently when `mpeg_quant=1` is set —
+  intra-in-P, inter-1MV, Inter4MV, GMC, B-VOP forward / backward /
+  bidirectional / direct, all share the new `QuantMode` enum
+  threaded through `encode_p_vop_body_with_grid` /
+  `encode_b_vop_body` / `encode_inter_block` /
+  `encode_intra_mb_inner`. Mutually exclusive with `dp` (the DP
+  encoder body is H.263-quant only). New tests:
+  `tests/p_vop.rs::mpeg_quant_self_roundtrip` (≥ 30 dB on a
+  64×64 GOP-of-4),
+  `tests/p_vop.rs::mpeg_quant_ffmpeg_decode` (ffmpeg cross-decode
+  ≥ 28 dB; in practice 39-41 dB, byte-equivalent to our self-decode
+  within rounding), and `tests/p_vop.rs::mpeg_quant_with_dp_rejected`
+  (factory-time rejection of incompatible options).
 - encoder: **Multi-warp-point GMC (2/3/4-point, §7.7.4 + §7.7.5).** New
   `gmc_warp_points` codec option (1..=4) controls the warp's degrees
   of freedom: 1 = pure translation (round-20 path), 2 = conformal,

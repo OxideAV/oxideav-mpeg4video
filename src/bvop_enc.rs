@@ -58,6 +58,7 @@
 use oxideav_core::Result;
 
 use crate::bvop::{direct_mode_mvs, direct_mode_mvs_4, BMbMotion, BMode, BMvGrid, BRowPred};
+use crate::encoder::QuantMode;
 use crate::headers::vol::ZIGZAG;
 use crate::inter::MvGrid;
 use crate::mb::IVopPicture;
@@ -160,6 +161,7 @@ pub fn encode_b_vop_body(
     trb: i32,
     trd: i32,
     quarter_sample: bool,
+    quant_mode: QuantMode,
 ) -> Result<()> {
     let width = width as usize;
     let height = height as usize;
@@ -209,6 +211,7 @@ pub fn encode_b_vop_body(
                 trb,
                 trd,
                 quarter_sample,
+                quant_mode,
             )?;
 
             emit_b_mb(bw, &mb, &mut row_pred, f_code_fwd, f_code_bwd);
@@ -258,6 +261,7 @@ fn estimate_b_mb(
     trb: i32,
     trd: i32,
     quarter_sample: bool,
+    quant_mode: QuantMode,
 ) -> Result<BMbEncoding> {
     let src_y = load_luma_mb(v, width, height, mb_x, mb_y);
 
@@ -468,7 +472,7 @@ fn estimate_b_mb(
                 pred_blk[j * 8 + i] = pred_y[(sub_y + j) * 16 + (sub_x + i)];
             }
         }
-        let (levels, recon) = encode_inter_block(&src_blk, &pred_blk, vop_quant);
+        let (levels, recon) = encode_inter_block(&src_blk, &pred_blk, vop_quant, quant_mode);
         coded[blk] = levels.iter().any(|&l| l != 0);
         ac_levels[blk] = levels;
         for j in 0..8 {
@@ -477,8 +481,8 @@ fn estimate_b_mb(
             }
         }
     }
-    let (lcb, recon_cb) = encode_inter_block(&src_cb, &pred_cb, vop_quant);
-    let (lcr, recon_cr) = encode_inter_block(&src_cr, &pred_cr, vop_quant);
+    let (lcb, recon_cb) = encode_inter_block(&src_cb, &pred_cb, vop_quant, quant_mode);
+    let (lcr, recon_cr) = encode_inter_block(&src_cr, &pred_cr, vop_quant, quant_mode);
     coded[4] = lcb.iter().any(|&l| l != 0);
     coded[5] = lcr.iter().any(|&l| l != 0);
     ac_levels[4] = lcb;
@@ -1420,7 +1424,20 @@ mod tests {
                 let co = grid.get(mb_x, mb_y);
                 let co_mvs4: [(i32, i32); 4] = if co.four_mv { co.mv } else { [co.mv[0]; 4] };
                 let mb = estimate_b_mb(
-                    &v, 32, 32, &prev, &next, mb_x, mb_y, 4, co_mvs4, co.four_mv, trb, trd, false,
+                    &v,
+                    32,
+                    32,
+                    &prev,
+                    &next,
+                    mb_x,
+                    mb_y,
+                    4,
+                    co_mvs4,
+                    co.four_mv,
+                    trb,
+                    trd,
+                    false,
+                    QuantMode::H263,
                 )
                 .expect("estimate_b_mb");
                 emit_b_mb(&mut bw, &mb, &mut row_pred, 1, 1);

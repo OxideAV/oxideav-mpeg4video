@@ -158,6 +158,147 @@ pub fn dc_scaler(block_idx: usize, quant: u32) -> u32 {
     }
 }
 
+// -------------------------------------------------------------------------
+// Forward (encoder) MPEG-quant — invert the dequant rules above, picking
+// the integer level whose reconstruction is closest to the input
+// coefficient. Used by the encoder when the VOL is emitted with
+// `mpeg_quant = 1`.
+// -------------------------------------------------------------------------
+
+/// Forward MPEG-quant for one intra-AC coefficient. Inverts the §7.4.4.3
+/// equation (17) intra rule
+///   `recon = (2 * |level| * wQ * matrix[i]) / 16`
+/// and picks the integer `level` whose reconstruction is closest to the
+/// input. Index 0 (DC) is owned by the caller; this routine only handles
+/// AC indices 1..64.
+///
+/// `matrix_zz` is the intra quant matrix in NATURAL order (same indexing
+/// as `dequantise_intra_mpeg4`); `quant` is the active vop_quant.
+pub fn quantise_ac_intra_mpeg4(coef: i32, idx: usize, quant: u32, matrix_zz: &[u8; 64]) -> i32 {
+    if coef == 0 || quant == 0 || idx == 0 {
+        return 0;
+    }
+    let m = matrix_zz[idx] as i32;
+    if m <= 0 {
+        return 0;
+    }
+    let wq = quant as i32;
+    let denom = 2 * wq * m; // recon(L) = denom * L / 16
+    if denom <= 0 {
+        return 0;
+    }
+    let abs = coef.unsigned_abs() as i32;
+    // Closed-form coarse seed: l_low = (16 * abs) / denom; compare l_low and l_low + 1.
+    let l_low = ((16 * abs) / denom).max(0);
+    let mut best_l = 0i32;
+    let mut best_err = abs;
+    for cand in [l_low.saturating_sub(1), l_low, l_low + 1] {
+        if cand < 0 {
+            continue;
+        }
+        let recon = (denom * cand) / 16;
+        let err = (abs - recon).abs();
+        if err < best_err {
+            best_err = err;
+            best_l = cand;
+        }
+    }
+    if coef < 0 {
+        -best_l
+    } else {
+        best_l
+    }
+}
+
+/// Forward MPEG-quant for one inter coefficient. Inverts the §7.4.4.3
+/// equation (18) inter rule
+///   `recon = ((2 * |level| + 1) * wQ * matrix[i]) / 16`
+/// and picks the integer `level` whose reconstruction is closest. Inter
+/// blocks use this for ALL 64 indices (the H.263 encoder side is the
+/// matching call for `mpeg_quant = 0` mode).
+///
+/// `matrix_zz` is the non-intra quant matrix in NATURAL order.
+pub fn quantise_ac_inter_mpeg4(coef: i32, idx: usize, quant: u32, matrix_zz: &[u8; 64]) -> i32 {
+    if coef == 0 || quant == 0 {
+        return 0;
+    }
+    let m = matrix_zz[idx] as i32;
+    if m <= 0 {
+        return 0;
+    }
+    let wq = quant as i32;
+    let factor = wq * m;
+    if factor <= 0 {
+        return 0;
+    }
+    let abs = coef.unsigned_abs() as i32;
+    // recon(L) = ((2L + 1) * factor) / 16. Solve 2L+1 ≈ 16*abs / factor →
+    // L ≈ (16 * abs / factor - 1) / 2. Compare the closest 3 integer Ls.
+    let twol_plus_one = (16 * abs + factor / 2) / factor;
+    let l_seed = if twol_plus_one >= 1 {
+        (twol_plus_one - 1) / 2
+    } else {
+        0
+    };
+    let mut best_l = 0i32;
+    let mut best_err = abs;
+    for cand in [l_seed.saturating_sub(1), l_seed, l_seed + 1] {
+        if cand < 0 {
+            continue;
+        }
+        let recon = ((2 * cand + 1) * factor) / 16;
+        let err = (abs - recon).abs();
+        if err < best_err {
+            best_err = err;
+            best_l = cand;
+        }
+    }
+    if coef < 0 {
+        -best_l
+    } else {
+        best_l
+    }
+}
+
+/// Reconstruct one inter coefficient under the MPEG-quant rule given a
+/// quantised `level`. Mirrors the body of `dequantise_inter_mpeg4` but
+/// for a single coefficient (encoder-side reconstruct loop). Mismatch
+/// control is the caller's responsibility (apply once to coeffs[63]
+/// after summing all reconstructions, per §7.4.4.7).
+pub fn reconstruct_inter_mpeg4(level: i32, idx: usize, quant: u32, matrix_zz: &[u8; 64]) -> i32 {
+    if level == 0 || quant == 0 {
+        return 0;
+    }
+    let m = matrix_zz[idx] as i32;
+    if m <= 0 {
+        return 0;
+    }
+    let wq = quant as i32;
+    let abs = level.unsigned_abs() as i32;
+    let val = ((2 * abs + 1) * wq * m) / 16;
+    let signed = if level < 0 { -val } else { val };
+    signed.clamp(-2048, 2047)
+}
+
+/// Reconstruct one intra-AC coefficient under the MPEG-quant rule given a
+/// quantised `level`. Mirrors the body of `dequantise_intra_mpeg4`. No
+/// mismatch control is applied to intra blocks (§7.4.4.7 is non-intra
+/// only).
+pub fn reconstruct_intra_mpeg4(level: i32, idx: usize, quant: u32, matrix_zz: &[u8; 64]) -> i32 {
+    if level == 0 || quant == 0 || idx == 0 {
+        return 0;
+    }
+    let m = matrix_zz[idx] as i32;
+    if m <= 0 {
+        return 0;
+    }
+    let wq = quant as i32;
+    let abs = level.unsigned_abs() as i32;
+    let val = (2 * abs * wq * m) / 16;
+    let signed = if level < 0 { -val } else { val };
+    signed.clamp(-2048, 2047)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,5 +327,71 @@ mod tests {
         assert_eq!(dc_scaler(4, 1), 8); // chroma
         assert_eq!(dc_scaler(0, 31), 46);
         assert_eq!(dc_scaler(5, 31), 25);
+    }
+
+    /// MPEG-quant intra-AC forward + dequant must round-trip every
+    /// coefficient that already lies on the reconstruction lattice. We
+    /// pick a few `(quant, idx, level)` combos, dequantise to `recon`,
+    /// re-quantise, and assert we get the same level back.
+    #[test]
+    fn mpeg_intra_forward_round_trip_lattice() {
+        let m = crate::headers::vol::DEFAULT_INTRA_QUANT_MATRIX;
+        for &q in &[1u32, 2, 5, 8, 16, 31] {
+            for &idx in &[1usize, 7, 17, 32, 63] {
+                for &lvl in &[1i32, -1, 4, -7, 12, -25] {
+                    let recon = reconstruct_intra_mpeg4(lvl, idx, q, &m);
+                    if recon == 0 || recon.abs() >= 2047 {
+                        // dead zone or saturation — encoder is allowed to
+                        // round to a different (smaller-magnitude) level.
+                        continue;
+                    }
+                    let back = quantise_ac_intra_mpeg4(recon, idx, q, &m);
+                    // Forward picks the closest level. Allow ±1 because
+                    // (2*L*wQ*Q)/16 rounds toward zero so adjacent
+                    // levels share boundaries.
+                    assert!(
+                        (back - lvl).abs() <= 1,
+                        "intra mpeg-quant: q={q} idx={idx} lvl={lvl} recon={recon} back={back}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Same as above for inter blocks. Inter has the half-step shift in
+    /// the dequant rule (`2L+1` instead of `2L`).
+    #[test]
+    fn mpeg_inter_forward_round_trip_lattice() {
+        let m = crate::headers::vol::DEFAULT_NON_INTRA_QUANT_MATRIX;
+        for &q in &[1u32, 2, 5, 8, 16, 31] {
+            for &idx in &[0usize, 1, 7, 17, 32, 63] {
+                for &lvl in &[1i32, -1, 4, -7, 12, -25] {
+                    let recon = reconstruct_inter_mpeg4(lvl, idx, q, &m);
+                    if recon == 0 || recon.abs() >= 2047 {
+                        continue;
+                    }
+                    let back = quantise_ac_inter_mpeg4(recon, idx, q, &m);
+                    assert!(
+                        (back - lvl).abs() <= 1,
+                        "inter mpeg-quant: q={q} idx={idx} lvl={lvl} recon={recon} back={back}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Forward-quant of a coefficient between two valid reconstructions
+    /// must pick the closer of the two. Sanity check at low quant.
+    #[test]
+    fn mpeg_intra_forward_picks_closest() {
+        let m = crate::headers::vol::DEFAULT_INTRA_QUANT_MATRIX;
+        // q=2, idx=1, matrix[1]=17 → recon(L) = (2*L*2*17)/16 = 4*17*L/16 = 4.25*L.
+        // L=1 -> 4, L=2 -> 8 (truncating). Coef 6 is closer to 4 (err 2) than 8 (err 2):
+        // tie, picks lower magnitude (L=1).
+        assert_eq!(quantise_ac_intra_mpeg4(6, 1, 2, &m), 1);
+        // Coef 7 is closer to 8 (err 1) than 4 (err 3) -> L=2.
+        assert_eq!(quantise_ac_intra_mpeg4(7, 1, 2, &m), 2);
+        // Negative input.
+        assert_eq!(quantise_ac_intra_mpeg4(-7, 1, 2, &m), -2);
     }
 }

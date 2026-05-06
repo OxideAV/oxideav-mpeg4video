@@ -1905,3 +1905,188 @@ fn static_sprite_rejected_with_incompatible_options() {
         "sprite_static + bf=2 must be rejected"
     );
 }
+
+// ----------------------------------------------------------------------------
+// MPEG-quant (`mpeg_quant=1`) — round 39 addition
+// ----------------------------------------------------------------------------
+
+/// Self-roundtrip with `mpeg_quant=1`. The encoder advertises the matrix
+/// quant flag in the VOL and forward-quantises every block through the
+/// MPEG-4 matrix path (Tables 7-1 / 7-2 defaults). The decoder then
+/// reconstructs the same way, so a 64×64 GOP-of-4 stream should round-trip
+/// at acceptable PSNR (target ≥ 30 dB after I+3·P).
+#[test]
+fn mpeg_quant_self_roundtrip() {
+    let (width, height) = (64u32, 64u32);
+    let num_frames = 4u32;
+
+    let src_frames: Vec<VideoFrame> = (0..num_frames)
+        .map(|i| make_frame(i, width, height))
+        .collect();
+
+    let mut params = CodecParameters::video(CodecId::new(oxideav_mpeg4video::CODEC_ID_STR));
+    params.media_type = MediaType::Video;
+    params.width = Some(width);
+    params.height = Some(height);
+    params.pixel_format = Some(PixelFormat::Yuv420P);
+    params.frame_rate = Some(Rational::new(24, 1));
+    params.options.insert("mpeg_quant", "1");
+    params.options.insert("g", "16");
+    let mut enc =
+        oxideav_mpeg4video::encoder::make_encoder(&params).expect("build mpeg_quant=1 encoder");
+
+    let mut es = Vec::new();
+    for f in &src_frames {
+        enc.send_frame(&Frame::Video(f.clone())).expect("send");
+    }
+    enc.flush().expect("flush");
+    loop {
+        match enc.receive_packet() {
+            Ok(pkt) => es.extend_from_slice(&pkt.data),
+            Err(oxideav_core::Error::NeedMore) | Err(oxideav_core::Error::Eof) => break,
+            Err(e) => panic!("recv: {e:?}"),
+        }
+    }
+    eprintln!("mpeg_quant=1 ES: {} bytes", es.len());
+
+    // Decode with our own decoder.
+    let dec_params = CodecParameters::video(CodecId::new(oxideav_mpeg4video::CODEC_ID_STR));
+    let mut dec = oxideav_mpeg4video::decoder::make_decoder(&dec_params).expect("build decoder");
+    let pkt = Packet::new(0, TimeBase::new(1, 24), es.clone());
+    dec.send_packet(&pkt).expect("send_packet");
+    dec.flush().expect("flush decoder");
+
+    let mut decoded: Vec<VideoFrame> = Vec::new();
+    loop {
+        match dec.receive_frame() {
+            Ok(Frame::Video(f)) => decoded.push(f),
+            Ok(_) => panic!("non-video frame"),
+            Err(oxideav_core::Error::NeedMore) | Err(oxideav_core::Error::Eof) => break,
+            Err(e) => panic!("decode: {e:?}"),
+        }
+    }
+    assert_eq!(
+        decoded.len(),
+        num_frames as usize,
+        "mpeg_quant=1 decoded {} frames, expected {}",
+        decoded.len(),
+        num_frames
+    );
+    for (i, (s, d)) in src_frames.iter().zip(decoded.iter()).enumerate() {
+        let p = psnr(&flatten_frame(s), &flatten_frame(d));
+        eprintln!("mpeg_quant=1 frame {i}: PSNR = {p:.2} dB");
+        assert!(
+            p > 30.0,
+            "mpeg_quant=1 frame {i} PSNR {p:.2} dB below 30 dB acceptance bar"
+        );
+    }
+}
+
+/// Cross-decode `mpeg_quant=1` through ffmpeg. Validates that ffmpeg's
+/// `mpeg4` decoder reads our VOL `mpeg_quant=1` flag and applies the
+/// matrix dequant correctly to both intra (I) and inter (P) blocks. If
+/// the bit ever drifts in the VOL the cross-decode will detect it
+/// immediately (ffmpeg would mis-dequant inter blocks at the wrong
+/// rule and PSNR would crash).
+#[test]
+fn mpeg_quant_ffmpeg_decode() {
+    let ff = Command::new("ffmpeg").arg("-version").output();
+    if ff.is_err() || !ff.as_ref().unwrap().status.success() {
+        eprintln!("ffmpeg not available — skipping");
+        return;
+    }
+    let (width, height) = (64u32, 64u32);
+    let num_frames = 4u32;
+    let src_frames: Vec<VideoFrame> = (0..num_frames)
+        .map(|i| make_frame(i, width, height))
+        .collect();
+
+    let mut params = CodecParameters::video(CodecId::new(oxideav_mpeg4video::CODEC_ID_STR));
+    params.media_type = MediaType::Video;
+    params.width = Some(width);
+    params.height = Some(height);
+    params.pixel_format = Some(PixelFormat::Yuv420P);
+    params.frame_rate = Some(Rational::new(24, 1));
+    params.options.insert("mpeg_quant", "1");
+    params.options.insert("g", "16");
+    let mut enc =
+        oxideav_mpeg4video::encoder::make_encoder(&params).expect("build mpeg_quant=1 encoder");
+
+    let mut es = Vec::new();
+    for f in &src_frames {
+        enc.send_frame(&Frame::Video(f.clone())).expect("send");
+    }
+    enc.flush().expect("flush");
+    loop {
+        match enc.receive_packet() {
+            Ok(pkt) => es.extend_from_slice(&pkt.data),
+            Err(oxideav_core::Error::NeedMore) | Err(oxideav_core::Error::Eof) => break,
+            Err(e) => panic!("recv: {e:?}"),
+        }
+    }
+
+    // Pipe ES through ffmpeg's mpeg4 decoder and read the YUV back.
+    let tmp_dir = std::env::temp_dir();
+    let in_path = tmp_dir.join("mp4v_mq.m4v");
+    let out_path = tmp_dir.join("mp4v_mq.yuv");
+    std::fs::write(&in_path, &es).expect("write es");
+    let out = Command::new("ffmpeg")
+        .arg("-y")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-f")
+        .arg("m4v")
+        .arg("-i")
+        .arg(&in_path)
+        .arg("-f")
+        .arg("rawvideo")
+        .arg("-pix_fmt")
+        .arg("yuv420p")
+        .arg(&out_path)
+        .output()
+        .expect("run ffmpeg");
+    assert!(
+        out.status.success(),
+        "ffmpeg failed: {}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let yuv = std::fs::read(&out_path).expect("read yuv");
+    let frame_size = (width as usize * height as usize) * 3 / 2;
+    let n_frames = yuv.len() / frame_size;
+    assert!(
+        n_frames >= num_frames as usize,
+        "ffmpeg returned {n_frames} frames, expected ≥ {}",
+        num_frames
+    );
+    for (i, src) in src_frames.iter().enumerate() {
+        let off = i * frame_size;
+        let dec = &yuv[off..off + frame_size];
+        let p = psnr(&flatten_frame(src), dec);
+        eprintln!("mpeg_quant=1 ffmpeg frame {i}: PSNR = {p:.2} dB");
+        assert!(
+            p > 28.0,
+            "mpeg_quant=1 ffmpeg frame {i} PSNR {p:.2} dB below 28 dB \
+             acceptance bar — VOL or block-level mismatch"
+        );
+    }
+}
+
+/// `mpeg_quant=1` and `dp=1` are mutually exclusive (the DP encoder body
+/// uses H.263 quant only). Catch the rejection at factory time.
+#[test]
+fn mpeg_quant_with_dp_rejected() {
+    let mut params = CodecParameters::video(CodecId::new(oxideav_mpeg4video::CODEC_ID_STR));
+    params.media_type = MediaType::Video;
+    params.width = Some(32);
+    params.height = Some(32);
+    params.pixel_format = Some(PixelFormat::Yuv420P);
+    params.frame_rate = Some(Rational::new(24, 1));
+    params.options.insert("mpeg_quant", "1");
+    params.options.insert("dp", "1");
+    let result = oxideav_mpeg4video::encoder::make_encoder(&params);
+    assert!(
+        result.is_err(),
+        "mpeg_quant=1 + dp=1 must be rejected at factory time"
+    );
+}

@@ -151,10 +151,24 @@ decoder accepts as-is. Input is `Yuv420P` only.
   `vop_coded = 0` — the decoder re-emits the sprite canvas. Mutually
   exclusive with `gmc`, `dp`, `qpel`, `bf>0`. Static-sprite S-VOPs
   with `vop_coded = 1` (piece updates) are deferred.
-- **Quantisation.** H.263 quant (`mpeg_quant = 0`), constant
-  `vop_quant = 5` by default, no dquant. Override per-encoder via
-  the `qp` codec option (1..=31), or split per VOP-type with
-  `qp_i` / `qp_p` / `qp_b`.
+- **Quantisation.** H.263 quant (`mpeg_quant = 0`, default) or MPEG-4
+  matrix quant (`mpeg_quant = 1`, opt-in via the codec option of the
+  same name). Constant `vop_quant = 5` by default, no dquant. Override
+  per-encoder via the `qp` codec option (1..=31), or split per VOP-type
+  with `qp_i` / `qp_p` / `qp_b`.
+- **MPEG-4 matrix quant (`mpeg_quant = 1`, round 39).** When enabled,
+  the VOL emits `mpeg_quant = 1` plus two `0` bits
+  (`load_intra_quant_matrix = 0` and `load_non_intra_quant_matrix =
+  0`); the encoder forward-quantises every block — intra DC scaler
+  aside — through the §7.4.4.3 matrix path
+  (`iq::quantise_ac_intra_mpeg4` / `quantise_ac_inter_mpeg4`) using the
+  spec-default Tables 7-1 (intra) and 7-2 (non-intra). Inter blocks
+  apply the §7.4.4.7 mismatch-control nudge on coeff[63] so the
+  decoder's reconstruction matches bit-exactly. Mutually exclusive with
+  `dp` (the DP encoder body is H.263-quant only). ffmpeg cross-decode
+  validated on the synthetic 64×64 moving-gradient fixture
+  (`tests/p_vop.rs::mpeg_quant_ffmpeg_decode`, ≥ 39 dB on every
+  frame, byte-equivalent to our self-decode within rounding).
 - **Resync markers.** Not emitted (`resync_marker_disable = 1`).
 
 Round-trip PSNR on the synthetic 64×64 moving-gradient test
@@ -215,7 +229,6 @@ Out of scope for the encoder:
   bit-exactly: standard Tcoef recovers 7/16 (forward only, stops at
   the damage), RVLC recovers 14/16 (forward 7 + reverse 7).
 - Interlace, scalability.
-- MPEG-4 matrix quant (`mpeg_quant = 1`).
 
 ## Performance
 

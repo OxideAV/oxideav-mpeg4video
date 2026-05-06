@@ -59,7 +59,7 @@
 use oxideav_core::Result;
 
 use crate::block::BlockNeighbour;
-use crate::encoder::{block_pel_position, encode_intra_mb_in_p, fdct8x8};
+use crate::encoder::{block_pel_position, encode_intra_mb_in_p, fdct8x8, QuantMode};
 use crate::headers::vol::ZIGZAG;
 use crate::inter::{MbMotion, MvGrid};
 use crate::mb::{IVopPicture, PredGrid};
@@ -211,6 +211,7 @@ pub fn encode_p_vop_body(
         rounding_type,
         false,
         None,
+        QuantMode::H263,
     )?;
     Ok(pic)
 }
@@ -240,6 +241,7 @@ pub fn encode_p_vop_body_with_grid(
     rounding_type: bool,
     quarter_sample: bool,
     warp: Option<&crate::gmc::WarpParams>,
+    quant_mode: QuantMode,
 ) -> Result<(IVopPicture, MvGrid)> {
     let width = width as usize;
     let height = height as usize;
@@ -271,6 +273,7 @@ pub fn encode_p_vop_body_with_grid(
                 &mv_grid,
                 quarter_sample,
                 warp,
+                quant_mode,
             )?;
 
             // Intra-in-P decision (§6.3.7): the inter SAD is the cost we
@@ -323,6 +326,7 @@ pub fn encode_p_vop_body_with_grid(
                     vop_quant,
                     &mut pred_grid,
                     &mut pic,
+                    quant_mode,
                 )?;
                 // MV grid: intra MBs contribute (0,0) to the median
                 // predictor of future inter MBs (§7.6.7 step 3) and
@@ -583,6 +587,7 @@ pub(crate) fn estimate_and_encode_mb(
     mv_grid: &MvGrid,
     quarter_sample: bool,
     warp: Option<&crate::gmc::WarpParams>,
+    quant_mode: QuantMode,
 ) -> Result<PMbEncoding> {
     let force_one_mv = false;
     // 1. Integer-pel search over the 16×16 luma MB.
@@ -855,7 +860,7 @@ pub(crate) fn estimate_and_encode_mb(
         };
         let src = read_luma_block_from_mb(v, width, height, mb_x, mb_y, sub_x, sub_y);
         let pred_blk = read_pred_block(&pred_y, 16, sub_x, sub_y);
-        let (levels, recon) = encode_inter_block(&src, &pred_blk, vop_quant);
+        let (levels, recon) = encode_inter_block(&src, &pred_blk, vop_quant, quant_mode);
         mb.luma_coded[blk] = levels.iter().any(|&l| l != 0);
         mb.ac_levels[blk] = levels;
         // Stamp reconstructed samples back into mb.recon_y.
@@ -869,8 +874,8 @@ pub(crate) fn estimate_and_encode_mb(
     // Chroma blocks.
     let src_cb = load_chroma_block(v, width, height, 1, mb_x, mb_y);
     let src_cr = load_chroma_block(v, width, height, 2, mb_x, mb_y);
-    let (levels_cb, recon_cb) = encode_inter_block(&src_cb, &pred_cb, vop_quant);
-    let (levels_cr, recon_cr) = encode_inter_block(&src_cr, &pred_cr, vop_quant);
+    let (levels_cb, recon_cb) = encode_inter_block(&src_cb, &pred_cb, vop_quant, quant_mode);
+    let (levels_cr, recon_cr) = encode_inter_block(&src_cr, &pred_cr, vop_quant, quant_mode);
     mb.chroma_coded[0] = levels_cb.iter().any(|&l| l != 0);
     mb.chroma_coded[1] = levels_cr.iter().any(|&l| l != 0);
     mb.ac_levels[4] = levels_cb;
@@ -1642,6 +1647,7 @@ pub(crate) fn encode_inter_block(
     src: &[u8; 64],
     pred: &[u8; 64],
     quant: u32,
+    quant_mode: QuantMode,
 ) -> ([i32; 64], [u8; 64]) {
     // Residual.
     let mut res = [0f32; 64];
@@ -1653,29 +1659,55 @@ pub(crate) fn encode_inter_block(
     // Quantise. Inter H.263 dequant rule is
     //   recon(l) = 2*Q*|l| + Q_plus; Q_plus = Q if Q odd, Q-1 if Q even;
     //   recon(0) = 0.
+    // MPEG-quant rule (§7.4.4.3 eq 18):
+    //   recon(l) = ((2*|l| + 1) * wQ * matrix[i]) / 16
     // Forward pick the level whose reconstruction is closest to `coef`.
     let q = quant as i32;
     let q_plus = if q & 1 == 1 { q } else { q - 1 };
     let two_q = 2 * q;
+    let inter_matrix = crate::headers::vol::DEFAULT_NON_INTRA_QUANT_MATRIX;
 
     let mut levels = [0i32; 64];
-    for i in 0..64 {
-        let c = res[i].round() as i32;
-        levels[i] = quantise_ac_inter_h263(c, two_q, q_plus).clamp(-2047, 2047);
-    }
-
-    // Reconstruct: dequantise + IDCT + add predictor + clip.
     let mut deq = [0i32; 64];
-    for i in 0..64 {
-        let l = levels[i];
-        if l == 0 {
-            deq[i] = 0;
-        } else {
-            let abs = l.unsigned_abs() as i32;
-            let val = two_q * abs + q_plus;
-            deq[i] = if l < 0 { -val } else { val };
+    match quant_mode {
+        QuantMode::H263 => {
+            for i in 0..64 {
+                let c = res[i].round() as i32;
+                levels[i] = quantise_ac_inter_h263(c, two_q, q_plus).clamp(-2047, 2047);
+            }
+            // Reconstruct: dequantise.
+            for i in 0..64 {
+                let l = levels[i];
+                if l == 0 {
+                    deq[i] = 0;
+                } else {
+                    let abs = l.unsigned_abs() as i32;
+                    let val = two_q * abs + q_plus;
+                    deq[i] = if l < 0 { -val } else { val };
+                }
+            }
+        }
+        QuantMode::Mpeg4 => {
+            for i in 0..64 {
+                let c = res[i].round() as i32;
+                levels[i] = crate::iq::quantise_ac_inter_mpeg4(c, i, quant, &inter_matrix)
+                    .clamp(-2047, 2047);
+            }
+            // Reconstruct under §7.4.4.3 eq (18) + §7.4.4.7 mismatch.
+            let mut sum: i64 = 0;
+            for i in 0..64 {
+                deq[i] = crate::iq::reconstruct_inter_mpeg4(levels[i], i, quant, &inter_matrix);
+                sum += deq[i] as i64;
+            }
+            // Mismatch control on the last coefficient when the parity
+            // of the reconstructed sum is even (matches
+            // `dequantise_inter_mpeg4`'s decoder-side toggle).
+            if sum & 1 == 0 {
+                deq[63] ^= 1;
+            }
         }
     }
+
     let mut deqf = [0f32; 64];
     for i in 0..64 {
         deqf[i] = deq[i] as f32;
