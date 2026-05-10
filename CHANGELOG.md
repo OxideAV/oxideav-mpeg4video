@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.5](https://github.com/OxideAV/oxideav-mpeg4video/compare/v0.1.4...v0.1.5) - 2026-05-06
+
+### Other
+
+- drop dead `linkme` dep
+- MPEG-4 matrix quantisation (mpeg_quant=1, §7.4.4.3)
+- encoder + decoder: static sprite VOP + zoom-in GMC fixture + PSNR_Y target
+- multi-warp GMC (n=2/3/4) + intra-in-P MVD-bit accounting
+- auto-register via oxideav_core::register! macro (linkme distributed slice)
+- unify entry point on register(&mut RuntimeContext) ([#502](https://github.com/OxideAV/oxideav-mpeg4video/pull/502))
+
 ### Added
 
 - encoder: **MPEG-4 matrix quantisation (`mpeg_quant = 1`, §7.4.4.3,
