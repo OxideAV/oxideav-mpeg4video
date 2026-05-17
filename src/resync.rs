@@ -28,12 +28,12 @@
 //! `bits_count & 7`. The `RESYNC_PREFIX_BY_BIT_ALIGN` table mirrors
 //! FFmpeg's `mpeg4_resync_prefix`.
 
+use oxideav_core::bits::{BitReader, BitWriter};
 use oxideav_core::{Error, Result};
 
 use crate::bits_ext::BitReaderExt;
 use crate::headers::vol::VideoObjectLayer;
 use crate::headers::vop::{VideoObjectPlane, VopCodingType};
-use oxideav_core::bits::BitReader;
 
 /// First 16 bits of a stuffed resync-marker, indexed by `bits_count & 7`
 /// of the decoder's position before the stuffing.
@@ -211,6 +211,63 @@ pub fn try_consume_resync_marker_after(
     Ok(ResyncResult::Resync { mb_num, new_quant })
 }
 
+/// Emit a `video_packet_header()` (§6.3.5.2) at the current bit position.
+///
+/// Layout, matching `try_consume_resync_marker_after` exactly:
+/// 1. **stuffing** — `0` then 1..=7 `1`s to reach a byte boundary. If
+///    already byte-aligned, a full `0_1111111` (0x7F) byte is emitted.
+/// 2. **resync_marker** — `N` zero bits then a `1`. `N` comes from
+///    [`video_packet_prefix_length`].
+/// 3. **macroblock_number** — `mb_num_bits(mb_count)` bits naming the
+///    next MB to decode (flat scan order, zero-indexed).
+/// 4. **quant_scale** — `quant_precision` bits with the new quantiser
+///    for the packet that follows. Must be non-zero (clamped to 1).
+/// 5. **header_extension_code (HEC)** — 1 bit. We always emit `0`
+///    (no extension payload).
+///
+/// `mb_count` is the total number of MBs in the VOP (`mb_w * mb_h`),
+/// used only to size the `macroblock_number` field per spec.
+pub fn write_video_packet_header(
+    bw: &mut BitWriter,
+    coding_type: VopCodingType,
+    f_code_fwd: u8,
+    f_code_bwd: u8,
+    quant_precision: u8,
+    mb_count: u32,
+    mb_num: u32,
+    new_quant: u32,
+) {
+    debug_assert!(mb_num < mb_count, "mb_num must point inside the VOP");
+    debug_assert!(new_quant >= 1, "quant must be at least 1");
+    // 1. Stuffing — `0` then `1`s to byte-align.
+    if bw.is_byte_aligned() {
+        bw.write_byte(0x7F);
+    } else {
+        bw.write_bits(0, 1);
+        while !bw.is_byte_aligned() {
+            bw.write_bits(1, 1);
+        }
+    }
+    // 2. Resync marker (N zeros + 1).
+    let n_zeros = video_packet_prefix_length(coding_type, f_code_fwd, f_code_bwd);
+    let mut remaining = n_zeros;
+    while remaining >= 24 {
+        bw.write_bits(0, 24);
+        remaining -= 24;
+    }
+    if remaining > 0 {
+        bw.write_bits(0, remaining);
+    }
+    bw.write_bits(1, 1);
+    // 3. macroblock_number.
+    let mb_bits = mb_num_bits(mb_count);
+    bw.write_bits(mb_num, mb_bits);
+    // 4. quant_scale (`quant_precision` bits, default 5). Always >= 1.
+    bw.write_bits(new_quant.max(1), quant_precision as u32);
+    // 5. HEC = 0 — no extension payload.
+    bw.write_bits(0, 1);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,6 +342,96 @@ mod tests {
         );
         // Bit position must be unchanged.
         assert_eq!(br.bit_position(), 0);
+    }
+
+    #[test]
+    fn write_then_read_roundtrip_i_vop_byte_aligned() {
+        // Encoder emits a packet header at a byte boundary, decoder
+        // round-trips the same mb_num / new_quant.
+        let mut bw = BitWriter::new();
+        let vol = synth_vol();
+        let vop = synth_vop_i();
+        write_video_packet_header(
+            &mut bw,
+            VopCodingType::I,
+            0,
+            0,
+            vol.quant_precision,
+            16,
+            4,
+            3,
+        );
+        // Add a sentinel `01` so the decoder's bit position has somewhere
+        // to land (the decoder only cares about the marker prefix; no
+        // additional MB data needed for the test).
+        bw.write_bits(0b01, 2);
+        bw.align_to_byte_zero();
+        let data = bw.finish();
+        let mut br = BitReader::new(&data);
+        let r = try_consume_resync_marker(&mut br, &vol, &vop, 16).unwrap();
+        match r {
+            ResyncResult::Resync { mb_num, new_quant } => {
+                assert_eq!(mb_num, 4);
+                assert_eq!(new_quant, 3);
+            }
+            _ => panic!("expected resync to be detected, got {:?}", r),
+        }
+    }
+
+    #[test]
+    fn write_then_read_roundtrip_unaligned_position() {
+        // Start mid-byte (write 3 bits first) so the stuffing path
+        // exercises the partial-byte fill (1 zero + 4 ones).
+        let mut bw = BitWriter::new();
+        bw.write_bits(0b101, 3);
+        let vol = synth_vol();
+        let vop = synth_vop_p_fcode2();
+        write_video_packet_header(
+            &mut bw,
+            VopCodingType::P,
+            2,
+            0,
+            vol.quant_precision,
+            32,
+            7,
+            5,
+        );
+        bw.write_bits(0b01, 2);
+        bw.align_to_byte_zero();
+        let data = bw.finish();
+        let mut br = BitReader::new(&data);
+        // Skip the leading 3 sentinel bits so the decoder lands at the
+        // same position the encoder was at when it wrote the marker.
+        let _ = br.read_u32(3).unwrap();
+        let r = try_consume_resync_marker(&mut br, &vol, &vop, 32).unwrap();
+        match r {
+            ResyncResult::Resync { mb_num, new_quant } => {
+                assert_eq!(mb_num, 7);
+                assert_eq!(new_quant, 5);
+            }
+            _ => panic!("expected resync to be detected, got {:?}", r),
+        }
+    }
+
+    fn synth_vop_p_fcode2() -> VideoObjectPlane {
+        VideoObjectPlane {
+            vop_coding_type: VopCodingType::P,
+            modulo_time_base: 0,
+            vop_time_increment: 0,
+            vop_coded: true,
+            rounding_type: false,
+            intra_dc_vlc_thr: 0,
+            vop_quant: 3,
+            vop_fcode_forward: 2,
+            vop_fcode_backward: 0,
+            width: 64,
+            height: 64,
+            sprite_trajectory: None,
+            interlaced: false,
+            top_field_first: false,
+            alternate_vertical_scan: false,
+            brightness_change_factor: 0,
+        }
     }
 
     fn synth_vol() -> VideoObjectLayer {

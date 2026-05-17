@@ -142,6 +142,25 @@ pub const GMC_SPRITE_WARPING_ACCURACY: u8 = 0;
 /// forward-only tcoef tables — preserving round-21 behaviour.
 pub const DEFAULT_REVERSIBLE_VLC: bool = false;
 
+/// Default `resync_marker_period`. `0` disables mid-VOP resync emission
+/// entirely (the encoder emits one packet per picture, matching round-72
+/// behaviour and keeping `resync_marker_disable = 1` in the VOL). A
+/// positive value `N` causes the combined-mode I and P encoders to
+/// splice a `video_packet_header()` (§6.3.5.2) after every `N` complete
+/// macroblocks — once `(mb_idx + 1) % N == 0` and another MB still
+/// remains. The VOL flips `resync_marker_disable = 0` so the decoder
+/// looks for the marker. Mutually exclusive with `data_partitioned = 1`
+/// (DP defines its own per-VOP video-packet layout) and with the
+/// `static_sprite` path (no MB loop). GMC, QPel, and B-VOPs encode as
+/// usual; resync currently only splits I- and P-VOP bodies — B-VOP
+/// resync remains future work.
+pub const DEFAULT_RESYNC_MARKER_PERIOD: u32 = 0;
+/// Hard upper bound on `resync_marker_period` to keep callers from
+/// asking for absurd values that would explode bitstream size with
+/// per-MB headers. 1024 MBs is roughly a 1080p frame; finer splits than
+/// that exhaust the packet-header overhead budget very quickly.
+pub const MAX_RESYNC_MARKER_PERIOD: u32 = 1024;
+
 /// Encoder factory used by `register()`.
 pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     let width = params
@@ -365,6 +384,41 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     // conformant: the VOL `quarter_sample = 1` flag tells the decoder
     // that all forward/backward MVDs in B-VOPs are in QPel units.
 
+    // `resync_marker_period` (in MBs). When > 0, the combined-mode I/P
+    // encoders splice a `video_packet_header()` (§6.3.5.2) every N
+    // complete MBs; the VOL flips `resync_marker_disable = 0`. The
+    // current implementation covers I-VOP and combined-mode P-VOP
+    // bodies; static-sprite and DP paths already define their own
+    // packet rules and are rejected here.
+    let resync_marker_period = match params.options.get("resync_marker_period") {
+        Some(s) => {
+            let v: u32 = s.parse().map_err(|_| {
+                Error::invalid(format!(
+                    "mpeg4 encoder: option resync_marker_period={s} not an integer"
+                ))
+            })?;
+            if v > MAX_RESYNC_MARKER_PERIOD {
+                return Err(Error::invalid(format!(
+                    "mpeg4 encoder: resync_marker_period={v} exceeds {MAX_RESYNC_MARKER_PERIOD}"
+                )));
+            }
+            v
+        }
+        None => DEFAULT_RESYNC_MARKER_PERIOD,
+    };
+    if resync_marker_period > 0 && data_partitioned {
+        return Err(Error::unsupported(
+            "mpeg4 encoder: resync_marker_period>0 + dp=1 not supported \
+             (DP defines its own per-VOP video-packet layout)",
+        ));
+    }
+    if resync_marker_period > 0 && static_sprite {
+        return Err(Error::unsupported(
+            "mpeg4 encoder: resync_marker_period>0 + sprite_static=1 not supported \
+             (S-VOPs with vop_coded=0 carry no MB data to split)",
+        ));
+    }
+
     Ok(Box::new(Mpeg4VideoEncoder {
         output_params,
         width,
@@ -395,6 +449,7 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         rounding_type: false,
         static_sprite,
         mpeg_quant,
+        resync_marker_period,
     }))
 }
 
@@ -488,6 +543,17 @@ struct Mpeg4VideoEncoder {
     /// encoded as the sprite canvas (I-VOP body); all subsequent frames
     /// become S-VOPs with `vop_coded = 0` (decoder re-emits the canvas).
     static_sprite: bool,
+    /// Mid-VOP `video_packet_header()` (§6.3.5.2) emission cadence in
+    /// macroblocks. `0` keeps the round-72 behaviour (one packet per
+    /// VOP, `resync_marker_disable = 1`). A positive value `N` causes
+    /// the combined-mode I- and P-VOP encoders to splice a packet
+    /// header after every `N`-th complete MB. The VOL emits
+    /// `resync_marker_disable = 0`. Mutually exclusive with
+    /// `data_partitioned` (DP defines its own packet layout per
+    /// §6.2.6) and with the static-sprite path. GMC and B-VOPs are
+    /// allowed in the encoder but currently only I and P bodies get
+    /// mid-VOP splits.
+    resync_marker_period: u32,
 }
 
 impl Encoder for Mpeg4VideoEncoder {
@@ -591,6 +657,7 @@ impl Mpeg4VideoEncoder {
                 self.reversible_vlc,
                 self.static_sprite,
                 self.mpeg_quant,
+                self.resync_marker_period > 0,
             );
             self.headers_emitted = true;
         }
@@ -631,6 +698,7 @@ impl Mpeg4VideoEncoder {
                     self.height,
                     self.vop_quant_i,
                     QuantMode::from_flag(self.mpeg_quant),
+                    self.resync_marker_period,
                 )?
             };
             self.reference = Some(pic);
@@ -692,6 +760,7 @@ impl Mpeg4VideoEncoder {
                     self.quarter_sample,
                     warp.as_ref(),
                     QuantMode::from_flag(self.mpeg_quant),
+                    self.resync_marker_period,
                 )?
             };
             self.reference = Some(pic);
@@ -702,8 +771,10 @@ impl Mpeg4VideoEncoder {
         // byte boundary; `0x7F` if already aligned. DP-conformant decoders
         // (ffmpeg) require this exact pattern at the end of a video
         // packet so they don't keep parsing into the trailing zeros and
-        // misinterpret them as more MB data.
-        if self.data_partitioned {
+        // misinterpret them as more MB data. The same applies when the
+        // encoder is splicing resync markers: a tail of bare zeros would
+        // look like a new marker prefix.
+        if self.data_partitioned || self.resync_marker_period > 0 {
             align_with_one_zero_then_ones(&mut bw);
         } else {
             bw.align_to_byte_zero();
@@ -745,6 +816,7 @@ impl Mpeg4VideoEncoder {
                 self.reversible_vlc,
                 self.static_sprite,
                 self.mpeg_quant,
+                self.resync_marker_period > 0,
             );
             self.headers_emitted = true;
         }
@@ -770,6 +842,7 @@ impl Mpeg4VideoEncoder {
                     self.height,
                     self.vop_quant_i,
                     QuantMode::from_flag(self.mpeg_quant),
+                    self.resync_marker_period,
                 )?
             };
             self.reference = Some(pic);
@@ -813,6 +886,7 @@ impl Mpeg4VideoEncoder {
                 self.quarter_sample,
                 warp.as_ref(),
                 QuantMode::from_flag(self.mpeg_quant),
+                self.resync_marker_period,
             )?;
             self.reference = Some(pic);
             self.reference_grid = Some(grid);
@@ -820,8 +894,9 @@ impl Mpeg4VideoEncoder {
         }
         // Spec-conformant `next_start_code()` stuffing — see `emit_i_or_p`
         // for the full rationale (DP-conformant decoders need this exact
-        // pattern at the end of a video packet).
-        if self.data_partitioned {
+        // pattern at the end of a video packet, and the same applies
+        // when resync markers are enabled).
+        if self.data_partitioned || self.resync_marker_period > 0 {
             align_with_one_zero_then_ones(&mut bw);
         } else {
             bw.align_to_byte_zero();
@@ -998,6 +1073,7 @@ fn write_vos_vo_vol(
     reversible_vlc: bool,
     static_sprite: bool,
     mpeg_quant: bool,
+    resync_markers_enabled: bool,
 ) {
     // VOS.
     write_start_code(bw, VOS_START_CODE);
@@ -1153,9 +1229,13 @@ fn write_vos_vo_vol(
     bw.write_bits(1, 1); // complexity_estimation_disable = 1
                          // resync_marker_disable — must be 0 when DP is on
                          // (DP is only legal inside a video packet — the
-                         // first packet starts at the VOP header). 1
-                         // otherwise.
-    bw.write_bits(if data_partitioned { 0 } else { 1 }, 1);
+                         // first packet starts at the VOP header). Also 0
+                         // when the encoder is configured to splice mid-
+                         // VOP video_packet_header()s (resync markers).
+                         // 1 otherwise so legacy decoders never look for
+                         // a marker we'll never emit.
+    let resync_disable = !(data_partitioned || resync_markers_enabled);
+    bw.write_bits(if resync_disable { 1 } else { 0 }, 1);
     bw.write_bits(if data_partitioned { 1 } else { 0 }, 1); // data_partitioned
     if data_partitioned {
         // reversible_vlc — only emitted when DP is on (§6.2.3). When
@@ -1665,6 +1745,13 @@ impl QuantMode {
 /// used as the MC reference for subsequent P-VOPs. Uses the shared decoder
 /// path so the reconstruction is bit-exact relative to what the decoder
 /// would produce from the same bitstream.
+///
+/// When `resync_period > 0`, the encoder splices a
+/// `video_packet_header()` (§6.3.5.2) after every `resync_period`-th
+/// complete MB (skipping the trailing MB, where the
+/// `next_start_code()` already terminates the VOP). The decoder resets
+/// DC/AC prediction across packet boundaries, so we mirror that here by
+/// clearing the local `PredGrid` after each split.
 pub(crate) fn encode_i_vop_body_and_reconstruct(
     bw: &mut BitWriter,
     v: &VideoFrame,
@@ -1672,11 +1759,13 @@ pub(crate) fn encode_i_vop_body_and_reconstruct(
     height: u32,
     vop_quant: u32,
     quant_mode: QuantMode,
+    resync_period: u32,
 ) -> Result<IVopPicture> {
     let width = width as usize;
     let height = height as usize;
     let mb_w = width.div_ceil(16);
     let mb_h = height.div_ceil(16);
+    let mb_total = (mb_w * mb_h) as u32;
 
     let mut grid = PredGrid::new(mb_w, mb_h);
     // We reconstruct by re-reading our emitted bitstream. That's the same
@@ -1686,11 +1775,32 @@ pub(crate) fn encode_i_vop_body_and_reconstruct(
     // (done below via the `out` parameter).
     let mut pic = IVopPicture::new(width, height);
 
+    let mut mb_idx: u32 = 0;
     for mb_y in 0..mb_h {
         for mb_x in 0..mb_w {
             encode_intra_mb_reconstruct(
                 bw, v, width, height, mb_x, mb_y, vop_quant, &mut grid, &mut pic, quant_mode,
             )?;
+            mb_idx += 1;
+            // Splice a video_packet_header() after every Nth complete MB,
+            // skipping the trailing MB (the encoder appends a
+            // next_start_code() stuffing pad after the body and that is
+            // the natural picture terminator).
+            if resync_period > 0 && mb_idx < mb_total && mb_idx % resync_period == 0 {
+                crate::resync::write_video_packet_header(
+                    bw,
+                    crate::headers::vop::VopCodingType::I,
+                    0,
+                    0,
+                    5, // quant_precision — matches `write_vos_vo_vol`
+                    mb_total,
+                    mb_idx,
+                    vop_quant,
+                );
+                // Decoder side resets the DC/AC predictor grid across the
+                // packet boundary (see `decoder::decode_ivop_pic_body`).
+                grid = PredGrid::new(mb_w, mb_h);
+            }
         }
     }
     Ok(pic)

@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- encoder: **`video_packet_header()` mid-VOP resync emission
+  (`resync_marker_period`, §6.3.5.2, round 73).** New
+  `resync_marker_period` codec option (default `0` = disabled, range
+  `1..=1024` macroblocks). When non-zero, the combined-mode I- and
+  P-VOP encoders splice a `video_packet_header()` after every Nth
+  complete MB. The VOL emits `resync_marker_disable = 0`, and the
+  trailing VOP body pads with the spec-conformant `0` then `1`s
+  (`next_start_code()` rule) so a decoder's marker scanner doesn't
+  treat trailing zeros as a new marker prefix. Predictor reset across
+  packet boundaries: the DC/AC `PredGrid` is cleared, the
+  `slice_first_mb` is threaded into
+  `crate::pvop::emit_p_mb::predict_mv_full` and
+  `mvd_savings_for_intra_in_p::predict_mv_full` so the §7.6.2
+  first-slice-line predictor special cases trigger correctly for the
+  first row of every new packet. The MV grid is intentionally NOT
+  reset (matches decoder behaviour — `slice_first_mb` is the only
+  gate). Mutually exclusive with `data_partitioned = 1` (DP defines
+  its own per-VOP packet layout per §6.2.6) and with `sprite_static
+  = 1` (S-VOPs with `vop_coded = 0` have no MB body to split). New
+  public helper `crate::resync::write_video_packet_header` is shared
+  by the I- and P-VOP encoders and round-trips through the existing
+  `crate::resync::try_consume_resync_marker_after` decoder. ffmpeg
+  cross-decode validated on a 96×96 4-frame fixture at period 9
+  (3 mid-VOP splits per VOP, `tests/resync.rs::resync_ffmpeg_decode`,
+  ≥ 44 dB I-VOP / ≥ 26 dB first P-VOP). Self-roundtrip tests cover
+  period 4 (9 splits per VOP) and period 6 (5 splits per VOP) over
+  8 frames at ≥ 30 dB PSNR per frame
+  (`resync_self_roundtrip_psnr_passes`,
+  `resync_high_frequency_period_still_roundtrips`). Option-validation
+  tests (`resync_with_incompatible_options_rejected`,
+  `resync_default_zero_keeps_legacy_behaviour`) lock in the factory
+  gates and the legacy default. Marker-byte pattern presence check
+  (`resync_marker_pattern_present_in_p_vop_body`) asserts at least
+  4 markers appear in the P-VOP body. Round-trip writer/reader
+  unit tests in `src/resync.rs::tests` exercise both byte-aligned
+  and unaligned stuffing paths.
+
 ## [0.1.5](https://github.com/OxideAV/oxideav-mpeg4video/compare/v0.1.4...v0.1.5) - 2026-05-06
 
 ### Other

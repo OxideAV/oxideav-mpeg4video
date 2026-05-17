@@ -212,6 +212,7 @@ pub fn encode_p_vop_body(
         false,
         None,
         QuantMode::H263,
+        0,
     )?;
     Ok(pic)
 }
@@ -242,11 +243,13 @@ pub fn encode_p_vop_body_with_grid(
     quarter_sample: bool,
     warp: Option<&crate::gmc::WarpParams>,
     quant_mode: QuantMode,
+    resync_period: u32,
 ) -> Result<(IVopPicture, MvGrid)> {
     let width = width as usize;
     let height = height as usize;
     let mb_w = width.div_ceil(16);
     let mb_h = height.div_ceil(16);
+    let mb_total = (mb_w * mb_h) as u32;
 
     let mut pic = IVopPicture::new(width, height);
     let mut mv_grid = MvGrid::new(mb_w, mb_h);
@@ -256,8 +259,22 @@ pub fn encode_p_vop_body_with_grid(
     // intra MBs read `dc=1024, is_intra=false` from inter neighbours,
     // matching the decoder's `decode_p_vop_body`.
     let mut pred_grid = PredGrid::new(mb_w, mb_h);
+    // First MB of the current video packet (the "slice"). Updated each
+    // time we emit a `video_packet_header()`. Threaded into
+    // `predict_mv_full` so the MV-predictor first-slice-line special
+    // cases (§7.6.2 / FFmpeg `ff_h263_pred_motion`) trigger correctly
+    // for the first row of the new packet.
+    let mut slice_first_mb_x: usize = 0;
+    let mut slice_first_mb_y: usize = 0;
 
     let gmc_enabled = warp.is_some();
+    // GMC + resync — every Inter MB carries an mcsel bit (§6.3.7) but
+    // the spec only allows mid-VOP `video_packet_header()` splits when
+    // the encoder also maintains predictor reset across the boundary.
+    // The DC/AC PredGrid and slice_first_mb tracking already handle
+    // that; the warp parameters themselves are per-VOP so they apply
+    // uniformly across packets.
+    let mut mb_idx: u32 = 0;
     for mb_y in 0..mb_h {
         for mb_x in 0..mb_w {
             // Decision pass — also produces a fully-reconstructed inter MB.
@@ -293,7 +310,15 @@ pub fn encode_p_vop_body_with_grid(
             let mvd_credit = if mb.gmc || mb.skipped {
                 0
             } else {
-                mvd_savings_for_intra_in_p(&mb, mb_x, mb_y, &mv_grid, f_code_fwd)
+                mvd_savings_for_intra_in_p(
+                    &mb,
+                    mb_x,
+                    mb_y,
+                    &mv_grid,
+                    f_code_fwd,
+                    slice_first_mb_x,
+                    slice_first_mb_y,
+                )
             };
             // Add the inter mode's MVD bit cost (in SAD-equivalent units)
             // to its coding-cost proxy: intra-in-P saves those bits, so
@@ -345,7 +370,17 @@ pub fn encode_p_vop_body_with_grid(
                     },
                 );
             } else {
-                emit_p_mb(bw, &mb, mb_x, mb_y, &mut mv_grid, f_code_fwd, gmc_enabled);
+                emit_p_mb(
+                    bw,
+                    &mb,
+                    mb_x,
+                    mb_y,
+                    &mut mv_grid,
+                    f_code_fwd,
+                    gmc_enabled,
+                    slice_first_mb_x,
+                    slice_first_mb_y,
+                );
                 // Stash reconstructed samples into `pic`.
                 write_recon_to_pic(&mut pic, &mb, mb_x, mb_y);
                 // Reset PredGrid for inter MB (mirrors the decoder's
@@ -371,6 +406,36 @@ pub fn encode_p_vop_body_with_grid(
                     }
                 };
                 mv_grid.set(mb_x, mb_y, motion);
+            }
+
+            mb_idx += 1;
+            // Splice a video_packet_header() after every Nth complete MB
+            // (skip the trailing MB — next_start_code() pads the picture
+            // terminator). The decoder resets the DC/AC predictor grid
+            // and recomputes its `slice_first_mb` from `mb_num`, so we
+            // mirror both here. The MV grid is intentionally NOT
+            // reset; the decoder keeps it intact and uses
+            // `slice_first_mb` to gate first-row predictor lookups
+            // through `predict_mv_full`.
+            if resync_period > 0 && mb_idx < mb_total && mb_idx % resync_period == 0 {
+                let coding_type = if warp.is_some() {
+                    crate::headers::vop::VopCodingType::S
+                } else {
+                    crate::headers::vop::VopCodingType::P
+                };
+                crate::resync::write_video_packet_header(
+                    bw,
+                    coding_type,
+                    f_code_fwd,
+                    0,
+                    5,
+                    mb_total,
+                    mb_idx,
+                    vop_quant,
+                );
+                pred_grid = PredGrid::new(mb_w, mb_h);
+                slice_first_mb_x = (mb_idx as usize) % mb_w;
+                slice_first_mb_y = (mb_idx as usize) / mb_w;
             }
         }
     }
@@ -469,12 +534,15 @@ fn inter_cost_proxy(mb: &PMbEncoding) -> u32 {
 /// roughly costs `MVD_BIT_TO_SAD` SAD points to the inter side
 /// (empirically tuned, mirrors the `FOURMV_LAMBDA` / `GMC_LAMBDA`
 /// scaling used elsewhere in this file).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn mvd_savings_for_intra_in_p(
     mb: &PMbEncoding,
     mb_x: usize,
     mb_y: usize,
     mv_grid: &MvGrid,
     f_code_fwd: u8,
+    slice_first_mb_x: usize,
+    slice_first_mb_y: usize,
 ) -> u32 {
     /// SAD-points-per-bit conversion at Q≈5 (matches `FOURMV_LAMBDA`
     /// and `GMC_LAMBDA` derivations).
@@ -492,7 +560,15 @@ pub(crate) fn mvd_savings_for_intra_in_p(
         let mut total: u32 = 0;
         for blk in 0..4 {
             tmp.set(mb_x, mb_y, committed);
-            let (px, py) = crate::inter::predict_mv_full(&tmp, mb_x, mb_y, blk, true, 0, 0);
+            let (px, py) = crate::inter::predict_mv_full(
+                &tmp,
+                mb_x,
+                mb_y,
+                blk,
+                true,
+                slice_first_mb_x,
+                slice_first_mb_y,
+            );
             let (mvx, mvy) = mb.mv4_half[blk];
             let dx = wrap_mvd(mvx - px, range);
             let dy = wrap_mvd(mvy - py, range);
@@ -501,7 +577,15 @@ pub(crate) fn mvd_savings_for_intra_in_p(
         }
         total
     } else {
-        let (px, py) = crate::inter::predict_mv_full(mv_grid, mb_x, mb_y, 0, false, 0, 0);
+        let (px, py) = crate::inter::predict_mv_full(
+            mv_grid,
+            mb_x,
+            mb_y,
+            0,
+            false,
+            slice_first_mb_x,
+            slice_first_mb_y,
+        );
         let (mvx, mvy) = mb.mv_half;
         let dx = wrap_mvd(mvx - px, range);
         let dy = wrap_mvd(mvy - py, range);
@@ -1754,6 +1838,7 @@ fn quantise_ac_inter_h263(coef: i32, two_q: i32, q_plus: i32) -> i32 {
 // Bitstream emission
 // -------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn emit_p_mb(
     bw: &mut BitWriter,
     mb: &PMbEncoding,
@@ -1762,6 +1847,8 @@ fn emit_p_mb(
     mv_grid: &mut MvGrid,
     f_code_fwd: u8,
     gmc_enabled: bool,
+    slice_first_mb_x: usize,
+    slice_first_mb_y: usize,
 ) {
     if mb.skipped {
         // §6.3.5: not_coded = 1.
@@ -1841,7 +1928,15 @@ fn emit_p_mb(
         };
         for blk in 0..4 {
             mv_grid.set(mb_x, mb_y, committed);
-            let (px, py) = crate::inter::predict_mv_full(mv_grid, mb_x, mb_y, blk, true, 0, 0);
+            let (px, py) = crate::inter::predict_mv_full(
+                mv_grid,
+                mb_x,
+                mb_y,
+                blk,
+                true,
+                slice_first_mb_x,
+                slice_first_mb_y,
+            );
             let (mvx, mvy) = mb.mv4_half[blk];
             let dx = mvx - px;
             let dy = mvy - py;
@@ -1858,7 +1953,15 @@ fn emit_p_mb(
         // in case future callers re-use the in-progress grid.
         mv_grid.set(mb_x, mb_y, committed);
     } else {
-        let (px, py) = crate::inter::predict_mv_full(mv_grid, mb_x, mb_y, 0, false, 0, 0);
+        let (px, py) = crate::inter::predict_mv_full(
+            mv_grid,
+            mb_x,
+            mb_y,
+            0,
+            false,
+            slice_first_mb_x,
+            slice_first_mb_y,
+        );
         let (mvx, mvy) = mb.mv_half;
         let dx = mvx - px;
         let dy = mvy - py;

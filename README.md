@@ -169,7 +169,33 @@ decoder accepts as-is. Input is `Yuv420P` only.
   validated on the synthetic 64×64 moving-gradient fixture
   (`tests/p_vop.rs::mpeg_quant_ffmpeg_decode`, ≥ 39 dB on every
   frame, byte-equivalent to our self-decode within rounding).
-- **Resync markers.** Not emitted (`resync_marker_disable = 1`).
+- **Resync markers (`resync_marker_period`, round 73).** Opt-in mid-VOP
+  `video_packet_header()` (§6.3.5.2) emission. New
+  `resync_marker_period` codec option (default `0` = disabled, range
+  `1..=1024` macroblocks). When non-zero, the VOL flips
+  `resync_marker_disable = 0`, and the combined-mode I- and P-VOP
+  encoders splice a packet header after every Nth complete MB. Each
+  header is: stuffing (`0` then `1`s to byte-align, or full `0x7F` if
+  already aligned), `N`-zero resync marker (16 for I-VOPs, `f_code+15`
+  for P/S-VOPs, `max(f,b)+15` for B-VOPs — minimum 17), trailing `1`,
+  `ceil(log2(mb_count-1))+1`-bit `macroblock_number`,
+  `quant_precision`-bit `quant_scale`, then `HEC = 0`. Per the
+  spec-conformant `next_start_code()` rule, the trailing VOP body also
+  pads with `0` then `1`s when resync is on (a bare-zero tail would
+  match a resync prefix in the decoder's scanner). Predictor reset
+  across packet boundaries: DC/AC `PredGrid` is cleared; the
+  `slice_first_mb` is threaded into `predict_mv_full` so the §7.6.2
+  first-slice-line MV-predictor special cases trigger correctly for
+  the first row of every new packet. The MV grid is **not** reset —
+  the decoder keeps it intact and uses `slice_first_mb` to gate
+  first-row predictor lookups. Mutually exclusive with `dp = 1` (DP
+  defines its own per-VOP packet layout per §6.2.6) and with
+  `sprite_static = 1` (S-VOPs with `vop_coded = 0` carry no MB data
+  to split). ffmpeg cross-decode validated on a 96×96 4-frame fixture
+  at period 9 (3 splits per VOP): ≥ 44 dB I-VOP and ≥ 26 dB first
+  P-VOP through ffmpeg (`tests/resync.rs::resync_ffmpeg_decode`).
+  Self-roundtrip + decoder symmetry tests at period 4 (9 splits per
+  96×96 VOP) and period 6.
 
 Round-trip PSNR on the synthetic 64×64 moving-gradient test
 (`tests/p_vop.rs`): around 43 dB on the I-VOP, around 41.6 dB on the
