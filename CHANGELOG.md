@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6](https://github.com/OxideAV/oxideav-mpeg4video/compare/v0.1.5...v0.1.6) - 2026-05-17
+
+### Other
+
+- encoder mid-VOP video_packet_header() resync (§6.3.5.2)
+
 ### Added
 
 - encoder: **`video_packet_header()` mid-VOP resync emission
