@@ -1,0 +1,18 @@
+# release-plz config — https://release-plz.dev/docs/config
+
+[workspace]
+changelog_path = "./CHANGELOG.md"
+allow_dirty = false
+
+git_tag_name = "v{{ version }}"
+git_release_name = "v{{ version }}"
+
+# We intentionally add public fields to structs (for new bitstream
+# features), which cargo-semver-checks flags as breaking because
+# struct-literal construction must be updated. For a pre-1.0 crate
+# that ships bitstream decoders, every struct-literal caller is
+# in-tree and we'd rather bump the patch number than the minor.
+# Disable the semver-check so release-plz bumps based on conventional
+# commits alone (patch by default; use `!` or `BREAKING CHANGE:` in
+# the footer for genuine breaks).
+semver_check = false
