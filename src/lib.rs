@@ -30,6 +30,13 @@
 //!   run-length expansion from §6.3.3) surface as
 //!   `VolHeader::intra_quant_mat: Option<[u8; 64]>` /
 //!   `VolHeader::nonintra_quant_mat: Option<[u8; 64]>`.
+//! * Round 5: §6.2.6 macroblock-layer header bit-walk — `not_coded`
+//!   (P-VOP), `mcbpc` (Tables B.6 / B.7), `ac_pred_flag` (intra MB),
+//!   `cbpy` (Table B.8, 4 non-transparent blocks), `dquant`
+//!   (Table 6-32). Surfaces as `MacroblockHeader { not_coded,
+//!   mb_type, cbpc, ac_pred_flag, cbpy, dquant_delta }` via
+//!   `parse_macroblock_header`. Stuffing macroblocks are
+//!   transparently skipped per §6.2.6.
 //! * Strict failure on Studio Profiles, FGS layers, and non-rectangular
 //!   shapes — those branches are recognised and rejected with a typed
 //!   error, never silently mis-parsed. Sprite bodies, complexity-
@@ -56,10 +63,14 @@
 use oxideav_core::RuntimeContext;
 
 pub mod bitreader;
+pub mod macroblock;
 pub mod vol;
 pub mod vop;
 
 pub use bitreader::{BitReader, BitReaderError};
+pub use macroblock::{
+    dquant_value, parse_macroblock_header, DerivedMbType, MacroblockHeader, MacroblockParseError,
+};
 pub use vol::{
     parse_video_object_layer, parse_visual_object_header, parse_visual_object_sequence_header,
     AspectRatio, SpriteEnable, VbvParameters, VolControlParameters, VolHeader, VolParseError,
@@ -87,6 +98,9 @@ pub enum Error {
     /// A VOP / Group-of-VOP header parse failed. See [`VopParseError`]
     /// for the discrimination.
     Vop(VopParseError),
+    /// A macroblock-layer header parse failed. See
+    /// [`MacroblockParseError`] for the discrimination.
+    Macroblock(MacroblockParseError),
 }
 
 impl core::fmt::Display for Error {
@@ -98,6 +112,9 @@ impl core::fmt::Display for Error {
             ),
             Error::Vol(err) => write!(f, "oxideav-mpeg4video: VOL parse error: {err}"),
             Error::Vop(err) => write!(f, "oxideav-mpeg4video: VOP parse error: {err}"),
+            Error::Macroblock(err) => {
+                write!(f, "oxideav-mpeg4video: macroblock parse error: {err}")
+            }
         }
     }
 }
@@ -113,6 +130,12 @@ impl From<VolParseError> for Error {
 impl From<VopParseError> for Error {
     fn from(err: VopParseError) -> Self {
         Error::Vop(err)
+    }
+}
+
+impl From<MacroblockParseError> for Error {
+    fn from(err: MacroblockParseError) -> Self {
+        Error::Macroblock(err)
     }
 }
 
@@ -144,5 +167,15 @@ mod tests {
         let e: Error = VopParseError::Truncated.into();
         assert!(matches!(e, Error::Vop(VopParseError::Truncated)));
         assert!(format!("{e}").contains("VOP parse error"));
+    }
+
+    #[test]
+    fn macroblock_error_round_trip() {
+        let e: Error = MacroblockParseError::Truncated.into();
+        assert!(matches!(
+            e,
+            Error::Macroblock(MacroblockParseError::Truncated)
+        ));
+        assert!(format!("{e}").contains("macroblock parse error"));
     }
 }

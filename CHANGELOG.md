@@ -8,6 +8,41 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 5 of the clean-room rebuild: §6.2.6 macroblock-layer
+  header bit-walk for I-VOPs and P-VOPs with rectangular VOL shape
+  and 4 non-transparent blocks. New `parse_macroblock_header(br,
+  vop_coding_type, vol)` consumes `not_coded` (P-VOP only — Table B.1
+  shows it absent on I-VOP), `mcbpc` (Tables B.6 / B.7), the intra-MB
+  `ac_pred_flag`, `cbpy` (Table B.8, 4 non-transparent blocks), and
+  `dquant` (Table 6-32) into a typed `MacroblockHeader { not_coded,
+  mb_type, cbpc, ac_pred_flag, cbpy, dquant_delta }`. Stuffing
+  macroblocks (mcbpc → "Stuffing") are consumed transparently per
+  §6.2.6; the function returns the first non-stuffing header.
+- `MacroblockHeader::SKIPPED` const for the not_coded=1 P-VOP case
+  (§6.3.6 — decoder treats as inter with zero MV and no DCT data).
+- `DerivedMbType` enum (`Inter`, `InterQ`, `Inter4V`, `Intra`,
+  `IntraQ`) matching the Table B.1 derived_mb_type integers, with
+  `as_u8`, `is_intra`, `has_dquant` predicates.
+- `dquant_value(code: u8) -> i8` expanding Table 6-32 (`00 → -1`,
+  `01 → -2`, `10 → +1`, `11 → +2`).
+- `MacroblockParseError { Truncated, InvalidMcbpc { window },
+  InvalidCbpy { window }, UnsupportedVopKind(VopCodingType),
+  UnsupportedShape(u8) }` + `Display` + `Error` + `From<BitReaderError>`.
+- `Error::Macroblock(MacroblockParseError)` variant + `From`
+  conversion on the crate-level error surface.
+- 23 round-5 unit tests: Table 6-32 dquant round-trip;
+  `DerivedMbType` predicates; minimal I-VOP intra MB; I-VOP intra+q
+  with dquant; P-VOP not_coded skip; P-VOP inter MB (no dquant);
+  P-VOP inter+q with dquant -2; P-VOP intra with ac_pred; P-VOP
+  inter4v; I-VOP stuffing skip; P-VOP stuffing skip; B-VOP /
+  S-VOP rejection; non-rectangular-shape rejection; invalid mcbpc
+  prefix; invalid cbpy prefix; truncated; Display coverage for all
+  five error variants; `MacroblockHeader::SKIPPED` defaults;
+  full round-trip of every Table B.6 / B.7 non-stuffing entry; full
+  round-trip of every Table B.8 entry (intra + inter columns);
+  `MacroblockParseError -> Error` conversion + Display contains
+  "macroblock parse error".
+
 - Round 4 of the clean-room rebuild: §6.2.3.3 `quant_type == 1`
   quantiser-matrix load body decode. After `quant_type = 1`, the
   parser reads `load_intra_quant_mat` (1 bit) and, if set, the
