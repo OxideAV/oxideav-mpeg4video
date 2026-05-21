@@ -8,6 +8,33 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 4 of the clean-room rebuild: §6.2.3.3 `quant_type == 1`
+  quantiser-matrix load body decode. After `quant_type = 1`, the
+  parser reads `load_intra_quant_mat` (1 bit) and, if set, the
+  `8*[2-64]` zigzag-ordered 8-bit `intra_quant_mat` list terminated
+  by an optional 0 sentinel (with the remaining entries set to the
+  last non-zero value per §6.3.3); same for `load_nonintra_quant_mat`
+  / `nonintra_quant_mat`. The grayscale follow-on
+  (`load_*_quant_mat_grayscale`) is gated on
+  `video_object_layer_shape == "grayscale"`, which the parser
+  rejects upfront.
+- `VolHeader::intra_quant_mat: Option<[u8; 64]>` and
+  `VolHeader::nonintra_quant_mat: Option<[u8; 64]>`. `Some(_)` only
+  when the corresponding `load_*_quant_mat` flag was set; entries
+  are stored in zigzag scan order with the 0-sentinel run-length
+  expansion already applied.
+- `VolParseError::EmptyQuantMatrix(&'static str)` for the malformed
+  case where the first transmitted matrix byte is 0 (the `8*[2-64]`
+  syntax requires at least two values; a leading 0 implies zero
+  transmitted).
+- 9 round-4 unit tests: full 64-entry intra matrix with no sentinel;
+  two-entry intra with zero-sentinel run-length fill; both intra +
+  nonintra loaded simultaneously; intra-only / nonintra-only mixed
+  with the un-loaded sibling staying `None`; leading-0 intra and
+  leading-0 nonintra rejection; minimal two-entry list; full-64 no
+  sentinel verifies the tail is *not* re-filled; direct truncation
+  of the `parse_quant_matrix` helper. `vol_error_branch_displays`
+  was extended to assert the new error's `Display` text.
 - Round 3 of the clean-room rebuild: promotion of the ISO/IEC 14496-2
   §6.2.3 trailing VOL fields onto `VolHeader` — `interlaced`,
   `obmc_disable`, `sprite_enable` (Table 6-19), `not_8_bit`,

@@ -6,7 +6,7 @@
 //! rebuild lands the §6.2 configuration-header parsers
 //! (`VisualObjectSequence` / `VisualObject` / `VideoObjectLayer`).
 //!
-//! ## Round-1..3 scope
+//! ## Round-1..4 scope
 //!
 //! * Identification of the three start codes — `0x000001B0`,
 //!   `0x000001B5`, `0x000001Bx` — that delimit configuration data.
@@ -24,13 +24,18 @@
 //!   `reduced_resolution_vop_enable`, `scalability`), together with
 //!   `VopContext::from_vol(&vol)` and `VopHeader::from_vol(&vol,
 //!   payload)` convenience entry points.
+//! * Round 4: §6.2.3.3 `quant_type == 1` matrix-load body decode —
+//!   `load_intra_quant_mat` / `load_nonintra_quant_mat` plus the
+//!   `8*[2-64]` zigzag-ordered 8-bit list (with the 0-sentinel
+//!   run-length expansion from §6.3.3) surface as
+//!   `VolHeader::intra_quant_mat: Option<[u8; 64]>` /
+//!   `VolHeader::nonintra_quant_mat: Option<[u8; 64]>`.
 //! * Strict failure on Studio Profiles, FGS layers, and non-rectangular
 //!   shapes — those branches are recognised and rejected with a typed
-//!   error, never silently mis-parsed. Sprite bodies, quant-matrix
-//!   load, complexity-estimation headers, and `newpred_enable` bodies
-//!   are likewise typed-rejected (`VolParseError::UnsupportedBranch`)
-//!   so the bit position never drifts past a branch we don't yet
-//!   decode.
+//!   error, never silently mis-parsed. Sprite bodies, complexity-
+//!   estimation headers, and `newpred_enable` bodies are likewise
+//!   typed-rejected (`VolParseError::UnsupportedBranch`) so the bit
+//!   position never drifts past a branch we don't yet decode.
 //!
 //! Macroblock-level VOP decoding is **not** included; it lands in
 //! later rounds.

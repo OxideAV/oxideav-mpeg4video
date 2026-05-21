@@ -5,7 +5,7 @@ A pure-Rust MPEG-4 Part 2 Video codec (ISO/IEC 14496-2) for the
 
 ## Status
 
-**Round 3 of the clean-room rebuild (2026-05-21).** The prior
+**Round 4 of the clean-room rebuild (2026-05-22).** The prior
 implementation was retired on 2026-05-18 under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md);
 the VLC tables admitted to sourcing their numeric entries from an
@@ -23,6 +23,13 @@ enforcement procedure.
   `reduced_resolution_vop_enable`, `scalability`) plus a
   `VopHeader::from_vol(vol, payload)` / `VopContext::from_vol(&vol)`
   convenience pair.
+* Round 4 — §6.2.3.3 `quant_type == 1` matrix-load body decode:
+  `load_intra_quant_mat` / `load_nonintra_quant_mat` followed by the
+  `8*[2-64]` zigzag-ordered 8-bit list with the 0-sentinel run-length
+  expansion ("remaining values set equal to the last non-zero value"
+  per §6.3.3). New `VolHeader::intra_quant_mat: Option<[u8; 64]>` and
+  `nonintra_quant_mat: Option<[u8; 64]>` fields surface the resulting
+  matrices in zigzag scan order.
 
 Macroblock-level decoding lands in later rounds.
 
@@ -54,27 +61,32 @@ Macroblock-level decoding lands in later rounds.
 | Sprite / scalability / newpred VOP branches   | rejected (typed errors) |
 | `interlaced` / `obmc_disable` / `sprite_enable` VOL fields | surfaced (Table 6-19) |
 | `quant_precision` / `bits_per_pixel` VOL fields | surfaced (`not_8_bit` path) |
-| `quant_type` + matrix-load presence            | flag surfaced; bodies rejected |
+| `quant_type` flag                              | surfaced |
+| `load_intra_quant_mat` / `load_nonintra_quant_mat` bodies | decoded into `[u8; 64]` zigzag (round 4) |
 | `complexity_estimation_disable` / `resync_marker_disable` | surfaced |
 | `data_partitioned` / `reversible_vlc` VOL flags | surfaced |
 | `newpred_enable` / `reduced_resolution_vop_enable` (verid != 1) | surfaced; body rejected |
 | `scalability` VOL flag                         | surfaced |
 | `VopContext::from_vol(&vol)`                   | populates context from VolHeader |
 | `VopHeader::from_vol(&vol, payload)`           | one-call VOL+VOP plumbing |
-| Sprite-body / quant-matrix / complexity-est-header VOL branches | typed `UnsupportedBranch` |
+| Sprite-body / complexity-est-header VOL branches | typed `UnsupportedBranch` |
 | Macroblock decode                             | not yet |
 | Encoder                                       | not yet |
 
-60 round-1+2+3 unit tests pass.
+69 round-1+2+3+4 unit tests pass.
 
 ## Provenance
 
 Every numeric value and bit layout in this crate is sourced from
 ISO/IEC 14496-2:2004 (3rd edition) — Tables 6-3 (start codes), 6-14
-(aspect ratios), 6-15 (chroma formats), 6-16 (shape types), 6-23
-(time-code layout), 6-24 (`vop_coding_type`), 6-25 (`intra_dc_vlc_thr`)
-— and the syntax tables of §6.2.2 / §6.2.3 / §6.2.4 / §6.2.5 plus the
-semantics in §6.3.3 / §6.3.4 / §6.3.5. The text was read from
+(aspect ratios), 6-15 (chroma formats), 6-16 (shape types), 6-19
+(`sprite_enable`), 6-23 (time-code layout), 6-24 (`vop_coding_type`),
+6-25 (`intra_dc_vlc_thr`) — and the syntax tables of §6.2.2 / §6.2.3
+/ §6.2.4 / §6.2.5 plus the semantics in §6.3.3 (including the
+`8*[2-64]` zigzag-ordered quant-matrix list, the zero-sentinel
+"remaining values set equal to the last non-zero value" rule, and the
+intra "shall always be 8" / non-intra "shall not be 0" first-value
+constraints) / §6.3.4 / §6.3.5. The text was read from
 `docs/video/mpeg4-visual/ISO_IEC_14496-2-2004-3rd-edition.txt`. No
 third-party MPEG-4 source was consulted.
 

@@ -104,6 +104,13 @@ pub enum VolParseError {
     /// shape, complexity-estimation header, or a custom
     /// `intra_quant_mat` / `nonintra_quant_mat`).
     UnsupportedBranch(&'static str),
+    /// The transmitted `intra_quant_mat` or `nonintra_quant_mat` list
+    /// was malformed: its first 8-bit value was 0, which §6.3.3 defines
+    /// as the "no more values follow" sentinel. The syntax `8*[2-64]`
+    /// requires at least two values, so a leading 0 implies zero values
+    /// transmitted and is a bitstream error. Carries the matrix name
+    /// (`"intra"` / `"nonintra"`) for diagnostics.
+    EmptyQuantMatrix(&'static str),
 }
 
 impl core::fmt::Display for VolParseError {
@@ -134,6 +141,12 @@ impl core::fmt::Display for VolParseError {
             }
             VolParseError::UnsupportedBranch(name) => {
                 write!(f, "VOL branch '{name}' not supported by round-3 parser")
+            }
+            VolParseError::EmptyQuantMatrix(name) => {
+                write!(
+                    f,
+                    "{name}_quant_mat first value was 0 (list must hold 2..=64 entries)"
+                )
             }
         }
     }
@@ -313,6 +326,25 @@ pub struct VolHeader {
     /// (matrix-driven) inverse-quantisation method, `false` the
     /// second (H.263-style).
     pub quant_type: bool,
+    /// Intra-block quantisation matrix loaded with `load_intra_quant_mat
+    /// == 1` (§6.2.3 / §6.3.3). `Some(_)` only when the bitstream
+    /// transmits a custom matrix; `None` otherwise (the default Annex
+    /// matrix at §6.3.3 should be used).
+    ///
+    /// The 64 bytes are stored in zigzag scan order — the same order
+    /// they were transmitted in. The first value is "shall always be 8"
+    /// per §6.3.3; this parser surfaces the raw stream and does not
+    /// substitute. Run-length expansion of the zero-sentinel rule
+    /// ("remaining, non-transmitted values are set equal to the last
+    /// non-zero value") is performed here so the caller sees a
+    /// fully-populated `[u8; 64]`.
+    pub intra_quant_mat: Option<[u8; 64]>,
+    /// Non-intra-block quantisation matrix loaded with
+    /// `load_nonintra_quant_mat == 1` (§6.2.3 / §6.3.3). Same encoding
+    /// and expansion convention as [`Self::intra_quant_mat`]; the
+    /// spec's only difference is the first-value constraint (intra
+    /// "shall always be 8"; non-intra "shall not be 0").
+    pub nonintra_quant_mat: Option<[u8; 64]>,
     /// `quarter_sample` flag (§6.3.3). Only present when
     /// `video_object_layer_verid != 1`; defaults to `false`
     /// otherwise.
@@ -387,6 +419,53 @@ fn read_marker_bit(br: &mut BitReader<'_>) -> Result<(), VolParseError> {
     } else {
         Err(VolParseError::MarkerBitMissing)
     }
+}
+
+/// Decode a `load_intra_quant_mat` / `load_nonintra_quant_mat` body
+/// per §6.2.3 syntax (`8*[2-64]`) + §6.3.3 semantics.
+///
+/// The bitstream carries a sequence of 8-bit unsigned values in zigzag
+/// scan order. A value of 0 terminates the list, and the remaining
+/// non-transmitted entries are filled with the last non-zero value. If
+/// all 64 values are transmitted without a 0 sentinel, the list ends
+/// naturally. A leading 0 is a bitstream error (the spec mandates 2..=64
+/// transmitted values; 0-as-first-byte implies zero transmitted).
+///
+/// `name` is the matrix's spec-side identifier ("intra" / "nonintra")
+/// used only for diagnostic error messages.
+fn parse_quant_matrix(
+    br: &mut BitReader<'_>,
+    name: &'static str,
+) -> Result<[u8; 64], VolParseError> {
+    let mut mat = [0u8; 64];
+    let mut last_nonzero: u8 = 0;
+    let mut terminated = false;
+    for (i, slot) in mat.iter_mut().enumerate() {
+        let v = br.read_bits(8)? as u8;
+        if v == 0 {
+            if i == 0 {
+                return Err(VolParseError::EmptyQuantMatrix(name));
+            }
+            terminated = true;
+            break;
+        }
+        *slot = v;
+        last_nonzero = v;
+    }
+    if terminated {
+        // i is the position of the 0 sentinel; mat[i..64] needs the
+        // last non-zero fill. The terminator itself is at mat[i] which
+        // is currently 0; overwrite from there.
+        for slot in mat.iter_mut() {
+            if *slot == 0 {
+                *slot = last_nonzero;
+            }
+        }
+        // The above re-walks mat from the start, but every prefix entry
+        // was non-zero (we exited the loop on the first 0), so only the
+        // tail is rewritten. This avoids tracking `i` across the break.
+    }
+    Ok(mat)
 }
 
 fn parse_vol_control(br: &mut BitReader<'_>) -> Result<VolControlParameters, VolParseError> {
@@ -542,25 +621,33 @@ fn parse_video_object_layer_body(
     // linear_composition) is gated on `shape == grayscale`, which is
     // already rejected upfront.
     let quant_type = br.read_bool()?;
-    if quant_type {
-        // load_intra_quant_mat + load_nonintra_quant_mat carry
-        // variable-length 8-bit run lists. Round 3 doesn't yet
-        // decode those bodies — surface the branch cleanly so the
-        // bit position doesn't drift.
+    let (intra_quant_mat, nonintra_quant_mat) = if quant_type {
+        // §6.2.3 syntax table at spec line ~4045:
+        //   load_intra_quant_mat                                  1 bslbf
+        //   if (load_intra_quant_mat)
+        //         intra_quant_mat                                 8*[2-64] uimsbf
+        //   load_nonintra_quant_mat                               1 bslbf
+        //   if (load_nonintra_quant_mat)
+        //         nonintra_quant_mat                              8*[2-64] uimsbf
+        // The grayscale follow-on (`load_*_quant_mat_grayscale`) is
+        // gated on `video_object_layer_shape == "grayscale"` which is
+        // already rejected upfront via `UnsupportedShape`.
         let load_intra = br.read_bool()?;
-        if load_intra {
-            return Err(VolParseError::UnsupportedBranch(
-                "load_intra_quant_mat body",
-            ));
-        }
+        let intra = if load_intra {
+            Some(parse_quant_matrix(br, "intra")?)
+        } else {
+            None
+        };
         let load_nonintra = br.read_bool()?;
-        if load_nonintra {
-            return Err(VolParseError::UnsupportedBranch(
-                "load_nonintra_quant_mat body",
-            ));
-        }
-        // (grayscale variant is gated on shape == grayscale.)
-    }
+        let nonintra = if load_nonintra {
+            Some(parse_quant_matrix(br, "nonintra")?)
+        } else {
+            None
+        };
+        (intra, nonintra)
+    } else {
+        (None, None)
+    };
     let quarter_sample = if video_object_layer_verid != 1 {
         br.read_bool()?
     } else {
@@ -619,6 +706,8 @@ fn parse_video_object_layer_body(
         quant_precision,
         bits_per_pixel,
         quant_type,
+        intra_quant_mat,
+        nonintra_quant_mat,
         quarter_sample,
         complexity_estimation_disable,
         resync_marker_disable,
@@ -1206,21 +1295,6 @@ mod tests {
     }
 
     #[test]
-    fn round3_quant_type_load_matrix_is_rejected() {
-        let mut w = BitWriter::new();
-        write_vol_header_up_to_trailing(&mut w, None, 0b00, false);
-        w.write_bits(0, 1); // interlaced
-        w.write_bits(0, 1); // obmc_disable
-        w.write_bits(0, 1); // sprite_enable
-        w.write_bits(0, 1); // not_8_bit
-        w.write_bits(1, 1); // quant_type = 1
-        w.write_bits(1, 1); // load_intra_quant_mat = 1
-        w.align();
-        let err = parse_video_object_layer(&w.buf, 0).unwrap_err();
-        assert!(matches!(err, VolParseError::UnsupportedBranch(_)));
-    }
-
-    #[test]
     fn round3_quant_type_no_load_succeeds() {
         let mut w = BitWriter::new();
         write_vol_header_up_to_trailing(&mut w, None, 0b00, false);
@@ -1238,6 +1312,191 @@ mod tests {
         w.align();
         let h = parse_video_object_layer(&w.buf, 0).unwrap();
         assert!(h.quant_type);
+        // No `load_*` bit set ⇒ no custom matrix carried.
+        assert!(h.intra_quant_mat.is_none());
+        assert!(h.nonintra_quant_mat.is_none());
+    }
+
+    /// Helper that emits a quant_type=1 VOL fixture with caller-supplied
+    /// intra / nonintra matrix payloads (each `Option<Vec<u8>>`; `None`
+    /// means `load_*_quant_mat = 0`, `Some(bytes)` means load=1 followed
+    /// by `bytes` written byte-aligned via 8-bit writes).
+    fn make_quant_matrix_vol(intra: Option<&[u8]>, nonintra: Option<&[u8]>) -> Vec<u8> {
+        let mut w = BitWriter::new();
+        write_vol_header_up_to_trailing(&mut w, None, 0b00, false);
+        w.write_bits(0, 1); // interlaced
+        w.write_bits(0, 1); // obmc_disable
+        w.write_bits(0, 1); // sprite_enable = NotUsed
+        w.write_bits(0, 1); // not_8_bit
+        w.write_bits(1, 1); // quant_type = 1
+        match intra {
+            Some(bytes) => {
+                w.write_bits(1, 1);
+                for b in bytes {
+                    w.write_bits(u32::from(*b), 8);
+                }
+            }
+            None => w.write_bits(0, 1),
+        }
+        match nonintra {
+            Some(bytes) => {
+                w.write_bits(1, 1);
+                for b in bytes {
+                    w.write_bits(u32::from(*b), 8);
+                }
+            }
+            None => w.write_bits(0, 1),
+        }
+        w.write_bits(1, 1); // complexity_estimation_disable
+        w.write_bits(0, 1); // resync_marker_disable
+        w.write_bits(0, 1); // data_partitioned
+        w.write_bits(0, 1); // scalability
+        w.align();
+        w.buf
+    }
+
+    #[test]
+    fn round4_load_intra_quant_mat_full_64_values() {
+        // Transmit all 64 entries with no zero sentinel — the natural
+        // end of the list. Use a recognisable triangular pattern so the
+        // round-trip is visually obvious.
+        let payload: Vec<u8> = (1..=64).collect();
+        let data = make_quant_matrix_vol(Some(&payload), None);
+        let h = parse_video_object_layer(&data, 0).unwrap();
+        let mat = h.intra_quant_mat.expect("intra matrix present");
+        for (i, m) in mat.iter().enumerate() {
+            assert_eq!(*m as usize, i + 1, "zigzag position {i}");
+        }
+        assert!(h.nonintra_quant_mat.is_none());
+    }
+
+    #[test]
+    fn round4_load_intra_quant_mat_zero_sentinel_runs_last_nonzero() {
+        // Two values then a 0 sentinel: matrix should be [8, 17, 17,
+        // 17, …]. (8 is the spec-mandated first value; 17 is the
+        // arbitrary second value, which is also the last non-zero
+        // value that gets run-length-replicated into the tail per
+        // §6.3.3.)
+        let payload = [8u8, 17u8, 0u8];
+        let data = make_quant_matrix_vol(Some(&payload), None);
+        let h = parse_video_object_layer(&data, 0).unwrap();
+        let mat = h.intra_quant_mat.expect("intra matrix present");
+        assert_eq!(mat[0], 8);
+        assert_eq!(mat[1], 17);
+        for v in &mat[2..] {
+            assert_eq!(*v, 17);
+        }
+    }
+
+    #[test]
+    fn round4_load_both_intra_and_nonintra_matrices() {
+        // Spec-recommended default intra matrix (first row of the
+        // §6.3.3 default; values 8..27) terminated by 0, plus a short
+        // nonintra payload [16, 16, 0] → matrix [16, 16, 16, …].
+        let intra_payload = [8u8, 17, 18, 19, 21, 23, 25, 27, 0];
+        let nonintra_payload = [16u8, 16, 0];
+        let data = make_quant_matrix_vol(Some(&intra_payload), Some(&nonintra_payload));
+        let h = parse_video_object_layer(&data, 0).unwrap();
+
+        let intra = h.intra_quant_mat.expect("intra matrix present");
+        assert_eq!(&intra[0..8], &[8u8, 17, 18, 19, 21, 23, 25, 27]);
+        for v in &intra[8..] {
+            assert_eq!(*v, 27, "tail filled with last non-zero (27)");
+        }
+
+        let nonintra = h.nonintra_quant_mat.expect("nonintra matrix present");
+        assert_eq!(nonintra[0], 16);
+        for v in &nonintra[1..] {
+            assert_eq!(*v, 16);
+        }
+    }
+
+    #[test]
+    fn round4_load_intra_only_then_nonintra_default() {
+        // Load intra (2 bytes + 0) but leave nonintra at default
+        // (load_nonintra = 0). The parser surfaces the absent nonintra
+        // matrix as `None` so the caller knows to use the default.
+        let intra_payload = [8u8, 16, 0];
+        let data = make_quant_matrix_vol(Some(&intra_payload), None);
+        let h = parse_video_object_layer(&data, 0).unwrap();
+        assert!(h.intra_quant_mat.is_some());
+        assert!(h.nonintra_quant_mat.is_none());
+    }
+
+    #[test]
+    fn round4_load_nonintra_only_then_intra_default() {
+        // Mirror image: nonintra loaded, intra default. Confirms the
+        // load_intra / load_nonintra branches are independent.
+        let nonintra_payload = [20u8, 20, 0];
+        let data = make_quant_matrix_vol(None, Some(&nonintra_payload));
+        let h = parse_video_object_layer(&data, 0).unwrap();
+        assert!(h.intra_quant_mat.is_none());
+        let mat = h.nonintra_quant_mat.expect("nonintra matrix present");
+        assert_eq!(mat[0], 20);
+        assert_eq!(mat[63], 20);
+    }
+
+    #[test]
+    fn round4_empty_intra_quant_mat_is_rejected() {
+        // A leading 0 byte means the encoder transmitted zero values,
+        // violating the `8*[2-64]` syntax constraint.
+        let payload = [0u8];
+        let data = make_quant_matrix_vol(Some(&payload), None);
+        let err = parse_video_object_layer(&data, 0).unwrap_err();
+        assert_eq!(err, VolParseError::EmptyQuantMatrix("intra"));
+    }
+
+    #[test]
+    fn round4_empty_nonintra_quant_mat_is_rejected() {
+        // Intra is full-length so it doesn't trip the same error
+        // first; then nonintra starts with 0.
+        let intra_payload: Vec<u8> = (1..=64).collect();
+        let nonintra_payload = [0u8];
+        let data = make_quant_matrix_vol(Some(&intra_payload), Some(&nonintra_payload));
+        let err = parse_video_object_layer(&data, 0).unwrap_err();
+        assert_eq!(err, VolParseError::EmptyQuantMatrix("nonintra"));
+    }
+
+    #[test]
+    fn round4_minimal_two_entry_intra_matrix() {
+        // Smallest legal list per `8*[2-64]`: two non-zero values then
+        // the 0 sentinel. Tail fills with the second value.
+        let payload = [8u8, 100, 0];
+        let data = make_quant_matrix_vol(Some(&payload), None);
+        let h = parse_video_object_layer(&data, 0).unwrap();
+        let mat = h.intra_quant_mat.expect("intra matrix present");
+        assert_eq!(mat[0], 8);
+        assert_eq!(mat[1], 100);
+        for v in &mat[2..] {
+            assert_eq!(*v, 100);
+        }
+    }
+
+    #[test]
+    fn round4_full_64_no_sentinel_does_not_run_length_fill() {
+        // Exactly 64 values with no 0 ⇒ no run-length expansion.
+        // Verify the last entry equals what was transmitted, not the
+        // last non-zero. (They happen to be the same here, but we use
+        // a non-monotone pattern to make the property visible.)
+        let mut payload = vec![1u8; 64];
+        payload[63] = 7;
+        let data = make_quant_matrix_vol(Some(&payload), None);
+        let h = parse_video_object_layer(&data, 0).unwrap();
+        let mat = h.intra_quant_mat.expect("intra matrix present");
+        for v in &mat[..63] {
+            assert_eq!(*v, 1);
+        }
+        assert_eq!(mat[63], 7);
+    }
+
+    #[test]
+    fn round4_quant_matrix_helper_handles_truncation() {
+        // Direct-call test of `parse_quant_matrix` against a truncated
+        // slice: load=1 but the matrix payload is cut short before any
+        // value is read.
+        let mut br = BitReader::new(&[]);
+        let err = parse_quant_matrix(&mut br, "intra").unwrap_err();
+        assert_eq!(err, VolParseError::Truncated);
     }
 
     #[test]
@@ -1246,5 +1505,9 @@ mod tests {
         assert!(format!("{e}").contains("foo"));
         let e = VolParseError::BadQuantPrecision(11);
         assert!(format!("{e}").contains("11"));
+        let e = VolParseError::EmptyQuantMatrix("intra");
+        let s = format!("{e}");
+        assert!(s.contains("intra"));
+        assert!(s.contains("2..=64"));
     }
 }
