@@ -55,7 +55,7 @@
 //! `scalability=false`.
 
 use crate::bitreader::{BitReader, BitReaderError};
-use crate::vol::VolParseError;
+use crate::vol::{SpriteEnable, VolHeader, VolParseError};
 
 /// Start code for a `Group_of_VideoObjectPlane()` (§6.2.4 / §6.3.4 —
 /// `0x000001B3`).
@@ -160,6 +160,25 @@ impl Default for VopContext {
             newpred_enable: false,
             reduced_resolution_vop_enable: false,
             complexity_estimation_disable: true,
+        }
+    }
+}
+
+impl VopContext {
+    /// Build a [`VopContext`] by projecting the round-3 fields out of a
+    /// parsed [`VolHeader`]. The caller no longer needs to keep the
+    /// fields in sync by hand — `parse_video_object_plane_header(..,
+    /// VopContext::from_vol(&vol))` is the canonical pipeline.
+    pub fn from_vol(vol: &VolHeader) -> Self {
+        Self {
+            quant_precision: vol.quant_precision,
+            interlaced: vol.interlaced,
+            sprite_gmc: matches!(vol.sprite_enable, SpriteEnable::Gmc),
+            sprite_static: matches!(vol.sprite_enable, SpriteEnable::Static),
+            scalability: vol.scalability,
+            newpred_enable: vol.newpred_enable,
+            reduced_resolution_vop_enable: vol.reduced_resolution_vop_enable,
+            complexity_estimation_disable: vol.complexity_estimation_disable,
         }
     }
 }
@@ -339,6 +358,24 @@ fn parse_group_of_vop_body(br: &mut BitReader<'_>) -> Result<GovHeader, VopParse
         closed_gov,
         broken_link,
     })
+}
+
+impl VopHeader {
+    /// Parse a VOP header directly against the [`VolHeader`] it
+    /// belongs to. Equivalent to
+    /// `parse_video_object_plane_header(payload,
+    /// vol.time_increment_resolution, VopContext::from_vol(vol))`,
+    /// but reads more naturally at call sites that already have the
+    /// `VolHeader` in scope. The convenience constructor is the
+    /// recommended entry point now that round 3 promotes the
+    /// context bits onto [`VolHeader`].
+    pub fn from_vol(vol: &VolHeader, payload: &[u8]) -> Result<Self, VopParseError> {
+        parse_video_object_plane_header(
+            payload,
+            vol.time_increment_resolution,
+            VopContext::from_vol(vol),
+        )
+    }
 }
 
 /// Parse a §6.2.5 `VideoObjectPlane` header starting at the
@@ -923,6 +960,82 @@ mod tests {
             found: 0,
         };
         assert!(format!("{e}").contains("missing x"));
+    }
+
+    /// Build a minimal VOL fixture suitable for `VopHeader::from_vol`
+    /// integration tests. Mirrors the round-3 helper in `vol.rs`.
+    fn build_minimal_vol(resolution: u16, width: u16, height: u16) -> Vec<u8> {
+        let mut w = BitWriter::new();
+        w.write_bits(crate::vol::VIDEO_OBJECT_LAYER_START_CODE_MIN, 32);
+        w.write_bits(0, 1); // random_accessible_vol
+        w.write_bits(1, 8); // video_object_type_indication
+        w.write_bits(0, 1); // is_object_layer_identifier
+        w.write_bits(0b0001, 4); // aspect_ratio_info = 1:1
+        w.write_bits(0, 1); // vol_control_parameters = 0
+        w.write_bits(0b00, 2); // video_object_layer_shape = rectangular
+        w.write_marker();
+        w.write_bits(u32::from(resolution), 16);
+        w.write_marker();
+        w.write_bits(0, 1); // fixed_vop_rate
+        w.write_marker();
+        w.write_bits(u32::from(width), 13);
+        w.write_marker();
+        w.write_bits(u32::from(height), 13);
+        w.write_marker();
+        // Round-3 trailing block (everything off).
+        w.write_bits(0, 1); // interlaced
+        w.write_bits(0, 1); // obmc_disable
+        w.write_bits(0, 1); // sprite_enable (1 bit, verid=1)
+        w.write_bits(0, 1); // not_8_bit
+        w.write_bits(0, 1); // quant_type
+        w.write_bits(1, 1); // complexity_estimation_disable
+        w.write_bits(0, 1); // resync_marker_disable
+        w.write_bits(0, 1); // data_partitioned
+        w.write_bits(0, 1); // scalability
+        w.align();
+        w.buf
+    }
+
+    #[test]
+    fn vop_context_from_vol_picks_up_promoted_fields() {
+        let vol_data = build_minimal_vol(30_000, 176, 144);
+        let vol = crate::vol::parse_video_object_layer(&vol_data, 0x01).unwrap();
+        let ctx = VopContext::from_vol(&vol);
+        assert_eq!(ctx.quant_precision, 5);
+        assert!(!ctx.interlaced);
+        assert!(!ctx.sprite_gmc);
+        assert!(!ctx.sprite_static);
+        assert!(!ctx.scalability);
+        assert!(!ctx.newpred_enable);
+        assert!(!ctx.reduced_resolution_vop_enable);
+        assert!(ctx.complexity_estimation_disable);
+    }
+
+    #[test]
+    fn vop_header_from_vol_parses_minimal_i_vop() {
+        let vol_data = build_minimal_vol(30_000, 176, 144);
+        let vol = crate::vol::parse_video_object_layer(&vol_data, 0x01).unwrap();
+        let vop_data = make_i_vop(30_000, 0, 1001, 7, 3);
+        let header = VopHeader::from_vol(&vol, &vop_data).unwrap();
+        assert_eq!(header.coding_type, VopCodingType::I);
+        assert_eq!(header.time_increment, 1001);
+        assert_eq!(header.quant, 7);
+        assert_eq!(header.intra_dc_vlc_thr, 3);
+    }
+
+    #[test]
+    fn vop_header_from_vol_uses_vol_resolution() {
+        // Build a VOL with a small resolution (so vop_time_increment
+        // is only 1 bit wide) and confirm `from_vol` plumbs it
+        // through.
+        let vol_data = build_minimal_vol(2, 16, 16);
+        let vol = crate::vol::parse_video_object_layer(&vol_data, 0).unwrap();
+        assert_eq!(vol.time_increment_resolution, 2);
+        // Build an I-VOP with resolution=2.
+        let vop_data = make_i_vop(2, 0, 1, 5, 0);
+        let header = VopHeader::from_vol(&vol, &vop_data).unwrap();
+        assert_eq!(header.time_increment, 1);
+        assert_eq!(header.composed_ticks, 1);
     }
 
     #[test]

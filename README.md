@@ -5,7 +5,7 @@ A pure-Rust MPEG-4 Part 2 Video codec (ISO/IEC 14496-2) for the
 
 ## Status
 
-**Round 2 of the clean-room rebuild (2026-05-21).** The prior
+**Round 3 of the clean-room rebuild (2026-05-21).** The prior
 implementation was retired on 2026-05-18 under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md);
 the VLC tables admitted to sourcing their numeric entries from an
@@ -16,6 +16,13 @@ enforcement procedure.
   (`VisualObjectSequence` / `VisualObject` / `VideoObjectLayer`).
 * Round 2 — structural parsing of §6.2.4 Group-of-VOP and §6.2.5 Video
   Object Plane headers up to (but not including) the macroblock layer.
+* Round 3 — promotion of the §6.2.3 trailing fields onto
+  `VolHeader` (`interlaced`, `obmc_disable`, `sprite_enable`,
+  `quant_precision`, `quant_type`, `complexity_estimation_disable`,
+  `resync_marker_disable`, `data_partitioned`, `newpred_enable`,
+  `reduced_resolution_vop_enable`, `scalability`) plus a
+  `VopHeader::from_vol(vol, payload)` / `VopContext::from_vol(&vol)`
+  convenience pair.
 
 Macroblock-level decoding lands in later rounds.
 
@@ -45,10 +52,20 @@ Macroblock-level decoding lands in later rounds.
 | `vop_fcode_forward` / `vop_fcode_backward`    | surfaced, 0 rejected as forbidden |
 | Interlaced `top_field_first` / `alt_vert_scan`| consumed structurally (kept aligned) |
 | Sprite / scalability / newpred VOP branches   | rejected (typed errors) |
+| `interlaced` / `obmc_disable` / `sprite_enable` VOL fields | surfaced (Table 6-19) |
+| `quant_precision` / `bits_per_pixel` VOL fields | surfaced (`not_8_bit` path) |
+| `quant_type` + matrix-load presence            | flag surfaced; bodies rejected |
+| `complexity_estimation_disable` / `resync_marker_disable` | surfaced |
+| `data_partitioned` / `reversible_vlc` VOL flags | surfaced |
+| `newpred_enable` / `reduced_resolution_vop_enable` (verid != 1) | surfaced; body rejected |
+| `scalability` VOL flag                         | surfaced |
+| `VopContext::from_vol(&vol)`                   | populates context from VolHeader |
+| `VopHeader::from_vol(&vol, payload)`           | one-call VOL+VOP plumbing |
+| Sprite-body / quant-matrix / complexity-est-header VOL branches | typed `UnsupportedBranch` |
 | Macroblock decode                             | not yet |
 | Encoder                                       | not yet |
 
-44 round-1+2 unit tests pass.
+60 round-1+2+3 unit tests pass.
 
 ## Provenance
 

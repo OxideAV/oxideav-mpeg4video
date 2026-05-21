@@ -6,7 +6,7 @@
 //! rebuild lands the §6.2 configuration-header parsers
 //! (`VisualObjectSequence` / `VisualObject` / `VideoObjectLayer`).
 //!
-//! ## Round-1 scope
+//! ## Round-1..3 scope
 //!
 //! * Identification of the three start codes — `0x000001B0`,
 //!   `0x000001B5`, `0x000001Bx` — that delimit configuration data.
@@ -15,9 +15,22 @@
 //!   dimensions, time-increment resolution, optional
 //!   `vol_control_parameters` + VBV block, and the marker bits that
 //!   stop start-code emulation inside the header.
+//! * Round 3: promotion of the §6.2.3 trailing fields onto
+//!   `VolHeader` (`interlaced`, `obmc_disable`, `sprite_enable`,
+//!   `not_8_bit` / `quant_precision` / `bits_per_pixel`,
+//!   `quant_type`, `quarter_sample`,
+//!   `complexity_estimation_disable`, `resync_marker_disable`,
+//!   `data_partitioned` / `reversible_vlc`, `newpred_enable`,
+//!   `reduced_resolution_vop_enable`, `scalability`), together with
+//!   `VopContext::from_vol(&vol)` and `VopHeader::from_vol(&vol,
+//!   payload)` convenience entry points.
 //! * Strict failure on Studio Profiles, FGS layers, and non-rectangular
 //!   shapes — those branches are recognised and rejected with a typed
-//!   error, never silently mis-parsed.
+//!   error, never silently mis-parsed. Sprite bodies, quant-matrix
+//!   load, complexity-estimation headers, and `newpred_enable` bodies
+//!   are likewise typed-rejected (`VolParseError::UnsupportedBranch`)
+//!   so the bit position never drifts past a branch we don't yet
+//!   decode.
 //!
 //! Macroblock-level VOP decoding is **not** included; it lands in
 //! later rounds.
@@ -44,7 +57,7 @@ pub mod vop;
 pub use bitreader::{BitReader, BitReaderError};
 pub use vol::{
     parse_video_object_layer, parse_visual_object_header, parse_visual_object_sequence_header,
-    AspectRatio, VbvParameters, VolControlParameters, VolHeader, VolParseError,
+    AspectRatio, SpriteEnable, VbvParameters, VolControlParameters, VolHeader, VolParseError,
     VIDEO_OBJECT_LAYER_START_CODE_MAX, VIDEO_OBJECT_LAYER_START_CODE_MIN,
     VIDEO_OBJECT_START_CODE_MAX, VIDEO_OBJECT_START_CODE_MIN, VISUAL_OBJECT_SEQUENCE_END_CODE,
     VISUAL_OBJECT_SEQUENCE_START_CODE, VISUAL_OBJECT_START_CODE,

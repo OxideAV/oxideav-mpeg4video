@@ -17,10 +17,16 @@
 //! * §6.2.2 `VisualObjectSequence()` + `VisualObject()` — for the
 //!   `profile_and_level_indication` byte and the optional video
 //!   signal type / identifier fields.
-//! * §6.2.3 `VideoObjectLayer()` — for the VOL header bit layout.
+//! * §6.2.3 `VideoObjectLayer()` — for the VOL header bit layout
+//!   including `interlaced`, `obmc_disable`, `sprite_enable`,
+//!   `not_8_bit` / `quant_precision`, `quant_type`,
+//!   `complexity_estimation_disable`, `resync_marker_disable`,
+//!   `data_partitioned`, `newpred_enable`,
+//!   `reduced_resolution_vop_enable`, and `scalability` (round 3).
 //! * §6.2.x semantics — for `aspect_ratio_info` (Table 6-14),
 //!   `chroma_format` (Table 6-15), `video_object_layer_shape`
-//!   (Table 6-16), and the marker-bit conventions.
+//!   (Table 6-16), `sprite_enable` (Table 6-19), and the marker-bit
+//!   conventions.
 //!
 //! We restrict ourselves to the non-Studio, non-FGS branch of
 //! `VideoObjectLayer()` (i.e. the `else { is_object_layer_identifier
@@ -28,7 +34,11 @@
 //! Fine-Granularity-Scalable layers are not yet wired up; encountering
 //! one returns [`VolParseError::UnsupportedProfile`] /
 //! [`VolParseError::UnsupportedFgs`] rather than silently producing
-//! wrong values.
+//! wrong values. Sprite-with-coordinates (`sprite_enable == static`
+//! or `GMC`) and the load-quantiser-matrix branch are rejected
+//! cleanly with [`VolParseError::UnsupportedBranch`] so callers can
+//! tell "we know what this means, just haven't wired the payload"
+//! apart from a hard parse failure.
 
 use crate::bitreader::{BitReader, BitReaderError};
 
@@ -85,6 +95,15 @@ pub enum VolParseError {
     /// Those carriage paths are outside the rectangular-video focus
     /// of this round.
     UnsupportedVisualObjectType(u8),
+    /// `quant_precision` (Table §6.3.3) outside the legal 3..=9
+    /// range — bitstream is malformed.
+    BadQuantPrecision(u8),
+    /// The VOL declared a branch the round-3 structural parser
+    /// recognises but does not yet walk in detail (e.g.
+    /// `sprite_enable == static / GMC`, `not_8_bit` with grayscale
+    /// shape, complexity-estimation header, or a custom
+    /// `intra_quant_mat` / `nonintra_quant_mat`).
+    UnsupportedBranch(&'static str),
 }
 
 impl core::fmt::Display for VolParseError {
@@ -110,6 +129,12 @@ impl core::fmt::Display for VolParseError {
             VolParseError::UnsupportedVisualObjectType(t) => {
                 write!(f, "visual_object_type={t} not supported by this parser")
             }
+            VolParseError::BadQuantPrecision(p) => {
+                write!(f, "quant_precision={p} outside the allowed 3..=9 range")
+            }
+            VolParseError::UnsupportedBranch(name) => {
+                write!(f, "VOL branch '{name}' not supported by round-3 parser")
+            }
         }
     }
 }
@@ -119,6 +144,48 @@ impl std::error::Error for VolParseError {}
 impl From<BitReaderError> for VolParseError {
     fn from(_: BitReaderError) -> Self {
         VolParseError::Truncated
+    }
+}
+
+/// Decoded `sprite_enable` field (Table 6-19, §6.3.3).
+///
+/// The on-wire encoding depends on `video_object_layer_verid`:
+/// `verid == 0001` carries a single bit (`0` → `NotUsed`, `1` →
+/// `Static`); later verids carry two bits (`00` → `NotUsed`, `01`
+/// → `Static`, `10` → `Gmc`, `11` → reserved).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpriteEnable {
+    /// `0` (1-bit form) or `00` (2-bit form) — sprite coding is not
+    /// used in this VOL.
+    NotUsed,
+    /// `1` (1-bit form) or `01` (2-bit form) — Static (Basic or Low
+    /// Latency) sprite coding.
+    Static,
+    /// `10` (2-bit form only) — Global Motion Compensation. An S-VOP
+    /// with `sprite_enable == GMC` is denoted "S (GMC)-VOP" in the
+    /// spec.
+    Gmc,
+    /// `11` (2-bit form only) — reserved.
+    Reserved,
+}
+
+impl SpriteEnable {
+    fn from_one_bit(bit: u32) -> Self {
+        if bit & 1 == 1 {
+            SpriteEnable::Static
+        } else {
+            SpriteEnable::NotUsed
+        }
+    }
+
+    fn from_two_bits(bits: u32) -> Self {
+        match bits & 0b11 {
+            0b00 => SpriteEnable::NotUsed,
+            0b01 => SpriteEnable::Static,
+            0b10 => SpriteEnable::Gmc,
+            0b11 => SpriteEnable::Reserved,
+            _ => unreachable!("masked to 2 bits"),
+        }
     }
 }
 
@@ -223,6 +290,59 @@ pub struct VolHeader {
     /// `video_object_layer_shape` (Table 6-16). Only `rectangular`
     /// (value `0`) returns successfully today.
     pub video_object_layer_shape: u8,
+    /// `interlaced` flag (§6.3.3). `false` means progressive frame
+    /// VOPs; `true` enables `top_field_first` /
+    /// `alternate_vertical_scan_flag` in the VOP header.
+    pub interlaced: bool,
+    /// `obmc_disable` flag (§6.3.3). When `true`, overlapped block
+    /// motion compensation is suppressed.
+    pub obmc_disable: bool,
+    /// Decoded `sprite_enable` (Table 6-19).
+    pub sprite_enable: SpriteEnable,
+    /// `not_8_bit` flag (§6.3.3). When `true`, `quant_precision` and
+    /// `bits_per_pixel` are transmitted in-line; otherwise the spec
+    /// defaults `quant_precision = 5` and `bits_per_pixel = 8`.
+    pub not_8_bit: bool,
+    /// `quant_precision` (§6.3.3). Five-bit default when `not_8_bit`
+    /// is `false`. Legal range is 3..=9.
+    pub quant_precision: u8,
+    /// `bits_per_pixel` (§6.3.3). Eight-bit default when `not_8_bit`
+    /// is `false`.
+    pub bits_per_pixel: u8,
+    /// `quant_type` flag (§6.3.3). `true` selects the first
+    /// (matrix-driven) inverse-quantisation method, `false` the
+    /// second (H.263-style).
+    pub quant_type: bool,
+    /// `quarter_sample` flag (§6.3.3). Only present when
+    /// `video_object_layer_verid != 1`; defaults to `false`
+    /// otherwise.
+    pub quarter_sample: bool,
+    /// `complexity_estimation_disable` (§6.3.3). When `true`, the
+    /// VOP header does NOT carry a complexity-estimation block.
+    /// Round 3 only accepts `true`.
+    pub complexity_estimation_disable: bool,
+    /// `resync_marker_disable` (§6.3.3). When `true`, no
+    /// `resync_marker` bit pattern appears in the VOP payload.
+    pub resync_marker_disable: bool,
+    /// `data_partitioned` (§6.3.3). When `true`, intra DC
+    /// coefficients are sent in a separate partition from AC and
+    /// inter data.
+    pub data_partitioned: bool,
+    /// `reversible_vlc` (§6.3.3). Defined only when
+    /// `data_partitioned == true`; defaults to `false` otherwise.
+    pub reversible_vlc: bool,
+    /// `newpred_enable` (§6.3.3). Defined only when
+    /// `video_object_layer_verid != 1`; defaults to `false`
+    /// otherwise.
+    pub newpred_enable: bool,
+    /// `reduced_resolution_vop_enable` (§6.3.3). Defined only when
+    /// `video_object_layer_verid != 1`; defaults to `false`
+    /// otherwise.
+    pub reduced_resolution_vop_enable: bool,
+    /// `scalability` flag (§6.3.3). When `true`, the VOL declares
+    /// a scalable enhancement layer. Round 3 rejects this branch
+    /// upfront; the field is surfaced so callers can detect it.
+    pub scalability: bool,
 }
 
 /// Compute the bit-width needed to represent the range
@@ -378,6 +498,105 @@ fn parse_video_object_layer_body(
     let height = br.read_bits(13)? as u16;
     read_marker_bit(br)?;
 
+    // Round 3 extension: continue the `if (video_object_layer_shape !=
+    // "binary only")` branch — `interlaced`, `obmc_disable`,
+    // `sprite_enable`, `not_8_bit` / `quant_precision`, `quant_type`,
+    // `complexity_estimation_disable`, `resync_marker_disable`,
+    // `data_partitioned`, optional `newpred_enable` /
+    // `reduced_resolution_vop_enable`, and `scalability`. Spec lines
+    // 3989..=4079 of `ISO_IEC_14496-2-2004-3rd-edition.txt`.
+    let interlaced = br.read_bool()?;
+    let obmc_disable = br.read_bool()?;
+    let sprite_enable = if video_object_layer_verid == 1 {
+        SpriteEnable::from_one_bit(br.read_bits(1)?)
+    } else {
+        SpriteEnable::from_two_bits(br.read_bits(2)?)
+    };
+    // The full sprite block (sprite_width / _height / coordinates /
+    // warping points / accuracy / brightness change / low-latency)
+    // is not part of round 3. Surface a typed rejection so the bit
+    // position doesn't quietly drift.
+    if matches!(sprite_enable, SpriteEnable::Static | SpriteEnable::Gmc) {
+        return Err(VolParseError::UnsupportedBranch(
+            "sprite_enable static/GMC body",
+        ));
+    }
+    if matches!(sprite_enable, SpriteEnable::Reserved) {
+        return Err(VolParseError::UnsupportedBranch("sprite_enable reserved"));
+    }
+    // sadct_disable is only present when verid != 1 AND shape !=
+    // rectangular (spec line 4014). Round 3 gates `shape ==
+    // rectangular` upfront, so we never read it.
+    let not_8_bit = br.read_bool()?;
+    let (quant_precision, bits_per_pixel) = if not_8_bit {
+        let qp = br.read_bits(4)? as u8;
+        let bpp = br.read_bits(4)? as u8;
+        if !(3..=9).contains(&qp) {
+            return Err(VolParseError::BadQuantPrecision(qp));
+        }
+        (qp, bpp)
+    } else {
+        (5, 8)
+    };
+    // Grayscale sub-block (no_gray_quant_update / composition_method /
+    // linear_composition) is gated on `shape == grayscale`, which is
+    // already rejected upfront.
+    let quant_type = br.read_bool()?;
+    if quant_type {
+        // load_intra_quant_mat + load_nonintra_quant_mat carry
+        // variable-length 8-bit run lists. Round 3 doesn't yet
+        // decode those bodies — surface the branch cleanly so the
+        // bit position doesn't drift.
+        let load_intra = br.read_bool()?;
+        if load_intra {
+            return Err(VolParseError::UnsupportedBranch(
+                "load_intra_quant_mat body",
+            ));
+        }
+        let load_nonintra = br.read_bool()?;
+        if load_nonintra {
+            return Err(VolParseError::UnsupportedBranch(
+                "load_nonintra_quant_mat body",
+            ));
+        }
+        // (grayscale variant is gated on shape == grayscale.)
+    }
+    let quarter_sample = if video_object_layer_verid != 1 {
+        br.read_bool()?
+    } else {
+        false
+    };
+    let complexity_estimation_disable = br.read_bool()?;
+    if !complexity_estimation_disable {
+        return Err(VolParseError::UnsupportedBranch(
+            "define_vop_complexity_estimation_header",
+        ));
+    }
+    let resync_marker_disable = br.read_bool()?;
+    let data_partitioned = br.read_bool()?;
+    let reversible_vlc = if data_partitioned {
+        br.read_bool()?
+    } else {
+        false
+    };
+    let (newpred_enable, reduced_resolution_vop_enable) = if video_object_layer_verid != 1 {
+        let np = br.read_bool()?;
+        if np {
+            // newpred_enable body: requested_upstream_message_type (2
+            // bits) + newpred_segment_type (1 bit). We consume those
+            // structurally to keep alignment if we ever continue past
+            // this point in a future round, but reject the branch
+            // immediately afterwards since the rest of the VOL syntax
+            // depends on it being false.
+            return Err(VolParseError::UnsupportedBranch("newpred_enable body"));
+        }
+        let rr = br.read_bool()?;
+        (np, rr)
+    } else {
+        (false, false)
+    };
+    let scalability = br.read_bool()?;
+
     Ok(VolHeader {
         profile_level,
         width,
@@ -393,6 +612,21 @@ fn parse_video_object_layer_body(
         video_object_layer_verid,
         video_object_layer_priority,
         video_object_layer_shape,
+        interlaced,
+        obmc_disable,
+        sprite_enable,
+        not_8_bit,
+        quant_precision,
+        bits_per_pixel,
+        quant_type,
+        quarter_sample,
+        complexity_estimation_disable,
+        resync_marker_disable,
+        data_partitioned,
+        reversible_vlc,
+        newpred_enable,
+        reduced_resolution_vop_enable,
+        scalability,
     })
 }
 
@@ -487,6 +721,29 @@ mod tests {
         }
     }
 
+    /// Append the round-3 trailing fields onto a writer that has just
+    /// finished writing the rectangular width/height marker block.
+    /// All values map onto the "simplest possible" Simple-Profile
+    /// path: no interlace, no sprite, no `not_8_bit`, second
+    /// inverse-quant method, complexity estimation disabled, no
+    /// resync marker, no data partitioning, verid == 1 so no
+    /// quarter_sample / newpred / reduced_res bits, and scalability
+    /// off.
+    fn write_minimal_trailing(w: &mut BitWriter) {
+        w.write_bits(0, 1); // interlaced = 0
+        w.write_bits(0, 1); // obmc_disable = 0
+                            // verid == 1 → sprite_enable is 1 bit.
+        w.write_bits(0, 1); // sprite_enable = NotUsed
+        w.write_bits(0, 1); // not_8_bit = 0
+        w.write_bits(0, 1); // quant_type = 0
+                            // verid == 1 → no quarter_sample bit.
+        w.write_bits(1, 1); // complexity_estimation_disable = 1
+        w.write_bits(1, 1); // resync_marker_disable = 1
+        w.write_bits(0, 1); // data_partitioned = 0
+                            // verid == 1 → no newpred / reduced_res bits.
+        w.write_bits(0, 1); // scalability = 0
+    }
+
     fn make_minimal_vol(width: u16, height: u16) -> Vec<u8> {
         let mut w = BitWriter::new();
         // video_object_layer_start_code = 0x000001Bx (low nibble 0).
@@ -510,6 +767,7 @@ mod tests {
         w.write_marker();
         w.write_bits(u32::from(height), 13);
         w.write_marker();
+        write_minimal_trailing(&mut w);
         w.align();
         w.buf
     }
@@ -527,6 +785,22 @@ mod tests {
         assert!(header.vol_control.is_none());
         assert_eq!(header.video_object_layer_shape, 0);
         assert_eq!(header.profile_level, 0x01);
+        // Round-3 fields populated from the minimal trailing block.
+        assert!(!header.interlaced);
+        assert!(!header.obmc_disable);
+        assert_eq!(header.sprite_enable, SpriteEnable::NotUsed);
+        assert!(!header.not_8_bit);
+        assert_eq!(header.quant_precision, 5);
+        assert_eq!(header.bits_per_pixel, 8);
+        assert!(!header.quant_type);
+        assert!(!header.quarter_sample);
+        assert!(header.complexity_estimation_disable);
+        assert!(header.resync_marker_disable);
+        assert!(!header.data_partitioned);
+        assert!(!header.reversible_vlc);
+        assert!(!header.newpred_enable);
+        assert!(!header.reduced_resolution_vop_enable);
+        assert!(!header.scalability);
     }
 
     #[test]
@@ -565,6 +839,7 @@ mod tests {
         w.write_marker();
         w.write_bits(480, 13);
         w.write_marker();
+        write_minimal_trailing(&mut w);
         w.align();
         let header = parse_video_object_layer(&w.buf, 0).unwrap();
         assert_eq!(
@@ -624,6 +899,7 @@ mod tests {
         w.write_marker();
         w.write_bits(144, 13);
         w.write_marker();
+        write_minimal_trailing(&mut w);
         w.align();
         let h = parse_video_object_layer(&w.buf, 0xF0).unwrap();
         let vol = h.vol_control.expect("vol_control block expected");
@@ -710,5 +986,265 @@ mod tests {
         w.align();
         let err = parse_video_object_layer(&w.buf, 0).unwrap_err();
         assert_eq!(err, VolParseError::UnsupportedShape(3));
+    }
+
+    /// Helper for round-3 trailing-field experiments: bit-writer just
+    /// past the rectangular width/height marker block, with the caller
+    /// in charge of writing `interlaced`..=`scalability`.
+    fn write_vol_header_up_to_trailing(
+        w: &mut BitWriter,
+        verid: Option<u8>,
+        shape: u32,
+        with_vbv: bool,
+    ) {
+        w.write_bits(VIDEO_OBJECT_LAYER_START_CODE_MIN, 32);
+        w.write_bits(0, 1); // random_accessible_vol
+        w.write_bits(1, 8); // video_object_type_indication
+        if let Some(v) = verid {
+            w.write_bits(1, 1); // is_object_layer_identifier
+            w.write_bits(u32::from(v), 4);
+            w.write_bits(0, 3); // priority
+        } else {
+            w.write_bits(0, 1);
+        }
+        w.write_bits(0b0001, 4); // aspect_ratio_info = 1:1
+        if with_vbv {
+            w.write_bits(1, 1); // vol_control_parameters
+            w.write_bits(0b01, 2); // chroma_format = 4:2:0
+            w.write_bits(0, 1); // low_delay
+            w.write_bits(0, 1); // vbv_parameters
+        } else {
+            w.write_bits(0, 1); // vol_control_parameters
+        }
+        w.write_bits(shape, 2);
+        w.write_marker();
+        w.write_bits(30_000, 16);
+        w.write_marker();
+        w.write_bits(0, 1); // fixed_vop_rate
+        w.write_marker();
+        w.write_bits(352, 13);
+        w.write_marker();
+        w.write_bits(288, 13);
+        w.write_marker();
+    }
+
+    #[test]
+    fn round3_interlaced_flag_is_carried_back() {
+        let mut w = BitWriter::new();
+        write_vol_header_up_to_trailing(&mut w, None, 0b00, false);
+        w.write_bits(1, 1); // interlaced = 1
+        w.write_bits(0, 1); // obmc_disable
+        w.write_bits(0, 1); // sprite_enable (1 bit, verid=1)
+        w.write_bits(0, 1); // not_8_bit
+        w.write_bits(0, 1); // quant_type
+        w.write_bits(1, 1); // complexity_estimation_disable
+        w.write_bits(0, 1); // resync_marker_disable
+        w.write_bits(0, 1); // data_partitioned
+        w.write_bits(0, 1); // scalability
+        w.align();
+        let header = parse_video_object_layer(&w.buf, 0).unwrap();
+        assert!(header.interlaced);
+        assert_eq!(header.sprite_enable, SpriteEnable::NotUsed);
+    }
+
+    #[test]
+    fn round3_not_8_bit_decodes_quant_precision_and_bpp() {
+        let mut w = BitWriter::new();
+        write_vol_header_up_to_trailing(&mut w, None, 0b00, false);
+        w.write_bits(0, 1); // interlaced
+        w.write_bits(1, 1); // obmc_disable = 1
+        w.write_bits(0, 1); // sprite_enable
+        w.write_bits(1, 1); // not_8_bit = 1
+        w.write_bits(7, 4); // quant_precision = 7
+        w.write_bits(10, 4); // bits_per_pixel = 10
+        w.write_bits(0, 1); // quant_type
+        w.write_bits(1, 1); // complexity_estimation_disable
+        w.write_bits(1, 1); // resync_marker_disable
+        w.write_bits(0, 1); // data_partitioned
+        w.write_bits(0, 1); // scalability
+        w.align();
+        let header = parse_video_object_layer(&w.buf, 0).unwrap();
+        assert!(header.not_8_bit);
+        assert_eq!(header.quant_precision, 7);
+        assert_eq!(header.bits_per_pixel, 10);
+        assert!(header.obmc_disable);
+    }
+
+    #[test]
+    fn round3_bad_quant_precision_is_rejected() {
+        let mut w = BitWriter::new();
+        write_vol_header_up_to_trailing(&mut w, None, 0b00, false);
+        w.write_bits(0, 1); // interlaced
+        w.write_bits(0, 1); // obmc_disable
+        w.write_bits(0, 1); // sprite_enable
+        w.write_bits(1, 1); // not_8_bit = 1
+        w.write_bits(2, 4); // quant_precision = 2 (illegal, <3)
+        w.write_bits(8, 4);
+        w.align();
+        let err = parse_video_object_layer(&w.buf, 0).unwrap_err();
+        assert_eq!(err, VolParseError::BadQuantPrecision(2));
+    }
+
+    #[test]
+    fn round3_sprite_static_is_rejected_with_branch_error() {
+        let mut w = BitWriter::new();
+        write_vol_header_up_to_trailing(&mut w, None, 0b00, false);
+        w.write_bits(0, 1); // interlaced
+        w.write_bits(0, 1); // obmc_disable
+        w.write_bits(1, 1); // sprite_enable = Static (1-bit form)
+        w.align();
+        let err = parse_video_object_layer(&w.buf, 0).unwrap_err();
+        match err {
+            VolParseError::UnsupportedBranch(name) => {
+                assert!(name.contains("sprite_enable"));
+            }
+            other => panic!("expected UnsupportedBranch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn round3_verid2_sprite_uses_two_bits() {
+        // verid = 2 ⇒ sprite_enable is 2 bits; encode `00` (NotUsed).
+        let mut w = BitWriter::new();
+        write_vol_header_up_to_trailing(&mut w, Some(2), 0b00, false);
+        w.write_bits(0, 1); // interlaced
+        w.write_bits(0, 1); // obmc_disable
+        w.write_bits(0b00, 2); // sprite_enable = NotUsed
+        w.write_bits(0, 1); // not_8_bit
+        w.write_bits(0, 1); // quant_type
+        w.write_bits(0, 1); // quarter_sample (verid != 1)
+        w.write_bits(1, 1); // complexity_estimation_disable
+        w.write_bits(0, 1); // resync_marker_disable
+        w.write_bits(0, 1); // data_partitioned
+        w.write_bits(0, 1); // newpred_enable
+        w.write_bits(0, 1); // reduced_resolution_vop_enable
+        w.write_bits(0, 1); // scalability
+        w.align();
+        let header = parse_video_object_layer(&w.buf, 0).unwrap();
+        assert_eq!(header.video_object_layer_verid, 2);
+        assert_eq!(header.sprite_enable, SpriteEnable::NotUsed);
+        assert!(!header.quarter_sample);
+        assert!(!header.newpred_enable);
+        assert!(!header.reduced_resolution_vop_enable);
+    }
+
+    #[test]
+    fn round3_verid2_sprite_gmc_is_rejected() {
+        let mut w = BitWriter::new();
+        write_vol_header_up_to_trailing(&mut w, Some(2), 0b00, false);
+        w.write_bits(0, 1);
+        w.write_bits(0, 1);
+        w.write_bits(0b10, 2); // sprite_enable = GMC
+        w.align();
+        let err = parse_video_object_layer(&w.buf, 0).unwrap_err();
+        assert!(matches!(err, VolParseError::UnsupportedBranch(_)));
+    }
+
+    #[test]
+    fn round3_verid2_sprite_reserved_is_rejected() {
+        let mut w = BitWriter::new();
+        write_vol_header_up_to_trailing(&mut w, Some(2), 0b00, false);
+        w.write_bits(0, 1);
+        w.write_bits(0, 1);
+        w.write_bits(0b11, 2); // sprite_enable = Reserved
+        w.align();
+        let err = parse_video_object_layer(&w.buf, 0).unwrap_err();
+        assert!(matches!(err, VolParseError::UnsupportedBranch(_)));
+    }
+
+    #[test]
+    fn round3_complexity_estimation_header_branch_is_rejected() {
+        let mut w = BitWriter::new();
+        write_vol_header_up_to_trailing(&mut w, None, 0b00, false);
+        w.write_bits(0, 1); // interlaced
+        w.write_bits(0, 1); // obmc_disable
+        w.write_bits(0, 1); // sprite_enable
+        w.write_bits(0, 1); // not_8_bit
+        w.write_bits(0, 1); // quant_type
+        w.write_bits(0, 1); // complexity_estimation_disable = 0 → header expected
+        w.align();
+        let err = parse_video_object_layer(&w.buf, 0).unwrap_err();
+        assert!(matches!(err, VolParseError::UnsupportedBranch(_)));
+    }
+
+    #[test]
+    fn round3_data_partitioned_reads_reversible_vlc() {
+        let mut w = BitWriter::new();
+        write_vol_header_up_to_trailing(&mut w, None, 0b00, false);
+        w.write_bits(0, 1); // interlaced
+        w.write_bits(0, 1); // obmc_disable
+        w.write_bits(0, 1); // sprite_enable
+        w.write_bits(0, 1); // not_8_bit
+        w.write_bits(0, 1); // quant_type
+        w.write_bits(1, 1); // complexity_estimation_disable
+        w.write_bits(1, 1); // resync_marker_disable
+        w.write_bits(1, 1); // data_partitioned
+        w.write_bits(1, 1); // reversible_vlc
+        w.write_bits(0, 1); // scalability
+        w.align();
+        let h = parse_video_object_layer(&w.buf, 0).unwrap();
+        assert!(h.data_partitioned);
+        assert!(h.reversible_vlc);
+    }
+
+    #[test]
+    fn round3_scalability_flag_is_carried_back() {
+        let mut w = BitWriter::new();
+        write_vol_header_up_to_trailing(&mut w, None, 0b00, false);
+        w.write_bits(0, 1);
+        w.write_bits(0, 1);
+        w.write_bits(0, 1);
+        w.write_bits(0, 1);
+        w.write_bits(0, 1);
+        w.write_bits(1, 1); // complexity_estimation_disable
+        w.write_bits(0, 1);
+        w.write_bits(0, 1);
+        w.write_bits(1, 1); // scalability
+        w.align();
+        let h = parse_video_object_layer(&w.buf, 0).unwrap();
+        assert!(h.scalability);
+    }
+
+    #[test]
+    fn round3_quant_type_load_matrix_is_rejected() {
+        let mut w = BitWriter::new();
+        write_vol_header_up_to_trailing(&mut w, None, 0b00, false);
+        w.write_bits(0, 1); // interlaced
+        w.write_bits(0, 1); // obmc_disable
+        w.write_bits(0, 1); // sprite_enable
+        w.write_bits(0, 1); // not_8_bit
+        w.write_bits(1, 1); // quant_type = 1
+        w.write_bits(1, 1); // load_intra_quant_mat = 1
+        w.align();
+        let err = parse_video_object_layer(&w.buf, 0).unwrap_err();
+        assert!(matches!(err, VolParseError::UnsupportedBranch(_)));
+    }
+
+    #[test]
+    fn round3_quant_type_no_load_succeeds() {
+        let mut w = BitWriter::new();
+        write_vol_header_up_to_trailing(&mut w, None, 0b00, false);
+        w.write_bits(0, 1); // interlaced
+        w.write_bits(0, 1); // obmc_disable
+        w.write_bits(0, 1); // sprite_enable
+        w.write_bits(0, 1); // not_8_bit
+        w.write_bits(1, 1); // quant_type = 1
+        w.write_bits(0, 1); // load_intra_quant_mat = 0
+        w.write_bits(0, 1); // load_nonintra_quant_mat = 0
+        w.write_bits(1, 1); // complexity_estimation_disable
+        w.write_bits(0, 1); // resync_marker_disable
+        w.write_bits(0, 1); // data_partitioned
+        w.write_bits(0, 1); // scalability
+        w.align();
+        let h = parse_video_object_layer(&w.buf, 0).unwrap();
+        assert!(h.quant_type);
+    }
+
+    #[test]
+    fn vol_error_branch_displays() {
+        let e = VolParseError::UnsupportedBranch("foo");
+        assert!(format!("{e}").contains("foo"));
+        let e = VolParseError::BadQuantPrecision(11);
+        assert!(format!("{e}").contains("11"));
     }
 }

@@ -8,6 +8,41 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 3 of the clean-room rebuild: promotion of the ISO/IEC 14496-2
+  §6.2.3 trailing VOL fields onto `VolHeader` — `interlaced`,
+  `obmc_disable`, `sprite_enable` (Table 6-19), `not_8_bit`,
+  `quant_precision`, `bits_per_pixel`, `quant_type`,
+  `quarter_sample` (when verid != 1), `complexity_estimation_disable`,
+  `resync_marker_disable`, `data_partitioned`, `reversible_vlc`,
+  `newpred_enable` (verid != 1), `reduced_resolution_vop_enable`
+  (verid != 1), and `scalability`.
+- `SpriteEnable` enum (`NotUsed` / `Static` / `Gmc` / `Reserved`)
+  matching the Table 6-19 one-bit (verid == 1) and two-bit (verid !=
+  1) on-wire encodings.
+- `VolParseError::BadQuantPrecision(u8)` for `not_8_bit` paths that
+  advertise a `quant_precision` outside §6.3.3's 3..=9 range.
+- `VolParseError::UnsupportedBranch(&'static str)` for the
+  recognised-but-out-of-scope §6.2.3 branches (`sprite_enable static`
+  / `GMC` / reserved body, `quant_type` load matrix bodies, custom
+  complexity-estimation header, `newpred_enable` body).
+- `VopContext::from_vol(&vol)` convenience constructor that pulls the
+  promoted fields out of `VolHeader` so callers no longer hand-stitch
+  context.
+- `VopHeader::from_vol(&vol, payload)` one-call entry point that
+  composes `parse_video_object_plane_header(payload,
+  vol.time_increment_resolution, VopContext::from_vol(&vol))`.
+- 16 round-3 unit tests: minimal VOL trailing-block parse;
+  `interlaced` / `obmc_disable` / `sprite_enable` carry-back;
+  `not_8_bit` + `quant_precision` + `bits_per_pixel` decode;
+  out-of-range `quant_precision` rejection; sprite-static rejection;
+  verid==2 two-bit `sprite_enable` (NotUsed + GMC + Reserved cases);
+  complexity-estimation-header branch rejection;
+  `data_partitioned` + `reversible_vlc` carry-back; `scalability`
+  carry-back; `quant_type` load-matrix rejection; `quant_type` no-load
+  success; `VolParseError::UnsupportedBranch` + `BadQuantPrecision`
+  display; `VopContext::from_vol` projection; `VopHeader::from_vol`
+  on a minimal I-VOP; `VopHeader::from_vol` propagates the VOL's
+  `vop_time_increment_resolution`.
 - Round 2 of the clean-room rebuild: structural parsers for the
   ISO/IEC 14496-2 §6.2.4 Group-of-VOP and §6.2.5 Video Object Plane
   headers, stopping cleanly at the macroblock layer.
