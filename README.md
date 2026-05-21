@@ -5,20 +5,19 @@ A pure-Rust MPEG-4 Part 2 Video codec (ISO/IEC 14496-2) for the
 
 ## Status
 
-**Round 1 of the clean-room rebuild (2026-05-21).** The prior
+**Round 2 of the clean-room rebuild (2026-05-21).** The prior
 implementation was retired on 2026-05-18 under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md);
 the VLC tables admitted to sourcing their numeric entries from an
 external library. Master history was fully erased per the Hat-3 cold-
 enforcement procedure.
 
-Round 1 brings back **structural parsing of the §6.2 configuration
-headers** — enough to identify a VOL, surface its profile / level
-byte, pixel dimensions, time-increment resolution, aspect ratio,
-optional `vol_control_parameters` + VBV block, and detect Studio /
-FGS branches with typed errors instead of silent mis-parse.
+* Round 1 — structural parsing of the §6.2 configuration headers
+  (`VisualObjectSequence` / `VisualObject` / `VideoObjectLayer`).
+* Round 2 — structural parsing of §6.2.4 Group-of-VOP and §6.2.5 Video
+  Object Plane headers up to (but not including) the macroblock layer.
 
-VOP- and macroblock-level decoding land in later rounds.
+Macroblock-level decoding lands in later rounds.
 
 ## What works today
 
@@ -36,18 +35,29 @@ VOP- and macroblock-level decoding land in later rounds.
 | Studio Profile (`profile == 0xE1..=0xE8`)     | rejected (typed error) |
 | FGS branch                                    | branch path not entered |
 | Non-rectangular shape                         | rejected (typed error) |
-| VOP header                                    | not yet |
+| `0x000001B3` Group-of-VOP header              | parsed (time-code + closed/broken) |
+| `0x000001B6` Video Object Plane header        | parsed (I / P / B / S coding types) |
+| `vop_coding_type` (Table 6-24)                | typed `VopCodingType` |
+| `modulo_time_base` + `vop_time_increment`     | composed into 64-bit tick count |
+| `vop_coded == 0` early return                 | typed default-fields VopHeader |
+| `vop_rounding_type` / `intra_dc_vlc_thr`      | surfaced (rounding gated on P/S-GMC) |
+| `vop_quant` (`quant_precision` 3..=9)         | surfaced as `u16`, default 5-bit width |
+| `vop_fcode_forward` / `vop_fcode_backward`    | surfaced, 0 rejected as forbidden |
+| Interlaced `top_field_first` / `alt_vert_scan`| consumed structurally (kept aligned) |
+| Sprite / scalability / newpred VOP branches   | rejected (typed errors) |
 | Macroblock decode                             | not yet |
 | Encoder                                       | not yet |
 
-20 round-1 unit tests pass.
+44 round-1+2 unit tests pass.
 
 ## Provenance
 
 Every numeric value and bit layout in this crate is sourced from
 ISO/IEC 14496-2:2004 (3rd edition) — Tables 6-3 (start codes), 6-14
-(aspect ratios), 6-15 (chroma formats), 6-16 (shape types) — and the
-syntax tables of §6.2. The text was read from
+(aspect ratios), 6-15 (chroma formats), 6-16 (shape types), 6-23
+(time-code layout), 6-24 (`vop_coding_type`), 6-25 (`intra_dc_vlc_thr`)
+— and the syntax tables of §6.2.2 / §6.2.3 / §6.2.4 / §6.2.5 plus the
+semantics in §6.3.3 / §6.3.4 / §6.3.5. The text was read from
 `docs/video/mpeg4-visual/ISO_IEC_14496-2-2004-3rd-edition.txt`. No
 third-party MPEG-4 source was consulted.
 

@@ -39,6 +39,7 @@ use oxideav_core::RuntimeContext;
 
 pub mod bitreader;
 pub mod vol;
+pub mod vop;
 
 pub use bitreader::{BitReader, BitReaderError};
 pub use vol::{
@@ -47,6 +48,10 @@ pub use vol::{
     VIDEO_OBJECT_LAYER_START_CODE_MAX, VIDEO_OBJECT_LAYER_START_CODE_MIN,
     VIDEO_OBJECT_START_CODE_MAX, VIDEO_OBJECT_START_CODE_MIN, VISUAL_OBJECT_SEQUENCE_END_CODE,
     VISUAL_OBJECT_SEQUENCE_START_CODE, VISUAL_OBJECT_START_CODE,
+};
+pub use vop::{
+    parse_group_of_vop_header, parse_video_object_plane_header, GovHeader, TimeCode, VopCodingType,
+    VopContext, VopHeader, VopParseError, GROUP_OF_VOP_START_CODE, VOP_START_CODE,
 };
 
 /// Crate-level error surface. Decoding entry points map their internal
@@ -61,6 +66,9 @@ pub enum Error {
     /// A configuration-header parse failed. See [`VolParseError`] for
     /// the discrimination.
     Vol(VolParseError),
+    /// A VOP / Group-of-VOP header parse failed. See [`VopParseError`]
+    /// for the discrimination.
+    Vop(VopParseError),
 }
 
 impl core::fmt::Display for Error {
@@ -71,6 +79,7 @@ impl core::fmt::Display for Error {
                 "oxideav-mpeg4video: feature not yet implemented in this round"
             ),
             Error::Vol(err) => write!(f, "oxideav-mpeg4video: VOL parse error: {err}"),
+            Error::Vop(err) => write!(f, "oxideav-mpeg4video: VOP parse error: {err}"),
         }
     }
 }
@@ -80,6 +89,12 @@ impl std::error::Error for Error {}
 impl From<VolParseError> for Error {
     fn from(err: VolParseError) -> Self {
         Error::Vol(err)
+    }
+}
+
+impl From<VopParseError> for Error {
+    fn from(err: VopParseError) -> Self {
+        Error::Vop(err)
     }
 }
 
@@ -104,5 +119,12 @@ mod tests {
     fn vol_error_round_trip() {
         let e: Error = VolParseError::Truncated.into();
         assert!(matches!(e, Error::Vol(VolParseError::Truncated)));
+    }
+
+    #[test]
+    fn vop_error_round_trip() {
+        let e: Error = VopParseError::Truncated.into();
+        assert!(matches!(e, Error::Vop(VopParseError::Truncated)));
+        assert!(format!("{e}").contains("VOP parse error"));
     }
 }
