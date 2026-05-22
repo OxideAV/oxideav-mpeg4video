@@ -8,6 +8,57 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 6 of the clean-room rebuild: §6.2.6 B-VOP macroblock-header
+  prefix bit-walk for rectangular VOL shape with 4:2:0 chroma. New
+  `parse_b_vop_mb_header(br, vol, vop_coding_type, table)` consumes
+  `modb` (Table B.3 — `1` / `01` / `00`), `mb_type` (Table B.4 for
+  non-scalable B-VOPs or Table B.5 for the spatially-scalable
+  enhancement layer with `ref_select_code == 00`), the 6-bit `cbpb`
+  (block_count == 6 per §6.2.6 NOTE), and the 1-or-2-bit `dbquant`
+  (Table 6-33: `0` → 0, `10` → -2, `11` → +2) into a typed
+  `BVopMbHeader { modb, mb_type, cbpb, mvdf_present, mvdb_present,
+  dbquant_delta }`. Motion-vector bodies are deliberately left
+  unread; the bit reader is positioned at the start of the
+  `interlaced_information()` / `motion_vector("…")` block per the
+  spec syntax.
+- `BVopMbType` enum (`Direct`, `Forward`, `Backward`, `Interpolated`)
+  with `has_forward_mv`, `has_backward_mv`, `may_have_dbquant`
+  predicates. `Direct` is reachable only via Table B.4; Table B.5
+  has no direct row per §7.9.2.8.3.
+- `BMbTypeTable { B4, B5 }` selector — callers pick the active
+  table from the VOL/VOP-level `ref_select_code && scalability`
+  predicate from §6.2.6.
+- `default_b_mb_type(scalable: bool) -> BVopMbType` — implements the
+  §6.3.6 default-type rule: scalable enhancement layer → "forward
+  mc + Q", otherwise → "direct". Used when `modb == '1'` and
+  therefore `mb_type` is absent from the bitstream.
+- `parse_dbquant(br)` standalone helper returning `(consumed_bits,
+  delta)` for the 1-or-2-bit Table 6-33 VLC.
+- `BVopMbParseError { Truncated, InvalidModb { window },
+  InvalidMbType { window }, NotBVop(VopCodingType),
+  UnsupportedShape(u8), UnsupportedChromaFormat(u8) }` + `Display`
+  + `Error` + `From<BitReaderError>`.
+- `Error::BVopMacroblock(BVopMbParseError)` variant + `From`
+  conversion on the crate-level error surface.
+- 27 round-6 unit tests: `modb` Table B.3 full round-trip;
+  Table 6-33 `dbquant` full round-trip; `BVopMbType` predicates;
+  default-type per scalability; `modb == 1` default direct vs
+  scalable default forward; `modb == 01` mb_type-present cases;
+  `modb == 00` cbpb-zero (no dbquant); `modb == 00` cbpb-non-zero
+  (dbquant present); Direct row never carries dbquant even when
+  cbpb is non-zero (§6.2.6 syntax `mb_type != '1'` gate); full
+  round-trip of every Table B.4 row; full round-trip of every
+  Table B.5 row; Table B.5 `1` decodes to Forward (not Direct);
+  dbquant = 0 (single 0 bit) and dbquant = -2 (`10`) round-trip;
+  rejection of non-B VOP coding types; rejection of non-rectangular
+  shape; rejection of non-4:2:0 chroma format (when explicit via
+  `vol_control`); 4:2:0 acceptance via explicit control block;
+  truncated buffer; truncated mid-mb_type; truncated mid-dbquant;
+  invalid mb_type window in Table B.5; `Display` coverage for all
+  six error variants; bit-reader position correctness past dbquant;
+  `BVopMbParseError -> Error` conversion + `Display` contains
+  "B-VOP macroblock parse error".
+
 - Round 5 of the clean-room rebuild: §6.2.6 macroblock-layer
   header bit-walk for I-VOPs and P-VOPs with rectangular VOL shape
   and 4 non-transparent blocks. New `parse_macroblock_header(br,

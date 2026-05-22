@@ -37,6 +37,13 @@
 //!   mb_type, cbpc, ac_pred_flag, cbpy, dquant_delta }` via
 //!   `parse_macroblock_header`. Stuffing macroblocks are
 //!   transparently skipped per §6.2.6.
+//! * Round 6: §6.2.6 B-VOP macroblock-header prefix — `modb`
+//!   (Table B.3), `mb_type` (Table B.4 non-scalable / Table B.5
+//!   scalable enhancement layer), `cbpb` (6-bit, 4:2:0 rectangular),
+//!   `dbquant` (Table 6-33). Surfaces as `BVopMbHeader { modb,
+//!   mb_type, cbpb, mvdf_present, mvdb_present, dbquant_delta }` via
+//!   `parse_b_vop_mb_header`. Motion-vector bodies remain out of
+//!   scope; the bit reader is left positioned at their start.
 //! * Strict failure on Studio Profiles, FGS layers, and non-rectangular
 //!   shapes — those branches are recognised and rejected with a typed
 //!   error, never silently mis-parsed. Sprite bodies, complexity-
@@ -63,11 +70,16 @@
 use oxideav_core::RuntimeContext;
 
 pub mod bitreader;
+pub mod bvop;
 pub mod macroblock;
 pub mod vol;
 pub mod vop;
 
 pub use bitreader::{BitReader, BitReaderError};
+pub use bvop::{
+    default_b_mb_type, parse_b_vop_mb_header, parse_dbquant, BMbTypeTable, BVopMbHeader,
+    BVopMbParseError, BVopMbType,
+};
 pub use macroblock::{
     dquant_value, parse_macroblock_header, DerivedMbType, MacroblockHeader, MacroblockParseError,
 };
@@ -101,6 +113,9 @@ pub enum Error {
     /// A macroblock-layer header parse failed. See
     /// [`MacroblockParseError`] for the discrimination.
     Macroblock(MacroblockParseError),
+    /// A B-VOP macroblock-header parse failed. See [`BVopMbParseError`]
+    /// for the discrimination.
+    BVopMacroblock(BVopMbParseError),
 }
 
 impl core::fmt::Display for Error {
@@ -114,6 +129,9 @@ impl core::fmt::Display for Error {
             Error::Vop(err) => write!(f, "oxideav-mpeg4video: VOP parse error: {err}"),
             Error::Macroblock(err) => {
                 write!(f, "oxideav-mpeg4video: macroblock parse error: {err}")
+            }
+            Error::BVopMacroblock(err) => {
+                write!(f, "oxideav-mpeg4video: B-VOP macroblock parse error: {err}")
             }
         }
     }
@@ -136,6 +154,12 @@ impl From<VopParseError> for Error {
 impl From<MacroblockParseError> for Error {
     fn from(err: MacroblockParseError) -> Self {
         Error::Macroblock(err)
+    }
+}
+
+impl From<BVopMbParseError> for Error {
+    fn from(err: BVopMbParseError) -> Self {
+        Error::BVopMacroblock(err)
     }
 }
 
@@ -177,5 +201,15 @@ mod tests {
             Error::Macroblock(MacroblockParseError::Truncated)
         ));
         assert!(format!("{e}").contains("macroblock parse error"));
+    }
+
+    #[test]
+    fn b_vop_macroblock_error_round_trip() {
+        let e: Error = BVopMbParseError::Truncated.into();
+        assert!(matches!(
+            e,
+            Error::BVopMacroblock(BVopMbParseError::Truncated)
+        ));
+        assert!(format!("{e}").contains("B-VOP macroblock parse error"));
     }
 }

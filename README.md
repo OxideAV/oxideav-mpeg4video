@@ -5,7 +5,7 @@ A pure-Rust MPEG-4 Part 2 Video codec (ISO/IEC 14496-2) for the
 
 ## Status
 
-**Round 5 of the clean-room rebuild (2026-05-22).** The prior
+**Round 6 of the clean-room rebuild (2026-05-22).** The prior
 implementation was retired on 2026-05-18 under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md);
 the VLC tables admitted to sourcing their numeric entries from an
@@ -39,6 +39,16 @@ enforcement procedure.
   dquant_delta }`. Stuffing macroblocks are transparently skipped
   per §6.2.6. B-VOP and sprite branches return
   `MacroblockParseError::UnsupportedVopKind`.
+* Round 6 — §6.2.6 B-VOP macroblock-header prefix. New
+  `parse_b_vop_mb_header` decodes `modb` (Table B.3), `mb_type`
+  (Table B.4 non-scalable / Table B.5 scalable enhancement layer),
+  the 6-bit `cbpb` (4:2:0 rectangular), and `dbquant` (Table 6-33)
+  into a typed `BVopMbHeader { modb, mb_type, cbpb, mvdf_present,
+  mvdb_present, dbquant_delta }`. `BVopMbType` enumerates
+  `Direct` / `Forward` / `Backward` / `Interpolated` per the table
+  rows; non-B VOP types return
+  `BVopMbParseError::NotBVop`. Motion-vector bodies remain out of
+  scope; the bit reader is left positioned at their start.
 
 Motion-vector + DCT-coefficient decode land in later rounds.
 
@@ -86,11 +96,18 @@ Motion-vector + DCT-coefficient decode land in later rounds.
 | `ac_pred_flag` (intra MB)                     | surfaced (round 5) |
 | `not_coded` skip (P-VOP)                      | `MacroblockHeader::SKIPPED` (round 5) |
 | Stuffing macroblock skip                      | transparent (round 5) |
-| B-VOP / S-VOP macroblock                      | typed `UnsupportedVopKind` |
+| B-VOP / S-VOP macroblock (round-5 path)       | typed `UnsupportedVopKind` |
+| B-VOP macroblock header prefix                | `parse_b_vop_mb_header` (round 6) |
+| `modb` Table B.3 (1 / 01 / 00)                | linear-prefix decode (round 6) |
+| `mb_type` Table B.4 (non-scalable B-VOP)      | linear-prefix decode (round 6) |
+| `mb_type` Table B.5 (scalable enhancement)    | linear-prefix decode (round 6) |
+| `cbpb` (6-bit, 4:2:0 rectangular)             | fixed-width decode (round 6) |
+| `dbquant` Table 6-33                          | 1-or-2-bit → 0 / ±2 (round 6) |
+| Default `mb_type` when `modb == 1`            | `direct` / `forward` per scalability (round 6) |
 | Motion-vector / DCT decode                    | not yet |
 | Encoder                                       | not yet |
 
-92 round-1+2+3+4+5 unit tests pass.
+119 round-1+2+3+4+5+6 unit tests pass.
 
 ## Provenance
 
@@ -99,14 +116,18 @@ ISO/IEC 14496-2:2004 (3rd edition) — Tables 6-3 (start codes), 6-14
 (aspect ratios), 6-15 (chroma formats), 6-16 (shape types), 6-19
 (`sprite_enable`), 6-23 (time-code layout), 6-24 (`vop_coding_type`),
 6-25 (`intra_dc_vlc_thr`), 6-32 (`dquant` codes), Annex B Tables B.1
-(mb_type ↔ derived_mb_type ↔ included elements), B.6 (mcbpc I-VOP),
-B.7 (mcbpc P-VOP), B.8 (cbpy 4-block) — and the syntax tables of
+(mb_type ↔ derived_mb_type ↔ included elements), B.3 (modb VLC),
+B.4 (B-VOP mb_type, non-scalable), B.5 (B-VOP mb_type, scalable
+enhancement layer), B.6 (mcbpc I-VOP), B.7 (mcbpc P-VOP), B.8
+(cbpy 4-block) — and Table 6-33 (dbquant), and the syntax tables of
 §6.2.2 / §6.2.3 / §6.2.4 / §6.2.5 / §6.2.6 plus the semantics in
 §6.3.3 (including the `8*[2-64]` zigzag-ordered quant-matrix list,
 the zero-sentinel "remaining values set equal to the last non-zero
 value" rule, and the intra "shall always be 8" / non-intra "shall
 not be 0" first-value constraints) / §6.3.4 / §6.3.5 / §6.3.6
-(macroblock-related semantics). The text was read from
+(macroblock-related semantics, including the B-VOP `modb` / `mb_type`
+/ `cbpb` / `dbquant` rules and the default-type "direct" vs
+"forward mc + Q" choice from §7.9.2.8.3). The text was read from
 `docs/video/mpeg4-visual/ISO_IEC_14496-2-2004-3rd-edition.txt`. No
 third-party MPEG-4 source was consulted.
 
