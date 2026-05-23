@@ -8,6 +8,35 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 7 of the clean-room rebuild: §6.2.6.2 `motion_vector(mode)`
+  bitstream decode plus the §7.6.3 general motion-vector decoding
+  process. New `decode_motion_vector_delta(br, mode, vop_fcode)` walks
+  one `motion_vector("forward" / "backward" / "direct")` body — a pair
+  of Table B.12 `mv_data` VLCs (65 codes, "vector differences" −16…+16
+  in half-pel steps; the on-wire value is the doubled integer −32…+32
+  per the §7.6.3 note), each followed by an `r_size`-bit
+  (`r_size = vop_fcode - 1`) `*_mv_residual` when
+  `vop_fcode != 1 && mv_data != 0`. It reconstructs the differential
+  vector `(MVDx, MVDy)` via the §7.6.3 recurrence
+  (`f = 1 << r_size`, `MVD = (Abs(mv_data)-1)*f + residual + 1`, sign
+  from `mv_data`) and returns a `MotionVectorDelta { dx, dy }`. The
+  `"direct"` branch reads only the two `mv_data` VLCs (no residuals).
+- `reconstruct_motion_vector(delta, px, py, vop_fcode)` — adds a
+  caller-supplied predictor `(Px, Py)` and applies the §7.6.3 /
+  Table 7-9 modulo wrap into `[low:high]` (`low = -32*f`,
+  `high = 32*f - 1`, `range = 64*f`), yielding the final
+  `MotionVector { x, y }`.
+- `MvMode { Direct, Forward, Backward }` selector mirroring the
+  §6.2.6.2 `mode` argument; `MotionVectorDelta { dx, dy }` and
+  `MotionVector { x, y }` value types.
+- `MotionParseError { Truncated, InvalidMvData { window },
+  InvalidFcode(u8) }` + `Display` + `Error` + `From<BitReaderError>`,
+  surfaced through the crate-level `Error::Motion` variant.
+- The motion-vector path is exercised by a full Table B.12 round-trip,
+  a prefix-free-table assertion (all 65 codes mutually
+  non-prefixing), a Table 7-9 bounds check, residual-gating cases for
+  `vop_fcode` 1 vs 2, and modulo-wrap boundary tests. Total unit test
+  count rises from 119 to 142.
 - Round 6 of the clean-room rebuild: §6.2.6 B-VOP macroblock-header
   prefix bit-walk for rectangular VOL shape with 4:2:0 chroma. New
   `parse_b_vop_mb_header(br, vol, vop_coding_type, table)` consumes
