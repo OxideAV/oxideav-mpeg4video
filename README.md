@@ -5,7 +5,7 @@ A pure-Rust MPEG-4 Part 2 Video codec (ISO/IEC 14496-2) for the
 
 ## Status
 
-**Round 6 of the clean-room rebuild (2026-05-22).** The prior
+**Round 7 of the clean-room rebuild (2026-05-24).** The prior
 implementation was retired on 2026-05-18 under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md);
 the VLC tables admitted to sourcing their numeric entries from an
@@ -49,8 +49,23 @@ enforcement procedure.
   rows; non-B VOP types return
   `BVopMbParseError::NotBVop`. Motion-vector bodies remain out of
   scope; the bit reader is left positioned at their start.
+* Round 7 — §6.2.6.2 `motion_vector(mode)` bitstream decode plus the
+  §7.6.3 differential-MV reconstruction. New `decode_mv_data` decodes
+  the Table B.12 MVD VLC (`*_mv_data`, 1-13 bits) into the signed
+  half-sample-unit value (range `[-32, 32]`). `decode_mv_component`
+  conditionally reads the `*_mv_residual` field
+  (`r_size = vop_fcode - 1` bits, gated on
+  `vop_fcode != 1 && mv_data != 0`) and reconstructs the component as
+  `MVD = (|mv_data|-1)*f + residual + 1` (with sign carry).
+  `decode_motion_vector` walks the `forward` / `backward` / `direct`
+  branches into a typed `MotionVectorDelta { mvdx, mvdy }` (direct mode
+  reads two raw VLCs with no residual). `apply_predictor` performs the
+  §7.6.3 `MV = P + MVD` step with the Table 7-9 `[low:high]` modulo
+  wrap; the predictor `(Px, Py)` derivation (median-of-three over the
+  MB grid, §7.6.2) and direct-mode temporal scaling (§7.6.5) remain
+  for later rounds.
 
-Motion-vector + DCT-coefficient decode land in later rounds.
+Predictor derivation + DCT-coefficient decode land in later rounds.
 
 ## What works today
 
@@ -104,10 +119,16 @@ Motion-vector + DCT-coefficient decode land in later rounds.
 | `cbpb` (6-bit, 4:2:0 rectangular)             | fixed-width decode (round 6) |
 | `dbquant` Table 6-33                          | 1-or-2-bit → 0 / ±2 (round 6) |
 | Default `mb_type` when `modb == 1`            | `direct` / `forward` per scalability (round 6) |
-| Motion-vector / DCT decode                    | not yet |
+| `motion_vector(mode)` body (fwd/bwd/direct)   | `decode_motion_vector` (round 7) |
+| `*_mv_data` Table B.12 VLC                     | linear-prefix decode, range [-32,32] (round 7) |
+| `*_mv_residual` (`r_size = vop_fcode-1`)       | gated read + §7.6.3 reconstruction (round 7) |
+| `MV = P + MVD` modulo wrap (Table 7-9)        | `apply_predictor` (round 7) |
+| Predictor `(Px, Py)` derivation (§7.6.2)      | not yet (caller supplies) |
+| Direct-mode temporal MV scaling (§7.6.5)      | not yet |
+| DCT-coefficient decode                         | not yet |
 | Encoder                                       | not yet |
 
-119 round-1+2+3+4+5+6 unit tests pass.
+145 round-1..7 unit tests pass.
 
 ## Provenance
 
@@ -119,15 +140,21 @@ ISO/IEC 14496-2:2004 (3rd edition) — Tables 6-3 (start codes), 6-14
 (mb_type ↔ derived_mb_type ↔ included elements), B.3 (modb VLC),
 B.4 (B-VOP mb_type, non-scalable), B.5 (B-VOP mb_type, scalable
 enhancement layer), B.6 (mcbpc I-VOP), B.7 (mcbpc P-VOP), B.8
-(cbpy 4-block) — and Table 6-33 (dbquant), and the syntax tables of
-§6.2.2 / §6.2.3 / §6.2.4 / §6.2.5 / §6.2.6 plus the semantics in
+(cbpy 4-block), B.12 (MVD VLC) — and Table 6-33 (dbquant), Table 7-9
+(motion-vector `[low:high]` range per `vop_fcode`), and the syntax
+tables of §6.2.2 / §6.2.3 / §6.2.4 / §6.2.5 / §6.2.6 (including
+§6.2.6.2 `motion_vector(mode)`) plus the semantics in
 §6.3.3 (including the `8*[2-64]` zigzag-ordered quant-matrix list,
 the zero-sentinel "remaining values set equal to the last non-zero
 value" rule, and the intra "shall always be 8" / non-intra "shall
 not be 0" first-value constraints) / §6.3.4 / §6.3.5 / §6.3.6
 (macroblock-related semantics, including the B-VOP `modb` / `mb_type`
-/ `cbpb` / `dbquant` rules and the default-type "direct" vs
-"forward mc + Q" choice from §7.9.2.8.3). The text was read from
+/ `cbpb` / `dbquant` rules, the §6.3.6.2 `*_mv_data` / `*_mv_residual`
+/ `r_size = vop_fcode - 1` rules, and the default-type "direct" vs
+"forward mc + Q" choice from §7.9.2.8.3) / §7.6.3 (general motion-
+vector decoding process: the `f` / `high` / `low` / `range`
+reconstruction and the `mv_data == 2 * (vector difference)` note).
+The text was read from
 `docs/video/mpeg4-visual/ISO_IEC_14496-2-2004-3rd-edition.txt`. No
 third-party MPEG-4 source was consulted.
 

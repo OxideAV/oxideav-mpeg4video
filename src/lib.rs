@@ -44,6 +44,17 @@
 //!   mb_type, cbpb, mvdf_present, mvdb_present, dbquant_delta }` via
 //!   `parse_b_vop_mb_header`. Motion-vector bodies remain out of
 //!   scope; the bit reader is left positioned at their start.
+//! * Round 7: §6.2.6.2 `motion_vector(mode)` bitstream decode plus the
+//!   §7.6.3 differential-MV reconstruction — the Table B.12 MVD VLC
+//!   (`*_mv_data`, 1-13 bits), the `*_mv_residual` field
+//!   (`r_size = vop_fcode - 1` bits, gated on
+//!   `vop_fcode != 1 && mv_data != 0`), and the
+//!   `MVD = (|mv_data|-1)*f + residual + 1` reconstruction for
+//!   `forward` / `backward` / `direct` modes. Surfaces as
+//!   `MotionVectorDelta { mvdx, mvdy }` via `decode_motion_vector`;
+//!   `apply_predictor` performs the `MV = P + MVD` modulo wrap once the
+//!   caller supplies the predictor (predictor derivation needs the
+//!   per-MB MV grid and lands later).
 //! * Strict failure on Studio Profiles, FGS layers, and non-rectangular
 //!   shapes — those branches are recognised and rejected with a typed
 //!   error, never silently mis-parsed. Sprite bodies, complexity-
@@ -72,6 +83,7 @@ use oxideav_core::RuntimeContext;
 pub mod bitreader;
 pub mod bvop;
 pub mod macroblock;
+pub mod motion;
 pub mod vol;
 pub mod vop;
 
@@ -82,6 +94,10 @@ pub use bvop::{
 };
 pub use macroblock::{
     dquant_value, parse_macroblock_header, DerivedMbType, MacroblockHeader, MacroblockParseError,
+};
+pub use motion::{
+    apply_predictor, decode_motion_vector, decode_mv_component, decode_mv_data, MotionParseError,
+    MotionVectorDelta, MvMode,
 };
 pub use vol::{
     parse_video_object_layer, parse_visual_object_header, parse_visual_object_sequence_header,
@@ -116,6 +132,9 @@ pub enum Error {
     /// A B-VOP macroblock-header parse failed. See [`BVopMbParseError`]
     /// for the discrimination.
     BVopMacroblock(BVopMbParseError),
+    /// A motion-vector body parse failed. See [`MotionParseError`] for
+    /// the discrimination.
+    Motion(MotionParseError),
 }
 
 impl core::fmt::Display for Error {
@@ -132,6 +151,9 @@ impl core::fmt::Display for Error {
             }
             Error::BVopMacroblock(err) => {
                 write!(f, "oxideav-mpeg4video: B-VOP macroblock parse error: {err}")
+            }
+            Error::Motion(err) => {
+                write!(f, "oxideav-mpeg4video: motion vector parse error: {err}")
             }
         }
     }
@@ -160,6 +182,12 @@ impl From<MacroblockParseError> for Error {
 impl From<BVopMbParseError> for Error {
     fn from(err: BVopMbParseError) -> Self {
         Error::BVopMacroblock(err)
+    }
+}
+
+impl From<MotionParseError> for Error {
+    fn from(err: MotionParseError) -> Self {
+        Error::Motion(err)
     }
 }
 
@@ -211,5 +239,12 @@ mod tests {
             Error::BVopMacroblock(BVopMbParseError::Truncated)
         ));
         assert!(format!("{e}").contains("B-VOP macroblock parse error"));
+    }
+
+    #[test]
+    fn motion_error_round_trip() {
+        let e: Error = MotionParseError::Truncated.into();
+        assert!(matches!(e, Error::Motion(MotionParseError::Truncated)));
+        assert!(format!("{e}").contains("motion vector parse error"));
     }
 }

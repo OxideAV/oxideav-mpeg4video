@@ -8,6 +8,46 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 7 of the clean-room rebuild: §6.2.6.2 `motion_vector(mode)`
+  bitstream decode plus the §7.6.3 differential-MV reconstruction. New
+  `decode_mv_data(br)` decodes the Table B.12 MVD VLC (`*_mv_data`,
+  1-13 bits) into a signed `i16` in half-sample units (range
+  `[-32, 32]`, i.e. two times the table's vector-difference column per
+  §7.6.3). `decode_mv_component(br, mv_data, vop_fcode)` reads the
+  `*_mv_residual` field only when `vop_fcode != 1 && mv_data != 0`
+  (`r_size = vop_fcode - 1` bits) and reconstructs the component as
+  `MVD = (|mv_data|-1)*f + residual + 1` with sign carry, where
+  `f = 1 << r_size`. `decode_motion_vector(br, mode, fcode_fwd,
+  fcode_bwd)` walks the `forward` / `backward` / `direct` branches of
+  the §6.2.6.2 syntax into a typed `MotionVectorDelta { mvdx, mvdy }`
+  (the direct branch reads two raw `*_mv_data` VLCs with no residual).
+- `MvMode` enum (`Direct`, `Forward`, `Backward`) selecting the
+  `motion_vector(mode)` branch and the relevant `vop_fcode`.
+- `apply_predictor(predictor, mvd, vop_fcode)` implementing the §7.6.3
+  `MV = P + MVD` step with the Table 7-9 `[low:high]` modulo wrap
+  (`high = 32*f - 1`, `low = -32*f`, `range = 64*f`). The predictor
+  `(Px, Py)` itself is caller-supplied; deriving it from the
+  neighbouring-macroblock MV grid (§7.6.2) and direct-mode temporal
+  scaling (§7.6.5) are deferred to later rounds.
+- `MotionParseError { Truncated, InvalidMvData { window },
+  InvalidFcode(u8) }` + `Display` + `Error` + `From<BitReaderError>`.
+- `Error::Motion(MotionParseError)` variant + `From` conversion on the
+  crate-level error surface.
+- 26 round-7 unit tests: Table B.12 completeness + prefix-free
+  invariant; full round-trip of every Table B.12 row with
+  bit-position assertion; `mv_data == 0` single-`1`-bit code;
+  truncated / all-zero-window rejection; `vop_fcode == 1` passthrough
+  (no residual read); `mv_data == 0` residual skip; fcode-2 positive /
+  negative reconstruction; fcode-3 residual-width check; bad-fcode
+  rejection (0 and 8); truncated residual; full `motion_vector` decode
+  for forward (fcode 1 and 2-with-residuals), backward
+  (uses `fcode_backward`, ignores forward), and direct (two VLCs, no
+  residual, sentinel-verified bit position); bad forward/backward
+  fcode rejection; `apply_predictor` no-wrap / high-wrap / low-wrap /
+  fcode-2-range / bad-fcode; `Display` coverage for all variants;
+  `BitReaderError -> MotionParseError` mapping. Plus a crate-level
+  `Error::Motion` round-trip test in `lib.rs`.
+
 - Round 6 of the clean-room rebuild: §6.2.6 B-VOP macroblock-header
   prefix bit-walk for rectangular VOL shape with 4:2:0 chroma. New
   `parse_b_vop_mb_header(br, vol, vop_coding_type, table)` consumes
