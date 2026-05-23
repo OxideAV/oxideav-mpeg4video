@@ -6,6 +6,19 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.5](https://github.com/OxideAV/oxideav-mpeg4video/releases/tag/v0.1.5) - 2026-05-23
+
+### Other
+
+- round 7: §6.2.6.2 motion_vector(mode) + §7.6.3 differential-MV decode
+- round 6: §6.2.6 B-VOP macroblock header prefix (modb/mb_type/cbpb/dbquant)
+- round 5: §6.2.6 macroblock-layer header bit-walk (mcbpc/cbpy/dquant)
+- round 4: decode quant_type==1 quantiser-matrix load body (§6.2.3.3)
+- round 3: promote §6.2.3 VOL fields onto VolHeader; VopHeader::from_vol
+- round 2: §6.2.4 GOV + §6.2.5 VOP header parse
+- round 1: §6.2 VisualObjectSequence / VisualObject / VOL header parse
+- orphan rebuild: clean-room scaffold post 2026-05-18 audit
+
 ### Added
 
 - Round 7 of the clean-room rebuild: §6.2.6.2 `motion_vector(mode)`
