@@ -51,7 +51,14 @@
 //!   `vop_fcode != 1 && mv_data != 0`) and reconstructs `(MVDx, MVDy)`;
 //!   `reconstruct_motion_vector(delta, px, py, vop_fcode)` adds a
 //!   caller-supplied predictor and applies the Table 7-9 modulo wrap.
-//!   The MV predictor itself (median, §7.6.5) is later-round work.
+//! * Round 8: §7.6.5 median-filter MV predictor.
+//!   `predict_motion_vector([Option<MotionVector>; 3])` resolves the
+//!   three candidate predictors (`MV1`/`MV2`/`MV3`, `None` = invalid /
+//!   transparent neighbour) by the four §7.6.5 validity rules and
+//!   computes `Px = Median(MV1x, MV2x, MV3x)` / `Py = Median(MV1y,
+//!   MV2y, MV3y)`; the result feeds straight into
+//!   `reconstruct_motion_vector`. Gathering the candidates from the
+//!   spatial neighbourhood (Figure 7-34 positions) is later-round work.
 //! * Strict failure on Studio Profiles, FGS layers, and non-rectangular
 //!   shapes — those branches are recognised and rejected with a typed
 //!   error, never silently mis-parsed. Sprite bodies, complexity-
@@ -93,8 +100,8 @@ pub use macroblock::{
     dquant_value, parse_macroblock_header, DerivedMbType, MacroblockHeader, MacroblockParseError,
 };
 pub use motion::{
-    decode_motion_vector_delta, reconstruct_motion_vector, MotionParseError, MotionVector,
-    MotionVectorDelta, MvMode,
+    decode_motion_vector_delta, predict_motion_vector, reconstruct_motion_vector, MotionParseError,
+    MotionVector, MotionVectorDelta, MvMode,
 };
 pub use vol::{
     parse_video_object_layer, parse_visual_object_header, parse_visual_object_sequence_header,

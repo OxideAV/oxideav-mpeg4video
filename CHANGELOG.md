@@ -8,6 +8,39 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 8 of the clean-room rebuild: §7.6.5 median-filter
+  motion-vector predictor for progressive P-/S(GMC)-VOPs. New
+  `predict_motion_vector([Option<MotionVector>; 3])` takes the three
+  spatial candidate predictors (`MV1`/`MV2`/`MV3`, where `None` marks
+  an invalid neighbour — a transparent macroblock/block, or a
+  neighbour outside the current VOP / video packet / GOB, all "treated
+  as transparent" per the §7.6.5 note), applies the four §7.6.5
+  validity decision rules (a valid candidate keeps its block vector;
+  exactly one invalid → set to zero; exactly two invalid → both set to
+  the one remaining valid candidate; all three invalid → zero), and
+  computes the predictor `Px = Median(MV1x, MV2x, MV3x)` /
+  `Py = Median(MV1y, MV2y, MV3y)`. The §7.6.5 worked example
+  (`MV1=(-2,3)`, `MV2=(1,5)`, `MV3=(-1,7)` → `Px=-1`, `Py=5`) fixes
+  `Median(a, b, c)` as the middle of three integers — the §4.1
+  arithmetic-operator clause does not list `Median`. The resolved
+  `(Px, Py)` feeds straight into the round-7
+  `reconstruct_motion_vector`. Internal `median3` and
+  `resolve_candidates` helpers back the public entry point.
+- Gathering the candidate predictors from the spatial neighbourhood
+  (Figure 7-34 block positions, the four-MV vs single-MV cases, and
+  the S(GMC)-VOP `mcsel == '1'` averaged-vector substitution of
+  §7.8.7.3) is deliberately left to a later round: Figure 7-34 is a
+  diagram with no textual position list in the spec text, so this
+  round resolves and medians candidates the caller has already
+  gathered.
+- 7 round-8 unit tests: `median3` middle-of-three (spec worked-example
+  components, permutation-invariance, duplicates, negative-spanning);
+  the full §7.6.5 worked example via `predict_motion_vector`; rule 1
+  (all three valid → component-wise median); rule 2 (one invalid → set
+  to zero); rule 3 (two invalid → both take the third, asserted for
+  each of the three valid slots); rule 4 (all invalid → zero); and an
+  end-to-end `predict_motion_vector` → `reconstruct_motion_vector`
+  pipeline. Total unit test count rises from 142 to 149.
 - Round 7 of the clean-room rebuild: §6.2.6.2 `motion_vector(mode)`
   bitstream decode plus the §7.6.3 general motion-vector decoding
   process. New `decode_motion_vector_delta(br, mode, vop_fcode)` walks

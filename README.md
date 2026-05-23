@@ -5,7 +5,7 @@ A pure-Rust MPEG-4 Part 2 Video codec (ISO/IEC 14496-2) for the
 
 ## Status
 
-**Round 7 of the clean-room rebuild (2026-05-24).** The prior
+**Round 8 of the clean-room rebuild (2026-05-24).** The prior
 implementation was retired on 2026-05-18 under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md);
 the VLC tables admitted to sourcing their numeric entries from an
@@ -61,11 +61,26 @@ enforcement procedure.
   on-wire `mv_data` is the doubled "vector differences" integer per the
   §7.6.3 note. `reconstruct_motion_vector(delta, px, py, vop_fcode)`
   adds a caller-supplied predictor and applies the Table 7-9 modulo
-  wrap into `[low:high]`, yielding the final `(MVx, MVy)`. The
-  predictor itself (median of neighbouring block vectors, §7.6.5) and
-  direct-mode predictor scaling remain later-round work.
+  wrap into `[low:high]`, yielding the final `(MVx, MVy)`.
+* Round 8 — §7.6.5 median-filter motion-vector predictor.
+  `predict_motion_vector([Option<MotionVector>; 3])` takes the three
+  candidate predictors (`MV1`/`MV2`/`MV3`; `None` marks an invalid
+  neighbour — transparent, or outside the current VOP / video packet /
+  GOB, all "treated as transparent" per §7.6.5), applies the four
+  §7.6.5 validity rules (one invalid → zero; two invalid → both take
+  the third; all invalid → zero), and computes `Px = Median(MV1x,
+  MV2x, MV3x)` / `Py = Median(MV1y, MV2y, MV3y)`. The spec's worked
+  example (`MV1=(-2,3)`, `MV2=(1,5)`, `MV3=(-1,7)` → `Px=-1`, `Py=5`)
+  pins `Median(a, b, c)` as the middle of three. The resolved
+  `(Px, Py)` feeds straight into `reconstruct_motion_vector`.
+  Gathering the candidates from the spatial neighbourhood
+  (Figure 7-34 block positions, the four-MV vs single-MV cases, and
+  the S(GMC)-VOP averaged-vector substitution of §7.8.7.3) remains
+  later-round work — Figure 7-34 is a diagram with no textual position
+  list. Direct-mode predictor scaling also remains later-round work.
 
-DCT-coefficient decode and the MV predictor lands in later rounds.
+DCT-coefficient decode and the MV-predictor candidate gathering land
+in later rounds.
 
 ## What works today
 
@@ -124,11 +139,12 @@ DCT-coefficient decode and the MV predictor lands in later rounds.
 | `*_mv_residual` (`r_size = vop_fcode-1`)      | gated read per §6.2.6.2 (round 7) |
 | §7.6.3 differential-MV reconstruction         | `(Abs-1)*f + res + 1`, sign (round 7) |
 | §7.6.3 predictor add + Table 7-9 modulo wrap  | `reconstruct_motion_vector` (round 7) |
-| MV predictor (median of neighbours, §7.6.5)   | not yet |
+| §7.6.5 median MV predictor + validity rules    | `predict_motion_vector` (round 8) |
+| MV-predictor candidate gathering (Figure 7-34) | not yet |
 | DCT decode                                    | not yet |
 | Encoder                                       | not yet |
 
-142 round-1..7 unit tests pass.
+149 round-1..8 unit tests pass.
 
 ## Provenance
 
@@ -155,7 +171,13 @@ syntax), §6.3.6.2 (`*_mv_data` / `*_mv_residual` + the
 decoding process: the `f`/`low`/`high`/`range` recurrence, the
 `MVD = (Abs(mv_data)-1)*f + residual + 1` reconstruction, the
 predictor add and the `[low:high]` modulo wrap, plus the note that
-`mv_data` is two times the Table B.12 "vector differences" value). The
+`mv_data` is two times the Table B.12 "vector differences" value), and
+§7.6.5 (the progressive P-/S(GMC)-VOP median-filter predictor: the
+four candidate-predictor validity rules, the `Px = Median(MV1x, MV2x,
+MV3x)` / `Py = Median(MV1y, MV2y, MV3y)` combination, and the worked
+example `MV1=(-2,3)`, `MV2=(1,5)`, `MV3=(-1,7)` → `Px=-1`, `Py=5`
+that fixes `Median(a, b, c)` as the middle of three since the §4.1
+operator clause does not define it). The
 text was read from
 `docs/video/mpeg4-visual/ISO_IEC_14496-2-2004-3rd-edition.txt`. No
 third-party MPEG-4 source was consulted.

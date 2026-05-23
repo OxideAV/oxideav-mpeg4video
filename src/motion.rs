@@ -33,14 +33,28 @@
 //!   vop_fcode == 1".
 //! * Table 7-9 — `[low:high]` range per `vop_fcode` (a cross-check on
 //!   the `f`-derived bounds).
+//! * §7.6.5 Vector decoding processing in progressive P-/S(GMC)-VOP —
+//!   the median-filter predictor. The three candidate predictors
+//!   (`MV1`, `MV2`, `MV3`) are resolved by the four validity rules of
+//!   §7.6.5 and combined component-wise with `Px = Median(MV1x, MV2x,
+//!   MV3x)` / `Py = Median(MV1y, MV2y, MV3y)`. The worked example in
+//!   the spec — `MV1=(-2,3)`, `MV2=(1,5)`, `MV3=(-1,7)` → `Px=-1`,
+//!   `Py=5` — pins the `Median(a, b, c)` definition as the middle of
+//!   three (the §4.1 operator clause does not list `Median`). The
+//!   resolved `(Px, Py)` feeds straight into
+//!   [`reconstruct_motion_vector`].
 //!
 //! ## Out of scope (this round)
 //!
-//! * The motion-vector **predictor** itself (median of three
-//!   neighbouring block vectors, §7.6.5 / §7.6.6) — the predictor is a
-//!   caller-supplied input here. This module reconstructs the
-//!   component value *given* a predictor; computing the predictor from
-//!   the neighbourhood is a later round.
+//! * **Gathering** the candidate predictors from the spatial
+//!   neighbourhood (the `MV1`/`MV2`/`MV3` block positions of
+//!   Figure 7-34, the four-MV vs single-MV cases, and the
+//!   S(GMC)-VOP `mcsel == '1'` averaged-vector substitution of
+//!   §7.8.7.3). Figure 7-34 is a diagram with no textual position list
+//!   in the spec, so the spatial layout is a later round; this module
+//!   resolves and medians candidates the caller has already gathered,
+//!   marking transparent / out-of-VOP / out-of-packet neighbours as
+//!   `None`.
 //! * The "direct" mode's predictor scaling from the co-located P-VOP MV
 //!   (§7.6.6) — `"direct"` here decodes only its `mv_data` pair (no
 //!   residuals, exactly as the §6.2.6.2 syntax shows) and reconstructs
@@ -353,6 +367,94 @@ fn wrap_component(mut value: i32, low: i32, high: i32, range: i32) -> i32 {
         value -= range;
     }
     value
+}
+
+// ---------------------------------------------------------------------------
+// §7.6.5 — median-filter motion-vector predictor (progressive P-/S(GMC)-VOP).
+// ---------------------------------------------------------------------------
+
+/// `Median(a, b, c)` — the middle value of three integers (§7.6.5).
+///
+/// The §4.1 arithmetic-operator clause does not define `Median`; the
+/// §7.6.5 worked example (`Median(-2, 1, -1) = -1`,
+/// `Median(3, 5, 7) = 5`) fixes it as the order statistic that discards
+/// the smallest and the largest of the three.
+fn median3(a: i32, b: i32, c: i32) -> i32 {
+    // max(min(a,b), min(max(a,b), c)) — the middle of three.
+    a.max(b).min(a.min(b).max(c))
+}
+
+/// Resolve the three §7.6.5 candidate predictors into concrete vectors.
+///
+/// Each input slot is `Some(vector)` when the corresponding spatial
+/// neighbour block vector is **valid** (the neighbour exists, is
+/// non-transparent, and is inside the current VOP / video packet /
+/// GOB), or `None` when it is **not valid** (transparent neighbour,
+/// transparent block of the current MB, or a neighbour outside the
+/// current VOP / video packet / GOB — all "treated as transparent" per
+/// the §7.6.5 note).
+///
+/// The four §7.6.5 decision rules are then applied:
+///
+/// 1. A valid candidate keeps its block vector.
+/// 2. If exactly **one** candidate is not valid, it is set to zero.
+/// 3. If exactly **two** candidates are not valid, they are set to the
+///    one remaining valid candidate.
+/// 4. If **all three** candidates are not valid, they are set to zero.
+///
+/// Returns the resolved `[MV1, MV2, MV3]` triple.
+fn resolve_candidates(candidates: [Option<MotionVector>; 3]) -> [MotionVector; 3] {
+    let zero = MotionVector { x: 0, y: 0 };
+    let valid_count = candidates.iter().filter(|c| c.is_some()).count();
+
+    match valid_count {
+        // Rule 4: all three invalid → all zero.
+        0 => [zero, zero, zero],
+        // Rule 3: exactly two invalid → the invalid pair takes the one
+        // remaining valid candidate.
+        1 => {
+            let only = candidates
+                .iter()
+                .find_map(|c| *c)
+                .expect("valid_count == 1 implies a Some");
+            [only, only, only]
+        }
+        // Rule 2: exactly one invalid → that one becomes zero; the two
+        // valid candidates keep their vectors. (Rule 1 for the valid
+        // ones is the `unwrap_or(zero)` identity here.)
+        // Rule 1 (all valid, valid_count == 3) also flows through this
+        // arm: every slot is `Some`, so each keeps its block vector.
+        _ => [
+            candidates[0].unwrap_or(zero),
+            candidates[1].unwrap_or(zero),
+            candidates[2].unwrap_or(zero),
+        ],
+    }
+}
+
+/// Compute the §7.6.5 motion-vector predictor `(Px, Py)` from the three
+/// spatial candidate predictors.
+///
+/// The candidates are first resolved by the four §7.6.5 validity rules
+/// (see [`resolve_candidates`] — `None` marks an invalid / transparent
+/// neighbour), then combined component-wise:
+///
+/// ```text
+/// Px = Median(MV1x, MV2x, MV3x)
+/// Py = Median(MV1y, MV2y, MV3y)
+/// ```
+///
+/// The returned vector is the `(Px, Py)` predictor that
+/// [`reconstruct_motion_vector`] adds to the decoded differential MV.
+/// Gathering the candidates from the spatial neighbourhood
+/// (Figure 7-34 positions) is the caller's responsibility and out of
+/// scope for this module.
+pub fn predict_motion_vector(candidates: [Option<MotionVector>; 3]) -> MotionVector {
+    let [mv1, mv2, mv3] = resolve_candidates(candidates);
+    MotionVector {
+        x: median3(mv1.x, mv2.x, mv3.x),
+        y: median3(mv1.y, mv2.y, mv3.y),
+    }
 }
 
 #[cfg(test)]
@@ -698,5 +800,115 @@ mod tests {
         assert_eq!(reconstruct_component(3, 2, 4), 11);
         // general path, negative: -((|−3|-1)*4 + 2 + 1) = -11.
         assert_eq!(reconstruct_component(-3, 2, 4), -11);
+    }
+
+    // ----- §7.6.5 median-filter predictor --------------------------------
+
+    #[test]
+    fn median3_picks_middle_value() {
+        // The §7.6.5 worked example components.
+        assert_eq!(median3(-2, 1, -1), -1);
+        assert_eq!(median3(3, 5, 7), 5);
+        // Order-independence: the median is invariant under permutation.
+        assert_eq!(median3(7, 3, 5), 5);
+        assert_eq!(median3(5, 7, 3), 5);
+        assert_eq!(median3(1, -2, -1), -1);
+        // Duplicates: the repeated value is the middle.
+        assert_eq!(median3(4, 4, 9), 4);
+        assert_eq!(median3(9, 4, 4), 4);
+        assert_eq!(median3(2, 2, 2), 2);
+        // Negative-spanning triple.
+        assert_eq!(median3(-10, 0, 10), 0);
+        assert_eq!(median3(-5, -5, -1), -5);
+    }
+
+    #[test]
+    fn predict_matches_spec_worked_example() {
+        // §7.6.5: MV1=(-2,3), MV2=(1,5), MV3=(-1,7) → Px=-1, Py=5.
+        let candidates = [
+            Some(MotionVector { x: -2, y: 3 }),
+            Some(MotionVector { x: 1, y: 5 }),
+            Some(MotionVector { x: -1, y: 7 }),
+        ];
+        let p = predict_motion_vector(candidates);
+        assert_eq!(p.x, -1);
+        assert_eq!(p.y, 5);
+    }
+
+    #[test]
+    fn rule1_all_valid_medians_each_component() {
+        // All three valid: each component is its own median.
+        let resolved = resolve_candidates([
+            Some(MotionVector { x: -2, y: 3 }),
+            Some(MotionVector { x: 1, y: 5 }),
+            Some(MotionVector { x: -1, y: 7 }),
+        ]);
+        assert_eq!(resolved[0], MotionVector { x: -2, y: 3 });
+        assert_eq!(resolved[1], MotionVector { x: 1, y: 5 });
+        assert_eq!(resolved[2], MotionVector { x: -1, y: 7 });
+    }
+
+    #[test]
+    fn rule2_one_invalid_becomes_zero() {
+        // Exactly one candidate invalid → it is set to zero; the two
+        // valid candidates keep their vectors.
+        let resolved = resolve_candidates([
+            Some(MotionVector { x: 4, y: -4 }),
+            None,
+            Some(MotionVector { x: -6, y: 6 }),
+        ]);
+        assert_eq!(resolved[0], MotionVector { x: 4, y: -4 });
+        assert_eq!(resolved[1], MotionVector { x: 0, y: 0 });
+        assert_eq!(resolved[2], MotionVector { x: -6, y: 6 });
+        // Predictor: Px = Median(4, 0, -6) = 0; Py = Median(-4, 0, 6) = 0.
+        let p = predict_motion_vector([
+            Some(MotionVector { x: 4, y: -4 }),
+            None,
+            Some(MotionVector { x: -6, y: 6 }),
+        ]);
+        assert_eq!(p.x, 0);
+        assert_eq!(p.y, 0);
+    }
+
+    #[test]
+    fn rule3_two_invalid_take_third() {
+        // Exactly two invalid → both set to the one remaining valid
+        // candidate. The predictor then equals that candidate (the
+        // median of three identical values).
+        for slot in 0..3 {
+            let mut c = [None, None, None];
+            let only = MotionVector { x: 7, y: -9 };
+            c[slot] = Some(only);
+            let resolved = resolve_candidates(c);
+            assert_eq!(resolved, [only, only, only], "valid in slot {slot}");
+            let p = predict_motion_vector(c);
+            assert_eq!(p, only, "predictor equals the sole valid candidate");
+        }
+    }
+
+    #[test]
+    fn rule4_all_invalid_is_zero() {
+        let resolved = resolve_candidates([None, None, None]);
+        let zero = MotionVector { x: 0, y: 0 };
+        assert_eq!(resolved, [zero, zero, zero]);
+        let p = predict_motion_vector([None, None, None]);
+        assert_eq!(p, zero);
+    }
+
+    #[test]
+    fn predict_feeds_reconstruct_motion_vector() {
+        // End-to-end: median predictor → §7.6.3 add + wrap. With
+        // candidates (-2,3),(1,5),(-1,7) the predictor is (-1,5);
+        // adding a delta of (4,-3) under fcode 2 gives (3,2), in range.
+        let candidates = [
+            Some(MotionVector { x: -2, y: 3 }),
+            Some(MotionVector { x: 1, y: 5 }),
+            Some(MotionVector { x: -1, y: 7 }),
+        ];
+        let p = predict_motion_vector(candidates);
+        let delta = MotionVectorDelta { dx: 4, dy: -3 };
+        let mv = reconstruct_motion_vector(delta, p.x, p.y, 2).unwrap();
+        assert_eq!(mv.x, 3);
+        assert_eq!(mv.y, 2);
     }
 }
