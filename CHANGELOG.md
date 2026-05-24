@@ -8,6 +8,44 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 9 of the clean-room rebuild: §7.4.1.1 intra-DC texture-
+  coefficient decode — the first stage of the §6.2.7 `block(i)`
+  texture syntax. New `decode_intra_dc(br, component)` reads
+  `dct_dc_size_luminance` (Table B.13, for `block(i)` index `i < 4`)
+  or `dct_dc_size_chrominance` (Table B.14, for `i >= 4`) selected by
+  the `DcComponent` argument, the `size`-bit `dct_dc_differential`
+  additional code (read only when `size != 0`), and the trailing
+  `marker_bit` (consumed and validated only when `size > 8`, per
+  Table B.15 NOTE 2's start-code-emulation guard). It applies the
+  Table B.15 sign-decode (`half_range = 2^(size-1)`; an additional
+  code `c >= half_range` → `+c`, else `(c + 1) - 2*half_range`) and
+  returns the signed *differential* DC value as
+  `IntraDcDifferential { size, differential }`. The result is the
+  block's differential DC; the §7.4.3.1 spatial predictor add
+  (`QF[0] = dct_dc_pred + differential`) and the §7.4.1.2 AC
+  coefficient decode are later-round work.
+- `DcComponent { Luminance, Chrominance }` with
+  `DcComponent::from_block_index(i)` (the §6.2.7 `i < 4` luminance /
+  `i >= 4` chrominance split for 4:2:0); `IntraDcDifferential { size,
+  differential }` value type.
+- `TextureParseError { Truncated, InvalidDcSize { window },
+  MarkerBitMissing }` + `Display` + `Error` + `From<BitReaderError>`,
+  surfaced through the new crate-level `Error::Texture` variant +
+  `From` conversion.
+- 23 round-9 unit tests: both `dct_dc_size` tables prefix-free and
+  covering sizes 0..=12; Table B.15 sign-decode for sizes 1/2/3 and
+  the size-8 boundaries (`-255`/`-128`/`128`/`255`); `size == 0` → 0;
+  `from_block_index` luma/chroma split; luminance & chrominance
+  size-0 (no additional code), size-1 positive/negative, size-2,
+  size-3; size-9 luminance positive with marker-bit consumption;
+  size-9 chrominance negative (`-511`) with marker; marker-bit-zero
+  rejection; invalid `dct_dc_size` prefix rejection; truncated empty
+  reader; truncated mid-additional-code; full round-trip of every
+  Table B.13 row (all-ones additional → `+(2^size - 1)`) and every
+  Table B.14 row (all-zeros additional → `1 - 2^size`); and `Display`
+  coverage for the three error variants. Plus one crate-level
+  `Error::Texture` round-trip test. Total unit test count rises from
+  149 to 173.
 - Round 8 of the clean-room rebuild: §7.6.5 median-filter
   motion-vector predictor for progressive P-/S(GMC)-VOPs. New
   `predict_motion_vector([Option<MotionVector>; 3])` takes the three

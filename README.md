@@ -5,7 +5,7 @@ A pure-Rust MPEG-4 Part 2 Video codec (ISO/IEC 14496-2) for the
 
 ## Status
 
-**Round 8 of the clean-room rebuild (2026-05-24).** The prior
+**Round 9 of the clean-room rebuild (2026-05-24).** The prior
 implementation was retired on 2026-05-18 under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md);
 the VLC tables admitted to sourcing their numeric entries from an
@@ -78,9 +78,21 @@ enforcement procedure.
   the S(GMC)-VOP averaged-vector substitution of §7.8.7.3) remains
   later-round work — Figure 7-34 is a diagram with no textual position
   list. Direct-mode predictor scaling also remains later-round work.
+* Round 9 — §7.4.1.1 intra-DC texture decode, the first stage of the
+  §6.2.7 `block(i)` syntax. `decode_intra_dc(br, component)` reads
+  `dct_dc_size_luminance` (Table B.13, block index `i < 4`) or
+  `dct_dc_size_chrominance` (Table B.14, `i >= 4`), the `size`-bit
+  `dct_dc_differential`, and the trailing `marker_bit` (Table B.15
+  NOTE 2, only when `size > 8`), then applies the Table B.15
+  sign-decode (`half_range = 2^(size-1)`; `c >= half_range` → `+c`,
+  else `(c + 1) - 2*half_range`) and returns the signed *differential*
+  DC value as `IntraDcDifferential { size, differential }`. The
+  §7.4.3.1 spatial DC predictor add (`QF[0] = dct_dc_pred +
+  differential`) and the §7.4.1.2 AC coefficient decode remain
+  later-round work.
 
-DCT-coefficient decode and the MV-predictor candidate gathering land
-in later rounds.
+The §7.4.3 spatial DC/AC predictor, AC-coefficient decode, and the
+MV-predictor candidate gathering land in later rounds.
 
 ## What works today
 
@@ -141,10 +153,15 @@ in later rounds.
 | §7.6.3 predictor add + Table 7-9 modulo wrap  | `reconstruct_motion_vector` (round 7) |
 | §7.6.5 median MV predictor + validity rules    | `predict_motion_vector` (round 8) |
 | MV-predictor candidate gathering (Figure 7-34) | not yet |
-| DCT decode                                    | not yet |
+| `dct_dc_size_luminance` Table B.13            | prefix-free VLC decode (round 9) |
+| `dct_dc_size_chrominance` Table B.14          | prefix-free VLC decode (round 9) |
+| `dct_dc_differential` Table B.15 sign-decode  | `decode_intra_dc` (round 9) |
+| intra-DC `marker_bit` (`size > 8`)            | consumed + validated (round 9) |
+| §7.4.3 spatial DC/AC predictor add            | not yet |
+| AC coefficient decode (§7.4.1.2)              | not yet |
 | Encoder                                       | not yet |
 
-149 round-1..8 unit tests pass.
+173 round-1..9 unit tests pass.
 
 ## Provenance
 
@@ -156,7 +173,9 @@ ISO/IEC 14496-2:2004 (3rd edition) — Tables 6-3 (start codes), 6-14
 (mb_type ↔ derived_mb_type ↔ included elements), B.3 (modb VLC),
 B.4 (B-VOP mb_type, non-scalable), B.5 (B-VOP mb_type, scalable
 enhancement layer), B.6 (mcbpc I-VOP), B.7 (mcbpc P-VOP), B.8
-(cbpy 4-block), B.12 (MVD VLC, 65 codes) — and Table 6-33 (dbquant),
+(cbpy 4-block), B.12 (MVD VLC, 65 codes), B.13 (dct_dc_size_luminance),
+B.14 (dct_dc_size_chrominance), B.15 (dct_dc_differential additional
+codes) — and Table 6-33 (dbquant),
 Table 7-9 (motion-vector range per vop_fcode), and the syntax tables of
 §6.2.2 / §6.2.3 / §6.2.4 / §6.2.5 / §6.2.6 plus the semantics in
 §6.3.3 (including the `8*[2-64]` zigzag-ordered quant-matrix list,
@@ -177,7 +196,14 @@ four candidate-predictor validity rules, the `Px = Median(MV1x, MV2x,
 MV3x)` / `Py = Median(MV1y, MV2y, MV3y)` combination, and the worked
 example `MV1=(-2,3)`, `MV2=(1,5)`, `MV3=(-1,7)` → `Px=-1`, `Py=5`
 that fixes `Median(a, b, c)` as the middle of three since the §4.1
-operator clause does not define it). The
+operator clause does not define it), and §7.4.1.1 / §6.2.7 (`block(i)`)
+/ §6.3.7 (the intra-DC texture decode: the `dct_dc_size_luminance`
+(`i < 4`) / `dct_dc_size_chrominance` (`i >= 4`) split, the
+`if (dct_dc_size != 0) dct_dc_differential` and
+`if (dct_dc_size > 8) marker_bit` gates, and the Table B.15
+sign-decode — `half_range = 2^(size-1)`; an additional code
+`c >= half_range` → `+c`, else `(c + 1) - 2*half_range` — confirmed
+against every Table B.15 boundary row). The
 text was read from
 `docs/video/mpeg4-visual/ISO_IEC_14496-2-2004-3rd-edition.txt`. No
 third-party MPEG-4 source was consulted.

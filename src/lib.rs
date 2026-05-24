@@ -59,6 +59,16 @@
 //!   MV2y, MV3y)`; the result feeds straight into
 //!   `reconstruct_motion_vector`. Gathering the candidates from the
 //!   spatial neighbourhood (Figure 7-34 positions) is later-round work.
+//! * Round 9: §7.4.1.1 intra-DC texture decode — the first stage of
+//!   the §6.2.7 `block(i)` syntax. `decode_intra_dc(br, component)`
+//!   reads `dct_dc_size_luminance` (Table B.13) or
+//!   `dct_dc_size_chrominance` (Table B.14), the `size`-bit
+//!   `dct_dc_differential`, and the trailing `marker_bit` (Table B.15
+//!   NOTE 2, when `size > 8`), returning the Table B.15 sign-decoded
+//!   *differential* DC value via `IntraDcDifferential { size,
+//!   differential }`. The §7.4.3 spatial DC/AC predictor that turns
+//!   the differential into the final coefficient, and AC coefficient
+//!   decode (§7.4.1.2), are later-round work.
 //! * Strict failure on Studio Profiles, FGS layers, and non-rectangular
 //!   shapes — those branches are recognised and rejected with a typed
 //!   error, never silently mis-parsed. Sprite bodies, complexity-
@@ -88,6 +98,7 @@ pub mod bitreader;
 pub mod bvop;
 pub mod macroblock;
 pub mod motion;
+pub mod texture;
 pub mod vol;
 pub mod vop;
 
@@ -103,6 +114,7 @@ pub use motion::{
     decode_motion_vector_delta, predict_motion_vector, reconstruct_motion_vector, MotionParseError,
     MotionVector, MotionVectorDelta, MvMode,
 };
+pub use texture::{decode_intra_dc, DcComponent, IntraDcDifferential, TextureParseError};
 pub use vol::{
     parse_video_object_layer, parse_visual_object_header, parse_visual_object_sequence_header,
     AspectRatio, SpriteEnable, VbvParameters, VolControlParameters, VolHeader, VolParseError,
@@ -139,6 +151,9 @@ pub enum Error {
     /// A `motion_vector(mode)` body parse / reconstruction failed. See
     /// [`MotionParseError`] for the discrimination.
     Motion(MotionParseError),
+    /// An intra-DC texture-coefficient decode failed. See
+    /// [`TextureParseError`] for the discrimination.
+    Texture(TextureParseError),
 }
 
 impl core::fmt::Display for Error {
@@ -158,6 +173,9 @@ impl core::fmt::Display for Error {
             }
             Error::Motion(err) => {
                 write!(f, "oxideav-mpeg4video: motion vector parse error: {err}")
+            }
+            Error::Texture(err) => {
+                write!(f, "oxideav-mpeg4video: texture parse error: {err}")
             }
         }
     }
@@ -192,6 +210,12 @@ impl From<BVopMbParseError> for Error {
 impl From<MotionParseError> for Error {
     fn from(err: MotionParseError) -> Self {
         Error::Motion(err)
+    }
+}
+
+impl From<TextureParseError> for Error {
+    fn from(err: TextureParseError) -> Self {
+        Error::Texture(err)
     }
 }
 
@@ -250,5 +274,12 @@ mod tests {
         let e: Error = MotionParseError::Truncated.into();
         assert!(matches!(e, Error::Motion(MotionParseError::Truncated)));
         assert!(format!("{e}").contains("motion vector parse error"));
+    }
+
+    #[test]
+    fn texture_error_round_trip() {
+        let e: Error = TextureParseError::Truncated.into();
+        assert!(matches!(e, Error::Texture(TextureParseError::Truncated)));
+        assert!(format!("{e}").contains("texture parse error"));
     }
 }
