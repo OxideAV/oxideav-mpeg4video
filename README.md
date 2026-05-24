@@ -5,7 +5,7 @@ A pure-Rust MPEG-4 Part 2 Video codec (ISO/IEC 14496-2) for the
 
 ## Status
 
-**Round 10 of the clean-room rebuild (2026-05-24).** The prior
+**Round 11 of the clean-room rebuild (2026-05-24).** The prior
 implementation was retired on 2026-05-18 under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md);
 the VLC tables admitted to sourcing their numeric entries from an
@@ -110,9 +110,30 @@ enforcement procedure.
   escape), the Type 4 (`short_video_header == 1`) escape, and the
   §7.4.2 inverse scan that places `(RUN, LEVEL)` into the
   zigzag-ordered coefficient array remain later-round work.
+* Round 11 — §7.4.2 inverse scan, the conversion of the
+  one-dimensional decoded coefficient stream `QFS[64]` into the
+  two-dimensional `PQF[v][u]` 8×8 block. Three scan tables transcribed
+  verbatim from Figure 7-4 — (a) Alternate-Horizontal, (b) Alternate-
+  Vertical, (c) Zigzag — live in `src/scan.rs` as `[[u8; 8]; 8]`
+  grids. `events_to_qfs(events, intra_dc)` expands a §7.4.1.2 AC
+  EVENT sequence (with an optional §7.4.1.1 intra-DC value at scan
+  position 0) into the dense `[i32; 64]` array, defensively returning
+  `InverseScanError::Overflow { position }` on a malformed stream that
+  would walk past coefficient 63. `inverse_scan(qfs, scan_type)`
+  applies the §7.4.2
+  `PQF[inv_scan_v[scan_type][n]][inv_scan_u[scan_type][n]] = QFS[n]`
+  loop; `events_to_pqf(events, intra_dc, scan_type)` is the one-call
+  combination. `select_scan_type(is_intra, ac_pred_flag,
+  dc_direction)` encodes the §7.4.2 selection rule (non-intra or
+  `ac_pred_flag == 0` → zigzag; intra + AC-pred + DC predictor from
+  above C → alternate-vertical; intra + AC-pred + DC predictor from
+  left A → alternate-horizontal); the predictor pass that supplies
+  `dc_direction` lands later. The `sadct_disable == 0` modified
+  inverse scan for non-rectangular VOPs remains out of scope.
 
-The §7.4.3 spatial DC/AC predictor, the §7.4.2 inverse scan, and the
-MV-predictor candidate gathering land in later rounds.
+The §7.4.3 spatial DC/AC predictor and the §7.4.4 inverse
+quantisation / inverse DCT, plus the MV-predictor candidate gathering
+of Figure 7-34, land in later rounds.
 
 ## What works today
 
@@ -182,13 +203,19 @@ MV-predictor candidate gathering land in later rounds.
 | §7.4.1.3 escape Type 2 (`ESC 10`, RMAX)       | `decode_ac_event` (round 10) |
 | §7.4.1.3 escape Type 3 (`ESC 11`, FLC + markers) | `decode_ac_event` (round 10) |
 | §6.2.7 `while (!last)` EVENT loop             | `decode_ac_events` (round 10) |
+| Figure 7-4 (a) Alternate-Horizontal scan table | transcribed (round 11) |
+| Figure 7-4 (b) Alternate-Vertical scan table   | transcribed (round 11) |
+| Figure 7-4 (c) Zigzag scan table               | transcribed (round 11) |
+| §7.4.2 `QFS[n] → PQF[v][u]` inverse scan      | `inverse_scan` (round 11) |
+| AC EVENTs (+ optional intra-DC) → `QFS[64]`   | `events_to_qfs` (round 11) |
+| §7.4.2 per-block scan-type selection          | `select_scan_type` (round 11) |
 | RVLC Tcoef tables (B.23..B.25) + Type 5 escape | not yet |
 | Type 4 escape (`short_video_header == 1`)     | not yet |
-| §7.4.2 inverse scan (RUN/LEVEL → zigzag)      | not yet |
+| `sadct_disable == 0` modified inverse scan    | not yet |
 | §7.4.3 spatial DC/AC predictor add            | not yet |
 | Encoder                                       | not yet |
 
-196 round-1..10 unit tests pass.
+219 round-1..11 unit tests pass.
 
 ## Provenance
 
@@ -240,7 +267,15 @@ escape modes — Type 1 `LEVEL = sign * (abs + LMAX(LAST, RUN))` from
 Tables B.19/B.20, Type 2 `RUN = RUN + RMAX(LAST, LEVEL) + 1` from
 Tables B.21/B.22, and the Type 3 fixed-length `LAST(1) RUN(6) marker
 LEVEL(12) marker` with the signed-12-bit two's-complement LEVEL and
-the reserved `0` / `-2048` values from Table B.18 b). The
+the reserved `0` / `-2048` values from Table B.18 b), and §7.4.2
+(the inverse-scan algorithm: the
+`PQF[inv_scan_v[scan_type][n]][inv_scan_u[scan_type][n]] = QFS[n]`
+loop over the three Figure 7-4 scan tables (a) Alternate-Horizontal,
+(b) Alternate-Vertical, (c) Zigzag, and the per-block scan-type
+selection — non-intra → zigzag; intra + `ac_pred_flag == 0` → zigzag
+for the whole macroblock; intra + `ac_pred_flag == 1` + DC predictor
+from C → alternate-vertical; intra + `ac_pred_flag == 1` + DC
+predictor from A → alternate-horizontal). The
 text was read from
 `docs/video/mpeg4-visual/ISO_IEC_14496-2-2004-3rd-edition.txt`. No
 third-party MPEG-4 source was consulted.

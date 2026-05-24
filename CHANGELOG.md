@@ -8,6 +8,47 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 11 of the clean-room rebuild: §7.4.2 inverse scan — the
+  conversion of the one-dimensional decoded coefficient stream
+  `QFS[64]` into the two-dimensional `PQF[v][u]` 8×8 block under one
+  of three scan patterns. The three scan tables from Figure 7-4 —
+  (a) Alternate-Horizontal, (b) Alternate-Vertical, (c) Zigzag — are
+  transcribed verbatim into `src/scan.rs` as `[[u8; 8]; 8]` grids
+  (`ALT_HORIZONTAL` / `ALT_VERTICAL` / `ZIGZAG`).
+  `inverse_scan(qfs, scan_type)` applies the §7.4.2
+  `PQF[inv_scan_v[scan_type][n]][inv_scan_u[scan_type][n]] = QFS[n]`
+  loop. `events_to_qfs(events, intra_dc)` expands a §7.4.1.2 AC EVENT
+  sequence (with an optional §7.4.1.1 intra-DC value at scan position
+  0) into the dense `[i32; 64]` array; defensively returns
+  `InverseScanError::Overflow { position }` if a malformed stream
+  would write past coefficient 63. `events_to_pqf(events, intra_dc,
+  scan_type)` is the one-call combination.
+  `select_scan_type(is_intra, ac_pred_flag, dc_direction)` encodes the
+  §7.4.2 per-block scan-selection rule: non-intra or `ac_pred_flag ==
+  0` → zigzag; intra + AC-pred + DC predictor from above (C) →
+  alternate-vertical; intra + AC-pred + DC predictor from left (A) →
+  alternate-horizontal.
+- `ScanType { AlternateHorizontal, AlternateVertical, Zigzag }`,
+  `DcPredictionDirection { FromLeft, FromAbove }`, and
+  `InverseScanError { Overflow { position } }` value types; the new
+  crate-level `Error::InverseScan` variant + `From` conversion.
+- 23 round-11 unit tests: each of the three scan grids is a
+  permutation of `0..=63`; zigzag starts in the canonical JPEG order
+  and ends with `63` at `(7, 7)`; alt-vertical's first column walks
+  `0,1,2,3,10,11,12,13` and alt-horizontal's first row matches it
+  (the two scans are each other's transpose, also asserted
+  cell-by-cell); `inverse_scan` round-trips a DC-only block, the
+  first six zigzag positions, the alt-vertical first column, the
+  alt-horizontal first row, and `QFS[63]` → `PQF[7][7]` for all three
+  scans; `events_to_qfs` with intra-DC (`run`-skips + LEVEL at the
+  right position) and without (AC EVENT walks from position 0);
+  overflow rejection both from position 0 and post-intra-DC; the
+  one-call `events_to_pqf` end-to-end; the four cases of
+  `select_scan_type` (intra without AC-pred = zigzag, non-intra always
+  zigzag, intra + AC-pred + above/left); and `Display` for
+  `InverseScanError`. Plus 1 round-11 `Error::InverseScan` lib-test
+  round-trip.
+
 - Round 10 of the clean-room rebuild: §7.4.1.2 AC-coefficient (EVENT)
   decode — the `while (!last) DCT coefficient` loop of the §6.2.7
   `block(i)` texture syntax, for the `short_video_header == 0` /

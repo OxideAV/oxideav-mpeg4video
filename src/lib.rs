@@ -79,6 +79,22 @@
 //!   `AcEvent { last, run, level }` / `TcoefTable { Intra, Inter }`. The
 //!   §7.4.2 inverse scan and the §7.4.3 spatial predictor are
 //!   later-round work.
+//! * Round 11: §7.4.2 inverse scan — the conversion of the
+//!   one-dimensional `QFS[64]` coefficient stream into the
+//!   two-dimensional `PQF[v][u]` 8×8 block under one of the three
+//!   Figure 7-4 scan patterns. `events_to_qfs(events, intra_dc)`
+//!   expands a §7.4.1.2 AC EVENT sequence (with an optional
+//!   §7.4.1.1 intra-DC value at scan position 0) into the dense
+//!   `[i32; 64]` array; `inverse_scan(qfs, scan_type)` applies the
+//!   `PQF[inv_scan_v[scan_type][n]][inv_scan_u[scan_type][n]] =
+//!   QFS[n]` loop. `select_scan_type(is_intra, ac_pred_flag,
+//!   dc_direction)` encodes the §7.4.2 selection rule (non-intra or
+//!   `ac_pred_flag == 0` → zigzag; intra + AC-pred + DC predictor
+//!   from above → alternate-vertical; intra + AC-pred + DC predictor
+//!   from left → alternate-horizontal). The §7.4.3 spatial DC/AC
+//!   predictor add (that supplies `dc_direction`) and the
+//!   §7.4.4 inverse quantisation / inverse DCT remain later-round
+//!   work.
 //! * Strict failure on Studio Profiles, FGS layers, and non-rectangular
 //!   shapes — those branches are recognised and rejected with a typed
 //!   error, never silently mis-parsed. Sprite bodies, complexity-
@@ -108,6 +124,7 @@ pub mod bitreader;
 pub mod bvop;
 pub mod macroblock;
 pub mod motion;
+pub mod scan;
 pub mod texture;
 pub mod vol;
 pub mod vop;
@@ -123,6 +140,10 @@ pub use macroblock::{
 pub use motion::{
     decode_motion_vector_delta, predict_motion_vector, reconstruct_motion_vector, MotionParseError,
     MotionVector, MotionVectorDelta, MvMode,
+};
+pub use scan::{
+    events_to_pqf, events_to_qfs, inverse_scan, select_scan_type, DcPredictionDirection,
+    InverseScanError, ScanType,
 };
 pub use texture::{
     decode_ac_event, decode_ac_events, decode_intra_dc, AcEvent, DcComponent, IntraDcDifferential,
@@ -167,6 +188,10 @@ pub enum Error {
     /// An intra-DC texture-coefficient decode failed. See
     /// [`TextureParseError`] for the discrimination.
     Texture(TextureParseError),
+    /// A §7.4.2 inverse-scan expansion failed (an AC EVENT stream
+    /// walked past coefficient 63). See [`InverseScanError`] for the
+    /// discrimination.
+    InverseScan(InverseScanError),
 }
 
 impl core::fmt::Display for Error {
@@ -189,6 +214,9 @@ impl core::fmt::Display for Error {
             }
             Error::Texture(err) => {
                 write!(f, "oxideav-mpeg4video: texture parse error: {err}")
+            }
+            Error::InverseScan(err) => {
+                write!(f, "oxideav-mpeg4video: inverse-scan error: {err}")
             }
         }
     }
@@ -229,6 +257,12 @@ impl From<MotionParseError> for Error {
 impl From<TextureParseError> for Error {
     fn from(err: TextureParseError) -> Self {
         Error::Texture(err)
+    }
+}
+
+impl From<InverseScanError> for Error {
+    fn from(err: InverseScanError) -> Self {
+        Error::InverseScan(err)
     }
 }
 
@@ -294,5 +328,15 @@ mod tests {
         let e: Error = TextureParseError::Truncated.into();
         assert!(matches!(e, Error::Texture(TextureParseError::Truncated)));
         assert!(format!("{e}").contains("texture parse error"));
+    }
+
+    #[test]
+    fn inverse_scan_error_round_trip() {
+        let e: Error = InverseScanError::Overflow { position: 64 }.into();
+        assert!(matches!(
+            e,
+            Error::InverseScan(InverseScanError::Overflow { position: 64 })
+        ));
+        assert!(format!("{e}").contains("inverse-scan error"));
     }
 }
