@@ -8,6 +8,42 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 10 of the clean-room rebuild: §7.4.1.2 AC-coefficient (EVENT)
+  decode — the `while (!last) DCT coefficient` loop of the §6.2.7
+  `block(i)` texture syntax, for the `short_video_header == 0` /
+  `reversible_vlc == 0` path. New `decode_ac_event(br, table_kind)`
+  decodes one `(LAST, RUN, LEVEL)` EVENT: the common case is a
+  Table B.16 (intra) / Table B.17 (inter) Tcoef VLC selected by the new
+  `TcoefTable` argument plus a trailing sign bit (`0` positive, `1`
+  negative). The §7.4.1.3 escape prefix `0000 011` selects one of the
+  first three escape modes — Type 1 (`ESC 0` + Tcoef VLC; `LEVEL =
+  sign * (abs(LEVEL) + LMAX(LAST, RUN))` via Tables B.19 (intra) /
+  B.20 (inter)), Type 2 (`ESC 10` + Tcoef VLC; `RUN = RUN +
+  RMAX(LAST, abs(LEVEL)) + 1` via Tables B.21 (intra) / B.22 (inter)),
+  and Type 3 (`ESC 11` + fixed-length `LAST(1) RUN(6) marker_bit
+  LEVEL(12) marker_bit`; the 12-bit LEVEL is signed two's-complement
+  with `0` and `-2048` reserved per Table B.18 b). New
+  `decode_ac_events(br, table_kind)` runs the full §6.2.7 loop,
+  returning every EVENT up to and including the `LAST == 1` terminator.
+- `TcoefTable { Intra, Inter }` selector and `AcEvent { last, run,
+  level }` value type, re-exported at the crate root.
+- The 102-entry Table B.16 (intra) and Table B.17 (inter) Tcoef EVENT
+  VLC tables in `src/tcoef_tables.rs`, `include!`d into `texture.rs`;
+  generated verbatim from the spec tables (each `(code_bits, code_len,
+  last, run, level)` without the trailing sign bit).
+- `TextureParseError::{InvalidTcoef { window }, EscapeMarkerBitMissing,
+  ReservedEscapeLevel}` variants with `Display`, threaded through the
+  existing `Error::Texture` conversion.
+- 23 round-10 unit tests: both Tcoef tables 102 entries, prefix-free,
+  no duplicates, and disjoint from the escape prefix; intra/inter
+  common-case EVENTs (with the intra-vs-inter `110s` divergence) and
+  sign handling; the `LAST == 1` terminator and the `decode_ac_events`
+  loop; escape Type 1 (LMAX add, both signs), Type 2 (RMAX run
+  expansion, intra & inter), Type 3 (positive/negative/min-legal
+  LEVEL, reserved `0` / `-2048` rejection, missing-marker rejection);
+  invalid-Tcoef and truncated-stream rejection; full round-trips over
+  every Table B.16 and Table B.17 entry; and LMAX/RMAX spot-checks.
+
 - Round 9 of the clean-room rebuild: §7.4.1.1 intra-DC texture-
   coefficient decode — the first stage of the §6.2.7 `block(i)`
   texture syntax. New `decode_intra_dc(br, component)` reads

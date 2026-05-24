@@ -67,8 +67,18 @@
 //!   NOTE 2, when `size > 8`), returning the Table B.15 sign-decoded
 //!   *differential* DC value via `IntraDcDifferential { size,
 //!   differential }`. The §7.4.3 spatial DC/AC predictor that turns
-//!   the differential into the final coefficient, and AC coefficient
-//!   decode (§7.4.1.2), are later-round work.
+//!   the differential into the final coefficient is later-round work.
+//! * Round 10: §7.4.1.2 AC-coefficient (EVENT) decode — the
+//!   `while (!last) DCT coefficient` loop of §6.2.7 `block(i)`, for the
+//!   `short_video_header == 0` / `reversible_vlc == 0` path.
+//!   `decode_ac_event(br, table_kind)` decodes one `(LAST, RUN, LEVEL)`
+//!   EVENT: a Table B.16 (intra) / Table B.17 (inter) Tcoef VLC plus a
+//!   sign bit, or one of the three §7.4.1.3 escape modes (Type 1 LMAX,
+//!   Type 2 RMAX, Type 3 fixed-length with markers).
+//!   `decode_ac_events(br, table_kind)` runs the full loop. Surfaces as
+//!   `AcEvent { last, run, level }` / `TcoefTable { Intra, Inter }`. The
+//!   §7.4.2 inverse scan and the §7.4.3 spatial predictor are
+//!   later-round work.
 //! * Strict failure on Studio Profiles, FGS layers, and non-rectangular
 //!   shapes — those branches are recognised and rejected with a typed
 //!   error, never silently mis-parsed. Sprite bodies, complexity-
@@ -114,7 +124,10 @@ pub use motion::{
     decode_motion_vector_delta, predict_motion_vector, reconstruct_motion_vector, MotionParseError,
     MotionVector, MotionVectorDelta, MvMode,
 };
-pub use texture::{decode_intra_dc, DcComponent, IntraDcDifferential, TextureParseError};
+pub use texture::{
+    decode_ac_event, decode_ac_events, decode_intra_dc, AcEvent, DcComponent, IntraDcDifferential,
+    TcoefTable, TextureParseError,
+};
 pub use vol::{
     parse_video_object_layer, parse_visual_object_header, parse_visual_object_sequence_header,
     AspectRatio, SpriteEnable, VbvParameters, VolControlParameters, VolHeader, VolParseError,

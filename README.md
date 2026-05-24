@@ -5,7 +5,7 @@ A pure-Rust MPEG-4 Part 2 Video codec (ISO/IEC 14496-2) for the
 
 ## Status
 
-**Round 9 of the clean-room rebuild (2026-05-24).** The prior
+**Round 10 of the clean-room rebuild (2026-05-24).** The prior
 implementation was retired on 2026-05-18 under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md);
 the VLC tables admitted to sourcing their numeric entries from an
@@ -91,7 +91,27 @@ enforcement procedure.
   differential`) and the §7.4.1.2 AC coefficient decode remain
   later-round work.
 
-The §7.4.3 spatial DC/AC predictor, AC-coefficient decode, and the
+* Round 10 — §7.4.1.2 AC-coefficient (EVENT) decode, the
+  `while (!last) DCT coefficient` loop of §6.2.7 `block(i)`, for the
+  `short_video_header == 0` / `reversible_vlc == 0` path.
+  `decode_ac_event(br, table_kind)` decodes one `(LAST, RUN, LEVEL)`
+  EVENT: the common case is a Table B.16 (intra) / Table B.17 (inter)
+  Tcoef VLC plus a trailing sign bit (`0` positive, `1` negative). The
+  §7.4.1.3 escape prefix `0000 011` selects one of the first three
+  escape modes — Type 1 (`ESC 0` + Tcoef VLC, `LEVEL = sign *
+  (abs + LMAX)` via Tables B.19/B.20), Type 2 (`ESC 10` + Tcoef VLC,
+  `RUN += RMAX + 1` via Tables B.21/B.22), and Type 3 (`ESC 11` +
+  `LAST(1) RUN(6) marker LEVEL(12) marker` fixed-length, signed
+  two's-complement LEVEL with `0` / `-2048` reserved per Table B.18 b).
+  `decode_ac_events(br, table_kind)` runs the full loop, returning every
+  EVENT up to and including the `LAST == 1` terminator. The 102-entry
+  Tcoef tables live in `src/tcoef_tables.rs` (generated verbatim from
+  Tables B.16 / B.17). The reversible-VLC tables (B.23..B.25 + Type 5
+  escape), the Type 4 (`short_video_header == 1`) escape, and the
+  §7.4.2 inverse scan that places `(RUN, LEVEL)` into the
+  zigzag-ordered coefficient array remain later-round work.
+
+The §7.4.3 spatial DC/AC predictor, the §7.4.2 inverse scan, and the
 MV-predictor candidate gathering land in later rounds.
 
 ## What works today
@@ -157,11 +177,18 @@ MV-predictor candidate gathering land in later rounds.
 | `dct_dc_size_chrominance` Table B.14          | prefix-free VLC decode (round 9) |
 | `dct_dc_differential` Table B.15 sign-decode  | `decode_intra_dc` (round 9) |
 | intra-DC `marker_bit` (`size > 8`)            | consumed + validated (round 9) |
+| AC EVENT Tcoef VLC Tables B.16 / B.17         | prefix-free decode + sign bit (round 10) |
+| §7.4.1.3 escape Type 1 (`ESC 0`, LMAX)        | `decode_ac_event` (round 10) |
+| §7.4.1.3 escape Type 2 (`ESC 10`, RMAX)       | `decode_ac_event` (round 10) |
+| §7.4.1.3 escape Type 3 (`ESC 11`, FLC + markers) | `decode_ac_event` (round 10) |
+| §6.2.7 `while (!last)` EVENT loop             | `decode_ac_events` (round 10) |
+| RVLC Tcoef tables (B.23..B.25) + Type 5 escape | not yet |
+| Type 4 escape (`short_video_header == 1`)     | not yet |
+| §7.4.2 inverse scan (RUN/LEVEL → zigzag)      | not yet |
 | §7.4.3 spatial DC/AC predictor add            | not yet |
-| AC coefficient decode (§7.4.1.2)              | not yet |
 | Encoder                                       | not yet |
 
-173 round-1..9 unit tests pass.
+196 round-1..10 unit tests pass.
 
 ## Provenance
 
@@ -175,7 +202,10 @@ B.4 (B-VOP mb_type, non-scalable), B.5 (B-VOP mb_type, scalable
 enhancement layer), B.6 (mcbpc I-VOP), B.7 (mcbpc P-VOP), B.8
 (cbpy 4-block), B.12 (MVD VLC, 65 codes), B.13 (dct_dc_size_luminance),
 B.14 (dct_dc_size_chrominance), B.15 (dct_dc_differential additional
-codes) — and Table 6-33 (dbquant),
+codes), B.16 (intra Tcoef EVENT VLC, 102 codes), B.17 (inter Tcoef
+EVENT VLC, 102 codes), B.18 (FLC for Type-3 escape RUN/LEVEL),
+B.19/B.20 (LMAX, intra/inter), B.21/B.22 (RMAX, intra/inter) — and
+Table 6-33 (dbquant),
 Table 7-9 (motion-vector range per vop_fcode), and the syntax tables of
 §6.2.2 / §6.2.3 / §6.2.4 / §6.2.5 / §6.2.6 plus the semantics in
 §6.3.3 (including the `8*[2-64]` zigzag-ordered quant-matrix list,
@@ -203,7 +233,14 @@ operator clause does not define it), and §7.4.1.1 / §6.2.7 (`block(i)`)
 `if (dct_dc_size > 8) marker_bit` gates, and the Table B.15
 sign-decode — `half_range = 2^(size-1)`; an additional code
 `c >= half_range` → `+c`, else `(c + 1) - 2*half_range` — confirmed
-against every Table B.15 boundary row). The
+against every Table B.15 boundary row), and §7.4.1.2 / §7.4.1.3
+(the AC-EVENT decode: the Table B.16 (intra) / B.17 (inter) Tcoef VLC
++ sign-bit common path, and the three `short_video_header == 0`
+escape modes — Type 1 `LEVEL = sign * (abs + LMAX(LAST, RUN))` from
+Tables B.19/B.20, Type 2 `RUN = RUN + RMAX(LAST, LEVEL) + 1` from
+Tables B.21/B.22, and the Type 3 fixed-length `LAST(1) RUN(6) marker
+LEVEL(12) marker` with the signed-12-bit two's-complement LEVEL and
+the reserved `0` / `-2048` values from Table B.18 b). The
 text was read from
 `docs/video/mpeg4-visual/ISO_IEC_14496-2-2004-3rd-edition.txt`. No
 third-party MPEG-4 source was consulted.

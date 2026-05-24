@@ -44,10 +44,40 @@
 //!   additional code. Table B.15 NOTE 2 inserts a `marker_bit` after
 //!   the additional code when `size > 8`.
 //!
+//! ## §7.4.1.2 AC coefficient (EVENT) decode
+//!
+//! [`decode_ac_event`] decodes one §7.4.1.2 `DCT coefficient` EVENT — a
+//! `(LAST, RUN, LEVEL)` triple — for the `short_video_header == 0`,
+//! `reversible_vlc == 0` path, the most common case. The most-frequent
+//! EVENTs are a single Tcoef VLC drawn from Table B.16 (intra blocks) or
+//! Table B.17 (inter blocks), selected by the [`TcoefTable`] argument; a
+//! trailing sign bit `s` (`0` positive, `1` negative) gives the LEVEL
+//! sign. Less-frequent EVENTs use the §7.4.1.3 escape coding, whose
+//! first three modes (the ones used when `short_video_header == 0` and
+//! the reversible tables are not in use) this module decodes:
+//!
+//! * **Type 1** — `ESC` + `"0"` + a Table B.16/B.17 VLC; LEVEL is
+//!   restored as `sign(LEVEL) * (abs(LEVEL) + LMAX(LAST, RUN))` with
+//!   `LMAX` from Table B.19 (intra) / Table B.20 (inter).
+//! * **Type 2** — `ESC` + `"10"` + a Table B.16/B.17 VLC; RUN is
+//!   restored as `RUN + RMAX(LAST, LEVEL) + 1` with `RMAX` from
+//!   Table B.21 (intra) / Table B.22 (inter).
+//! * **Type 3** — `ESC` + `"11"` + a fixed-length `[1-bit LAST]`
+//!   `[6-bit RUN]` `[marker_bit]` `[12-bit LEVEL]` `[marker_bit]`
+//!   (Table B.18 a / b). The 12-bit LEVEL is a signed two's-complement
+//!   value; `0` and `-2048` are reserved.
+//!
+//! [`decode_ac_events`] runs the §6.2.7 `while (!last) DCT coefficient`
+//! loop, returning every EVENT up to and including the one with
+//! `LAST == 1`.
+//!
 //! ## Out of scope (this round)
 //!
-//! * AC coefficient EVENTs (Tables B.16..B.25), the escape modes of
-//!   §7.4.1.3, and the `last`/`run`/`level` zigzag placement.
+//! * The reversible-VLC EVENT tables (Tables B.23..B.25) and the Type 5
+//!   escape used when `reversible_vlc == 1`.
+//! * The Type 4 escape (`short_video_header == 1`, Table B.18 a / c).
+//! * The §7.4.2 inverse scan that places `(RUN, LEVEL)` into the
+//!   zigzag-ordered 64-coefficient array.
 //! * The §7.4.3.1 / §7.4.3.2 spatial DC/AC prediction (gradient
 //!   direction, `dc_scaler`, predictor reset) that turns this
 //!   *differential* into the final coefficient.
@@ -110,6 +140,19 @@ pub enum TextureParseError {
     /// A `marker_bit` (Table B.15 NOTE 2, inserted when
     /// `dct_dc_size > 8`) was expected to be 1 but was read as 0.
     MarkerBitMissing,
+    /// The leading bits matched neither a Table B.16 / B.17 Tcoef code
+    /// nor the §7.4.1.3 escape prefix. The next-13-bits window
+    /// (right-aligned) we tried to match is reported for diagnostics.
+    InvalidTcoef {
+        /// The next-13-bits window (right-aligned) we tried to match.
+        window: u16,
+    },
+    /// A Type-3 escape `marker_bit` (one before and one after the 12-bit
+    /// LEVEL, per §7.4.1.3) was expected to be 1 but was read as 0.
+    EscapeMarkerBitMissing,
+    /// A Type-3 escape carried a reserved 12-bit LEVEL value (`0` or
+    /// `-2048`, both forbidden by Table B.18 b).
+    ReservedEscapeLevel,
 }
 
 impl core::fmt::Display for TextureParseError {
@@ -124,6 +167,15 @@ impl core::fmt::Display for TextureParseError {
             }
             TextureParseError::MarkerBitMissing => {
                 write!(f, "dct_dc marker_bit was 0 (expected 1)")
+            }
+            TextureParseError::InvalidTcoef { window } => {
+                write!(f, "invalid Tcoef prefix (next-13-bits = 0b{window:013b})")
+            }
+            TextureParseError::EscapeMarkerBitMissing => {
+                write!(f, "Type-3 escape marker_bit was 0 (expected 1)")
+            }
+            TextureParseError::ReservedEscapeLevel => {
+                write!(f, "Type-3 escape LEVEL was a reserved value (0 or -2048)")
             }
         }
     }
@@ -269,6 +321,276 @@ pub fn decode_intra_dc(
     };
 
     Ok(IntraDcDifferential { size, differential })
+}
+
+// ---------------------------------------------------------------------------
+// §7.4.1.2 AC coefficient (EVENT) decode
+// ---------------------------------------------------------------------------
+
+/// Which Tcoef VLC table applies to a block per §7.4.1.2: Table B.16 for
+/// intra blocks, Table B.17 for inter blocks. The choice also selects the
+/// matching LMAX (Table B.19/B.20) and RMAX (Table B.21/B.22) escape
+/// tables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TcoefTable {
+    /// Intra block — Table B.16, LMAX = Table B.19, RMAX = Table B.21.
+    Intra,
+    /// Inter block — Table B.17, LMAX = Table B.20, RMAX = Table B.22.
+    Inter,
+}
+
+/// One decoded §7.4.1.2 `DCT coefficient` EVENT: the `(LAST, RUN, LEVEL)`
+/// triple. `LEVEL` is the signed non-zero coefficient value (sign already
+/// applied); `RUN` is the count of zero coefficients preceding it; `last`
+/// marks the final non-zero coefficient of the block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AcEvent {
+    /// `LAST` flag: `true` if this is the last non-zero coefficient of the
+    /// block (no further EVENTs follow), `false` if more follow.
+    pub last: bool,
+    /// `RUN`: number of zero-valued coefficients preceding this one in the
+    /// zigzag scan.
+    pub run: u32,
+    /// `LEVEL`: the signed non-zero coefficient value.
+    pub level: i32,
+}
+
+/// The §7.4.1.3 escape prefix `0000 011` (7 bits) shared by Table B.16 and
+/// Table B.17. It is followed by a 1- or 2-bit mode selector.
+const TCOEF_ESCAPE_CODE: u32 = 0b000_0011;
+const TCOEF_ESCAPE_LEN: u8 = 7;
+
+// Table B.16 / Table B.17 entries are `(code_bits, code_len, last, run,
+// level)`; `code_bits` is the VLC *without* its trailing sign bit `s`,
+// which is read separately. Generated verbatim from the spec tables;
+// every code is prefix-free and none collides with TCOEF_ESCAPE_CODE.
+include!("tcoef_tables.rs");
+
+/// Match a prefix-free Tcoef table against the leading bits of `window`.
+/// Returns `(code_len, last, run, level)` on a hit (before the sign bit),
+/// `None` on no match.
+fn match_tcoef(
+    table: &[(u32, u8, u8, u8, u16)],
+    window: u32,
+    window_len: u8,
+) -> Option<(u8, bool, u32, i32)> {
+    for &(code, len, last, run, level) in table {
+        if len <= window_len {
+            let shift = window_len - len;
+            if (window >> shift) == code {
+                return Some((len, last != 0, run as u32, level as i32));
+            }
+        }
+    }
+    None
+}
+
+/// Table B.19 (intra) — LMAX as a function of `(LAST, RUN)`. Returns
+/// `None` for the `N/A` cells (a RUN beyond the tabulated range for a
+/// given LAST, which a conformant Type-1 escape never produces).
+fn lmax_intra(last: bool, run: u32) -> Option<i32> {
+    match (last, run) {
+        (false, 0) => Some(27),
+        (false, 1) => Some(10),
+        (false, 2) => Some(5),
+        (false, 3) => Some(4),
+        (false, 4..=7) => Some(3),
+        (false, 8..=9) => Some(2),
+        (false, 10..=14) => Some(1),
+        (true, 0) => Some(8),
+        (true, 1) => Some(3),
+        (true, 2..=6) => Some(2),
+        (true, 7..=20) => Some(1),
+        _ => None,
+    }
+}
+
+/// Table B.20 (inter) — LMAX as a function of `(LAST, RUN)`.
+fn lmax_inter(last: bool, run: u32) -> Option<i32> {
+    match (last, run) {
+        (false, 0) => Some(12),
+        (false, 1) => Some(6),
+        (false, 2) => Some(4),
+        (false, 3..=6) => Some(3),
+        (false, 7..=10) => Some(2),
+        (false, 11..=26) => Some(1),
+        (true, 0) => Some(3),
+        (true, 1) => Some(2),
+        (true, 2..=40) => Some(1),
+        _ => None,
+    }
+}
+
+/// Table B.21 (intra) — RMAX as a function of `(LAST, LEVEL)`. `LEVEL`
+/// here is the absolute decoded magnitude. Returns `None` for `N/A`.
+fn rmax_intra(last: bool, level: i32) -> Option<u32> {
+    match (last, level) {
+        (false, 1) => Some(14),
+        (false, 2) => Some(9),
+        (false, 3) => Some(7),
+        (false, 4) => Some(3),
+        (false, 5) => Some(2),
+        (false, 6..=10) => Some(1),
+        (false, 11..=27) => Some(0),
+        (true, 1) => Some(20),
+        (true, 2) => Some(6),
+        (true, 3) => Some(1),
+        (true, 4..=8) => Some(0),
+        _ => None,
+    }
+}
+
+/// Table B.22 (inter) — RMAX as a function of `(LAST, LEVEL)`.
+fn rmax_inter(last: bool, level: i32) -> Option<u32> {
+    match (last, level) {
+        (false, 1) => Some(26),
+        (false, 2) => Some(10),
+        (false, 3) => Some(6),
+        (false, 4) => Some(2),
+        (false, 5..=6) => Some(1),
+        (false, 7..=12) => Some(0),
+        (true, 1) => Some(40),
+        (true, 2) => Some(1),
+        (true, 3) => Some(0),
+        _ => None,
+    }
+}
+
+/// Decode the Table B.16 / B.17 VLC plus its trailing sign bit at the
+/// current position, returning `(last, run, signed_level)`. Used for the
+/// non-escape common path and for the Type-1 / Type-2 escape sub-VLC
+/// (before LMAX / RMAX restoration). Assumes the leading bits are a real
+/// Tcoef code, not the escape prefix.
+fn decode_tcoef_vlc(
+    br: &mut BitReader<'_>,
+    table: &[(u32, u8, u8, u8, u16)],
+) -> Result<(bool, u32, i32), TextureParseError> {
+    let avail = br.remaining_bits().min(13) as u8;
+    if avail == 0 {
+        return Err(TextureParseError::Truncated);
+    }
+    let window = br.next_bits(avail as usize)?;
+    let (code_len, last, run, level) =
+        match_tcoef(table, window, avail).ok_or(TextureParseError::InvalidTcoef {
+            window: window as u16,
+        })?;
+    br.skip_bits(code_len as usize)?;
+    let sign_negative = br.read_bool()?;
+    let signed = if sign_negative { -level } else { level };
+    Ok((last, run, signed))
+}
+
+/// Decode one §7.4.1.2 `DCT coefficient` EVENT for the
+/// `short_video_header == 0`, `reversible_vlc == 0` path.
+///
+/// The common case is a single Table B.16 (`TcoefTable::Intra`) /
+/// Table B.17 (`TcoefTable::Inter`) VLC plus a sign bit. The §7.4.1.3
+/// escape prefix `0000 011` selects one of the first three escape modes:
+///
+/// * Type 1 (`ESC 0`) — re-decode a Tcoef VLC, then
+///   `LEVEL = sign * (abs(LEVEL) + LMAX(LAST, RUN))`.
+/// * Type 2 (`ESC 10`) — re-decode a Tcoef VLC, then
+///   `RUN = RUN + RMAX(LAST, abs(LEVEL)) + 1`.
+/// * Type 3 (`ESC 11`) — fixed-length `LAST(1) RUN(6) marker LEVEL(12)
+///   marker`; the 12-bit LEVEL is signed two's-complement (`0` and
+///   `-2048` reserved).
+pub fn decode_ac_event(
+    br: &mut BitReader<'_>,
+    table_kind: TcoefTable,
+) -> Result<AcEvent, TextureParseError> {
+    let table = match table_kind {
+        TcoefTable::Intra => TCOEF_INTRA,
+        TcoefTable::Inter => TCOEF_INTER,
+    };
+
+    // Peek the escape prefix without consuming so a real code that merely
+    // *shares no* prefix with ESC falls through to the table decode.
+    let avail = br.remaining_bits().min(TCOEF_ESCAPE_LEN as usize) as u8;
+    if avail == 0 {
+        return Err(TextureParseError::Truncated);
+    }
+    let is_escape =
+        avail == TCOEF_ESCAPE_LEN && br.next_bits(TCOEF_ESCAPE_LEN as usize)? == TCOEF_ESCAPE_CODE;
+
+    if !is_escape {
+        let (last, run, level) = decode_tcoef_vlc(br, table)?;
+        return Ok(AcEvent { last, run, level });
+    }
+
+    // Consume the escape prefix, then the mode selector.
+    br.skip_bits(TCOEF_ESCAPE_LEN as usize)?;
+
+    if !br.read_bool()? {
+        // Type 1: "ESC" + "0" + VLC, LEVEL += LMAX.
+        let (last, run, level) = decode_tcoef_vlc(br, table)?;
+        let lmax = match table_kind {
+            TcoefTable::Intra => lmax_intra(last, run),
+            TcoefTable::Inter => lmax_inter(last, run),
+        }
+        .ok_or(TextureParseError::InvalidTcoef { window: 0 })?;
+        let abs = level.abs() + lmax;
+        let restored = if level < 0 { -abs } else { abs };
+        return Ok(AcEvent {
+            last,
+            run,
+            level: restored,
+        });
+    }
+
+    if !br.read_bool()? {
+        // Type 2: "ESC" + "10" + VLC, RUN += RMAX + 1.
+        let (last, run, level) = decode_tcoef_vlc(br, table)?;
+        let rmax = match table_kind {
+            TcoefTable::Intra => rmax_intra(last, level.abs()),
+            TcoefTable::Inter => rmax_inter(last, level.abs()),
+        }
+        .ok_or(TextureParseError::InvalidTcoef { window: 0 })?;
+        return Ok(AcEvent {
+            last,
+            run: run + rmax + 1,
+            level,
+        });
+    }
+
+    // Type 3: "ESC" + "11" + LAST(1) RUN(6) marker LEVEL(12) marker.
+    let last = br.read_bool()?;
+    let run = br.read_bits(6)?;
+    if !br.read_bool()? {
+        return Err(TextureParseError::EscapeMarkerBitMissing);
+    }
+    let raw_level = br.read_bits(12)?;
+    if !br.read_bool()? {
+        return Err(TextureParseError::EscapeMarkerBitMissing);
+    }
+    // 12-bit two's-complement; 0 and -2048 (0b1000_0000_0000) reserved.
+    let level = if raw_level >= 0x800 {
+        raw_level as i32 - 0x1000
+    } else {
+        raw_level as i32
+    };
+    if level == 0 || level == -2048 {
+        return Err(TextureParseError::ReservedEscapeLevel);
+    }
+    Ok(AcEvent { last, run, level })
+}
+
+/// Run the §6.2.7 `while (!last) DCT coefficient` loop: decode AC EVENTs
+/// until (and including) the one whose `LAST` flag is set, returning them
+/// in scan order. An empty stream that never reaches `LAST == 1` returns
+/// [`TextureParseError::Truncated`].
+pub fn decode_ac_events(
+    br: &mut BitReader<'_>,
+    table_kind: TcoefTable,
+) -> Result<Vec<AcEvent>, TextureParseError> {
+    let mut events = Vec::new();
+    loop {
+        let ev = decode_ac_event(br, table_kind)?;
+        let last = ev.last;
+        events.push(ev);
+        if last {
+            return Ok(events);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -571,5 +893,319 @@ mod tests {
                 .contains("invalid dct_dc_size")
         );
         assert!(format!("{}", TextureParseError::MarkerBitMissing).contains("marker_bit was 0"));
+        assert!(
+            format!("{}", TextureParseError::InvalidTcoef { window: 0 }).contains("invalid Tcoef")
+        );
+        assert!(format!("{}", TextureParseError::EscapeMarkerBitMissing)
+            .contains("Type-3 escape marker_bit"));
+        assert!(format!("{}", TextureParseError::ReservedEscapeLevel).contains("reserved value"));
+    }
+
+    // -----------------------------------------------------------------
+    // §7.4.1.2 AC coefficient (EVENT) decode tests
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn tcoef_tables_have_102_entries_each() {
+        // Table B.16 / Table B.17 each have 102 non-escape EVENTs.
+        assert_eq!(TCOEF_INTRA.len(), 102);
+        assert_eq!(TCOEF_INTER.len(), 102);
+    }
+
+    #[test]
+    fn tcoef_tables_are_prefix_free_and_no_dupes() {
+        for table in [TCOEF_INTRA, TCOEF_INTER] {
+            for (i, &(ca, la, ..)) in table.iter().enumerate() {
+                for (j, &(cb, lb, ..)) in table.iter().enumerate() {
+                    if i == j {
+                        continue;
+                    }
+                    if la <= lb {
+                        assert_ne!(cb >> (lb - la), ca, "code {ca:b} is a prefix of {cb:b}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn escape_prefix_disjoint_from_tables() {
+        // No real Tcoef code shares the 7-bit escape prefix 0000 011.
+        for table in [TCOEF_INTRA, TCOEF_INTER] {
+            for &(code, len, ..) in table {
+                if len >= TCOEF_ESCAPE_LEN {
+                    let top = code >> (len - TCOEF_ESCAPE_LEN);
+                    assert_ne!(
+                        top, TCOEF_ESCAPE_CODE,
+                        "code 0b{code:b} collides with escape"
+                    );
+                } else {
+                    // A shorter code can't begin with the 7-bit escape.
+                    let shifted = TCOEF_ESCAPE_CODE >> (TCOEF_ESCAPE_LEN - len);
+                    assert_ne!(code, shifted, "escape begins with code 0b{code:b}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn intra_common_event_positive() {
+        // Table B.16: "10s" = (LAST 0, RUN 0, LEVEL 1); sign 0 → +1.
+        let data = bits("10 0");
+        let mut br = BitReader::new(&data);
+        let ev = decode_ac_event(&mut br, TcoefTable::Intra).unwrap();
+        assert_eq!(
+            ev,
+            AcEvent {
+                last: false,
+                run: 0,
+                level: 1
+            }
+        );
+        assert_eq!(br.bit_position(), 3);
+    }
+
+    #[test]
+    fn intra_common_event_negative_sign() {
+        // "10s" with sign 1 → LEVEL -1.
+        let data = bits("10 1");
+        let mut br = BitReader::new(&data);
+        let ev = decode_ac_event(&mut br, TcoefTable::Intra).unwrap();
+        assert_eq!(ev.level, -1);
+    }
+
+    #[test]
+    fn inter_common_event_differs_from_intra() {
+        // Table B.17: "110s" = (LAST 0, RUN 1, LEVEL 1) — distinct from
+        // Table B.16's "110s" = (0, 0, 2).
+        let data = bits("110 0");
+        let mut br = BitReader::new(&data);
+        let ev = decode_ac_event(&mut br, TcoefTable::Inter).unwrap();
+        assert_eq!(ev.run, 1);
+        assert_eq!(ev.level, 1);
+
+        let mut br2 = BitReader::new(&data);
+        let ev2 = decode_ac_event(&mut br2, TcoefTable::Intra).unwrap();
+        assert_eq!(ev2.run, 0);
+        assert_eq!(ev2.level, 2);
+    }
+
+    #[test]
+    fn intra_last_event() {
+        // Table B.16: "0111s" = (LAST 1, RUN 0, LEVEL 1); sign 0 → +1.
+        let data = bits("0111 0");
+        let mut br = BitReader::new(&data);
+        let ev = decode_ac_event(&mut br, TcoefTable::Intra).unwrap();
+        assert!(ev.last);
+        assert_eq!(ev.run, 0);
+        assert_eq!(ev.level, 1);
+    }
+
+    #[test]
+    fn decode_ac_events_loop_two_events() {
+        // First "10s/0" = (0,0,1); then "0111s/1" = (LAST 1, 0, -1).
+        let data = bits("10 0  0111 1");
+        let mut br = BitReader::new(&data);
+        let events = decode_ac_events(&mut br, TcoefTable::Intra).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0],
+            AcEvent {
+                last: false,
+                run: 0,
+                level: 1
+            }
+        );
+        assert_eq!(
+            events[1],
+            AcEvent {
+                last: true,
+                run: 0,
+                level: -1
+            }
+        );
+    }
+
+    #[test]
+    fn escape_type1_intra_adds_lmax() {
+        // ESC(0000011) + "0" + Tcoef "10s/0" = (0,0,1). LMAX(intra, LAST 0,
+        // RUN 0) = 27. LEVEL restored = +(1 + 27) = 28.
+        let data = bits("0000011 0 10 0");
+        let mut br = BitReader::new(&data);
+        let ev = decode_ac_event(&mut br, TcoefTable::Intra).unwrap();
+        assert_eq!(
+            ev,
+            AcEvent {
+                last: false,
+                run: 0,
+                level: 28
+            }
+        );
+    }
+
+    #[test]
+    fn escape_type1_inter_negative_keeps_sign() {
+        // ESC + "0" + "10s/1" = (0,0,-1). LMAX(inter, LAST 0, RUN 0) = 12.
+        // restored = -(1 + 12) = -13.
+        let data = bits("0000011 0 10 1");
+        let mut br = BitReader::new(&data);
+        let ev = decode_ac_event(&mut br, TcoefTable::Inter).unwrap();
+        assert_eq!(ev.level, -13);
+    }
+
+    #[test]
+    fn escape_type2_intra_adds_rmax_plus_one() {
+        // ESC + "10" + "10s/0" = (0,0,1). RMAX(intra, LAST 0, LEVEL 1) = 14.
+        // RUN restored = 0 + 14 + 1 = 15.
+        let data = bits("0000011 10 10 0");
+        let mut br = BitReader::new(&data);
+        let ev = decode_ac_event(&mut br, TcoefTable::Intra).unwrap();
+        assert_eq!(
+            ev,
+            AcEvent {
+                last: false,
+                run: 15,
+                level: 1
+            }
+        );
+    }
+
+    #[test]
+    fn escape_type2_inter_run() {
+        // ESC + "10" + "110s/0" = (LAST 0, RUN 1, LEVEL 1) for inter.
+        // RMAX(inter, LAST 0, LEVEL 1) = 26. RUN restored = 1 + 26 + 1 = 28.
+        let data = bits("0000011 10 110 0");
+        let mut br = BitReader::new(&data);
+        let ev = decode_ac_event(&mut br, TcoefTable::Inter).unwrap();
+        assert_eq!(ev.run, 28);
+        assert_eq!(ev.level, 1);
+    }
+
+    #[test]
+    fn escape_type3_positive_level() {
+        // ESC + "11" + LAST(1)=0 + RUN(6)=000011(=3) + marker(1) +
+        // LEVEL(12)=000000001000(=8) + marker(1).
+        let data = bits("0000011 11 0 000011 1 000000001000 1");
+        let mut br = BitReader::new(&data);
+        let ev = decode_ac_event(&mut br, TcoefTable::Intra).unwrap();
+        assert_eq!(
+            ev,
+            AcEvent {
+                last: false,
+                run: 3,
+                level: 8
+            }
+        );
+    }
+
+    #[test]
+    fn escape_type3_negative_level_twos_complement() {
+        // LEVEL(12) = 1111 1111 1111 = -1 (two's complement). LAST = 1,
+        // RUN = 0.
+        let data = bits("0000011 11 1 000000 1 111111111111 1");
+        let mut br = BitReader::new(&data);
+        let ev = decode_ac_event(&mut br, TcoefTable::Inter).unwrap();
+        assert!(ev.last);
+        assert_eq!(ev.run, 0);
+        assert_eq!(ev.level, -1);
+    }
+
+    #[test]
+    fn escape_type3_min_legal_level() {
+        // LEVEL(12) = 1000 0000 0001 = -2047 (the most-negative legal
+        // value; -2048 is reserved).
+        let data = bits("0000011 11 0 000000 1 100000000001 1");
+        let mut br = BitReader::new(&data);
+        let ev = decode_ac_event(&mut br, TcoefTable::Intra).unwrap();
+        assert_eq!(ev.level, -2047);
+    }
+
+    #[test]
+    fn escape_type3_reserved_level_zero_rejected() {
+        // LEVEL(12) = all zeros = 0 → reserved.
+        let data = bits("0000011 11 0 000000 1 000000000000 1");
+        let mut br = BitReader::new(&data);
+        let err = decode_ac_event(&mut br, TcoefTable::Intra).unwrap_err();
+        assert_eq!(err, TextureParseError::ReservedEscapeLevel);
+    }
+
+    #[test]
+    fn escape_type3_reserved_level_min_rejected() {
+        // LEVEL(12) = 1000 0000 0000 = -2048 → reserved.
+        let data = bits("0000011 11 0 000000 1 100000000000 1");
+        let mut br = BitReader::new(&data);
+        let err = decode_ac_event(&mut br, TcoefTable::Intra).unwrap_err();
+        assert_eq!(err, TextureParseError::ReservedEscapeLevel);
+    }
+
+    #[test]
+    fn escape_type3_missing_marker_rejected() {
+        // First marker bit (after RUN) is 0 → reject.
+        let data = bits("0000011 11 0 000000 0 000000001000 1");
+        let mut br = BitReader::new(&data);
+        let err = decode_ac_event(&mut br, TcoefTable::Intra).unwrap_err();
+        assert_eq!(err, TextureParseError::EscapeMarkerBitMissing);
+    }
+
+    #[test]
+    fn invalid_tcoef_prefix_rejected() {
+        // 13 zero bits match no intra Tcoef code and are not the escape
+        // prefix (0000011) — InvalidTcoef. (Escape needs bits 5..6 = "11".)
+        let data = bits("0000000000000");
+        let mut br = BitReader::new(&data);
+        let err = decode_ac_event(&mut br, TcoefTable::Intra).unwrap_err();
+        assert!(matches!(err, TextureParseError::InvalidTcoef { .. }));
+    }
+
+    #[test]
+    fn ac_event_truncated_empty() {
+        let data: [u8; 0] = [];
+        let mut br = BitReader::new(&data);
+        let err = decode_ac_event(&mut br, TcoefTable::Intra).unwrap_err();
+        assert_eq!(err, TextureParseError::Truncated);
+    }
+
+    #[test]
+    fn every_intra_table_entry_round_trips() {
+        // Encode each (code, sign 0) and confirm the decoded EVENT matches
+        // the tabulated (last, run, level).
+        for &(code, len, last, run, level) in TCOEF_INTRA {
+            let mut s = format!("{code:0len$b}", len = len as usize);
+            s.push('0'); // positive sign
+            let data = bits(&s);
+            let mut br = BitReader::new(&data);
+            let ev = decode_ac_event(&mut br, TcoefTable::Intra).unwrap();
+            assert_eq!(ev.last, last != 0, "code 0b{code:b}");
+            assert_eq!(ev.run, run as u32, "code 0b{code:b}");
+            assert_eq!(ev.level, level as i32, "code 0b{code:b}");
+        }
+    }
+
+    #[test]
+    fn every_inter_table_entry_round_trips() {
+        for &(code, len, last, run, level) in TCOEF_INTER {
+            let mut s = format!("{code:0len$b}", len = len as usize);
+            s.push('1'); // negative sign
+            let data = bits(&s);
+            let mut br = BitReader::new(&data);
+            let ev = decode_ac_event(&mut br, TcoefTable::Inter).unwrap();
+            assert_eq!(ev.last, last != 0, "code 0b{code:b}");
+            assert_eq!(ev.run, run as u32, "code 0b{code:b}");
+            assert_eq!(ev.level, -(level as i32), "code 0b{code:b}");
+        }
+    }
+
+    #[test]
+    fn lmax_rmax_known_cells() {
+        // Spot-check the LMAX / RMAX tables against the spec.
+        assert_eq!(lmax_intra(false, 0), Some(27));
+        assert_eq!(lmax_intra(true, 20), Some(1));
+        assert_eq!(lmax_intra(true, 21), None);
+        assert_eq!(lmax_inter(false, 26), Some(1));
+        assert_eq!(lmax_inter(true, 40), Some(1));
+        assert_eq!(rmax_intra(false, 27), Some(0));
+        assert_eq!(rmax_intra(true, 1), Some(20));
+        assert_eq!(rmax_inter(false, 1), Some(26));
+        assert_eq!(rmax_inter(true, 2), Some(1));
     }
 }
