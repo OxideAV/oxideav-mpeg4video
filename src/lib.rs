@@ -115,6 +115,25 @@
 //!   outside the VOP / video packet (all prediction coefficients
 //!   taken as zero per §7.4.3.3). `saturate_qf` / `saturate_block`
 //!   apply the §7.4.3.4 `[-2048, 2047]` clamp.
+//! * Round 13: §7.4.4 inverse quantisation — Figure 7-7's full
+//!   `QF[v][u] -> F''[v][u] -> F'[v][u] -> F[v][u]` pipeline for
+//!   one 8×8 DCT block. `inverse_quant_intra_dc(qf00, comp, qs,
+//!   short_video_header)` evaluates the §7.4.4.1.1 intra DC formula
+//!   `F''[0][0] = dc_scaler * QF[0][0]` (Table 7-1 for
+//!   `short_video_header == 0`, fixed `dc_scaler = 8` otherwise per
+//!   §7.4.4.3). `inverse_quant_method1_coef(qf, w, qs, intra)` /
+//!   `inverse_quant_method1(qf, w, ctx)` implement the §7.4.4.1.2
+//!   first method — intra `(qf*W*qs*2)/16`, non-intra
+//!   `((2*qf + Sign(qf))*W*qs)/16`, fused with §7.4.4.4 saturation
+//!   to `[-2^(bpp+3), 2^(bpp+3) - 1]` and §7.4.4.5 mismatch control
+//!   (per the §7.4.4.6 summary pseudo-code). `inverse_quant_method2_coef`
+//!   / `inverse_quant_method2` implement the §7.4.4.2.1 second method
+//!   (`(2*|qf|+1)*qs` for odd `qs`, the same minus one for even `qs`,
+//!   sign re-applied via §7.4.4.2.1's trailing sentence) including
+//!   the §7.4.4.2 instruction to keep using §7.4.4.1.1 for the intra
+//!   DC coefficient. `InverseQuantContext` bundles the per-block
+//!   scalars (`macroblock_intra`, `component`, `quantiser_scale`,
+//!   `bits_per_pixel`, `short_video_header`).
 //! * Strict failure on Studio Profiles, FGS layers, and non-rectangular
 //!   shapes — those branches are recognised and rejected with a typed
 //!   error, never silently mis-parsed. Sprite bodies, complexity-
@@ -142,6 +161,7 @@ use oxideav_core::RuntimeContext;
 
 pub mod bitreader;
 pub mod bvop;
+pub mod inverse_quant;
 pub mod macroblock;
 pub mod motion;
 pub mod predictor;
@@ -154,6 +174,11 @@ pub use bitreader::{BitReader, BitReaderError};
 pub use bvop::{
     default_b_mb_type, parse_b_vop_mb_header, parse_dbquant, BMbTypeTable, BVopMbHeader,
     BVopMbParseError, BVopMbType,
+};
+pub use inverse_quant::{
+    inverse_quant_intra_dc, inverse_quant_method1, inverse_quant_method1_coef,
+    inverse_quant_method2, inverse_quant_method2_coef, saturate_fprime, saturation_bounds,
+    InverseQuantContext,
 };
 pub use macroblock::{
     dquant_value, parse_macroblock_header, DerivedMbType, MacroblockHeader, MacroblockParseError,

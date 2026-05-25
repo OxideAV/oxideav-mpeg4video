@@ -154,10 +154,26 @@ enforcement procedure.
   `NeighbourPosition { Left, AboveLeft, Above }` surface Figure 7-5
   for the predictor-gathering pass that will land in a later round.
 
-The §7.4.4 inverse quantisation / inverse DCT, the MV-predictor
-candidate gathering of Figure 7-34, and the Figure 7-34 neighbour
-walk that supplies the §7.4.3 predictor with concrete `FA` / `FB` /
-`FC` from a block grid, land in later rounds.
+Round 13 covers §7.4.4 inverse quantisation end-to-end for one 8×8
+block (Figure 7-7's `QF[v][u] -> F''[v][u] -> F'[v][u] -> F[v][u]`
+pipeline). `inverse_quant_method1(qf, w, ctx)` runs the §7.4.4.6
+summary pseudo-code: §7.4.4.1.1 intra DC `dc_scaler * QF[0][0]` (via
+the existing `predictor::dc_scaler`), §7.4.4.1.2 first method (intra
+`(QF*W[0]*qs*2)/16`, non-intra `((2*QF + Sign(QF))*W[1]*qs)/16`),
+§7.4.4.4 saturation to `[-2^(bpp+3), 2^(bpp+3) - 1]`, and §7.4.4.5
+mismatch control (LSB toggle on `F[7][7]` when the block sum is even,
+implemented via XOR per NOTE 1). `inverse_quant_method2` covers the
+§7.4.4.2 second method (`(2*|QF|+1)*qs` / `... - 1` for even `qs`,
+sign re-incorporated), with §7.4.4.2's "intra DC uses the same method
+as method 1" rule honoured. `inverse_quant_intra_dc` /
+`inverse_quant_method1_coef` / `inverse_quant_method2_coef` /
+`saturation_bounds` / `saturate_fprime` / `InverseQuantContext` are
+the public surface.
+
+The inverse DCT (§7.4.5 + Annex A), the MV-predictor candidate
+gathering of Figure 7-34, and the Figure 7-5 / §7.4.3 neighbour walk
+that supplies the §7.4.3 predictor with concrete `FA` / `FB` / `FC`
+from a block grid, land in later rounds.
 
 ## What works today
 
@@ -241,14 +257,22 @@ walk that supplies the §7.4.3 predictor with concrete `FA` / `FB` /
 | §7.4.3.3 AC first-col `(QFA*QpA)/QpX` add        | `predict_intra_ac_column` (round 12) |
 | §7.4.3.3 missing-neighbour zero-coefficient rule | `qfa/qfc_col == None` → pass-through (round 12) |
 | §7.4.3.4 `QF[v][u]` saturation `[-2048, 2047]`   | `saturate_qf` / `saturate_block` (round 12) |
-| §7.4.3 predictor-neighbour gathering            | not yet (Figure 7-34 walk over a block grid) |
+| §7.4.3 predictor-neighbour gathering            | not yet (Figure 7-5 walk over a block grid) |
+| §7.4.4.1.1 intra DC `F''[0][0] = dc_scaler * QF[0][0]` | `inverse_quant_intra_dc` (round 13) |
+| §7.4.4.1.2 method 1 intra `(QF*W*qs*2)/16`        | `inverse_quant_method1_coef` (round 13) |
+| §7.4.4.1.2 method 1 non-intra `((2*QF+Sign)*W*qs)/16` | `inverse_quant_method1_coef` (round 13) |
+| §7.4.4.2.1 method 2 (odd / even `qs`)             | `inverse_quant_method2_coef` (round 13) |
+| §7.4.4.3 `short_video_header == 1` DC fixed-8     | gated in `inverse_quant_intra_dc` (round 13) |
+| §7.4.4.4 saturation `[-2^(bpp+3), 2^(bpp+3) - 1]` | `saturate_fprime` / `saturation_bounds` (round 13) |
+| §7.4.4.5 mismatch control on `F[7][7]`            | fused into `inverse_quant_method1` (round 13) |
+| §7.4.4.6 method-1 summary pseudo-code             | `inverse_quant_method1` (round 13) |
 | RVLC Tcoef tables (B.23..B.25) + Type 5 escape | not yet |
 | Type 4 escape (`short_video_header == 1`)     | not yet |
 | `sadct_disable == 0` modified inverse scan    | not yet |
-| §7.4.4 inverse quantisation / IDCT             | not yet |
+| §7.4.5 inverse DCT (Annex A)                  | not yet |
 | Encoder                                       | not yet |
 
-250 round-1..12 unit tests pass.
+280 round-1..13 unit tests pass.
 
 ## Provenance
 
@@ -322,7 +346,28 @@ direction; Table 7-1's piece-wise linear `dc_scaler` — luminance
 `QFX[0][u] = PQFX[0][u] + (QFC[0][u] * QpC) // QpX` AC scaling, with
 the §7.4.3.3 "all the prediction coefficients of that block are
 assumed to be zero" rule for an out-of-VOP predictor block; and
-§7.4.3.4's `[-2048, 2047]` saturation). The
+§7.4.3.4's `[-2048, 2047]` saturation), and §7.4.4 (the inverse
+quantisation pipeline of Figure 7-7 for one 8×8 block: §7.4.4.1.1's
+intra DC formula `F''[0][0] = dc_scaler * QF[0][0]` with the Table
+7-1 (a.k.a. §7.4.4.3 nonlinear DC) scaler for
+`short_video_header == 0` and the fixed `dc_scaler = 8` of §7.4.1.1
+otherwise; §7.4.4.1.2's first method —
+`F''[v][u] = (QF[v][u] * W[0][v][u] * quantiser_scale * 2) / 16` for
+intra blocks and
+`F''[v][u] = ((2*QF[v][u] + Sign(QF[v][u])) * W[1][v][u] * quantiser_scale) / 16`
+for non-intra blocks; §7.4.4.2.1's second method —
+`F''[v][u] = (2*|QF[v][u]| + 1) * quantiser_scale` for odd
+`quantiser_scale`, the same minus one for even `quantiser_scale`,
+sign re-applied to obtain the final `F''[v][u]`, with §7.4.4.2's
+note that the intra DC coefficient is still quantised by the method
+of §7.4.4.1.1; §7.4.4.4's saturation of `F''[v][u]` to
+`[-2^(bits_per_pixel + 3), 2^(bits_per_pixel + 3) - 1]`; §7.4.4.5's
+mismatch control on the parity of the block sum, with the LSB toggle
+on `F[7][7]` per NOTE 1; and §7.4.4.6's "summary of quantiser process
+for method 1" pseudo-code that fuses all of the above, together with
+§4.1's clarification that `/` is integer division with truncation
+toward zero — Rust's `/` on signed integers matches — and the §4.1
+definition of `Sign(x) = 1` for `x >= 0`, `-1` for `x < 0`). The
 text was read from
 `docs/video/mpeg4-visual/ISO_IEC_14496-2-2004-3rd-edition.txt`. No
 third-party MPEG-4 source was consulted.

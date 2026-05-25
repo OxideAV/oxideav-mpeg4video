@@ -8,6 +8,36 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 13 of the clean-room rebuild: §7.4.4 inverse quantisation —
+  Figure 7-7's full `QF[v][u] -> F''[v][u] -> F'[v][u] -> F[v][u]`
+  pipeline for one 8×8 DCT block. New `src/inverse_quant.rs` module.
+  `inverse_quant_intra_dc(qf00, component, quantiser_scale,
+  short_video_header)` evaluates the §7.4.4.1.1 intra DC formula
+  `F''[0][0] = dc_scaler * QF[0][0]` — Table 7-1 (via
+  `predictor::dc_scaler`) when `short_video_header == 0`, the fixed
+  `dc_scaler = 8` of §7.4.4.3 / §7.4.1.1 otherwise.
+  `inverse_quant_method1_coef(qf, w, qs, intra)` /
+  `inverse_quant_method1(qf, w, ctx)` implement the §7.4.4.1.2 first
+  inverse-quantisation method — intra `(QF * W[0] * qs * 2) / 16`,
+  non-intra `((2*QF + Sign(QF)) * W[1] * qs) / 16` — and the whole-block
+  driver fuses §7.4.4.4 saturation to
+  `[-2^(bpp+3), 2^(bpp+3) - 1]` plus §7.4.4.5 mismatch control
+  (sum-parity gated LSB toggle on `F[7][7]`, implemented via XOR per
+  the §7.4.4.5 NOTE 1) following the §7.4.4.6 summary pseudo-code.
+  `inverse_quant_method2_coef(qf, qs)` /
+  `inverse_quant_method2(qf, ctx)` implement the §7.4.4.2.1 second
+  method (`(2*|QF|+1)*qs` for odd `qs`, the same minus one for even
+  `qs`, sign re-applied via the §7.4.4.2.1 trailing sentence) and
+  honour §7.4.4.2's instruction to keep using §7.4.4.1.1 for the
+  intra-DC coefficient. `saturation_bounds(bpp)` /
+  `saturate_fprime(value, bpp)` expose the §7.4.4.4 clamp.
+  `InverseQuantContext { macroblock_intra, component, quantiser_scale,
+  bits_per_pixel, short_video_header }` bundles the per-block scalars.
+  Method-1 / method-2 path arithmetic, both signs, both
+  `quantiser_scale` parities, both saturation polarities, the
+  short-video-header DC path, and the parity-driven mismatch toggle
+  are each covered by dedicated tests (+30 unit tests; 280 round-1..13
+  tests pass total).
 - Round 12 of the clean-room rebuild: §7.4.3 spatial DC / AC predictor
   for intra macroblocks (the `short_video_header == 0` path). New
   `src/predictor.rs` module. `default_neighbour_dc(bits_per_pixel)`
