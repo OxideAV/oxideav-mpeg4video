@@ -134,6 +134,19 @@
 //!   DC coefficient. `InverseQuantContext` bundles the per-block
 //!   scalars (`macroblock_intra`, `component`, `quantiser_scale`,
 //!   `bits_per_pixel`, `short_video_header`).
+//! * Round 14: §7.4.5 + Annex A inverse DCT — Annex A.1's orthonormal
+//!   8×8 IDCT, evaluated as two passes of the 1-D 8-point IDCT
+//!   `f(x) = √(2/N) Σ_u C(u) F(u) cos((2x+1)uπ/(2N))` with `N = 8`,
+//!   `C(0) = 1/√2`, `C(k) = 1` otherwise. `idct_8x8(coefficients,
+//!   bits_per_pixel)` returns the rounded + §7.4.5-saturated
+//!   `[[i32; 8]; 8]` block; `idct_saturation_bounds(bpp)` /
+//!   `saturate_idct_sample(value, bpp)` expose the §7.4.5
+//!   `[-2^bpp, 2^bpp - 1]` clamp. Round-trips a flat block + a
+//!   deterministic random block within ±1 LSB (the IEEE 1180-1990 §3.3
+//!   peak-error tolerance referenced by Annex A.1's normative
+//!   modifications), cross-validates against the §7.4.4 intra-DC
+//!   inverse-quant path, and exercises both saturation polarities and
+//!   the high-frequency checkerboard case.
 //! * Strict failure on Studio Profiles, FGS layers, and non-rectangular
 //!   shapes — those branches are recognised and rejected with a typed
 //!   error, never silently mis-parsed. Sprite bodies, complexity-
@@ -161,6 +174,7 @@ use oxideav_core::RuntimeContext;
 
 pub mod bitreader;
 pub mod bvop;
+pub mod idct;
 pub mod inverse_quant;
 pub mod macroblock;
 pub mod motion;
@@ -175,6 +189,7 @@ pub use bvop::{
     default_b_mb_type, parse_b_vop_mb_header, parse_dbquant, BMbTypeTable, BVopMbHeader,
     BVopMbParseError, BVopMbType,
 };
+pub use idct::{idct_8x8, idct_saturation_bounds, saturate_idct_sample};
 pub use inverse_quant::{
     inverse_quant_intra_dc, inverse_quant_method1, inverse_quant_method1_coef,
     inverse_quant_method2, inverse_quant_method2_coef, saturate_fprime, saturation_bounds,

@@ -5,7 +5,7 @@ A pure-Rust MPEG-4 Part 2 Video codec (ISO/IEC 14496-2) for the
 
 ## Status
 
-**Round 12 of the clean-room rebuild (2026-05-25).** The prior
+**Round 14 of the clean-room rebuild (2026-05-25).** The prior
 implementation was retired on 2026-05-18 under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md);
 the VLC tables admitted to sourcing their numeric entries from an
@@ -170,10 +170,25 @@ as method 1" rule honoured. `inverse_quant_intra_dc` /
 `saturation_bounds` / `saturate_fprime` / `InverseQuantContext` are
 the public surface.
 
-The inverse DCT (§7.4.5 + Annex A), the MV-predictor candidate
-gathering of Figure 7-34, and the Figure 7-5 / §7.4.3 neighbour walk
-that supplies the §7.4.3 predictor with concrete `FA` / `FB` / `FC`
-from a block grid, land in later rounds.
+Round 14 covers §7.4.5 + Annex A inverse DCT. `idct_8x8(coefficients,
+bits_per_pixel)` evaluates Annex A.1's orthonormal 8×8 IDCT
+`f(x, y) = (2/N) Σ_u Σ_v C(u) C(v) F(u, v) cos((2x+1)uπ/(2N))
+cos((2y+1)vπ/(2N))` as a separable two-pass 1-D IDCT against a
+lazily-initialised `f64` cosine-table `COS[u][x] =
+cos((2x+1)uπ/16)`, then rounds to nearest (§4.1) and saturates the
+output to `[-2^bpp, 2^bpp - 1]` per the §7.4.5 closing sentence.
+Round-trips a flat block and a deterministic random block within
+±1 LSB (the IEEE 1180-1990 §3.3 peak-error tolerance referenced by
+Annex A.1's normative modifications) and chains correctly off the
+§7.4.4 intra-DC inverse-quant path (`QF[0][0] = 4` at `qs = 5` →
+`F''[0][0] = 40` → uniform `f[y][x] = 5`).
+`idct_saturation_bounds(bpp)` / `saturate_idct_sample(value, bpp)`
+expose the §7.4.5 clamp.
+
+The MV-predictor candidate gathering of Figure 7-34 and the
+Figure 7-5 / §7.4.3 neighbour walk that supplies the §7.4.3
+predictor with concrete `FA` / `FB` / `FC` from a block grid land
+in later rounds.
 
 ## What works today
 
@@ -266,13 +281,14 @@ from a block grid, land in later rounds.
 | §7.4.4.4 saturation `[-2^(bpp+3), 2^(bpp+3) - 1]` | `saturate_fprime` / `saturation_bounds` (round 13) |
 | §7.4.4.5 mismatch control on `F[7][7]`            | fused into `inverse_quant_method1` (round 13) |
 | §7.4.4.6 method-1 summary pseudo-code             | `inverse_quant_method1` (round 13) |
+| §7.4.5 + Annex A.1 orthonormal 8×8 IDCT           | `idct_8x8` (round 14) |
+| §7.4.5 output saturation `[-2^bpp, 2^bpp - 1]`    | `idct_saturation_bounds` / `saturate_idct_sample` (round 14) |
 | RVLC Tcoef tables (B.23..B.25) + Type 5 escape | not yet |
 | Type 4 escape (`short_video_header == 1`)     | not yet |
 | `sadct_disable == 0` modified inverse scan    | not yet |
-| §7.4.5 inverse DCT (Annex A)                  | not yet |
 | Encoder                                       | not yet |
 
-280 round-1..13 unit tests pass.
+297 round-1..14 unit tests pass.
 
 ## Provenance
 
@@ -367,8 +383,19 @@ on `F[7][7]` per NOTE 1; and §7.4.4.6's "summary of quantiser process
 for method 1" pseudo-code that fuses all of the above, together with
 §4.1's clarification that `/` is integer division with truncation
 toward zero — Rust's `/` on signed integers matches — and the §4.1
-definition of `Sign(x) = 1` for `x >= 0`, `-1` for `x < 0`). The
-text was read from
+definition of `Sign(x) = 1` for `x >= 0`, `-1` for `x < 0`), and
+§7.4.5 + Annex A.1 (the inverse DCT: §7.4.5's "the inverse DCT
+transform defined in Annex A shall be applied to obtain the inverse
+transformed values, `f[y][x]`. These values shall be saturated so
+that `-2^bits_per_pixel ≤ f[y][x] ≤ 2^bits_per_pixel - 1`"; and
+Annex A.1's normative IDCT formula
+`f(x, y) = (2/N) Σ_u Σ_v C(u) C(v) F(u, v) cos((2x+1)uπ/(2N))
+cos((2y+1)vπ/(2N))` with `N = 8`, `C(0) = 1/√2`, `C(k) = 1` for
+`k ≠ 0`, together with Annex A.1's reference to IEEE Std 1180-1990
+with the two normative deviations on §3.2 (test set size +
+parameters) and §3.3 (peak per-pixel error ≤ 1 for any IDCT
+claiming compliance against the reference saturated mathematical
+integer-number IDCT)). The text was read from
 `docs/video/mpeg4-visual/ISO_IEC_14496-2-2004-3rd-edition.txt`. No
 third-party MPEG-4 source was consulted.
 

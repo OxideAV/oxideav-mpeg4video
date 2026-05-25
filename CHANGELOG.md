@@ -8,6 +8,30 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 14 of the clean-room rebuild: §7.4.5 + Annex A inverse
+  discrete cosine transform. New `src/idct.rs` module evaluating
+  Annex A.1's orthonormal 8×8 IDCT
+  `f(x, y) = (2/N) Σ_u Σ_v C(u) C(v) F(u, v) cos((2x+1)uπ/(2N))
+  cos((2y+1)vπ/(2N))` with `N = 8`, `C(0) = 1/√2`, `C(k) = 1` for
+  `k ≠ 0`. Implemented as a separable two-pass 1-D IDCT
+  (`f(x) = √(2/N) Σ_u C(u) F(u) cos((2x+1)uπ/(2N))`) against a
+  lazily-initialised `f64` cosine-table `COS[u][x] =
+  cos((2x+1)uπ/16)`. The final value is rounded to nearest (§4.1)
+  and saturated to `[-2^bits_per_pixel, 2^bits_per_pixel - 1]` per
+  the §7.4.5 closing sentence. `idct_8x8(coefficients,
+  bits_per_pixel)` is the entry point; `idct_saturation_bounds(bpp)`
+  / `saturate_idct_sample(value, bpp)` surface the §7.4.5 clamp.
+  Tests cover: DC-only block (`F[0][0] = 256` → `f[y][x] = 32`),
+  flat-block round-trip via a forward-DCT helper (recon ≤ ±1 LSB),
+  deterministic pseudo-random block round-trip (recon ≤ ±1 LSB per
+  IEEE 1180-1990 §3.3 with Annex A.1's normative deviations),
+  cross-validation against the §7.4.4 intra-DC inverse-quant path
+  (`QF = 4` at `qs = 5` → `F''[0][0] = 40` → `f[y][x] = 5`), zero
+  block at every supported `bpp` (4 / 8 / 10 / 12), both saturation
+  polarities, the §7.4.5 cosine-table sanity check at `cos(0) = 1`
+  / `cos(π/4) = √2/2`, the `F[0][*]` single-row `y`-uniform
+  property, and the highest-frequency `F[7][7]` checkerboard sign
+  pattern. 17 new unit tests, 297 total.
 - Round 13 of the clean-room rebuild: §7.4.4 inverse quantisation —
   Figure 7-7's full `QF[v][u] -> F''[v][u] -> F'[v][u] -> F[v][u]`
   pipeline for one 8×8 DCT block. New `src/inverse_quant.rs` module.
