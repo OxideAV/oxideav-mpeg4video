@@ -8,6 +8,54 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 12 of the clean-room rebuild: §7.4.3 spatial DC / AC predictor
+  for intra macroblocks (the `short_video_header == 0` path). New
+  `src/predictor.rs` module. `default_neighbour_dc(bits_per_pixel)`
+  returns the §7.4.3.1 fallback `F[0][0] = 2^(bits_per_pixel + 2)` for
+  neighbours outside the VOP / video packet or in a non-intra
+  macroblock. `dc_scaler(component, quantiser_scale)` evaluates
+  Table 7-1's piece-wise linear non-linear DC scaler — with separate
+  Type 1 (luminance) and Type 2 (chrominance) formulas across the
+  `1..=4` / `5..=8` / `9..=24` / `>= 25` quantiser bands (chrominance
+  merges the `5..=8` and `9..=24` columns under `(qs + 13) / 2`).
+  `select_dc_direction(fa, fb, fc)` applies the §7.4.3.1 rule
+  `|FA-FB| < |FB-FC|` → predict from `C` (above), else from `A`
+  (left). `predict_intra_dc(pqfx_dc, dir, fa, fc, dc_scaler_x)`
+  evaluates the §7.4.3.2 reconstruction
+  `QFX[0][0] = PQFX[0][0] + chosen / dc_scaler`.
+  `predict_intra_ac_row` / `predict_intra_ac_column` apply the
+  §7.4.3.3 first-row / first-column scaled-by-`QpC/QpX` (or
+  `QpA/QpX`) add; if the predictor neighbour is `None` (outside the
+  VOP / video packet) the call returns `PQFX` unchanged per §7.4.3.3
+  ("all the prediction coefficients of that block are assumed to be
+  zero"). `saturate_qf` / `saturate_block` apply the §7.4.3.4
+  `[-2048, 2047]` clamp.
+- `NeighbourPosition { Left, AboveLeft, Above }` and `NeighbourBlock
+  { dc, qp, first_row, first_column }` value types surfacing the
+  Figure 7-5 three-neighbour layout to callers that will gather
+  neighbours from a block grid in a future round.
+- 31 round-12 unit tests covering: `2^(bpp+2)` at `bpp` 4 / 8 / 12 (the
+  §6.3.3 valid range) and the panic guard at `bpp = 31`; every
+  Table 7-1 boundary value for luminance (`qs` 1..=4 / 5..=8 / 9..=24
+  / 25..=31) and chrominance (`qs` 1..=4 / 5..=24 / 25..=31, with the
+  truncated `(qs+13)/2`); luminance monotonicity across the full
+  5-bit quantiser range; the three direction-selection paths
+  (horizontal gradient → from C, vertical gradient → from A, equal
+  diffs → from A by the strict-`<` rule, default-neighbour-all-equal
+  → from A); `predict_intra_dc` from-above and from-left, with
+  truncation-toward-zero on both signs; `predict_intra_ac_column`
+  and `predict_intra_ac_row` with equal Qp ratios, doubled Qp,
+  truncating Qp ratios, and missing-neighbour pass-through; saturation
+  at the `[-2048, 2047]` boundary and beyond (including `i32::MIN/MAX`);
+  full DC-predictor integration on a luminance block (qs=5) and a
+  chrominance block (qs=7).
+- Re-export: `predict_intra_dc`, `predict_intra_ac_row`,
+  `predict_intra_ac_column`, `saturate_qf`, `saturate_block`,
+  `dc_scaler`, `default_neighbour_dc`, `select_dc_direction`,
+  `NeighbourBlock`, `NeighbourPosition` at the crate root. The
+  pre-existing `DcPredictionDirection` enum is shared with `scan` via
+  a `pub use`.
+
 - Round 11 of the clean-room rebuild: §7.4.2 inverse scan — the
   conversion of the one-dimensional decoded coefficient stream
   `QFS[64]` into the two-dimensional `PQF[v][u]` 8×8 block under one

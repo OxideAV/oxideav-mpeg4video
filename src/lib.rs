@@ -95,6 +95,26 @@
 //!   predictor add (that supplies `dc_direction`) and the
 //!   §7.4.4 inverse quantisation / inverse DCT remain later-round
 //!   work.
+//! * Round 12: §7.4.3 spatial DC/AC predictor for intra macroblocks
+//!   (`short_video_header == 0`). `default_neighbour_dc(bpp)` returns
+//!   the §7.4.3.1 fallback value `2^(bits_per_pixel + 2)` for
+//!   neighbours outside the VOP / video packet or in non-intra MBs.
+//!   `dc_scaler(component, qs)` evaluates Table 7-1 (the piece-wise
+//!   linear scaler with separate Type 1 luminance and Type 2
+//!   chrominance formulas across the `1..=4` / `5..=8` / `9..=24` /
+//!   `>= 25` quantiser bands; the chrominance row merges the `5..=8`
+//!   and `9..=24` columns under `(qs + 13) / 2`).
+//!   `select_dc_direction(fa, fb, fc)` applies the §7.4.3.1 rule
+//!   `|FA-FB| < |FB-FC|` → from C, else from A.
+//!   `predict_intra_dc(pqfx_dc, dir, fa, fc, dc_scaler_x)` evaluates
+//!   the §7.4.3.2 reconstruction
+//!   `QFX[0][0] = PQFX[0][0] + chosen / dc_scaler`.
+//!   `predict_intra_ac_row` / `predict_intra_ac_column` apply the
+//!   §7.4.3.3 first row / column add scaled by `QpC/QpX` or
+//!   `QpA/QpX`, returning `PQFX` unchanged when the predictor block is
+//!   outside the VOP / video packet (all prediction coefficients
+//!   taken as zero per §7.4.3.3). `saturate_qf` / `saturate_block`
+//!   apply the §7.4.3.4 `[-2048, 2047]` clamp.
 //! * Strict failure on Studio Profiles, FGS layers, and non-rectangular
 //!   shapes — those branches are recognised and rejected with a typed
 //!   error, never silently mis-parsed. Sprite bodies, complexity-
@@ -124,6 +144,7 @@ pub mod bitreader;
 pub mod bvop;
 pub mod macroblock;
 pub mod motion;
+pub mod predictor;
 pub mod scan;
 pub mod texture;
 pub mod vol;
@@ -140,6 +161,11 @@ pub use macroblock::{
 pub use motion::{
     decode_motion_vector_delta, predict_motion_vector, reconstruct_motion_vector, MotionParseError,
     MotionVector, MotionVectorDelta, MvMode,
+};
+pub use predictor::{
+    dc_scaler, default_neighbour_dc, predict_intra_ac_column, predict_intra_ac_row,
+    predict_intra_dc, saturate_block, saturate_qf, select_dc_direction, NeighbourBlock,
+    NeighbourPosition,
 };
 pub use scan::{
     events_to_pqf, events_to_qfs, inverse_scan, select_scan_type, DcPredictionDirection,

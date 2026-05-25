@@ -5,7 +5,7 @@ A pure-Rust MPEG-4 Part 2 Video codec (ISO/IEC 14496-2) for the
 
 ## Status
 
-**Round 11 of the clean-room rebuild (2026-05-24).** The prior
+**Round 12 of the clean-room rebuild (2026-05-25).** The prior
 implementation was retired on 2026-05-18 under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md);
 the VLC tables admitted to sourcing their numeric entries from an
@@ -131,9 +131,33 @@ enforcement procedure.
   `dc_direction` lands later. The `sadct_disable == 0` modified
   inverse scan for non-rectangular VOPs remains out of scope.
 
-The §7.4.3 spatial DC/AC predictor and the §7.4.4 inverse
-quantisation / inverse DCT, plus the MV-predictor candidate gathering
-of Figure 7-34, land in later rounds.
+* Round 12 — §7.4.3 spatial DC / AC predictor for intra macroblocks
+  (the `short_video_header == 0` path). New `src/predictor.rs` module.
+  `default_neighbour_dc(bpp)` returns the §7.4.3.1 fallback
+  `F[0][0] = 2^(bpp + 2)` used for neighbours outside the VOP / video
+  packet or in non-intra MBs. `dc_scaler(component, qs)` evaluates
+  Table 7-1's piece-wise linear non-linear DC scaler — Type 1
+  (luminance) and Type 2 (chrominance) formulas across
+  `1..=4` / `5..=8` / `9..=24` / `>= 25` quantiser bands (chrominance
+  merges the middle two columns under `(qs + 13) / 2`).
+  `select_dc_direction(fa, fb, fc)` applies the §7.4.3.1 rule
+  `|FA-FB| < |FB-FC|` → predict from `C` (above), else from `A`
+  (left). `predict_intra_dc(pqfx_dc, dir, fa, fc, dc_scaler_x)`
+  evaluates §7.4.3.2 `QFX[0][0] = PQFX[0][0] + chosen / dc_scaler`.
+  `predict_intra_ac_row` / `predict_intra_ac_column` apply the
+  §7.4.3.3 first-row / first-column scaled-by-`QpC/QpX` (or
+  `QpA/QpX`) add, returning `PQFX` unchanged when the predictor
+  neighbour is `None` (out of VOP / video packet — "all the
+  prediction coefficients of that block are assumed to be zero").
+  `saturate_qf` / `saturate_block` apply the §7.4.3.4 `[-2048, 2047]`
+  clamp. `NeighbourBlock { dc, qp, first_row, first_column }` and
+  `NeighbourPosition { Left, AboveLeft, Above }` surface Figure 7-5
+  for the predictor-gathering pass that will land in a later round.
+
+The §7.4.4 inverse quantisation / inverse DCT, the MV-predictor
+candidate gathering of Figure 7-34, and the Figure 7-34 neighbour
+walk that supplies the §7.4.3 predictor with concrete `FA` / `FB` /
+`FC` from a block grid, land in later rounds.
 
 ## What works today
 
@@ -209,13 +233,22 @@ of Figure 7-34, land in later rounds.
 | §7.4.2 `QFS[n] → PQF[v][u]` inverse scan      | `inverse_scan` (round 11) |
 | AC EVENTs (+ optional intra-DC) → `QFS[64]`   | `events_to_qfs` (round 11) |
 | §7.4.2 per-block scan-type selection          | `select_scan_type` (round 11) |
+| §7.4.3.1 default neighbour `F[0][0] = 2^(bpp+2)` | `default_neighbour_dc` (round 12) |
+| Table 7-1 `dc_scaler` (Type 1 / Type 2)          | `dc_scaler` (round 12) |
+| §7.4.3.1 `\|FA-FB\| < \|FB-FC\|` direction rule  | `select_dc_direction` (round 12) |
+| §7.4.3.2 `QFX[0][0] = PQFX + chosen / dc_scaler` | `predict_intra_dc` (round 12) |
+| §7.4.3.3 AC first-row `(QFC*QpC)/QpX` add        | `predict_intra_ac_row` (round 12) |
+| §7.4.3.3 AC first-col `(QFA*QpA)/QpX` add        | `predict_intra_ac_column` (round 12) |
+| §7.4.3.3 missing-neighbour zero-coefficient rule | `qfa/qfc_col == None` → pass-through (round 12) |
+| §7.4.3.4 `QF[v][u]` saturation `[-2048, 2047]`   | `saturate_qf` / `saturate_block` (round 12) |
+| §7.4.3 predictor-neighbour gathering            | not yet (Figure 7-34 walk over a block grid) |
 | RVLC Tcoef tables (B.23..B.25) + Type 5 escape | not yet |
 | Type 4 escape (`short_video_header == 1`)     | not yet |
 | `sadct_disable == 0` modified inverse scan    | not yet |
-| §7.4.3 spatial DC/AC predictor add            | not yet |
+| §7.4.4 inverse quantisation / IDCT             | not yet |
 | Encoder                                       | not yet |
 
-219 round-1..11 unit tests pass.
+250 round-1..12 unit tests pass.
 
 ## Provenance
 
@@ -275,7 +308,21 @@ loop over the three Figure 7-4 scan tables (a) Alternate-Horizontal,
 selection — non-intra → zigzag; intra + `ac_pred_flag == 0` → zigzag
 for the whole macroblock; intra + `ac_pred_flag == 1` + DC predictor
 from C → alternate-vertical; intra + `ac_pred_flag == 1` + DC
-predictor from A → alternate-horizontal). The
+predictor from A → alternate-horizontal), and §7.4.3 (the spatial
+DC/AC predictor for intra macroblocks: §7.4.3.1's
+`|FA-FB| < |FB-FC|` direction selection and the
+`F[0][0] = 2^(bits_per_pixel + 2)` default-neighbour rule; §7.4.3.2's
+`QFX[0][0] = PQFX[0][0] + chosen / dc_scaler` reconstruction with
+the chosen value being `FA[0][0]` or `FC[0][0]` per the §7.4.3.1
+direction; Table 7-1's piece-wise linear `dc_scaler` — luminance
+(Type 1) `1..=4` → 8, `5..=8` → 2*qs, `9..=24` → qs+8,
+`>= 25` → 2*qs-16; chrominance (Type 2) `1..=4` → 8,
+`5..=24` → (qs+13)/2, `>= 25` → qs-6; §7.4.3.3's
+`QFX[v][0] = PQFX[v][0] + (QFA[v][0] * QpA) // QpX` and
+`QFX[0][u] = PQFX[0][u] + (QFC[0][u] * QpC) // QpX` AC scaling, with
+the §7.4.3.3 "all the prediction coefficients of that block are
+assumed to be zero" rule for an out-of-VOP predictor block; and
+§7.4.3.4's `[-2048, 2047]` saturation). The
 text was read from
 `docs/video/mpeg4-visual/ISO_IEC_14496-2-2004-3rd-edition.txt`. No
 third-party MPEG-4 source was consulted.
