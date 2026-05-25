@@ -5,13 +5,26 @@ A pure-Rust MPEG-4 Part 2 Video codec (ISO/IEC 14496-2) for the
 
 ## Status
 
-**Round 15 of the clean-room rebuild (2026-05-25).** The prior
+**Round 16 of the clean-room rebuild (2026-05-26).** The prior
 implementation was retired on 2026-05-18 under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md);
 the VLC tables admitted to sourcing their numeric entries from an
 external library. Master history was fully erased per the Hat-3 cold-
 enforcement procedure.
 
+* Round 16 — §7.4.3 / Figure 7-5 predictor candidate gathering. New
+  `src/neighbour.rs`. `IntraBlockGrid::new(mb_rows, mb_cols)` allocates
+  the Figure 6-8 block sub-grids (luma `2*mb_rows × 2*mb_cols` +
+  Cb / Cr `mb_rows × mb_cols`) of `Option<BlockNeighbour>` for one
+  VOP. `predictors_for(mb_row, mb_col, i, bits_per_pixel,
+  quantiser_scale)` walks Figure 7-5 against the recorded grid and
+  returns the `BlockPredictors` argument round-15's
+  `decode_intra_block` already consumes. Neighbours outside the
+  sub-grid, recorded `None`, or marked `is_intra == false` fall back to
+  the §7.4.3.1 default (DC `2^(bits_per_pixel + 2)`, AC prediction
+  coefficients zeroed via `None`). `BlockNeighbour::from_qf(&qf, dc,
+  qp)` builds the stored state from a reconstructed intra block;
+  `block_grid_position` exposes the static Figure 6-8 mapping.
 * Round 1 — structural parsing of the §6.2 configuration headers
   (`VisualObjectSequence` / `VisualObject` / `VideoObjectLayer`).
 * Round 2 — structural parsing of §6.2.4 Group-of-VOP and §6.2.5 Video
@@ -210,11 +223,31 @@ block (method 2 exact; method 1 within the ±1-LSB §7.4.4.5
 mismatch-control tolerance), and a coded AC EVENT breaks block
 flatness.
 
-The MV-predictor candidate gathering of Figure 7-34 and the
-Figure 7-5 / §7.4.3 neighbour walk that supplies the §7.4.3
-predictor with concrete `FA` / `FB` / `FC` from a block grid land
-in later rounds, along with inter / B-VOP reconstruction (motion
-compensation) and the `short_video_header == 1` / `data_partitioned`
+Round 16 covers §7.4.3 / Figure 7-5 predictor candidate gathering — the
+cross-block walk that resolves each block-to-decode's three Figure 7-5
+neighbours `A` (left), `B` (above-left), `C` (above) from a per-VOP
+grid of already-decoded blocks. New `src/neighbour.rs`.
+`IntraBlockGrid::new(mb_rows, mb_cols)` allocates one
+`(2*mb_rows) × (2*mb_cols)` luma sub-grid plus two `mb_rows × mb_cols`
+Cb / Cr sub-grids of `Option<BlockNeighbour>`; `record(mb_row, mb_col,
+i, Some(BlockNeighbour))` fills cells as blocks are decoded;
+`predictors_for(mb_row, mb_col, i, bpp, qs)` walks Figure 7-5 and
+returns the `BlockPredictors` argument round 15's
+`decode_intra_block` already consumes. Neighbours outside the sub-grid,
+recorded `None` (e.g. video-packet boundary), or recorded with
+`is_intra == false` fall back to the §7.4.3.1 default
+`F[0][0] = 2^(bpp + 2)` (and the §7.4.3.3 first-row / first-column AC
+prediction coefficients are zeroed via `None`).
+`BlockNeighbour::from_qf(&qf, dc, qp)` extracts the §7.4.3 state from
+a reconstructed intra block. `block_grid_position(mb_row, mb_col, i)`
+exposes the Figure 6-8 mapping (luma at
+`(2*mb_row + top_bit, 2*mb_col + left_bit)`; Cb / Cr each at
+`(mb_row, mb_col)`).
+
+The MV-predictor candidate gathering of Figure 7-34 lands in later
+rounds, along with inter / B-VOP reconstruction (motion compensation),
+the §7.4.4 mismatch-control "feed F[v][u] back into the grid for the
+next MB" hook-up, and the `short_video_header == 1` / `data_partitioned`
 paths.
 
 ## What works today
@@ -299,7 +332,10 @@ paths.
 | §7.4.3.3 AC first-col `(QFA*QpA)/QpX` add        | `predict_intra_ac_column` (round 12) |
 | §7.4.3.3 missing-neighbour zero-coefficient rule | `qfa/qfc_col == None` → pass-through (round 12) |
 | §7.4.3.4 `QF[v][u]` saturation `[-2048, 2047]`   | `saturate_qf` / `saturate_block` (round 12) |
-| §7.4.3 predictor-neighbour gathering            | not yet (Figure 7-5 walk over a block grid) |
+| §7.4.3 predictor-neighbour gathering            | `IntraBlockGrid::predictors_for` (round 16) |
+| Figure 6-8 block-grid layout (4:2:0)            | `block_grid_position` (round 16) |
+| §7.4.3.1 non-intra-neighbour fallback           | `is_intra` gate in grid lookup (round 16) |
+| §7.4.3.3 out-of-VOP zero AC prediction          | `None` first row / column from grid (round 16) |
 | §7.4.4.1.1 intra DC `F''[0][0] = dc_scaler * QF[0][0]` | `inverse_quant_intra_dc` (round 13) |
 | §7.4.4.1.2 method 1 intra `(QF*W*qs*2)/16`        | `inverse_quant_method1_coef` (round 13) |
 | §7.4.4.1.2 method 1 non-intra `((2*QF+Sign)*W*qs)/16` | `inverse_quant_method1_coef` (round 13) |
@@ -323,7 +359,7 @@ paths.
 | `sadct_disable == 0` modified inverse scan    | not yet |
 | Encoder                                       | not yet |
 
-306 round-1..15 unit tests pass.
+325 round-1..16 unit tests pass.
 
 ## Provenance
 
@@ -441,7 +477,21 @@ when a block carries one or more coded AC coefficients, mapped to the
 six blocks via `cbp = (cbpy << 2) | cbpc` per the §6.2.7
 `if (cbp & (1 << (5 - i)))` derivation; and the §6.3.3 default intra
 matrix `[[8,17,18,…],…]` and default non-intra matrix
-`[[16,17,18,…],…]` used when no quantiser matrix was loaded). The
+`[[16,17,18,…],…]` used when no quantiser matrix was loaded), and
+§7.4.3 / Figure 7-5 / §6.1.3 / Figure 6-8 (the predictor candidate
+gathering of round 16: the Figure 7-5 `A` (left) / `B` (above-left) /
+`C` (above) layout for the block-to-decode `X`; the Figure 6-8 4:2:0
+block ordering that determines, given a macroblock at `(mb_row, mb_col)`
+and block index `i ∈ 0..6`, the per-component sub-grid position
+(luma 0..=3 at the 2×2 cells `(2*mb_row + top_bit, 2*mb_col + left_bit)`,
+Cb 4 / Cr 5 each at `(mb_row, mb_col)`); and §7.4.3.1's two defaults
+applied when a candidate is unavailable — "If any of the blocks A, B or
+C are outside of the VOP boundary, or the video packet boundary, or
+they do not belong to an intra coded macroblock, their `F[0][0]`
+values are assumed to take a value of `2^(bits_per_pixel + 2)`" plus
+§7.4.3.3's "If the prediction block (block 'A' or block 'C') is
+outside of the boundary of the VOP or video packet, then all the
+prediction coefficients of that block are assumed to be zero"). The
 text was read from
 `docs/video/mpeg4-visual/ISO_IEC_14496-2-2004-3rd-edition.txt`. No
 third-party MPEG-4 source was consulted.

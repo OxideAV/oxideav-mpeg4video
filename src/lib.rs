@@ -147,6 +147,24 @@
 //!   modifications), cross-validates against the §7.4.4 intra-DC
 //!   inverse-quant path, and exercises both saturation polarities and
 //!   the high-frequency checkerboard case.
+//! * Round 16: §7.4.3 / Figure 7-5 predictor candidate gathering —
+//!   the cross-block neighbour walk that resolves each block's
+//!   `A` (left) / `B` (above-left) / `C` (above) predictor blocks
+//!   from a per-VOP grid of already-decoded blocks. `IntraBlockGrid`
+//!   stores the luma `2 * mb_rows × 2 * mb_cols` sub-grid plus the
+//!   Cb / Cr `mb_rows × mb_cols` sub-grids of `Option<BlockNeighbour>`
+//!   (each carrying the inverse-quantised DC, the quantiser scale, the
+//!   first row / first column of quantised AC coefficients, and an
+//!   `is_intra` flag). `IntraBlockGrid::predictors_for(mb_row, mb_col,
+//!   i, bpp, qs)` walks Figure 7-5 against this grid to produce the
+//!   `BlockPredictors` argument that `decode_intra_block` already
+//!   consumes; neighbours outside the sub-grid or recorded as
+//!   `None` / non-intra fall back to the §7.4.3.1 default
+//!   `F[0][0] = 2^(bpp + 2)` (with §7.4.3.3 AC prediction coefficients
+//!   zeroed via `None`). `block_grid_position(mb_row, mb_col, i)` is
+//!   the static Figure 6-8 → sub-grid coordinate mapping; the four
+//!   in-MB luma blocks land at the 2 × 2 cells `(2*mb_row + top_bit,
+//!   2*mb_col + left_bit)`, Cb and Cr each at `(mb_row, mb_col)`.
 //! * Strict failure on Studio Profiles, FGS layers, and non-rectangular
 //!   shapes — those branches are recognised and rejected with a typed
 //!   error, never silently mis-parsed. Sprite bodies, complexity-
@@ -179,6 +197,7 @@ pub mod idct;
 pub mod inverse_quant;
 pub mod macroblock;
 pub mod motion;
+pub mod neighbour;
 pub mod predictor;
 pub mod scan;
 pub mod texture;
@@ -207,6 +226,9 @@ pub use macroblock::{
 pub use motion::{
     decode_motion_vector_delta, predict_motion_vector, reconstruct_motion_vector, MotionParseError,
     MotionVector, MotionVectorDelta, MvMode,
+};
+pub use neighbour::{
+    block_grid_position, BlockGridPosition, BlockNeighbour, ChromaPlane, IntraBlockGrid,
 };
 pub use predictor::{
     dc_scaler, default_neighbour_dc, predict_intra_ac_column, predict_intra_ac_row,

@@ -8,6 +8,40 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 16 of the clean-room rebuild: §7.4.3 / Figure 7-5 predictor
+  candidate gathering. New `src/neighbour.rs` module owns the cross-block
+  walk that resolves, for each block-to-decode `X`, the three Figure 7-5
+  neighbours `A` (left), `B` (above-left), and `C` (above) from a per-VOP
+  grid of already-decoded blocks. `IntraBlockGrid::new(mb_rows, mb_cols)`
+  allocates one `(2*mb_rows) × (2*mb_cols)` luma sub-grid plus two
+  `mb_rows × mb_cols` Cb / Cr sub-grids of `Option<BlockNeighbour>`;
+  every cell starts `None` and is filled by `record(mb_row, mb_col, i,
+  Some(BlockNeighbour))` as blocks are decoded.
+  `predictors_for(mb_row, mb_col, i, bits_per_pixel, quantiser_scale)`
+  walks Figure 7-5 against the recorded grid and returns the
+  `BlockPredictors` argument `decode_intra_block` already consumes.
+  Neighbours outside the sub-grid, recorded `None`, or recorded with
+  `is_intra == false` fall back to the §7.4.3.1 default `F[0][0] =
+  2^(bits_per_pixel + 2)` (and the §7.4.3.3 AC prediction coefficients
+  are zeroed via `None` `first_row` / `first_column`). `BlockNeighbour`
+  carries the inverse-quantised DC, the quantiser scale `Qp`, the first
+  row (`QF[0][1..=7]`) and first column (`QF[1..=7][0]`) of quantised AC
+  coefficients, and an `is_intra` flag; `BlockNeighbour::from_qf(&qf,
+  dc, qp)` builds it from a reconstructed intra block.
+  `block_grid_position(mb_row, mb_col, i)` exposes the static Figure 6-8
+  mapping from `(mb_row, mb_col, i)` to component sub-grid coordinates
+  (luma at `(2*mb_row + top_bit, 2*mb_col + left_bit)`, Cb / Cr each at
+  `(mb_row, mb_col)`). 19 tests cover the in-MB neighbour cases (block 1
+  picks block 0 as `A`; block 2 picks block 0 as `C`; block 3 sees all
+  three of blocks 2 / 0 / 1 as `A` / `B` / `C`), the cross-MB cases
+  (block 0 of the next column / row / inner MB picks the appropriate
+  block of the left / above / diagonal MB), the chroma sub-grid isolation
+  (Cb and Cr do not leak into each other or into the luma sub-grid), the
+  non-intra-neighbour fallback (`is_intra == false` triggers the
+  §7.4.3.1 default), the explicit `None` record (e.g. across a
+  video-packet boundary), and a deterministic 2×2 MB raster-walk
+  round-trip. The §7.4.3 spatial DC/AC predictor math (rounds 12 / 15)
+  consumes the resulting `BlockPredictors` unchanged.
 - Round 15 of the clean-room rebuild: §6.2.7 `block(i)` macroblock-level
   texture assembly for intra I-VOP macroblocks. New `src/block.rs`
   module drives the §7.4.x pipeline built in rounds 9..14 end-to-end on
