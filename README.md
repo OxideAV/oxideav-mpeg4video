@@ -5,7 +5,7 @@ A pure-Rust MPEG-4 Part 2 Video codec (ISO/IEC 14496-2) for the
 
 ## Status
 
-**Round 14 of the clean-room rebuild (2026-05-25).** The prior
+**Round 15 of the clean-room rebuild (2026-05-25).** The prior
 implementation was retired on 2026-05-18 under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md);
 the VLC tables admitted to sourcing their numeric entries from an
@@ -185,10 +185,37 @@ Annex A.1's normative modifications) and chains correctly off the
 `idct_saturation_bounds(bpp)` / `saturate_idct_sample(value, bpp)`
 expose the §7.4.5 clamp.
 
+Round 15 covers §6.2.7 `block(i)` macroblock-level texture assembly
+for intra I-VOP macroblocks — the per-macroblock driver that wires
+rounds 9..14 together. New `src/block.rs`. `decode_intra_block(br, i,
+coded, ctx, predictors, quant_matrix)` runs one block's §6.2.7
+`block(i)` syntax (always-present differential intra-DC; the
+`if (pattern_code[i]) while (!last) DCT coefficient` AC loop) through
+the full §7.4.x chain — read coefficients (`decode_intra_dc` +
+`decode_ac_events`) → `events_to_qfs` → §7.4.2 `inverse_scan` →
+§7.4.3 spatial DC/AC predictor (gated by `ac_pred_flag`) →
+§7.4.3.4 `saturate_block` → §7.4.4 inverse quant (method 1 with the
+`W[0]` matrix when `quant_type == 1`, else method 2) → §7.4.5 +
+Annex A `idct_8x8` → §6.3.2 final clip to `[0, 2^bpp - 1]`.
+`decode_intra_macroblock(...)` walks the §6.1.3.9 / Figure 6-8 4:2:0
+block order (0,1 / 2,3 luma; 4 Cb; 5 Cr) and assembles the
+reconstructed 16×16 luma + 8×8 Cb / 8×8 Cr `IntraMacroblock`.
+`pattern_code(cbpy, cbpc)` derives the six per-block coded flags;
+`BlockPredictors::outside(bpp, qs)` supplies the §7.4.3 "neighbour
+outside the VOP" state; `DEFAULT_INTRA_QUANT_MATRIX` /
+`DEFAULT_NONINTRA_QUANT_MATRIX` (§6.3.3) and `de_zigzag` /
+`intra_quant_matrix` resolve the method-1 matrix. A synthetic intra MB
+with a known DC differential reconstructs to the expected flat spatial
+block (method 2 exact; method 1 within the ±1-LSB §7.4.4.5
+mismatch-control tolerance), and a coded AC EVENT breaks block
+flatness.
+
 The MV-predictor candidate gathering of Figure 7-34 and the
 Figure 7-5 / §7.4.3 neighbour walk that supplies the §7.4.3
 predictor with concrete `FA` / `FB` / `FC` from a block grid land
-in later rounds.
+in later rounds, along with inter / B-VOP reconstruction (motion
+compensation) and the `short_video_header == 1` / `data_partitioned`
+paths.
 
 ## What works today
 
@@ -283,12 +310,20 @@ in later rounds.
 | §7.4.4.6 method-1 summary pseudo-code             | `inverse_quant_method1` (round 13) |
 | §7.4.5 + Annex A.1 orthonormal 8×8 IDCT           | `idct_8x8` (round 14) |
 | §7.4.5 output saturation `[-2^bpp, 2^bpp - 1]`    | `idct_saturation_bounds` / `saturate_idct_sample` (round 14) |
+| §6.2.7 `block(i)` intra-DC + AC loop driver       | `decode_intra_block` (round 15) |
+| §6.2.7 `pattern_code[i]` from `cbpy` / `cbpc`     | `pattern_code` (round 15) |
+| §6.1.3.9 / Figure 6-8 4:2:0 block assembly        | `decode_intra_macroblock` (round 15) |
+| Intra MB reconstruct → 16×16 luma + 8×8 Cb/Cr     | `IntraMacroblock` (round 15) |
+| §6.3.3 default intra / non-intra quant matrices   | `DEFAULT_*_QUANT_MATRIX` (round 15) |
+| zigzag → raster quant-matrix de-scan              | `de_zigzag` / `intra_quant_matrix` (round 15) |
+| §6.3.2 intra final clip `[0, 2^bpp - 1]`          | fused into `decode_intra_block` (round 15) |
+| Inter / B-VOP reconstruction (motion comp)        | not yet |
 | RVLC Tcoef tables (B.23..B.25) + Type 5 escape | not yet |
 | Type 4 escape (`short_video_header == 1`)     | not yet |
 | `sadct_disable == 0` modified inverse scan    | not yet |
 | Encoder                                       | not yet |
 
-297 round-1..14 unit tests pass.
+306 round-1..15 unit tests pass.
 
 ## Provenance
 
@@ -395,7 +430,19 @@ cos((2y+1)vπ/(2N))` with `N = 8`, `C(0) = 1/√2`, `C(k) = 1` for
 with the two normative deviations on §3.2 (test set size +
 parameters) and §3.3 (peak per-pixel error ≤ 1 for any IDCT
 claiming compliance against the reference saturated mathematical
-integer-number IDCT)). The text was read from
+integer-number IDCT)), and §6.2.7 / §6.1.3.9 / §6.3.7 / §6.3.3
+(the `block(i)` macroblock-level assembly: the §6.2.7 `block(i)`
+intra-DC branch followed by the `if (pattern_code[i]) while (!last)
+DCT coefficient` AC loop; the Figure 6-8 4:2:0 block ordering — four
+luminance blocks (0,1 / 2,3) then Cb (4) and Cr (5); the §6.2.6
+`for (i = 0; i < block_count; i++) block(i)` loop with `block_count
+= 6`; the §6.3.7 `cbpy` / `cbpc` semantics that set `pattern_code[i]`
+when a block carries one or more coded AC coefficients, mapped to the
+six blocks via `cbp = (cbpy << 2) | cbpc` per the §6.2.7
+`if (cbp & (1 << (5 - i)))` derivation; and the §6.3.3 default intra
+matrix `[[8,17,18,…],…]` and default non-intra matrix
+`[[16,17,18,…],…]` used when no quantiser matrix was loaded). The
+text was read from
 `docs/video/mpeg4-visual/ISO_IEC_14496-2-2004-3rd-edition.txt`. No
 third-party MPEG-4 source was consulted.
 

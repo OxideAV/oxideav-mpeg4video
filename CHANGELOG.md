@@ -8,6 +8,39 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 15 of the clean-room rebuild: §6.2.7 `block(i)` macroblock-level
+  texture assembly for intra I-VOP macroblocks. New `src/block.rs`
+  module drives the §7.4.x pipeline built in rounds 9..14 end-to-end on
+  a per-macroblock basis. `decode_intra_block(br, i, coded, ctx,
+  predictors, quant_matrix)` runs one block's §6.2.7 `block(i)` syntax
+  (the always-present differential intra-DC, then the
+  `if (pattern_code[i]) while (!last) DCT coefficient` AC loop) through
+  the full chain: `decode_intra_dc` + `decode_ac_events` →
+  `events_to_qfs` → §7.4.2 `inverse_scan` (scan pattern from
+  `select_scan_type`) → §7.4.3 spatial DC/AC predictor (`predict_intra_dc`
+  / `predict_intra_ac_row` / `predict_intra_ac_column`, gated by
+  `ac_pred_flag`) → §7.4.3.4 `saturate_block` → §7.4.4 inverse
+  quantisation (method 1 with the `W[0]` intra matrix when
+  `quant_type == 1`, else method 2) → §7.4.5 + Annex A `idct_8x8` →
+  §6.3.2 final clip to the display range `[0, 2^bpp - 1]`.
+  `decode_intra_macroblock(br, header, ctx, predictors, quant_matrix)`
+  walks the §6.1.3.9 / Figure 6-8 4:2:0 block order (0,1 / 2,3
+  luminance; 4 Cb; 5 Cr) and assembles the reconstructed 16×16
+  luminance + 8×8 Cb / 8×8 Cr `IntraMacroblock`. `pattern_code(cbpy,
+  cbpc)` derives the six §6.2.7 per-block coded flags from the
+  macroblock header. `BlockPredictors::outside(bpp, qs)` supplies the
+  §7.4.3.1 / §7.4.3.3 "neighbour outside the VOP" predictor state
+  (default DC `2^(bpp+2)`, zero AC prediction). The §6.3.3 default
+  intra / non-intra quantisation matrices (`DEFAULT_INTRA_QUANT_MATRIX`
+  / `DEFAULT_NONINTRA_QUANT_MATRIX`) and `de_zigzag` / `intra_quant_matrix`
+  resolve the method-1 `W[0]` matrix. Tests cover the `pattern_code`
+  bit-to-block mapping, `de_zigzag` placement, a DC-only block
+  reconstructing flat (method 2 exact 128, method 1 within ±1 LSB of
+  the §7.4.4.5 mismatch-control perturbation), a known +1 DC
+  differential reconstructing to a flat 130, a coded Type-3-escape AC
+  EVENT breaking block flatness, full six-block macroblock assembly
+  (flat luma 128 + flat chroma 128), and `NotCoded` / `NotIntra`
+  rejections.
 - Round 14 of the clean-room rebuild: §7.4.5 + Annex A inverse
   discrete cosine transform. New `src/idct.rs` module evaluating
   Annex A.1's orthonormal 8×8 IDCT

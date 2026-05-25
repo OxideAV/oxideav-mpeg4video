@@ -173,6 +173,7 @@
 use oxideav_core::RuntimeContext;
 
 pub mod bitreader;
+pub mod block;
 pub mod bvop;
 pub mod idct;
 pub mod inverse_quant;
@@ -185,6 +186,11 @@ pub mod vol;
 pub mod vop;
 
 pub use bitreader::{BitReader, BitReaderError};
+pub use block::{
+    de_zigzag, decode_intra_block, decode_intra_macroblock, intra_quant_matrix, pattern_code,
+    BlockAssemblyError, BlockPredictors, IntraMacroblock, MacroblockTextureContext,
+    DEFAULT_INTRA_QUANT_MATRIX, DEFAULT_NONINTRA_QUANT_MATRIX,
+};
 pub use bvop::{
     default_b_mb_type, parse_b_vop_mb_header, parse_dbquant, BMbTypeTable, BVopMbHeader,
     BVopMbParseError, BVopMbType,
@@ -258,6 +264,9 @@ pub enum Error {
     /// walked past coefficient 63). See [`InverseScanError`] for the
     /// discrimination.
     InverseScan(InverseScanError),
+    /// A §6.2.7 `block(i)` / macroblock texture assembly failed. See
+    /// [`BlockAssemblyError`] for the discrimination.
+    BlockAssembly(BlockAssemblyError),
 }
 
 impl core::fmt::Display for Error {
@@ -283,6 +292,9 @@ impl core::fmt::Display for Error {
             }
             Error::InverseScan(err) => {
                 write!(f, "oxideav-mpeg4video: inverse-scan error: {err}")
+            }
+            Error::BlockAssembly(err) => {
+                write!(f, "oxideav-mpeg4video: block assembly error: {err}")
             }
         }
     }
@@ -329,6 +341,12 @@ impl From<TextureParseError> for Error {
 impl From<InverseScanError> for Error {
     fn from(err: InverseScanError) -> Self {
         Error::InverseScan(err)
+    }
+}
+
+impl From<BlockAssemblyError> for Error {
+    fn from(err: BlockAssemblyError) -> Self {
+        Error::BlockAssembly(err)
     }
 }
 
