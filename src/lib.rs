@@ -147,6 +147,17 @@
 //!   modifications), cross-validates against the §7.4.4 intra-DC
 //!   inverse-quant path, and exercises both saturation polarities and
 //!   the high-frequency checkerboard case.
+//! * Round 17: §7.4.1.3 Type 4 escape — the `short_video_header == 1`
+//!   AC-EVENT escape coding. `decode_ac_event_short_video_header(br,
+//!   table_kind)` decodes one EVENT under the short-video-header
+//!   discipline: the common Tcoef VLC + sign bit (Tables B.16 / B.17) is
+//!   unchanged from `decode_ac_event`, but a Type 4 escape — ESC + 1-bit
+//!   LAST + 6-bit RUN + 8-bit signed-two's-complement LEVEL, with no
+//!   marker bits, per Table B.18 a / c — replaces the §7.4.1.3 Type
+//!   1..=3 escapes. The reserved LEVEL values `0` and `-128` are
+//!   rejected as [`TextureParseError::ReservedEscapeLevel`].
+//!   `decode_ac_events_short_video_header` runs the §6.2.7 `while
+//!   (!last) DCT coefficient` loop under the Type 4 path.
 //! * Round 16: §7.4.3 / Figure 7-5 predictor candidate gathering —
 //!   the cross-block neighbour walk that resolves each block's
 //!   `A` (left) / `B` (above-left) / `C` (above) predictor blocks
@@ -240,8 +251,9 @@ pub use scan::{
     InverseScanError, ScanType,
 };
 pub use texture::{
-    decode_ac_event, decode_ac_events, decode_intra_dc, AcEvent, DcComponent, IntraDcDifferential,
-    TcoefTable, TextureParseError,
+    decode_ac_event, decode_ac_event_short_video_header, decode_ac_events,
+    decode_ac_events_short_video_header, decode_intra_dc, AcEvent, DcComponent,
+    IntraDcDifferential, TcoefTable, TextureParseError,
 };
 pub use vol::{
     parse_video_object_layer, parse_visual_object_header, parse_visual_object_sequence_header,

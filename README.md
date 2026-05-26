@@ -5,13 +5,24 @@ A pure-Rust MPEG-4 Part 2 Video codec (ISO/IEC 14496-2) for the
 
 ## Status
 
-**Round 16 of the clean-room rebuild (2026-05-26).** The prior
+**Round 17 of the clean-room rebuild (2026-05-26).** The prior
 implementation was retired on 2026-05-18 under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md);
 the VLC tables admitted to sourcing their numeric entries from an
 external library. Master history was fully erased per the Hat-3 cold-
 enforcement procedure.
 
+* Round 17 — §7.4.1.3 Type 4 escape (`short_video_header == 1`).
+  `decode_ac_event_short_video_header(br, table_kind)` decodes one
+  §7.4.1.2 AC EVENT under the short-video-header path: the common
+  Table B.16 / B.17 Tcoef VLC + sign bit is unchanged from
+  `decode_ac_event`, but the §7.4.1.3 Type 1..=3 escapes are replaced
+  by Type 4 — `ESC` (`0000 011`) + 1-bit LAST + 6-bit RUN + 8-bit
+  signed two's-complement LEVEL (Table B.18 a / c), no marker bits.
+  The reserved LEVEL values `0000 0000` (0) and `1000 0000` (-128)
+  are rejected as `TextureParseError::ReservedEscapeLevel`.
+  `decode_ac_events_short_video_header(br, table_kind)` runs the
+  §6.2.7 `while (!last) DCT coefficient` loop against the Type-4 path.
 * Round 16 — §7.4.3 / Figure 7-5 predictor candidate gathering. New
   `src/neighbour.rs`. `IntraBlockGrid::new(mb_rows, mb_cols)` allocates
   the Figure 6-8 block sub-grids (luma `2*mb_rows × 2*mb_cols` +
@@ -317,7 +328,9 @@ paths.
 | §7.4.1.3 escape Type 1 (`ESC 0`, LMAX)        | `decode_ac_event` (round 10) |
 | §7.4.1.3 escape Type 2 (`ESC 10`, RMAX)       | `decode_ac_event` (round 10) |
 | §7.4.1.3 escape Type 3 (`ESC 11`, FLC + markers) | `decode_ac_event` (round 10) |
+| §7.4.1.3 escape Type 4 (`short_video_header == 1`, ESC + LAST + RUN + 8-bit LEVEL) | `decode_ac_event_short_video_header` (round 17) |
 | §6.2.7 `while (!last)` EVENT loop             | `decode_ac_events` (round 10) |
+| §6.2.7 `while (!last)` EVENT loop (SVH=1)     | `decode_ac_events_short_video_header` (round 17) |
 | Figure 7-4 (a) Alternate-Horizontal scan table | transcribed (round 11) |
 | Figure 7-4 (b) Alternate-Vertical scan table   | transcribed (round 11) |
 | Figure 7-4 (c) Zigzag scan table               | transcribed (round 11) |
@@ -355,11 +368,10 @@ paths.
 | §6.3.2 intra final clip `[0, 2^bpp - 1]`          | fused into `decode_intra_block` (round 15) |
 | Inter / B-VOP reconstruction (motion comp)        | not yet |
 | RVLC Tcoef tables (B.23..B.25) + Type 5 escape | not yet |
-| Type 4 escape (`short_video_header == 1`)     | not yet |
 | `sadct_disable == 0` modified inverse scan    | not yet |
 | Encoder                                       | not yet |
 
-325 round-1..16 unit tests pass.
+339 round-1..17 unit tests pass.
 
 ## Provenance
 
@@ -375,7 +387,9 @@ enhancement layer), B.6 (mcbpc I-VOP), B.7 (mcbpc P-VOP), B.8
 B.14 (dct_dc_size_chrominance), B.15 (dct_dc_differential additional
 codes), B.16 (intra Tcoef EVENT VLC, 102 codes), B.17 (inter Tcoef
 EVENT VLC, 102 codes), B.18 (FLC for Type-3 escape RUN/LEVEL),
-B.19/B.20 (LMAX, intra/inter), B.21/B.22 (RMAX, intra/inter) — and
+B.19/B.20 (LMAX, intra/inter), B.21/B.22 (RMAX, intra/inter), B.18 c
+(FLC for Type-4 escape LEVEL in the short-video-header path: 8-bit
+signed two's-complement with `0000 0000` and `1000 0000` reserved) — and
 Table 6-33 (dbquant),
 Table 7-9 (motion-vector range per vop_fcode), and the syntax tables of
 §6.2.2 / §6.2.3 / §6.2.4 / §6.2.5 / §6.2.6 plus the semantics in

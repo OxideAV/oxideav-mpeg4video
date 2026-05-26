@@ -71,11 +71,26 @@
 //! loop, returning every EVENT up to and including the one with
 //! `LAST == 1`.
 //!
+//! ## §7.4.1.3 Type 4 escape (short-video-header path)
+//!
+//! [`decode_ac_event_short_video_header`] decodes one §7.4.1.2 `DCT
+//! coefficient` EVENT for the `short_video_header == 1` path. The common
+//! Tcoef VLC + sign bit (Tables B.16 / B.17) is unchanged, but a Type 4
+//! escape replaces Types 1..=3:
+//!
+//! * **Type 4** — `ESC` (`0000 011`) + 1-bit LAST + 6-bit RUN + 8-bit
+//!   LEVEL, no marker bits. LEVEL is a signed two's-complement value
+//!   per Table B.18 a / c; the codes `0000 0000` (= 0) and
+//!   `1000 0000` (= -128) are reserved and rejected as
+//!   [`TextureParseError::ReservedEscapeLevel`].
+//!
+//! [`decode_ac_events_short_video_header`] runs the §6.2.7 `while
+//! (!last) DCT coefficient` loop against the Type-4 escape mode.
+//!
 //! ## Out of scope (this round)
 //!
 //! * The reversible-VLC EVENT tables (Tables B.23..B.25) and the Type 5
 //!   escape used when `reversible_vlc == 1`.
-//! * The Type 4 escape (`short_video_header == 1`, Table B.18 a / c).
 //! * The §7.4.2 inverse scan that places `(RUN, LEVEL)` into the
 //!   zigzag-ordered 64-coefficient array.
 //! * The §7.4.3.1 / §7.4.3.2 spatial DC/AC prediction (gradient
@@ -585,6 +600,86 @@ pub fn decode_ac_events(
     let mut events = Vec::new();
     loop {
         let ev = decode_ac_event(br, table_kind)?;
+        let last = ev.last;
+        events.push(ev);
+        if last {
+            return Ok(events);
+        }
+    }
+}
+
+/// Decode one §7.4.1.2 `DCT coefficient` EVENT for the
+/// `short_video_header == 1` path.
+///
+/// The common Tcoef VLC + sign bit (Table B.16 for intra, Table B.17 for
+/// inter) is unchanged from the long-header path. Only the §7.4.1.3 escape
+/// changes — Types 1..=3 are not used here; instead Type 4 is the only
+/// permitted escape mode. Per §7.4.1.3 paragraph 4:
+///
+/// > Type 4: The fourth type of escape code is used if and only if
+/// > short_video_header is 1. In this case, the 15 bits following ESC
+/// > are decoded as fixed length codes represented by 1-bit LAST, 6-bit
+/// > RUN and 8-bit LEVEL.
+///
+/// LEVEL is a signed two's-complement value drawn from Table B.18 c;
+/// `0000 0000` (= 0) and `1000 0000` (= -128) are reserved and rejected
+/// with [`TextureParseError::ReservedEscapeLevel`].
+///
+/// Unlike Type 3, there are no marker bits inside the Type 4 escape
+/// payload — the short-video-header bitstream uses a different
+/// resynchronisation discipline (Annex K) that does not require
+/// per-coefficient marker bits.
+pub fn decode_ac_event_short_video_header(
+    br: &mut BitReader<'_>,
+    table_kind: TcoefTable,
+) -> Result<AcEvent, TextureParseError> {
+    let table = match table_kind {
+        TcoefTable::Intra => TCOEF_INTRA,
+        TcoefTable::Inter => TCOEF_INTER,
+    };
+
+    // Peek the 7-bit escape prefix without consuming; a real code that
+    // shares no prefix with ESC falls through to the table decode.
+    let avail = br.remaining_bits().min(TCOEF_ESCAPE_LEN as usize) as u8;
+    if avail == 0 {
+        return Err(TextureParseError::Truncated);
+    }
+    let is_escape =
+        avail == TCOEF_ESCAPE_LEN && br.next_bits(TCOEF_ESCAPE_LEN as usize)? == TCOEF_ESCAPE_CODE;
+
+    if !is_escape {
+        let (last, run, level) = decode_tcoef_vlc(br, table)?;
+        return Ok(AcEvent { last, run, level });
+    }
+
+    // Type 4: ESC + LAST(1) + RUN(6) + LEVEL(8); no marker bits.
+    br.skip_bits(TCOEF_ESCAPE_LEN as usize)?;
+    let last = br.read_bool()?;
+    let run = br.read_bits(6)?;
+    let raw_level = br.read_bits(8)?;
+    // 8-bit two's-complement; 0 and -128 (0b1000_0000) reserved per
+    // §7.4.1.3 paragraph 4 + Table B.18 c.
+    let level = if raw_level >= 0x80 {
+        raw_level as i32 - 0x100
+    } else {
+        raw_level as i32
+    };
+    if level == 0 || level == -128 {
+        return Err(TextureParseError::ReservedEscapeLevel);
+    }
+    Ok(AcEvent { last, run, level })
+}
+
+/// Run the §6.2.7 `while (!last) DCT coefficient` loop for the
+/// `short_video_header == 1` path. See
+/// [`decode_ac_event_short_video_header`] for the per-EVENT semantics.
+pub fn decode_ac_events_short_video_header(
+    br: &mut BitReader<'_>,
+    table_kind: TcoefTable,
+) -> Result<Vec<AcEvent>, TextureParseError> {
+    let mut events = Vec::new();
+    loop {
+        let ev = decode_ac_event_short_video_header(br, table_kind)?;
         let last = ev.last;
         events.push(ev);
         if last {
@@ -1207,5 +1302,193 @@ mod tests {
         assert_eq!(rmax_intra(true, 1), Some(20));
         assert_eq!(rmax_inter(false, 1), Some(26));
         assert_eq!(rmax_inter(true, 2), Some(1));
+    }
+
+    // -----------------------------------------------------------------
+    // §7.4.1.3 Type 4 escape (short_video_header == 1) tests
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn svh_common_event_passes_through_unchanged() {
+        // Table B.16: "10s" = (LAST 0, RUN 0, LEVEL 1) — the common Tcoef
+        // VLC + sign bit path is identical between SVH=0 and SVH=1.
+        let data = bits("10 0");
+        let mut br = BitReader::new(&data);
+        let ev = decode_ac_event_short_video_header(&mut br, TcoefTable::Intra).unwrap();
+        assert_eq!(
+            ev,
+            AcEvent {
+                last: false,
+                run: 0,
+                level: 1
+            }
+        );
+        assert_eq!(br.bit_position(), 3);
+    }
+
+    #[test]
+    fn svh_inter_common_event_negative_sign() {
+        // Table B.17: "110s/1" = (LAST 0, RUN 1, LEVEL -1).
+        let data = bits("110 1");
+        let mut br = BitReader::new(&data);
+        let ev = decode_ac_event_short_video_header(&mut br, TcoefTable::Inter).unwrap();
+        assert_eq!(ev.run, 1);
+        assert_eq!(ev.level, -1);
+    }
+
+    #[test]
+    fn svh_type4_escape_positive_level() {
+        // ESC(0000011) + LAST=0 + RUN(6)=000011(=3) + LEVEL(8)=00001010(=10).
+        // No marker bits per §7.4.1.3 Type 4.
+        let data = bits("0000011 0 000011 00001010");
+        let mut br = BitReader::new(&data);
+        let ev = decode_ac_event_short_video_header(&mut br, TcoefTable::Intra).unwrap();
+        assert_eq!(
+            ev,
+            AcEvent {
+                last: false,
+                run: 3,
+                level: 10
+            }
+        );
+        // 7 (ESC) + 1 (LAST) + 6 (RUN) + 8 (LEVEL) = 22 bits.
+        assert_eq!(br.bit_position(), 22);
+    }
+
+    #[test]
+    fn svh_type4_escape_negative_level_twos_complement() {
+        // LEVEL(8) = 1111 1111 = -1 (two's complement). LAST=1, RUN=0.
+        let data = bits("0000011 1 000000 11111111");
+        let mut br = BitReader::new(&data);
+        let ev = decode_ac_event_short_video_header(&mut br, TcoefTable::Inter).unwrap();
+        assert!(ev.last);
+        assert_eq!(ev.run, 0);
+        assert_eq!(ev.level, -1);
+    }
+
+    #[test]
+    fn svh_type4_escape_max_legal_positive_level() {
+        // LEVEL(8) = 0111 1111 = +127 (max legal positive per Table B.18 c).
+        let data = bits("0000011 0 000000 01111111");
+        let mut br = BitReader::new(&data);
+        let ev = decode_ac_event_short_video_header(&mut br, TcoefTable::Intra).unwrap();
+        assert_eq!(ev.level, 127);
+    }
+
+    #[test]
+    fn svh_type4_escape_min_legal_negative_level() {
+        // LEVEL(8) = 1000 0001 = -127 (min legal negative; -128 reserved).
+        let data = bits("0000011 0 000000 10000001");
+        let mut br = BitReader::new(&data);
+        let ev = decode_ac_event_short_video_header(&mut br, TcoefTable::Intra).unwrap();
+        assert_eq!(ev.level, -127);
+    }
+
+    #[test]
+    fn svh_type4_escape_run_full_range() {
+        // RUN(6) = 111111 = 63 (max for 6 bits).
+        let data = bits("0000011 0 111111 00000001");
+        let mut br = BitReader::new(&data);
+        let ev = decode_ac_event_short_video_header(&mut br, TcoefTable::Inter).unwrap();
+        assert_eq!(ev.run, 63);
+        assert_eq!(ev.level, 1);
+    }
+
+    #[test]
+    fn svh_type4_escape_reserved_level_zero_rejected() {
+        // LEVEL(8) = 0000 0000 = 0 → reserved per Table B.18 c.
+        let data = bits("0000011 0 000000 00000000");
+        let mut br = BitReader::new(&data);
+        let err = decode_ac_event_short_video_header(&mut br, TcoefTable::Intra).unwrap_err();
+        assert_eq!(err, TextureParseError::ReservedEscapeLevel);
+    }
+
+    #[test]
+    fn svh_type4_escape_reserved_level_min_rejected() {
+        // LEVEL(8) = 1000 0000 = -128 → reserved per Table B.18 c.
+        let data = bits("0000011 0 000000 10000000");
+        let mut br = BitReader::new(&data);
+        let err = decode_ac_event_short_video_header(&mut br, TcoefTable::Intra).unwrap_err();
+        assert_eq!(err, TextureParseError::ReservedEscapeLevel);
+    }
+
+    #[test]
+    fn svh_type4_escape_truncated_mid_level() {
+        // ESC + LAST + RUN = 14 bits, with the LEVEL byte missing entirely
+        // (slice cut off after the RUN). The padding-to-byte from the `bits`
+        // helper supplies 2 stray zero bits, so the reader has 16 bits;
+        // requesting 8 LEVEL bits fails because only 2 are available beyond
+        // the 14-bit prefix.
+        let data = bits("0000011 0 000011");
+        let mut br = BitReader::new(&data);
+        let err = decode_ac_event_short_video_header(&mut br, TcoefTable::Intra).unwrap_err();
+        assert_eq!(err, TextureParseError::Truncated);
+    }
+
+    #[test]
+    fn svh_type4_escape_last_flag_carried_through() {
+        // Confirm the 1-bit LAST is honoured (Type 4 carries LAST inline,
+        // unlike the common Tcoef VLC which encodes it as part of the
+        // codeword).
+        let data = bits("0000011 1 000000 00000001");
+        let mut br = BitReader::new(&data);
+        let ev = decode_ac_event_short_video_header(&mut br, TcoefTable::Inter).unwrap();
+        assert!(ev.last);
+        assert_eq!(ev.run, 0);
+        assert_eq!(ev.level, 1);
+    }
+
+    #[test]
+    fn svh_events_loop_terminates_on_last() {
+        // First a common-path "10s/0" = (0,0,+1), then a Type-4 escape
+        // with LAST=1, RUN=2, LEVEL=+5.
+        let data = bits("10 0  0000011 1 000010 00000101");
+        let mut br = BitReader::new(&data);
+        let events = decode_ac_events_short_video_header(&mut br, TcoefTable::Intra).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0],
+            AcEvent {
+                last: false,
+                run: 0,
+                level: 1
+            }
+        );
+        assert_eq!(
+            events[1],
+            AcEvent {
+                last: true,
+                run: 2,
+                level: 5
+            }
+        );
+    }
+
+    #[test]
+    fn svh_events_loop_truncated_without_last_returns_error() {
+        // An empty reader yields Truncated on the very first EVENT — the
+        // loop never sees LAST==1.
+        let data: [u8; 0] = [];
+        let mut br = BitReader::new(&data);
+        let err = decode_ac_events_short_video_header(&mut br, TcoefTable::Inter).unwrap_err();
+        assert_eq!(err, TextureParseError::Truncated);
+    }
+
+    #[test]
+    fn svh_does_not_attempt_type3_marker_bits() {
+        // Long-header Type 3 layout (ESC + "11" + LAST + RUN + marker +
+        // LEVEL(12) + marker) is *not* a valid SVH stream. If we hand
+        // such bits to the SVH path, it must decode as Type 4: ESC +
+        // LAST(1)=1 + RUN(6)=100000(=32) + LEVEL(8)=00000000_... but
+        // the 8 LEVEL bits would here be "00000011" (= +3) and the
+        // function must NOT look for marker bits.
+        // bit layout: ESC(7) + "1" + "100000" + "00000011" = 22 bits.
+        let data = bits("0000011 1 100000 00000011");
+        let mut br = BitReader::new(&data);
+        let ev = decode_ac_event_short_video_header(&mut br, TcoefTable::Intra).unwrap();
+        assert!(ev.last);
+        assert_eq!(ev.run, 32);
+        assert_eq!(ev.level, 3);
+        assert_eq!(br.bit_position(), 22);
     }
 }

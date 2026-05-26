@@ -8,6 +8,29 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 17 of the clean-room rebuild: §7.4.1.3 Type 4 escape — the
+  `short_video_header == 1` AC-EVENT escape coding.
+  `decode_ac_event_short_video_header(br, table_kind)` decodes one
+  §7.4.1.2 `DCT coefficient` EVENT under the short-video-header
+  discipline. The common Tcoef VLC + sign bit (Table B.16 for intra,
+  Table B.17 for inter) is unchanged from `decode_ac_event`, but the
+  §7.4.1.3 Type 1..=3 escapes are replaced by Type 4: `ESC`
+  (`0000 011`) + 1-bit LAST + 6-bit RUN + 8-bit signed
+  two's-complement LEVEL (Table B.18 a / c), no marker bits per
+  §7.4.1.3 paragraph 4. The reserved LEVEL values `0000 0000` (= 0)
+  and `1000 0000` (= -128) are rejected as
+  `TextureParseError::ReservedEscapeLevel`.
+  `decode_ac_events_short_video_header(br, table_kind)` runs the
+  §6.2.7 `while (!last) DCT coefficient` loop against the Type-4 path.
+  14 new tests cover the common-path passthrough (intra positive /
+  inter negative), the Type-4 escape positive / negative LEVELs, the
+  max-legal-positive (`+127`) and min-legal-negative (`-127`)
+  boundaries, the full RUN range (`63`), both reserved LEVEL
+  rejections (`0` and `-128`), the inline LAST flag, the loop
+  terminator behaviour (LAST=1), the loop's truncation handling
+  (empty reader → `Truncated`), the absence of marker bits (LEVEL
+  bits that would be a marker in Type 3 are now LEVEL bits), and
+  truncation mid-LEVEL byte.
 - Round 16 of the clean-room rebuild: §7.4.3 / Figure 7-5 predictor
   candidate gathering. New `src/neighbour.rs` module owns the cross-block
   walk that resolves, for each block-to-decode `X`, the three Figure 7-5
