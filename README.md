@@ -24,11 +24,12 @@ enforcement procedure.
   quarter-pel (when `quarter_sample == 1`) per the §7.8.7.3 bin table,
   and clips to the Table 7-9 `[low:high]` range for the supplied
   `vop_fcode`. `pel_denominator` is the caller's pel-wise fixed-point
-  grid (e.g. `16` for sixteenth-pel sprite warping) — it must be a
-  multiple of 2 / 4 respectively so the spec's `//` rounding to the
-  output grid lands on an exact integer. Surfaces as `AMV_PIXEL_COUNT`
-  + `averaged_motion_vector` alongside the existing §7.6.5
-  `predict_motion_vector`.
+  grid (`1` for integer-pel input, `2` for half-pel, `4` for
+  quarter-pel, `16` for the sixteenth-pel grid used by §7.8.5 sub-pel
+  warping, …); any positive value yields well-defined integer
+  arithmetic via the spec's `//` rounding. Surfaces as
+  `AMV_PIXEL_COUNT` + `averaged_motion_vector` alongside the existing
+  §7.6.5 `predict_motion_vector`.
 * Round 18 — §6.2.5 `video_packet_header` decode (rectangular shape).
   New `src/video_packet.rs`. `parse_video_packet_header(br, &ctx)`
   consumes the §5.2.5 `next_resync_marker()` stuffing run, reads the

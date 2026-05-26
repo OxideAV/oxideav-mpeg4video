@@ -502,24 +502,24 @@ fn rdiv_away(num: i64, denom: i64) -> i64 {
 /// `pel_mvs_x` / `pel_mvs_y` are the 16×16 = 256 luminance pel-wise motion
 /// vectors produced by sprite warping (§7.8.5), each measured in
 /// `1 / pel_denominator` of a pel. `pel_denominator` is the caller's
-/// fixed-point grid (e.g. `16` for sixteenth-pel sprite warping); it must
-/// be a multiple of `2` when `quarter_sample == 0` and a multiple of `4`
-/// when `quarter_sample == 1`, so the AMV expressed in the output unit is
-/// representable by the spec's `//` rounding rule.
+/// fixed-point grid (`1` for integer pel, `2` for half-pel input,
+/// `4` for quarter-pel input, `16` for the sixteenth-pel grid used by
+/// the §7.8.5 sub-pel warping pipeline, etc.) and must be non-zero;
+/// any positive value yields well-defined integer arithmetic via the
+/// spec's `//` rounding.
 ///
 /// The returned [`MotionVector`] is the candidate predictor in
 /// **half-pel units** when `quarter_sample == false` or **quarter-pel
 /// units** when `quarter_sample == true` — the same unit the rest of
 /// this module uses for `MotionVector` values, and the unit the
-/// [`fcode_bounds`] `[low:high]` range applies to. Out-of-range values
-/// are clipped per the §7.8.7.3 final sentence ("If the quantised AMV
-/// is outside the motion vector range specified by f_code, it is
-/// clipped in the range").
+/// Table 7-9 `[low:high]` range applies to. Out-of-range values are
+/// clipped per the §7.8.7.3 final sentence ("If the quantised AMV is
+/// outside the motion vector range specified by f_code, it is clipped
+/// in the range").
 ///
 /// Returns [`MotionParseError::InvalidFcode`] when `vop_fcode` is
 /// outside `1..=7` and [`MotionParseError::Truncated`] (re-used as a
-/// generic "bad-input" sentinel) when `pel_denominator` is zero or not
-/// a multiple of the required grid step.
+/// generic "bad-input" sentinel) when `pel_denominator` is zero.
 pub fn averaged_motion_vector(
     pel_mvs_x: &[i64; AMV_PIXEL_COUNT],
     pel_mvs_y: &[i64; AMV_PIXEL_COUNT],
@@ -531,22 +531,17 @@ pub fn averaged_motion_vector(
     if pel_denominator == 0 {
         return Err(MotionParseError::Truncated);
     }
-    // Output unit: half-pel (denom 2) or quarter-pel (denom 4). The caller
-    // must supply a `pel_denominator` whose product with `Nb = 256` and
-    // whose ratio with the output unit yield exact integer arithmetic; this
-    // is the §7.8.7.3 quantisation precondition.
-    let out_unit: u32 = if quarter_sample { 4 } else { 2 };
-    if pel_denominator % out_unit != 0 {
-        return Err(MotionParseError::Truncated);
-    }
     // Real AMV = sum / (Nb * pel_denominator) pels.
-    // Result in `1/out_unit`-pel units = (sum * out_unit) // (Nb * pel_denominator).
+    // Output integer in `1 / out_unit`-pel units is
+    //     (out_unit * sum) // (Nb * pel_denominator)
+    // with `//` the §3.4 round-half-away-from-zero division.
     let nb = AMV_PIXEL_COUNT as i64;
-    let denom_out: i64 = nb * i64::from(pel_denominator / out_unit);
+    let out_unit: i64 = if quarter_sample { 4 } else { 2 };
+    let denom_out: i64 = nb * i64::from(pel_denominator);
     let sum_x: i64 = pel_mvs_x.iter().copied().sum();
     let sum_y: i64 = pel_mvs_y.iter().copied().sum();
-    let mut amv_x = rdiv_away(sum_x, denom_out);
-    let mut amv_y = rdiv_away(sum_y, denom_out);
+    let mut amv_x = rdiv_away(out_unit * sum_x, denom_out);
+    let mut amv_y = rdiv_away(out_unit * sum_y, denom_out);
     let low = i64::from(low);
     let high = i64::from(high);
     amv_x = amv_x.clamp(low, high);
@@ -1053,18 +1048,30 @@ mod tests {
     }
 
     #[test]
-    fn amv_pel_denominator_must_match_output_grid() {
-        let (x, y) = flat_pel_grid(0, 0);
-        // half-pel output needs `pel_denominator` divisible by 2; 3 fails.
-        assert_eq!(
-            averaged_motion_vector(&x, &y, 3, false, 1),
-            Err(MotionParseError::Truncated)
-        );
-        // quarter-pel output needs `pel_denominator` divisible by 4; 2 fails.
-        assert_eq!(
-            averaged_motion_vector(&x, &y, 2, true, 1),
-            Err(MotionParseError::Truncated)
-        );
+    fn amv_integer_pel_input_accepted() {
+        // pel_denominator == 1 (integer-pel input). Real AMV = sum / 256
+        // pels. Output in half-pels = (2 * sum) // 256.
+        // sum = 256 * 3 (flat MV of 3 pels) → AMV_half_x = 768 // 256 = 6.
+        let (x, y) = flat_pel_grid(3, -2);
+        let amv = averaged_motion_vector(&x, &y, 1, false, 7).unwrap();
+        // 256*3=768; 2*768=1536; 1536/(256*1)=6.
+        // 256*-2=-512; 2*-512=-1024; -1024/(256)= -4.
+        assert_eq!(amv, MotionVector { x: 6, y: -4 });
+    }
+
+    #[test]
+    fn amv_mismatched_pel_denominator_still_rounds_correctly() {
+        // `pel_denominator == 3` is not a multiple of 2 — historically a
+        // precondition error, but the spec's `//` operator is defined for
+        // any positive denominator, so the function now accepts it and
+        // rounds to the half-pel grid via the spec's away-from-zero rule.
+        // Real value 1/3 pel (=0.333…) → half-sample bin [0.25, 0.75) → 0.5.
+        // sum = 256 (flat MV of 1 in third-pels = 0.333…).
+        // AMV_half = (2 * 256) // (256 * 3) = 512 // 768 → away-from-zero
+        // round of 512/768 = 0.667 → 1 half-pel.
+        let (x, y) = flat_pel_grid(1, 0);
+        let amv = averaged_motion_vector(&x, &y, 3, false, 7).unwrap();
+        assert_eq!(amv, MotionVector { x: 1, y: 0 });
     }
 
     #[test]
