@@ -212,6 +212,7 @@ pub mod neighbour;
 pub mod predictor;
 pub mod scan;
 pub mod texture;
+pub mod video_packet;
 pub mod vol;
 pub mod vop;
 
@@ -254,6 +255,11 @@ pub use texture::{
     decode_ac_event, decode_ac_event_short_video_header, decode_ac_events,
     decode_ac_events_short_video_header, decode_intra_dc, AcEvent, DcComponent,
     IntraDcDifferential, TcoefTable, TextureParseError,
+};
+pub use video_packet::{
+    consume_next_resync_marker, macroblock_number_bit_width, parse_video_packet_header,
+    probe_resync_marker, resync_marker_length, total_macroblocks, VideoPacketContext,
+    VideoPacketHeader, VideoPacketParseError,
 };
 pub use vol::{
     parse_video_object_layer, parse_visual_object_header, parse_visual_object_sequence_header,
@@ -301,6 +307,9 @@ pub enum Error {
     /// A §6.2.7 `block(i)` / macroblock texture assembly failed. See
     /// [`BlockAssemblyError`] for the discrimination.
     BlockAssembly(BlockAssemblyError),
+    /// A §6.2.5 `video_packet_header` parse failed. See
+    /// [`VideoPacketParseError`] for the discrimination.
+    VideoPacket(VideoPacketParseError),
 }
 
 impl core::fmt::Display for Error {
@@ -329,6 +338,9 @@ impl core::fmt::Display for Error {
             }
             Error::BlockAssembly(err) => {
                 write!(f, "oxideav-mpeg4video: block assembly error: {err}")
+            }
+            Error::VideoPacket(err) => {
+                write!(f, "oxideav-mpeg4video: video_packet_header error: {err}")
             }
         }
     }
@@ -381,6 +393,12 @@ impl From<InverseScanError> for Error {
 impl From<BlockAssemblyError> for Error {
     fn from(err: BlockAssemblyError) -> Self {
         Error::BlockAssembly(err)
+    }
+}
+
+impl From<VideoPacketParseError> for Error {
+    fn from(err: VideoPacketParseError) -> Self {
+        Error::VideoPacket(err)
     }
 }
 
@@ -456,5 +474,15 @@ mod tests {
             Error::InverseScan(InverseScanError::Overflow { position: 64 })
         ));
         assert!(format!("{e}").contains("inverse-scan error"));
+    }
+
+    #[test]
+    fn video_packet_error_round_trip() {
+        let e: Error = VideoPacketParseError::Truncated.into();
+        assert!(matches!(
+            e,
+            Error::VideoPacket(VideoPacketParseError::Truncated)
+        ));
+        assert!(format!("{e}").contains("video_packet_header error"));
     }
 }

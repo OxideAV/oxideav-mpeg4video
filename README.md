@@ -5,13 +5,34 @@ A pure-Rust MPEG-4 Part 2 Video codec (ISO/IEC 14496-2) for the
 
 ## Status
 
-**Round 17 of the clean-room rebuild (2026-05-26).** The prior
+**Round 18 of the clean-room rebuild (2026-05-26).** The prior
 implementation was retired on 2026-05-18 under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md);
 the VLC tables admitted to sourcing their numeric entries from an
 external library. Master history was fully erased per the Hat-3 cold-
 enforcement procedure.
 
+* Round 18 — §6.2.5 `video_packet_header` decode (rectangular shape).
+  New `src/video_packet.rs`. `parse_video_packet_header(br, &ctx)`
+  consumes the §5.2.5 `next_resync_marker()` stuffing run, reads the
+  17..=23-bit `resync_marker`, decodes the Table 6-27
+  `macroblock_number` (`ceil(log2(total_mbs))` bits, 1..=14),
+  the `quant_precision`-bit `quant_scale` (1..=2^precision - 1; 0
+  rejected), and the `header_extension_code`. When the extension bit
+  is set, the rectangular extension body — `modulo_time_base`,
+  `vop_time_increment`, `vop_coding_type`, `intra_dc_vlc_thr`, and
+  the per-coding-type `vop_fcode_forward` / `vop_fcode_backward` —
+  is decoded into the optional `VideoPacketHeader` fields.
+  `macroblock_number_bit_width(total_mbs)` evaluates Table 6-27.
+  `resync_marker_length(coding_type, fcode_fwd, fcode_bwd)` evaluates
+  the §6.3.3 length rule (17 for I, `16 + fcode` for P / S(GMC),
+  `max(16 + max(fcode_fwd, fcode_bwd), 17)` for B).
+  `consume_next_resync_marker(br)` runs the §5.2.5 stuffing loop;
+  `probe_resync_marker(br, …)` non-destructively peeks for the
+  marker at a byte-aligned position. Non-rectangular and binary-only
+  shapes, sprite-GMC trajectory, newpred, and reduced-resolution VOP
+  branches are typed-rejected via
+  `VideoPacketParseError::UnsupportedBranch`.
 * Round 17 — §7.4.1.3 Type 4 escape (`short_video_header == 1`).
   `decode_ac_event_short_video_header(br, table_kind)` decodes one
   §7.4.1.2 AC EVENT under the short-video-header path: the common
@@ -261,6 +282,29 @@ the §7.4.4 mismatch-control "feed F[v][u] back into the grid for the
 next MB" hook-up, and the `short_video_header == 1` / `data_partitioned`
 paths.
 
+Round 18 covers §6.2.5 `video_packet_header` for the rectangular shape
+— the resync-marker walk that lets the decoder recover from packet
+loss in error-prone transports. New `src/video_packet.rs`.
+`parse_video_packet_header(br, &VideoPacketContext)` consumes the
+§5.2.5 `next_resync_marker()` stuffing (`0 1*` to byte alignment),
+the 17..=23-bit `resync_marker` (`(15+fcode)` zeros + `1` per §6.3.3,
+17 for I-VOPs and binary-only, `max(15 + max(fcode_fwd, fcode_bwd),
+17)` for B), the Table 6-27 `macroblock_number` (`ceil(log2(total_mbs))`
+bits, 1..=14), the `quant_precision`-bit `quant_scale` (0 rejected),
+and the `header_extension_code`. When the extension bit is set the
+rectangular extension body — `modulo_time_base`, `vop_time_increment`,
+`vop_coding_type`, `intra_dc_vlc_thr`, plus `vop_fcode_forward` /
+`vop_fcode_backward` per coding type — is decoded into the optional
+fields of `VideoPacketHeader`. `macroblock_number_bit_width(total)` /
+`total_macroblocks(width, height)` expose the Table 6-27 inputs;
+`resync_marker_length(coding_type, fcode_fwd, fcode_bwd)` exposes the
+§6.3.3 length formula; `consume_next_resync_marker(br)` runs the
+§5.2.5 stuffing; `probe_resync_marker(br, …)` non-destructively asks
+"is the next byte-aligned position a marker of the expected length?".
+Non-rectangular and binary-only shape, sprite-GMC trajectory, newpred,
+and reduced-resolution VOP extension bodies are typed-rejected via
+`VideoPacketParseError::UnsupportedBranch`.
+
 ## What works today
 
 | Surface                                       | Status |
@@ -369,9 +413,14 @@ paths.
 | Inter / B-VOP reconstruction (motion comp)        | not yet |
 | RVLC Tcoef tables (B.23..B.25) + Type 5 escape | not yet |
 | `sadct_disable == 0` modified inverse scan    | not yet |
+| §5.2.5 `next_resync_marker()` stuffing        | `consume_next_resync_marker` (round 18) |
+| §6.3.3 `resync_marker` length (17..=23)        | `resync_marker_length` (round 18) |
+| Table 6-27 `macroblock_number` bit width       | `macroblock_number_bit_width` (round 18) |
+| §6.2.5 `video_packet_header` (rectangular)     | `parse_video_packet_header` (round 18) |
+| `header_extension_code == 1` rectangular body  | typed `VideoPacketHeader` (round 18) |
 | Encoder                                       | not yet |
 
-339 round-1..17 unit tests pass.
+372 round-1..18 unit tests pass.
 
 ## Provenance
 
@@ -505,8 +554,29 @@ they do not belong to an intra coded macroblock, their `F[0][0]`
 values are assumed to take a value of `2^(bits_per_pixel + 2)`" plus
 §7.4.3.3's "If the prediction block (block 'A' or block 'C') is
 outside of the boundary of the VOP or video packet, then all the
-prediction coefficients of that block are assumed to be zero"). The
-text was read from
+prediction coefficients of that block are assumed to be zero"), and
+§5.2.5 / §6.2.5 / §6.3.3 / Table 6-27 (the `video_packet_header` of
+round 18: §5.2.5's `next_resync_marker()` zero-bit-plus-`1`-stuffing
+to byte alignment; the §6.2.5 `video_packet_header()` syntax table
+read in the order — `next_resync_marker()` → `resync_marker` →
+`macroblock_number` → `quant_scale` (rectangular shape skips the
+shape-extension body since `video_object_layer_shape != "rectangular"`
+gates it out) → `header_extension_code` → (when set)
+`modulo_time_base` → `vop_time_increment` → `vop_coding_type` →
+`intra_dc_vlc_thr` → optional `vop_fcode_forward` (not I) → optional
+`vop_fcode_backward` (B only); the §6.3.3 `resync_marker` length
+formula — 17 bits for I-VOPs and binary-only shape (16 zeros + 1),
+`(15 + fcode)` zeros + 1 for P / S(GMC), `max(15 + max(fcode_fwd,
+fcode_bwd), 17)` zeros + 1 for B; §6.3.3's `macroblock_number`
+fixed-length code in 1..=14 bits whose width is selected from Table
+6-27 against `((video_object_layer_width + 15) / 16) *
+((video_object_layer_height + 15) / 16)`; §6.3.3's `quant_scale` "an
+unsigned integer which specifies the absolute value of quantiser
+scale", `quant_precision` bits wide (default 5); §6.3.3's
+`header_extension_code` semantics that enumerate exactly which
+optional fields land in the extension body and the rectangular shape
+case where the bit is read *after* `quant_scale`). The text was read
+from
 `docs/video/mpeg4-visual/ISO_IEC_14496-2-2004-3rd-edition.txt`. No
 third-party MPEG-4 source was consulted.
 

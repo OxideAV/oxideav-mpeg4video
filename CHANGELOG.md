@@ -8,6 +8,42 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 18 of the clean-room rebuild: §6.2.5 `video_packet_header`
+  decode (rectangular shape). New `src/video_packet.rs`.
+  `parse_video_packet_header(br, &VideoPacketContext)` consumes the
+  §5.2.5 `next_resync_marker()` stuffing run (`0 1*` to byte
+  alignment), the 17..=23-bit `resync_marker` per §6.3.3 length
+  formula (17 for I, `16 + fcode` for P / S(GMC),
+  `max(16 + max(fcode_fwd, fcode_bwd), 17)` for B), the Table 6-27
+  `macroblock_number` (`ceil(log2(total_mbs))` bits, 1..=14), the
+  `quant_precision`-bit `quant_scale` (1..=2^precision - 1; 0
+  rejected as `ForbiddenQuantScale`), and the `header_extension_code`.
+  When the extension bit is set the rectangular extension body —
+  `modulo_time_base`, `vop_time_increment`, `vop_coding_type`,
+  `intra_dc_vlc_thr`, plus optional `vop_fcode_forward` (not I) and
+  `vop_fcode_backward` (B only) — is decoded into the corresponding
+  optional fields of `VideoPacketHeader`.
+  `macroblock_number_bit_width(total)` evaluates Table 6-27.
+  `total_macroblocks(width, height)` exposes the input expression.
+  `resync_marker_length(coding_type, fcode_fwd, fcode_bwd)` evaluates
+  the §6.3.3 length formula. `consume_next_resync_marker(br)` runs the
+  §5.2.5 stuffing; `probe_resync_marker(br, …)` non-destructively
+  peeks for the marker at a byte-aligned position. Non-rectangular
+  and binary-only shape, sprite-GMC trajectory inside the extension,
+  newpred-enable `vop_id` extension, and reduced-resolution VOP
+  extension are typed-rejected via
+  `VideoPacketParseError::UnsupportedBranch`. 33 new tests cover
+  Table 6-27 boundaries (every row at lo + hi), the §6.3.3 length
+  formula across I / P / S / B with all relevant fcode ranges, the
+  §5.2.5 stuffing positive path + reader-aligned and partial-byte
+  cases + first-bit and tail-bit rejections, `probe_resync_marker`
+  positive / non-aligned-reader / P-vs-I disambiguation, and the
+  full parser path on I / P / B with and without the extension body
+  plus every rejection arm (resync-disabled, non-rectangular,
+  bad-quant-precision, missing-marker, mb-number out of range,
+  zero quant_scale, zero fcode in extension, sprite-GMC + newpred +
+  reduced-resolution extension rejections).
+
 - Round 17 of the clean-room rebuild: §7.4.1.3 Type 4 escape — the
   `short_video_header == 1` AC-EVENT escape coding.
   `decode_ac_event_short_video_header(br, table_kind)` decodes one
