@@ -147,6 +147,17 @@
 //!   modifications), cross-validates against the §7.4.4 intra-DC
 //!   inverse-quant path, and exercises both saturation polarities and
 //!   the high-frequency checkerboard case.
+//! * Round 19: §7.8.7.3 S(GMC)-VOP averaged-vector substitution —
+//!   `averaged_motion_vector(pel_mvs_x, pel_mvs_y, pel_denominator,
+//!   quarter_sample, vop_fcode)` returns the candidate motion-vector
+//!   predictor that downstream §7.6.5 median calls substitute for an
+//!   `mcsel == 1` GMC neighbour. The function sums the 256 luminance
+//!   pel-wise motion vectors (the §7.8.7.3 note fixes `Nb = 256`),
+//!   divides by 256 with the spec's `//` operator (§3.4 — round to
+//!   nearest, ties away from zero), quantises to half-pel (when
+//!   `quarter_sample == 0`) or quarter-pel (when `quarter_sample == 1`)
+//!   per the §7.8.7.3 bin table, and clips to the Table 7-9
+//!   `[low:high]` range for the supplied `vop_fcode`.
 //! * Round 17: §7.4.1.3 Type 4 escape — the `short_video_header == 1`
 //!   AC-EVENT escape coding. `decode_ac_event_short_video_header(br,
 //!   table_kind)` decodes one EVENT under the short-video-header
@@ -236,8 +247,9 @@ pub use macroblock::{
     dquant_value, parse_macroblock_header, DerivedMbType, MacroblockHeader, MacroblockParseError,
 };
 pub use motion::{
-    decode_motion_vector_delta, predict_motion_vector, reconstruct_motion_vector, MotionParseError,
-    MotionVector, MotionVectorDelta, MvMode,
+    averaged_motion_vector, decode_motion_vector_delta, predict_motion_vector,
+    reconstruct_motion_vector, MotionParseError, MotionVector, MotionVectorDelta, MvMode,
+    AMV_PIXEL_COUNT,
 };
 pub use neighbour::{
     block_grid_position, BlockGridPosition, BlockNeighbour, ChromaPlane, IntraBlockGrid,

@@ -457,6 +457,106 @@ pub fn predict_motion_vector(candidates: [Option<MotionVector>; 3]) -> MotionVec
     }
 }
 
+// ---------------------------------------------------------------------------
+// §7.8.7.3 — S(GMC)-VOP averaged-vector substitution.
+//
+// Macroblocks with `mcsel == 1` do not carry their own block motion vector;
+// pel-wise motion vectors are produced by sprite warping (§7.8.5). When such
+// a macroblock is referenced as a neighbour for the §7.6.5 median predictor
+// (or as the co-located reference for B-VOP direct mode, §7.6.6), the spec
+// substitutes the per-pixel-averaged motion vector
+//
+//     AMVx = (Σ MVx(x,y)) // Nb           AMVy = (Σ MVy(x,y)) // Nb
+//
+// with `Nb = 256` (all 16×16 luminance pixels). The averaged value is then
+// quantised to the target sub-pel grid (half-pel when `quarter_sample == 0`,
+// quarter-pel when `quarter_sample == 1`) and clipped to the Table 7-9
+// `[low:high]` range for the supplied `vop_fcode`.
+//
+// The spec's `//` operator (§3.4) is integer division with rounding to the
+// nearest integer; half-integer values are rounded **away from zero**. The
+// pel-wise input MVs arrive in a caller-defined fixed-point unit; the
+// `pel_denominator` parameter tells this function what fraction of a pel one
+// integer step represents.
+// ---------------------------------------------------------------------------
+
+/// The §7.8.7.3 luminance-block pixel count (`Nb = 256`, all 16×16 pixels
+/// of one macroblock).
+pub const AMV_PIXEL_COUNT: usize = 256;
+
+/// Integer division with rounding to the nearest integer, ties **away
+/// from zero** (the spec's `//` operator, §3.4). `denom` must be positive.
+fn rdiv_away(num: i64, denom: i64) -> i64 {
+    debug_assert!(denom > 0);
+    let half = denom / 2;
+    if num >= 0 {
+        (num + half) / denom
+    } else {
+        -((-num + half) / denom)
+    }
+}
+
+/// Compute the §7.8.7.3 averaged motion vector for one S(GMC)-VOP
+/// `mcsel == 1` macroblock and quantise it to the target sub-pel grid.
+///
+/// `pel_mvs_x` / `pel_mvs_y` are the 16×16 = 256 luminance pel-wise motion
+/// vectors produced by sprite warping (§7.8.5), each measured in
+/// `1 / pel_denominator` of a pel. `pel_denominator` is the caller's
+/// fixed-point grid (e.g. `16` for sixteenth-pel sprite warping); it must
+/// be a multiple of `2` when `quarter_sample == 0` and a multiple of `4`
+/// when `quarter_sample == 1`, so the AMV expressed in the output unit is
+/// representable by the spec's `//` rounding rule.
+///
+/// The returned [`MotionVector`] is the candidate predictor in
+/// **half-pel units** when `quarter_sample == false` or **quarter-pel
+/// units** when `quarter_sample == true` — the same unit the rest of
+/// this module uses for `MotionVector` values, and the unit the
+/// [`fcode_bounds`] `[low:high]` range applies to. Out-of-range values
+/// are clipped per the §7.8.7.3 final sentence ("If the quantised AMV
+/// is outside the motion vector range specified by f_code, it is
+/// clipped in the range").
+///
+/// Returns [`MotionParseError::InvalidFcode`] when `vop_fcode` is
+/// outside `1..=7` and [`MotionParseError::Truncated`] (re-used as a
+/// generic "bad-input" sentinel) when `pel_denominator` is zero or not
+/// a multiple of the required grid step.
+pub fn averaged_motion_vector(
+    pel_mvs_x: &[i64; AMV_PIXEL_COUNT],
+    pel_mvs_y: &[i64; AMV_PIXEL_COUNT],
+    pel_denominator: u32,
+    quarter_sample: bool,
+    vop_fcode: u8,
+) -> Result<MotionVector, MotionParseError> {
+    let (_f, low, high, _range) = fcode_bounds(vop_fcode)?;
+    if pel_denominator == 0 {
+        return Err(MotionParseError::Truncated);
+    }
+    // Output unit: half-pel (denom 2) or quarter-pel (denom 4). The caller
+    // must supply a `pel_denominator` whose product with `Nb = 256` and
+    // whose ratio with the output unit yield exact integer arithmetic; this
+    // is the §7.8.7.3 quantisation precondition.
+    let out_unit: u32 = if quarter_sample { 4 } else { 2 };
+    if pel_denominator % out_unit != 0 {
+        return Err(MotionParseError::Truncated);
+    }
+    // Real AMV = sum / (Nb * pel_denominator) pels.
+    // Result in `1/out_unit`-pel units = (sum * out_unit) // (Nb * pel_denominator).
+    let nb = AMV_PIXEL_COUNT as i64;
+    let denom_out: i64 = nb * i64::from(pel_denominator / out_unit);
+    let sum_x: i64 = pel_mvs_x.iter().copied().sum();
+    let sum_y: i64 = pel_mvs_y.iter().copied().sum();
+    let mut amv_x = rdiv_away(sum_x, denom_out);
+    let mut amv_y = rdiv_away(sum_y, denom_out);
+    let low = i64::from(low);
+    let high = i64::from(high);
+    amv_x = amv_x.clamp(low, high);
+    amv_y = amv_y.clamp(low, high);
+    Ok(MotionVector {
+        x: amv_x as i32,
+        y: amv_y as i32,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -910,5 +1010,186 @@ mod tests {
         let mv = reconstruct_motion_vector(delta, p.x, p.y, 2).unwrap();
         assert_eq!(mv.x, 3);
         assert_eq!(mv.y, 2);
+    }
+
+    // ----- §7.8.7.3 averaged-vector substitution -----------------------
+
+    /// Build a constant pel-wise grid of `(vx, vy)` repeated 256 times.
+    fn flat_pel_grid(vx: i64, vy: i64) -> ([i64; AMV_PIXEL_COUNT], [i64; AMV_PIXEL_COUNT]) {
+        ([vx; AMV_PIXEL_COUNT], [vy; AMV_PIXEL_COUNT])
+    }
+
+    #[test]
+    fn amv_rdiv_away_zero_and_positive_half() {
+        // Spec §3.4: `//` rounds half away from zero. 3//2 = 2, -3//2 = -2.
+        assert_eq!(rdiv_away(3, 2), 2);
+        assert_eq!(rdiv_away(-3, 2), -2);
+        assert_eq!(rdiv_away(0, 256), 0);
+        assert_eq!(rdiv_away(128, 256), 1); // exact half rounds up
+        assert_eq!(rdiv_away(-128, 256), -1); // exact half rounds down
+        assert_eq!(rdiv_away(127, 256), 0); // just below half
+    }
+
+    #[test]
+    fn amv_invalid_fcode_rejected() {
+        let (x, y) = flat_pel_grid(0, 0);
+        assert_eq!(
+            averaged_motion_vector(&x, &y, 16, false, 0),
+            Err(MotionParseError::InvalidFcode(0))
+        );
+        assert_eq!(
+            averaged_motion_vector(&x, &y, 16, false, 8),
+            Err(MotionParseError::InvalidFcode(8))
+        );
+    }
+
+    #[test]
+    fn amv_zero_pel_denominator_rejected() {
+        let (x, y) = flat_pel_grid(0, 0);
+        assert_eq!(
+            averaged_motion_vector(&x, &y, 0, false, 1),
+            Err(MotionParseError::Truncated)
+        );
+    }
+
+    #[test]
+    fn amv_pel_denominator_must_match_output_grid() {
+        let (x, y) = flat_pel_grid(0, 0);
+        // half-pel output needs `pel_denominator` divisible by 2; 3 fails.
+        assert_eq!(
+            averaged_motion_vector(&x, &y, 3, false, 1),
+            Err(MotionParseError::Truncated)
+        );
+        // quarter-pel output needs `pel_denominator` divisible by 4; 2 fails.
+        assert_eq!(
+            averaged_motion_vector(&x, &y, 2, true, 1),
+            Err(MotionParseError::Truncated)
+        );
+    }
+
+    #[test]
+    fn amv_flat_grid_round_trips_constant_vector() {
+        // 256 copies of (x=32 sixteenths, y=-48 sixteenths) = (2.0, -3.0) pels.
+        // Sum_x = 8192, Sum_y = -12288, denom_out (half-pel) = 256 * (16/2) = 2048.
+        // AMV_half_x = 8192 // 2048 = 4 (= 2.0 pels), AMV_half_y = -12288 // 2048 = -6 (= -3.0 pels).
+        let (x, y) = flat_pel_grid(32, -48);
+        let amv = averaged_motion_vector(&x, &y, 16, false, 7).unwrap();
+        assert_eq!(amv, MotionVector { x: 4, y: -6 });
+    }
+
+    #[test]
+    fn amv_flat_grid_quarter_sample_grid() {
+        // Same input but quarter-sample output. denom_out = 256 * (16/4) = 1024.
+        // AMV_q_x = 8192 // 1024 = 8 (= 2.0 pels), AMV_q_y = -12288 // 1024 = -12.
+        let (x, y) = flat_pel_grid(32, -48);
+        let amv = averaged_motion_vector(&x, &y, 16, true, 7).unwrap();
+        assert_eq!(amv, MotionVector { x: 8, y: -12 });
+    }
+
+    #[test]
+    fn amv_quantises_quarter_pel_bin_low_edge_to_zero() {
+        // Real value 0.24 pel → quarter-sample bin [0.125, 0.375) → 0.25.
+        // Wait: 0.24 is in [0.125, 0.375) so it rounds to 0.25 = 1 quarter-pel.
+        // Encode 0.24 pel as 256 copies of value 4 in 16ths (= 0.25 pel exactly is 4).
+        // Use value 1 in 16ths (= 0.0625 pel), in [0, 0.125) → 0.
+        // sum = 256, denom_out_q = 1024 → 256 // 1024 = 0.
+        let (x, y) = flat_pel_grid(1, 0);
+        let amv = averaged_motion_vector(&x, &y, 16, true, 7).unwrap();
+        assert_eq!(amv, MotionVector { x: 0, y: 0 });
+    }
+
+    #[test]
+    fn amv_quantises_quarter_pel_bin_inside_to_quarter() {
+        // value 3 in 16ths = 0.1875 pel, in [0.125, 0.375) → 0.25 = 1 quarter-pel.
+        // sum = 256 * 3 = 768. denom_out_q = 1024. 768 // 1024 = 1 (= 0.25 pel).
+        let (x, y) = flat_pel_grid(3, 0);
+        let amv = averaged_motion_vector(&x, &y, 16, true, 7).unwrap();
+        assert_eq!(amv, MotionVector { x: 1, y: 0 });
+    }
+
+    #[test]
+    fn amv_quantises_half_pel_bin_low_edge() {
+        // Real value 0.24 pel → half-sample bin [0, 0.25) → 0.
+        // value 3 in 16ths = 0.1875 pel, in [0, 0.25) → 0 half-pels.
+        // sum = 768. denom_out_h = 256 * 8 = 2048. 768 // 2048 = 0.
+        let (x, y) = flat_pel_grid(3, 0);
+        let amv = averaged_motion_vector(&x, &y, 16, false, 7).unwrap();
+        assert_eq!(amv, MotionVector { x: 0, y: 0 });
+    }
+
+    #[test]
+    fn amv_quantises_half_pel_bin_boundary_inclusive() {
+        // Real value exactly 0.25 pel → half-sample bin [0.25, 0.75) → 0.5.
+        // value 4 in 16ths = 0.25 pel. sum = 1024. 1024 // 2048 = 1 (half-pel = 0.5).
+        let (x, y) = flat_pel_grid(4, 0);
+        let amv = averaged_motion_vector(&x, &y, 16, false, 7).unwrap();
+        assert_eq!(amv, MotionVector { x: 1, y: 0 });
+    }
+
+    #[test]
+    fn amv_quantises_half_pel_unit_inclusive_endpoint() {
+        // Real value exactly 1.0 pel → half-sample bin [0.75, 1.0] → 1.0.
+        // value 16 in 16ths. sum = 4096. 4096 // 2048 = 2 (half-pel = 1.0).
+        let (x, y) = flat_pel_grid(16, 0);
+        let amv = averaged_motion_vector(&x, &y, 16, false, 7).unwrap();
+        assert_eq!(amv, MotionVector { x: 2, y: 0 });
+    }
+
+    #[test]
+    fn amv_negative_mirrors_positive_quantisation() {
+        // Negative version of the 0.5-pel boundary: value -4 in 16ths.
+        // sum = -1024 → -1024 // 2048 = -1 (since half rounds away from zero).
+        let (x, y) = flat_pel_grid(-4, -16);
+        let amv = averaged_motion_vector(&x, &y, 16, false, 7).unwrap();
+        assert_eq!(amv, MotionVector { x: -1, y: -2 });
+    }
+
+    #[test]
+    fn amv_clipped_to_fcode_range_high() {
+        // fcode 1 → [-32, 31] half-pels. Pel grid 16 in 16ths = 1.0 pel
+        // = 2 half-pels — well within range. Push beyond: 256 in 16ths
+        // = 16.0 pels = 32 half-pels — exceeds high (31), clip to 31.
+        let (x, y) = flat_pel_grid(256, 0);
+        let amv = averaged_motion_vector(&x, &y, 16, false, 1).unwrap();
+        assert_eq!(amv, MotionVector { x: 31, y: 0 });
+    }
+
+    #[test]
+    fn amv_clipped_to_fcode_range_low() {
+        // fcode 1 → [-32, 31]. Value -257 in 16ths = -16.0625 pel
+        // = -32.125 half-pels → rounds to -32 (no clip yet, exactly at low).
+        // Push further: -300 in 16ths → sum = -76800; /2048 = -37.5 → -38 → clip to -32.
+        let (x, y) = flat_pel_grid(-300, 0);
+        let amv = averaged_motion_vector(&x, &y, 16, false, 1).unwrap();
+        assert_eq!(amv, MotionVector { x: -32, y: 0 });
+    }
+
+    #[test]
+    fn amv_mixed_pixel_grid_sums_correctly() {
+        // Half the macroblock at vx=8 (16ths), half at vx=-8.
+        // sum_x = 128*8 + 128*(-8) = 0 → AMV_x = 0.
+        let mut x = [0i64; AMV_PIXEL_COUNT];
+        for (i, slot) in x.iter_mut().enumerate() {
+            *slot = if i < 128 { 8 } else { -8 };
+        }
+        let y = [0i64; AMV_PIXEL_COUNT];
+        let amv = averaged_motion_vector(&x, &y, 16, true, 5).unwrap();
+        assert_eq!(amv, MotionVector { x: 0, y: 0 });
+    }
+
+    #[test]
+    fn amv_eighth_pel_denominator_quarter_sample() {
+        // pel_denominator = 8 (eighth-pel input) with quarter-sample output.
+        // 8 % 4 == 0 → accepted. value 2 in eighths = 0.25 pel exactly.
+        // sum = 512. denom_out_q = 256 * (8/4) = 512. AMV = 1 quarter-pel.
+        let (x, y) = flat_pel_grid(2, 0);
+        let amv = averaged_motion_vector(&x, &y, 8, true, 7).unwrap();
+        assert_eq!(amv, MotionVector { x: 1, y: 0 });
+    }
+
+    #[test]
+    fn amv_pixel_count_constant_matches_spec() {
+        // §7.8.7.3 note: "Nb is always 256 into the following expression".
+        assert_eq!(AMV_PIXEL_COUNT, 256);
     }
 }

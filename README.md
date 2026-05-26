@@ -5,13 +5,30 @@ A pure-Rust MPEG-4 Part 2 Video codec (ISO/IEC 14496-2) for the
 
 ## Status
 
-**Round 18 of the clean-room rebuild (2026-05-26).** The prior
+**Round 19 of the clean-room rebuild (2026-05-26).** The prior
 implementation was retired on 2026-05-18 under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md);
 the VLC tables admitted to sourcing their numeric entries from an
 external library. Master history was fully erased per the Hat-3 cold-
 enforcement procedure.
 
+* Round 19 — §7.8.7.3 S(GMC)-VOP averaged-vector substitution.
+  `averaged_motion_vector(pel_mvs_x, pel_mvs_y, pel_denominator,
+  quarter_sample, vop_fcode)` computes the candidate motion-vector
+  predictor for `mcsel == 1` macroblocks (those that have no own block
+  motion vector — pel-wise motion vectors come from sprite warping per
+  §7.8.5). The function sums `Nb = 256` luminance pel-wise MVs (the
+  §7.8.7.3 note fixes `Nb` at 256), divides by 256 using the spec's
+  `//` operator (§3.4 — rounding to the nearest integer, half away
+  from zero), quantises to half-pel (when `quarter_sample == 0`) or
+  quarter-pel (when `quarter_sample == 1`) per the §7.8.7.3 bin table,
+  and clips to the Table 7-9 `[low:high]` range for the supplied
+  `vop_fcode`. `pel_denominator` is the caller's pel-wise fixed-point
+  grid (e.g. `16` for sixteenth-pel sprite warping) — it must be a
+  multiple of 2 / 4 respectively so the spec's `//` rounding to the
+  output grid lands on an exact integer. Surfaces as `AMV_PIXEL_COUNT`
+  + `averaged_motion_vector` alongside the existing §7.6.5
+  `predict_motion_vector`.
 * Round 18 — §6.2.5 `video_packet_header` decode (rectangular shape).
   New `src/video_packet.rs`. `parse_video_packet_header(br, &ctx)`
   consumes the §5.2.5 `next_resync_marker()` stuffing run, reads the
