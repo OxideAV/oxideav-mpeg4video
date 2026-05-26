@@ -275,7 +275,8 @@ pub use video_packet::{
 };
 pub use vol::{
     parse_video_object_layer, parse_visual_object_header, parse_visual_object_sequence_header,
-    AspectRatio, SpriteEnable, VbvParameters, VolControlParameters, VolHeader, VolParseError,
+    AspectRatio, ColourDescription, SpriteEnable, VbvParameters, VideoSignalType,
+    VisualObjectHeader, VolControlParameters, VolHeader, VolParseError,
     VIDEO_OBJECT_LAYER_START_CODE_MAX, VIDEO_OBJECT_LAYER_START_CODE_MIN,
     VIDEO_OBJECT_START_CODE_MAX, VIDEO_OBJECT_START_CODE_MIN, VISUAL_OBJECT_SEQUENCE_END_CODE,
     VISUAL_OBJECT_SEQUENCE_START_CODE, VISUAL_OBJECT_START_CODE,

@@ -8,6 +8,27 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 20 of the clean-room rebuild: §6.2.2 / §6.3.2.3 / §6.3.2.4
+  `VisualObject()` header tightening. `parse_visual_object_header`
+  now returns a typed `VisualObjectHeader { visual_object_verid,
+  visual_object_priority, is_visual_object_identifier,
+  visual_object_type, video_signal_type }` instead of the bare
+  `visual_object_type` byte. `visual_object_verid` defaults to `1`
+  (per §6.3.2.3 — "When this field does not exist, the value … is
+  `0001`") and `visual_object_priority` defaults to `1` (highest
+  legal value; `0` is reserved per §6.3.2.3) when
+  `is_visual_object_identifier == 0`. The §6.2.2 `video_signal_type()`
+  body now decodes when the leading flag bit is set: 3-bit
+  `video_format` (Table 6-7), 1-bit `video_range`, and the optional
+  8 + 8 + 8 `colour_primaries` / `transfer_characteristics` /
+  `matrix_coefficients` triple (Tables 6-8 / 6-9 / 6-10), surfaced via
+  `VideoSignalType` + `ColourDescription`.
+  `ColourDescription::default_when_absent()` returns the §6.3.2.4
+  BT.709 fallback (`1, 1, 1`) for callers that need the absent-block
+  default. The 1-bit `video_signal_type` flag is consumed
+  unconditionally so the bit reader stays aligned with downstream
+  start-code search.
+
 - Round 19 of the clean-room rebuild: §7.8.7.3 S(GMC)-VOP
   averaged-vector substitution. `averaged_motion_vector(pel_mvs_x,
   pel_mvs_y, pel_denominator, quarter_sample, vop_fcode)` returns the
@@ -628,6 +649,13 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   VBV decode, fixed-VOP rate, Studio Profile rejection, FGS branch
   awareness, non-rectangular shape rejection, and
   `vop_time_increment_bits` width formula.
+
+### Changed
+
+- Round 20: `parse_visual_object_header` return type changed from
+  `Result<u8, VolParseError>` to `Result<VisualObjectHeader,
+  VolParseError>`. Callers reading the old `visual_object_type` byte
+  should use the new struct's `.visual_object_type` field.
 
 ### Notes
 

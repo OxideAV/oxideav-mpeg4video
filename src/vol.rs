@@ -202,6 +202,94 @@ impl SpriteEnable {
     }
 }
 
+/// Decoded `colour_description` block of a §6.2.2 `video_signal_type()`.
+///
+/// All three fields are 8-bit `uimsbf` integers whose enumerations are
+/// defined in Tables 6-8 / 6-9 / 6-10. We surface the raw values; the
+/// caller decides how to map them onto its display-side colour model.
+///
+/// Per §6.3.2.4, when `video_signal_type()` is absent or
+/// `colour_description == 0`, the spec defaults all three to value `1`
+/// (ITU-R BT.709 primaries, BT.709 transfer, BT.709 matrix); we expose
+/// that default via [`ColourDescription::default_when_absent`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColourDescription {
+    /// `colour_primaries` (Table 6-8). Value `0` is forbidden.
+    pub colour_primaries: u8,
+    /// `transfer_characteristics` (Table 6-9). Value `0` is forbidden.
+    pub transfer_characteristics: u8,
+    /// `matrix_coefficients` (Table 6-10). Value `0` is forbidden.
+    pub matrix_coefficients: u8,
+}
+
+impl ColourDescription {
+    /// Spec default for the three colour fields when `video_signal_type()`
+    /// is absent or `colour_description == 0`: BT.709 across the board
+    /// (per the §6.3.2.4 "assumed to be ... having the value 1"
+    /// clauses).
+    pub const fn default_when_absent() -> Self {
+        Self {
+            colour_primaries: 1,
+            transfer_characteristics: 1,
+            matrix_coefficients: 1,
+        }
+    }
+}
+
+/// Decoded `video_signal_type()` block (§6.2.2 / §6.3.2.4).
+///
+/// `video_signal_type()` is itself optional inside `VisualObject()` —
+/// `video_signal_type` is a 1-bit flag, and when it is `0` none of the
+/// fields below appear in the bitstream. This struct represents only
+/// the case where the flag was `1`; surface the whole thing as
+/// `Option<VideoSignalType>` on the parent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VideoSignalType {
+    /// `video_format` (Table 6-7). 0..=7; the spec assigns enumerations
+    /// to 0..=5 and reserves 6 / 7.
+    pub video_format: u8,
+    /// `video_range`. `false` → studio swing (Y 16..=235, C 16..=240
+    /// for 8-bit), `true` → full swing (Y/C 0..=255 for 8-bit).
+    pub video_range: bool,
+    /// `colour_description` payload. `None` when the flag bit is `0`
+    /// (callers may consult [`ColourDescription::default_when_absent`]
+    /// for the §6.3.2.4 fallback).
+    pub colour: Option<ColourDescription>,
+}
+
+/// Decoded `VisualObject()` header (§6.2.2).
+///
+/// Surfaces the `is_visual_object_identifier` payload (defaulted per
+/// §6.3.2.3 when the bit is `0`), the `visual_object_type` selector
+/// (Table 6-6), and — when the selector is `video ID` — the optional
+/// `video_signal_type()` block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VisualObjectHeader {
+    /// `visual_object_verid` (Table 6-5). Defaults to `1` ("object
+    /// type listed in Table 9-1") when `is_visual_object_identifier ==
+    /// 0` per §6.3.2.3.
+    pub visual_object_verid: u8,
+    /// `visual_object_priority` (1..=7; `0` is reserved per §6.3.2.3).
+    /// Defaults to `1` ("highest priority") when
+    /// `is_visual_object_identifier == 0`. The spec doesn't define a
+    /// fallback explicitly, so we mirror the §6.3.2.3 wording that
+    /// "value of zero is reserved" by picking the highest legal
+    /// priority as the absent-field default.
+    pub visual_object_priority: u8,
+    /// `is_visual_object_identifier` flag. `true` when verid /
+    /// priority were transmitted in the bitstream.
+    pub is_visual_object_identifier: bool,
+    /// `visual_object_type` (Table 6-6). This parser only succeeds
+    /// when the value is `1` (`video ID`); other types return
+    /// [`VolParseError::UnsupportedVisualObjectType`].
+    pub visual_object_type: u8,
+    /// Optional `video_signal_type()`. `None` when the
+    /// `video_signal_type` flag bit was `0` in the bitstream
+    /// (semantically: §6.3.2.4 defaults apply across the board).
+    /// `Some(_)` when the flag was `1`.
+    pub video_signal_type: Option<VideoSignalType>,
+}
+
 /// Pixel aspect ratio, derived from `aspect_ratio_info` (Table 6-14).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AspectRatio {
@@ -739,12 +827,63 @@ pub fn parse_visual_object_sequence_header(data: &[u8]) -> Result<u8, VolParseEr
     Ok(profile_level)
 }
 
+/// Parse one §6.2.2 `video_signal_type()` body, given a bit reader
+/// positioned at the leading `video_signal_type` flag bit.
+///
+/// Returns `Ok(Some(_))` when the flag is set and the block follows;
+/// `Ok(None)` when the flag is `0` (callers should fall back to the
+/// §6.3.2.4 defaults).
+fn parse_video_signal_type(
+    br: &mut BitReader<'_>,
+) -> Result<Option<VideoSignalType>, VolParseError> {
+    let present = br.read_bool()?;
+    if !present {
+        return Ok(None);
+    }
+    let video_format = br.read_bits(3)? as u8;
+    let video_range = br.read_bool()?;
+    let has_colour = br.read_bool()?;
+    let colour = if has_colour {
+        let colour_primaries = br.read_bits(8)? as u8;
+        let transfer_characteristics = br.read_bits(8)? as u8;
+        let matrix_coefficients = br.read_bits(8)? as u8;
+        Some(ColourDescription {
+            colour_primaries,
+            transfer_characteristics,
+            matrix_coefficients,
+        })
+    } else {
+        None
+    };
+    Ok(Some(VideoSignalType {
+        video_format,
+        video_range,
+        colour,
+    }))
+}
+
 /// Parse a `VisualObject` header — the bits between `0x000001B5` and
-/// the next start code, returning `visual_object_type`. The structural
-/// parser supports only `visual_object_type == "video ID"` (numeric
-/// value `1` per §6.3.2 / Table 6-7); other types return
-/// [`VolParseError::UnsupportedVisualObjectType`].
-pub fn parse_visual_object_header(data: &[u8]) -> Result<u8, VolParseError> {
+/// the next start code, returning a typed [`VisualObjectHeader`].
+///
+/// The structural parser supports only `visual_object_type == "video
+/// ID"` (numeric value `1` per §6.3.2 / Table 6-6); other types
+/// return [`VolParseError::UnsupportedVisualObjectType`].
+///
+/// When `is_visual_object_identifier == 1`, the 4-bit
+/// `visual_object_verid` + 3-bit `visual_object_priority` are decoded
+/// into the corresponding fields. When the bit is `0`, the spec
+/// defaults from §6.3.2.3 apply (`verid = 1`, `priority = 1`).
+///
+/// When the selector is `video ID`, the §6.2.2 syntax follows up with
+/// `video_signal_type()`. Its 1-bit `video_signal_type` flag is
+/// consumed unconditionally; when the flag is set, the
+/// `video_format` (3 bits), `video_range` (1 bit),
+/// `colour_description` (1 bit), and — when `colour_description == 1`
+/// — `colour_primaries` / `transfer_characteristics` /
+/// `matrix_coefficients` (8 bits each) are all surfaced. When the
+/// flag is clear, [`VisualObjectHeader::video_signal_type`] is `None`
+/// and the §6.3.2.4 defaults (BT.709 colour, studio swing) apply.
+pub fn parse_visual_object_header(data: &[u8]) -> Result<VisualObjectHeader, VolParseError> {
     let mut br = BitReader::new(data);
     let sc = br.read_bits(32)?;
     if sc != VISUAL_OBJECT_START_CODE {
@@ -754,20 +893,33 @@ pub fn parse_visual_object_header(data: &[u8]) -> Result<u8, VolParseError> {
         });
     }
     let is_visual_object_identifier = br.read_bool()?;
-    if is_visual_object_identifier {
-        let _visual_object_verid = br.read_bits(4)?;
-        let _visual_object_priority = br.read_bits(3)?;
-    }
+    let (visual_object_verid, visual_object_priority) = if is_visual_object_identifier {
+        let verid = br.read_bits(4)? as u8;
+        let priority = br.read_bits(3)? as u8;
+        (verid, priority)
+    } else {
+        // §6.3.2.3: "When this field does not exist, the value of
+        // visual_object_verid is `0001`". Priority defaults to the
+        // highest legal value (1) since `0` is reserved.
+        (1, 1)
+    };
     let visual_object_type = br.read_bits(4)? as u8;
     // §6.2.2: when type is video or still-texture, video_signal_type()
-    // follows. We accept video (value 1 per Table 6-7) and reject the
+    // follows. We accept video (value 1 per Table 6-6) and reject the
     // rest, since this round is about rectangular video VOLs.
     if visual_object_type != 1 {
         return Err(VolParseError::UnsupportedVisualObjectType(
             visual_object_type,
         ));
     }
-    Ok(visual_object_type)
+    let video_signal_type = parse_video_signal_type(&mut br)?;
+    Ok(VisualObjectHeader {
+        visual_object_verid,
+        visual_object_priority,
+        is_visual_object_identifier,
+        visual_object_type,
+        video_signal_type,
+    })
 }
 
 #[cfg(test)]
@@ -1047,19 +1199,136 @@ mod tests {
     #[test]
     fn visual_object_header_accepts_video_id() {
         // 0x000001B5 + is_visual_object_identifier=0 (1 bit) +
-        // visual_object_type=0001 (4 bits) = 5 bits total in trailing
-        // byte. MSB-first: 0_0001___ = 0b00001000 = 0x08.
+        // visual_object_type=0001 (4 bits) + video_signal_type=0 (1
+        // bit) = 6 bits total in trailing byte. MSB-first:
+        // 0_0001_0__ = 0b00001000 = 0x08. (Pad bits are don't-care
+        // since no more reads happen.)
         let data = [0x00, 0x00, 0x01, 0xB5, 0x08];
-        let t = parse_visual_object_header(&data).unwrap();
-        assert_eq!(t, 1);
+        let h = parse_visual_object_header(&data).unwrap();
+        assert_eq!(h.visual_object_type, 1);
+        // §6.3.2.3 defaults: verid = 1, priority = 1 when the
+        // identifier bit was 0.
+        assert!(!h.is_visual_object_identifier);
+        assert_eq!(h.visual_object_verid, 1);
+        assert_eq!(h.visual_object_priority, 1);
+        // video_signal_type flag was 0 → no block decoded.
+        assert!(h.video_signal_type.is_none());
     }
 
     #[test]
     fn visual_object_header_rejects_non_video_type() {
         // type = 0010 (still-texture per Table 6-7 in this position).
+        // is_id=0 (1 bit) + type=0010 (4 bits) = 5 bits, MSB-first:
+        // 0_0010___ = 0b00010000.
         let data = [0x00, 0x00, 0x01, 0xB5, 0b0001_0000];
         let err = parse_visual_object_header(&data).unwrap_err();
         assert!(matches!(err, VolParseError::UnsupportedVisualObjectType(2)));
+    }
+
+    #[test]
+    fn visual_object_header_decodes_identifier_block() {
+        // Bits after start code: is_id=1, verid=0010, priority=011,
+        // type=0001, vst=0. = 1 + 4 + 3 + 4 + 1 = 13 bits.
+        // Byte 1: 1_0010_011 = 0b1001_0011 = 0x93.
+        // Byte 2: 0001_0___ trailing pad. = 0b0001_0000 = 0x10.
+        let data = [0x00, 0x00, 0x01, 0xB5, 0x93, 0x10];
+        let h = parse_visual_object_header(&data).unwrap();
+        assert!(h.is_visual_object_identifier);
+        assert_eq!(h.visual_object_verid, 0b0010);
+        assert_eq!(h.visual_object_priority, 0b011);
+        assert_eq!(h.visual_object_type, 1);
+        assert!(h.video_signal_type.is_none());
+    }
+
+    #[test]
+    fn visual_object_header_decodes_video_signal_type_no_colour() {
+        // Bits: is_id=0, type=0001, vst=1, video_format=010 (NTSC),
+        // video_range=0, colour_description=0. = 1 + 4 + 1 + 3 + 1 + 1
+        // = 11 bits.
+        // Byte 1: 0_0001_1_01 = 0b0000_1101 = 0x0D.
+        // Byte 2: 0_0_____ trailing pad. = 0b0000_0000 = 0x00.
+        let data = [0x00, 0x00, 0x01, 0xB5, 0x0D, 0x00];
+        let h = parse_visual_object_header(&data).unwrap();
+        let vst = h.video_signal_type.expect("video_signal_type flag set");
+        assert_eq!(vst.video_format, 0b010);
+        assert!(!vst.video_range);
+        assert!(vst.colour.is_none());
+    }
+
+    #[test]
+    fn visual_object_header_decodes_video_signal_type_with_colour() {
+        // Bits: is_id=0, type=0001, vst=1, video_format=000 (Component),
+        // video_range=1, colour_description=1, colour_primaries=1,
+        // transfer_characteristics=6 (SMPTE 170M-style), matrix=5
+        // (ITU-R BT.470-2 System B,G). = 1 + 4 + 1 + 3 + 1 + 1 + 8 + 8
+        // + 8 = 35 bits across 5 bytes (last 5 bits pad).
+        //
+        // Pack MSB-first:
+        //   bit 0:  0       (is_visual_object_identifier)
+        //   bit 1:  0001    (visual_object_type)
+        //   bit 5:  1       (video_signal_type)
+        //   bit 6:  000     (video_format)
+        //   bit 9:  1       (video_range)
+        //   bit 10: 1       (colour_description)
+        //   bit 11: 00000001 (colour_primaries = 1)
+        //   bit 19: 00000110 (transfer_characteristics = 6)
+        //   bit 27: 00000101 (matrix_coefficients = 5)
+        //   bit 35: 00000   pad
+        let mut bw = BitWriter::new();
+        bw.write_bits(VISUAL_OBJECT_START_CODE, 32);
+        bw.write_bits(0, 1); // is_visual_object_identifier = 0
+        bw.write_bits(0b0001, 4); // visual_object_type = video ID
+        bw.write_bits(1, 1); // video_signal_type
+        bw.write_bits(0b000, 3); // video_format = Component
+        bw.write_bits(1, 1); // video_range
+        bw.write_bits(1, 1); // colour_description
+        bw.write_bits(1, 8); // colour_primaries
+        bw.write_bits(6, 8); // transfer_characteristics
+        bw.write_bits(5, 8); // matrix_coefficients
+        bw.align();
+        let h = parse_visual_object_header(&bw.buf).unwrap();
+        let vst = h.video_signal_type.expect("video_signal_type flag set");
+        assert_eq!(vst.video_format, 0);
+        assert!(vst.video_range);
+        let cd = vst.colour.expect("colour_description flag set");
+        assert_eq!(cd.colour_primaries, 1);
+        assert_eq!(cd.transfer_characteristics, 6);
+        assert_eq!(cd.matrix_coefficients, 5);
+    }
+
+    #[test]
+    fn visual_object_header_truncated_mid_vst() {
+        // is_id=0, type=0001, vst=1 → the §6.2.2 video_signal_type()
+        // body must follow. After only one trailing byte, the reader
+        // runs out part-way through `video_format` (needs 3 bits
+        // beyond the first 6) and we must surface Truncated rather
+        // than silently zero-fill.
+        // Byte: 0_0001_1__ where the last two bits start
+        // video_format (= the upper two of 010 = 0). MSB-first:
+        // 0b0000_1100 = 0x0C.
+        let data = [0x00, 0x00, 0x01, 0xB5, 0x0C];
+        let err = parse_visual_object_header(&data).unwrap_err();
+        assert!(matches!(err, VolParseError::Truncated));
+    }
+
+    #[test]
+    fn visual_object_header_truncated_mid_colour() {
+        // is_id=0, type=0001, vst=1, video_format=000, video_range=1,
+        // colour_description=1 — then bytes run out before
+        // colour_primaries finishes.
+        // Bits so far: 0_0001_1_000_1_1 = 11 bits → two bytes
+        // (0b0000_1100, 0b0110_0000 of which the trailing 5 are pad).
+        let data = [0x00, 0x00, 0x01, 0xB5, 0x0C, 0x60];
+        let err = parse_visual_object_header(&data).unwrap_err();
+        assert!(matches!(err, VolParseError::Truncated));
+    }
+
+    #[test]
+    fn colour_description_default_when_absent_is_bt709() {
+        let cd = ColourDescription::default_when_absent();
+        assert_eq!(cd.colour_primaries, 1);
+        assert_eq!(cd.transfer_characteristics, 1);
+        assert_eq!(cd.matrix_coefficients, 1);
     }
 
     #[test]

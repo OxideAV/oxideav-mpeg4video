@@ -5,13 +5,31 @@ A pure-Rust MPEG-4 Part 2 Video codec (ISO/IEC 14496-2) for the
 
 ## Status
 
-**Round 19 of the clean-room rebuild (2026-05-26).** The prior
+**Round 20 of the clean-room rebuild (2026-05-27).** The prior
 implementation was retired on 2026-05-18 under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md);
 the VLC tables admitted to sourcing their numeric entries from an
 external library. Master history was fully erased per the Hat-3 cold-
 enforcement procedure.
 
+* Round 20 — §6.2.2 / §6.3.2.3 / §6.3.2.4 `VisualObject()` header
+  tightening. `parse_visual_object_header` now returns a typed
+  `VisualObjectHeader { visual_object_verid, visual_object_priority,
+  is_visual_object_identifier, visual_object_type, video_signal_type }`
+  in place of the bare `visual_object_type` byte. The
+  `is_visual_object_identifier == 0` branch now surfaces the §6.3.2.3
+  defaults (`verid = 1` per "When this field does not exist, the value
+  … is `0001`"; `priority = 1` per "value of zero is reserved"). The
+  §6.2.2 `video_signal_type()` body now decodes when the leading flag
+  bit is set: 3-bit `video_format` (Table 6-7), 1-bit `video_range`,
+  and the optional 8 + 8 + 8 `colour_primaries` /
+  `transfer_characteristics` / `matrix_coefficients` triple (Tables
+  6-8 / 6-9 / 6-10), surfaced via `VideoSignalType` +
+  `ColourDescription`. `ColourDescription::default_when_absent()`
+  exposes the §6.3.2.4 BT.709 fallback (`1, 1, 1`) for callers that
+  need the absent-block default. The 1-bit `video_signal_type` flag
+  is consumed unconditionally so the bit reader stays aligned with the
+  downstream `next_start_code()` search.
 * Round 19 — §7.8.7.3 S(GMC)-VOP averaged-vector substitution.
   `averaged_motion_vector(pel_mvs_x, pel_mvs_y, pel_denominator,
   quarter_sample, vop_fcode)` computes the candidate motion-vector
@@ -329,7 +347,11 @@ and reduced-resolution VOP extension bodies are typed-rejected via
 | --------------------------------------------- | ------ |
 | `0x000001B0` Visual Object Sequence start     | parsed |
 | `profile_and_level_indication`                | surfaced |
-| `0x000001B5` Visual Object start              | parsed (video ID only) |
+| `0x000001B5` Visual Object start              | typed `VisualObjectHeader` (round 20) |
+| `is_visual_object_identifier` + verid / priority | decoded, §6.3.2.3 defaults applied (round 20) |
+| `video_signal_type()` flag + body              | typed `Option<VideoSignalType>` (round 20) |
+| `colour_description` triple                    | typed `Option<ColourDescription>` (round 20) |
+| `ColourDescription::default_when_absent()`     | §6.3.2.4 BT.709 fallback (round 20) |
 | `0x000001Bx` Video Object Layer start         | parsed |
 | `aspect_ratio_info` 0001..0101 + 1111         | typed `AspectRatio` |
 | `vop_time_increment_resolution`               | u16, marker-bit checked |
@@ -438,7 +460,7 @@ and reduced-resolution VOP extension bodies are typed-rejected via
 | `header_extension_code == 1` rectangular body  | typed `VideoPacketHeader` (round 18) |
 | Encoder                                       | not yet |
 
-372 round-1..18 unit tests pass.
+396 round-1..20 unit tests pass.
 
 ## Provenance
 
@@ -593,8 +615,25 @@ unsigned integer which specifies the absolute value of quantiser
 scale", `quant_precision` bits wide (default 5); §6.3.3's
 `header_extension_code` semantics that enumerate exactly which
 optional fields land in the extension body and the rectangular shape
-case where the bit is read *after* `quant_scale`). The text was read
-from
+case where the bit is read *after* `quant_scale`), and §6.2.2 /
+§6.3.2.3 / §6.3.2.4 (the `VisualObject()` header of round 20: the
+1-bit `is_visual_object_identifier` flag and the 4-bit
+`visual_object_verid` + 3-bit `visual_object_priority` it gates;
+the §6.3.2.3 defaults `verid = 1` ("When this field does not
+exist, the value of `visual_object_verid` is `0001`") and
+`priority = 1` (the highest legal priority, since "value of zero is
+reserved"); the §6.2.2 `video_signal_type()` body — 1-bit
+`video_signal_type` flag, 3-bit `video_format` (Table 6-7), 1-bit
+`video_range`, 1-bit `colour_description`, and — when set — 8-bit
+`colour_primaries` (Table 6-8) + 8-bit `transfer_characteristics`
+(Table 6-9) + 8-bit `matrix_coefficients` (Table 6-10); and the
+§6.3.2.4 absent-block defaults — "In the case that
+`video_signal_type()` is not present in the bitstream or
+`colour_description` is zero the chromaticity / transfer
+characteristics / matrix coefficients are assumed to be those
+corresponding to ... having the value 1" + "In the case that
+`video_signal_type()` is not present in the bitstream, `video_range`
+is assumed to have the value 0"). The text was read from
 `docs/video/mpeg4-visual/ISO_IEC_14496-2-2004-3rd-edition.txt`. No
 third-party MPEG-4 source was consulted.
 
