@@ -5,13 +5,42 @@ A pure-Rust MPEG-4 Part 2 Video codec (ISO/IEC 14496-2) for the
 
 ## Status
 
-**Round 20 of the clean-room rebuild (2026-05-27).** The prior
+**Round 21 of the clean-room rebuild (2026-05-27).** The prior
 implementation was retired on 2026-05-18 under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md);
 the VLC tables admitted to sourcing their numeric entries from an
 external library. Master history was fully erased per the Hat-3 cold-
 enforcement procedure.
 
+* Round 21 — §6.2.7 `block(i)` driver for inter macroblocks (the
+  §7.4.x DCT-coefficient pipeline through the non-intra branch, no
+  MV-predictor dependency). `decode_inter_block(br, i, coded, ctx,
+  quant_matrix)` runs one inter block's §6.2.7 syntax — `if
+  (pattern_code[i]) while (!last) DCT coefficient`, no intra-DC
+  prologue, no §7.4.3 spatial predictor — through the full §7.4.x
+  chain: read coefficients (`decode_ac_events(TcoefTable::Inter)`) →
+  `events_to_qfs(events, None)` → §7.4.2 zigzag `inverse_scan` →
+  §7.4.3.4 `saturate_block` → §7.4.4 inverse quant with
+  `macroblock_intra == false` (method 1 with `W[1]` when
+  `quant_type == 1`, else method 2 with the `(2*|QF|+1)*qs` formula
+  and the §7.4.4.2 sign-incorporation) → §7.4.5 + Annex A `idct_8x8`
+  saturating to `[-2^bpp, 2^bpp - 1]`. The output is the §7.3 step-2
+  residual `f[y][x]` — NOT clipped to `[0, 2^bpp - 1]` because the
+  §7.3 step-3 display clip happens after `d[y][x] = p[y][x] +
+  f[y][x]` in the caller's motion-compensation stage. When
+  `coded == false` no bits are consumed and the residual is the
+  all-zero block (the §6.2.7 `if (pattern_code[i])` guard).
+  `decode_inter_macroblock(br, header, ctx, quant_matrix)` accepts
+  `DerivedMbType ∈ {Inter, InterQ, Inter4V}`, walks Figure 6-8
+  (luma 0..=3 in 2×2; Cb 4; Cr 5), and assembles a 16×16 luma + 8×8
+  Cb / 8×8 Cr `InterMacroblock` of signed residuals. `not_coded`
+  short-circuits via `BlockAssemblyError::NotCoded` (the §7.5
+  skipped-MB zero-MV / zero-residual reconstruction is the caller's
+  motion-compensation responsibility); a non-inter `mb_type` returns
+  `BlockAssemblyError::NotInter`. `nonintra_quant_matrix(vol)`
+  resolves `W[1]` from the VOL header — the loaded
+  `nonintra_quant_mat` (de-zigzagged) when present, else the §6.3.3
+  default non-intra matrix.
 * Round 20 — §6.2.2 / §6.3.2.3 / §6.3.2.4 `VisualObject()` header
   tightening. `parse_visual_object_header` now returns a typed
   `VisualObjectHeader { visual_object_verid, visual_object_priority,
@@ -450,7 +479,15 @@ and reduced-resolution VOP extension bodies are typed-rejected via
 | §6.3.3 default intra / non-intra quant matrices   | `DEFAULT_*_QUANT_MATRIX` (round 15) |
 | zigzag → raster quant-matrix de-scan              | `de_zigzag` / `intra_quant_matrix` (round 15) |
 | §6.3.2 intra final clip `[0, 2^bpp - 1]`          | fused into `decode_intra_block` (round 15) |
-| Inter / B-VOP reconstruction (motion comp)        | not yet |
+| §6.2.7 `block(i)` inter-block driver (no DC)       | `decode_inter_block` (round 21) |
+| §7.4.2 zigzag scan for inter (non-intra) blocks    | gated in `decode_inter_block` (round 21) |
+| §7.4.4 inverse quant non-intra (method 1 + 2)      | `macroblock_intra == false` path (round 21) |
+| §7.3 step-2 inter residual `f[y][x]` (no clip)     | `decode_inter_block` output (round 21) |
+| Inter MB residual assembly (16×16 luma + 8×8 Cb/Cr) | `InterMacroblock` (round 21) |
+| `decode_inter_macroblock` (Inter / InterQ / Inter4V) | round 21 |
+| `nonintra_quant_matrix(vol)` `W[1]` resolver       | round 21 |
+| Motion compensation (`p[y][x]` + `f[y][x]` + §7.3 step-3 clip) | not yet |
+| B-VOP reconstruction (motion comp)                | not yet |
 | RVLC Tcoef tables (B.23..B.25) + Type 5 escape | not yet |
 | `sadct_disable == 0` modified inverse scan    | not yet |
 | §5.2.5 `next_resync_marker()` stuffing        | `consume_next_resync_marker` (round 18) |
@@ -460,7 +497,7 @@ and reduced-resolution VOP extension bodies are typed-rejected via
 | `header_extension_code == 1` rectangular body  | typed `VideoPacketHeader` (round 18) |
 | Encoder                                       | not yet |
 
-396 round-1..20 unit tests pass.
+405 round-1..21 unit tests pass.
 
 ## Provenance
 
@@ -633,7 +670,27 @@ reserved"); the §6.2.2 `video_signal_type()` body — 1-bit
 characteristics / matrix coefficients are assumed to be those
 corresponding to ... having the value 1" + "In the case that
 `video_signal_type()` is not present in the bitstream, `video_range`
-is assumed to have the value 0"). The text was read from
+is assumed to have the value 0"), and §6.2.7 / §7.3 / §7.4.x (the
+round-21 inter-block driver: the §6.2.7 `block(i)` syntax table gating
+the entire intra-DC prologue on `(!data_partitioned &&
+(derived_mb_type == 3 || derived_mb_type == 4))` — i.e. an inter
+`block(i)` is `if (pattern_code[i]) while (!last) DCT coefficient`,
+with no DC bits, no marker, and no §7.4.3 spatial predictor; §7.4.2's
+"non-intra blocks → zigzag" scan-selection rule; §7.4.4's non-intra
+method-1 formula `F''[v][u] = ((2*QF[v][u] + Sign(QF[v][u])) *
+W[1][v][u] * quantiser_scale) / 16` and §7.4.4.2 method-2 formula
+`F''[v][u] = (2*|QF[v][u]| + 1) * quantiser_scale` (or the same minus
+one for even `quantiser_scale`, with the §7.4.4.2 trailing sign-
+incorporation `F''[v][u] = Sign(QF[v][u]) * |F''[v][u]|`); §7.4.5 +
+Annex A.1's IDCT saturation of `f[y][x]` to `[-2^bpp, 2^bpp - 1]`; and
+the §7.3 VOP-reconstruction split — step 2 "In case of inter
+macroblocks, … the decoded texture data `f[y][x]` is added to the
+prediction values, resulting in the final luminance and chrominance
+values of the VOP: `d[y][x] = p[y][x] + f[y][x]`" plus step 3 "the
+calculated luminance and chrominance values of the reconstructed VOP
+are saturated so that `0 ≤ d[y][x] ≤ 2^bpp - 1`" — fixing that the
+inter block-driver's output is the §7.3 step-2 residual `f[y][x]`,
+NOT the §7.3 step-3 display-clipped `d[y][x]`). The text was read from
 `docs/video/mpeg4-visual/ISO_IEC_14496-2-2004-3rd-edition.txt`. No
 third-party MPEG-4 source was consulted.
 

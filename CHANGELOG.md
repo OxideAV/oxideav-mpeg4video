@@ -8,6 +8,29 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 21 of the clean-room rebuild: §6.2.7 `block(i)` driver for
+  inter macroblocks. `decode_inter_block(br, i, coded, ctx,
+  quant_matrix)` runs one inter block's §6.2.7 syntax — `if
+  (pattern_code[i]) while (!last) DCT coefficient`, no intra-DC
+  prologue, no §7.4.3 spatial predictor — through the §7.4.x chain:
+  `decode_ac_events(TcoefTable::Inter)` → `events_to_qfs(events,
+  None)` (no DC) → §7.4.2 zigzag `inverse_scan` (§7.4.2 "non-intra
+  blocks → zigzag") → §7.4.3.4 `saturate_block` → §7.4.4 inverse
+  quant with `macroblock_intra == false` (method 1 with `W[1]` when
+  `quant_type == 1`, else method 2) → §7.4.5 + Annex A `idct_8x8`
+  saturating to `[-2^bpp, 2^bpp - 1]`. The output is the §7.3 step-2
+  residual `f[y][x]`, not clipped to `[0, 2^bpp - 1]`. When
+  `coded == false` no bits are consumed and the residual is the
+  all-zero block. `decode_inter_macroblock` walks Figure 6-8 over
+  six blocks for any `DerivedMbType ∈ {Inter, InterQ, Inter4V}` and
+  assembles a 16×16 luma + 8×8 Cb / 8×8 Cr `InterMacroblock` of
+  signed residuals. `not_coded` short-circuits to
+  `BlockAssemblyError::NotCoded`; non-inter `mb_type` returns
+  `BlockAssemblyError::NotInter`. `nonintra_quant_matrix(vol)`
+  resolves `W[1]` from the VOL header (loaded `nonintra_quant_mat`
+  de-zigzagged when present, else the §6.3.3 default non-intra
+  matrix).
+
 - Round 20 of the clean-room rebuild: §6.2.2 / §6.3.2.3 / §6.3.2.4
   `VisualObject()` header tightening. `parse_visual_object_header`
   now returns a typed `VisualObjectHeader { visual_object_verid,
