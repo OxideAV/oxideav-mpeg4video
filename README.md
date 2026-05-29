@@ -5,13 +5,38 @@ A pure-Rust MPEG-4 Part 2 Video codec (ISO/IEC 14496-2) for the
 
 ## Status
 
-**Round 22 of the clean-room rebuild (2026-05-29).** The prior
+**Round 23 of the clean-room rebuild (2026-05-29).** The prior
 implementation was retired on 2026-05-18 under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md);
 the VLC tables admitted to sourcing their numeric entries from an
 external library. Master history was fully erased per the Hat-3 cold-
 enforcement procedure.
 
+* Round 23 — §7.6.2.1 half-sample bilinear interpolation (Figure 7-29).
+  New `src/half_sample.rs` with the four per-pixel formulas
+  `a = A`, `b = (A+B+1-rc)/2`, `c = (A+C+1-rc)/2`,
+  `d = (A+B+C+D+2-rc)/4` (integer division; `rc ∈ {0, 1}` from the
+  VOP-header `vop_rounding_type`).
+  `interpolate_pixel(A, B, C, D, half_x, half_y, rounding_control)`
+  selects the right formula for one pixel.
+  `split_half_pel(mv)` decomposes a §7.6.3 half-pel motion-vector
+  component into `(integer_part, half_pel_bit)` via arithmetic shift
+  — negative MVs round toward `-∞`, matching the spec's §3.4
+  division. `ReferenceVop::{new, with_stride, fetch_clamped}` wraps a
+  raster-order `&[u8]` plane and applies the §7.6.4 last-full-pel
+  edge clamp per component (Figure 7-33).
+  `fetch_clamped_sample(...)` skips unused neighbour fetches for
+  cheaper sub-pel cases (just `A` for integer-pel, two samples for
+  the horizontal / vertical half-pel cases, all four for the
+  diagonal). `interpolate_block(vop, mv_x, mv_y, origin_x, origin_y,
+  block_w, block_h, vop_rounding_type)` and
+  `interpolate_block_into(...)` fill an entire prediction block from
+  a single motion vector. The `Round 22` OBMC `FnMut(ObmcMv, i, j) -> u8`
+  sample-provider closure now has a concrete implementation that the
+  caller can wire to a reference frame. §7.6.2.2 quarter-sample mode
+  (the 8-tap FIR + bilinear quarter-pel) and §7.6.1 reference-VOP
+  padding remain later-round work. 25 new unit tests + 2 doctests;
+  total crate test count now 443 + 2 doc.
 * Round 22 — §7.6.6 Overlapped Motion Compensation (OBMC) for the
   8×8 luminance prediction block. `obmc_predict_block(current_mv,
   neighbours, cfg, sample)` composes the §7.6.6 luminance equation

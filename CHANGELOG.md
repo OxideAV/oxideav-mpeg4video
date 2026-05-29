@@ -8,6 +8,34 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 23 of the clean-room rebuild: §7.6.2.1 half-sample bilinear
+  interpolation (Figure 7-29). New `src/half_sample.rs` evaluates the
+  four §7.6.2.1 per-pixel formulas
+  `a = A`, `b = (A + B + 1 - rc) / 2`, `c = (A + C + 1 - rc) / 2`,
+  `d = (A + B + C + D + 2 - rc) / 4` (integer division;
+  `rc ∈ {0, 1}` from `vop_rounding_type`).
+  `interpolate_pixel(A, B, C, D, half_x, half_y, rounding_control)`
+  is the per-pixel kernel; `split_half_pel(mv)` decomposes a §7.6.3
+  half-pel motion-vector component into `(integer_part,
+  half_pel_bit)` via arithmetic shift (negative MVs round toward
+  `-∞`, matching §3.4 division). `ReferenceVop` wraps a raster-order
+  `&[u8]` reference plane (with optional row-stride) and exposes
+  `fetch_clamped(x, y)` for the §7.6.4 last-full-pel edge clamp
+  (per-component clipping, matching Figure 7-33).
+  `fetch_clamped_sample(vop, int_x, int_y, half_x, half_y, rc)`
+  composes the up-to-four neighbour fetches for one sub-pel sample,
+  lazily skipping `B` / `C` / `D` when the corresponding half-pel
+  bit is `0`. `interpolate_block(vop, mv_x, mv_y, origin_x,
+  origin_y, block_w, block_h, vop_rounding_type)` and
+  `interpolate_block_into(...)` fill an entire `block_w × block_h`
+  prediction block from one motion vector. The §7.6.6 OBMC
+  `FnMut(ObmcMv, i, j) -> u8` sample-provider closure now has a
+  concrete reference-plane implementation callers can wire up.
+  §7.6.2.2 quarter-sample mode (the 8-tap FIR + bilinear quarter-pel
+  step) and §7.6.1 reference-VOP padding remain later-round work.
+  25 new unit tests + 2 new doctests; total crate test count now
+  443 + 2 doc.
+
 - Round 22 of the clean-room rebuild: §7.6.6 Overlapped Motion
   Compensation (OBMC). `obmc_predict_block(current_mv, neighbours,
   cfg, sample)` composes the §7.6.6 luminance equation

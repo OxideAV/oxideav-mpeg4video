@@ -147,6 +147,26 @@
 //!   modifications), cross-validates against the §7.4.4 intra-DC
 //!   inverse-quant path, and exercises both saturation polarities and
 //!   the high-frequency checkerboard case.
+//! * Round 23: §7.6.2.1 half-sample bilinear interpolation (Figure
+//!   7-29). `interpolate_pixel(A, B, C, D, half_x, half_y,
+//!   rounding_control)` evaluates one of the four per-pixel formulas
+//!   `a = A`, `b = (A+B+1-rc)/2`, `c = (A+C+1-rc)/2`,
+//!   `d = (A+B+C+D+2-rc)/4` (integer division, `rc ∈ {0, 1}` from
+//!   `vop_rounding_type`). `split_half_pel(mv)` decomposes a half-pel
+//!   MV into `(integer_part, half_pel_bit)` via arithmetic shift, so
+//!   negative MVs round toward `-∞` as the spec's §3.4 division
+//!   requires. `ReferenceVop` wraps a `&[u8]` reconstructed reference
+//!   plane (with optional row-stride) and exposes
+//!   `fetch_clamped(x, y)` for the §7.6.4 last-full-pel edge clamp
+//!   (per-component clipping, matching Figure 7-33).
+//!   `fetch_clamped_sample(vop, int_x, int_y, half_x, half_y, rc)`
+//!   composes the up-to-four neighbour fetches needed for one sub-pel
+//!   sample, lazily skipping `B`/`C`/`D` when the corresponding
+//!   half-pel bit is zero. `interpolate_block(vop, mv_x, mv_y,
+//!   origin_x, origin_y, w, h, vop_rounding_type)` /
+//!   `interpolate_block_into(...)` fill an entire prediction block.
+//!   §7.6.2.2 quarter-sample mode (the 8-tap FIR + bilinear quarter-
+//!   pel) and §7.6.1 reference-VOP padding remain later-round work.
 //! * Round 22: §7.6.6 Overlapped Motion Compensation (OBMC) for the
 //!   8×8 luminance prediction block. `obmc_predict_block(current_mv,
 //!   neighbours, cfg, sample)` composes
@@ -236,6 +256,7 @@ use oxideav_core::RuntimeContext;
 pub mod bitreader;
 pub mod block;
 pub mod bvop;
+pub mod half_sample;
 pub mod idct;
 pub mod inverse_quant;
 pub mod macroblock;
@@ -259,6 +280,10 @@ pub use block::{
 pub use bvop::{
     default_b_mb_type, parse_b_vop_mb_header, parse_dbquant, BMbTypeTable, BVopMbHeader,
     BVopMbParseError, BVopMbType,
+};
+pub use half_sample::{
+    fetch_clamped_sample, interpolate_block, interpolate_block_into, interpolate_pixel,
+    split_half_pel, ReferenceVop,
 };
 pub use idct::{idct_8x8, idct_saturation_bounds, saturate_idct_sample};
 pub use inverse_quant::{
