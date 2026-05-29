@@ -147,6 +147,27 @@
 //!   modifications), cross-validates against the §7.4.4 intra-DC
 //!   inverse-quant path, and exercises both saturation polarities and
 //!   the high-frequency checkerboard case.
+//! * Round 22: §7.6.6 Overlapped Motion Compensation (OBMC) for the
+//!   8×8 luminance prediction block. `obmc_predict_block(current_mv,
+//!   neighbours, cfg, sample)` composes
+//!   `p(i, j) = (q(i,j)*H0(i,j) + r(i,j)*H1(i,j) + s(i,j)*H2(i,j) +
+//!   4) // 8` over the 64 pixels of one luminance block, where
+//!   `H0` / `H1` / `H2` are the Figure 7-35 / 7-36 / 7-37 weighting
+//!   matrices (each cell summing to 8). MV1 (the above-or-below
+//!   remote) is taken from `neighbours.above` for `j < 4` and from
+//!   `neighbours.below` for `j >= 4`; MV2 (left-or-right) similarly
+//!   pivots on `i < 4` / `i >= 4`. `RemoteBlockKind::{NotCoded,
+//!   Intra, Absent}` encode the four §7.6.6 remote-MV substitution
+//!   rules (not-coded → zero; intra → current MV; VOP/packet border
+//!   absent → current MV; current block on MB-bottom row → below
+//!   remote replaced by current MV via the `current_block_at_mb_bottom`
+//!   flag). `ObmcConfig::disabled()` short-circuits to the bare MV0
+//!   prediction `p = q` for the §7.6.6 opening-paragraph
+//!   `mcsel`-boundary case of S(GMC)-VOPs and the VOL-header
+//!   `obmc_disable == 1` case. The reference-frame sample fetch —
+//!   §7.6.2 bilinear half-sample interpolation — remains the caller's
+//!   responsibility; `obmc_predict_block` accepts an
+//!   `FnMut(ObmcMv, usize, usize) -> u8` sample-provider closure.
 //! * Round 19: §7.8.7.3 S(GMC)-VOP averaged-vector substitution —
 //!   `averaged_motion_vector(pel_mvs_x, pel_mvs_y, pel_denominator,
 //!   quarter_sample, vop_fcode)` returns the candidate motion-vector
@@ -220,6 +241,7 @@ pub mod inverse_quant;
 pub mod macroblock;
 pub mod motion;
 pub mod neighbour;
+pub mod obmc;
 pub mod predictor;
 pub mod scan;
 pub mod texture;
@@ -254,6 +276,10 @@ pub use motion::{
 };
 pub use neighbour::{
     block_grid_position, BlockGridPosition, BlockNeighbour, ChromaPlane, IntraBlockGrid,
+};
+pub use obmc::{
+    obmc_predict_block, ObmcConfig, ObmcMv, ObmcNeighbourhood, RemoteBlockKind, OBMC_H0, OBMC_H1,
+    OBMC_H2,
 };
 pub use predictor::{
     dc_scaler, default_neighbour_dc, predict_intra_ac_column, predict_intra_ac_row,

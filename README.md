@@ -5,13 +5,32 @@ A pure-Rust MPEG-4 Part 2 Video codec (ISO/IEC 14496-2) for the
 
 ## Status
 
-**Round 21 of the clean-room rebuild (2026-05-27).** The prior
+**Round 22 of the clean-room rebuild (2026-05-29).** The prior
 implementation was retired on 2026-05-18 under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md);
 the VLC tables admitted to sourcing their numeric entries from an
 external library. Master history was fully erased per the Hat-3 cold-
 enforcement procedure.
 
+* Round 22 — §7.6.6 Overlapped Motion Compensation (OBMC) for the
+  8×8 luminance prediction block. `obmc_predict_block(current_mv,
+  neighbours, cfg, sample)` composes the §7.6.6 luminance equation
+  `p(i, j) = (q(i,j)*H0(i,j) + r(i,j)*H1(i,j) + s(i,j)*H2(i,j) + 4)
+  // 8` over one 8×8 block. `OBMC_H0` / `OBMC_H1` / `OBMC_H2`
+  transcribe Figures 7-35 / 7-36 / 7-37 as `[[u8; 8]; 8]`
+  constants; a unit test verifies `H0 + H1 + H2 = 8` in every cell,
+  so flat reference samples reproduce the input. The per-pixel
+  remote-MV selection is implemented on `ObmcNeighbourhood`: MV1
+  takes `above` for `j < 4` and `below` for `j >= 4`; MV2 takes
+  `left` for `i < 4` and `right` for `i >= 4`. The four §7.6.6
+  substitution rules surface as `RemoteBlockKind::{Inter,
+  NotCoded, Intra, Absent}` (not-coded → zero; intra → current MV;
+  absent-at-border → current MV) with rule-4 below-MB carried by
+  `current_block_at_mb_bottom`. `ObmcConfig::disabled()` returns
+  the bare MV0 prediction for `obmc_disable == 1` and the §7.6.6
+  opening-paragraph mcsel-boundary case of S(GMC)-VOPs. The
+  §7.6.2 reference-frame sample fetch stays in the caller via an
+  `FnMut(ObmcMv, usize, usize) -> u8` sample-provider closure.
 * Round 21 — §6.2.7 `block(i)` driver for inter macroblocks (the
   §7.4.x DCT-coefficient pipeline through the non-intra branch, no
   MV-predictor dependency). `decode_inter_block(br, i, coded, ctx,

@@ -8,6 +8,31 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 22 of the clean-room rebuild: §7.6.6 Overlapped Motion
+  Compensation (OBMC). `obmc_predict_block(current_mv, neighbours,
+  cfg, sample)` composes the §7.6.6 luminance equation
+  `p(i, j) = (q(i,j)*H0(i,j) + r(i,j)*H1(i,j) + s(i,j)*H2(i,j) + 4)
+  // 8` over one 8×8 prediction block. `OBMC_H0` / `OBMC_H1` /
+  `OBMC_H2` transcribe Figures 7-35 / 7-36 / 7-37 of ISO/IEC
+  14496-2:2004 as `[[u8; 8]; 8]` constants; a unit test verifies
+  `H0 + H1 + H2 = 8` in every cell, so flat reference samples
+  (`q == r == s == C`) reproduce `C` exactly. The §7.6.6 per-pixel
+  remote-MV selection — MV1 from `above` for `j < 4` and from
+  `below` for `j >= 4`; MV2 from `left` for `i < 4` and from `right`
+  for `i >= 4` — is implemented on `ObmcNeighbourhood`. The four
+  §7.6.6 substitution rules surface as
+  `RemoteBlockKind::{Inter, NotCoded, Intra, Absent}` (not-coded →
+  zero MV; intra-coded → current MV; absent-at-border → current MV)
+  with the rule-4 "below-MB" override carried by
+  `ObmcNeighbourhood::current_block_at_mb_bottom`. `ObmcConfig::
+  disabled()` short-circuits to the bare MV0-only prediction
+  (one sample fetch per pixel, `p = q`) for the
+  `obmc_disable == 1` and S(GMC)-VOP mcsel-boundary cases of the
+  §7.6.6 opening paragraph. The reference-frame sample fetch
+  (§7.6.2 bilinear half-sample interpolation) stays in the caller
+  via the `FnMut(ObmcMv, usize, usize) -> u8` sample-provider
+  closure. 13 new unit tests; total crate test count now 418.
+
 - Round 21 of the clean-room rebuild: §6.2.7 `block(i)` driver for
   inter macroblocks. `decode_inter_block(br, i, coded, ctx,
   quant_matrix)` runs one inter block's §6.2.7 syntax — `if
