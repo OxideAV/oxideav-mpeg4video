@@ -147,6 +147,28 @@
 //!   modifications), cross-validates against the §7.4.4 intra-DC
 //!   inverse-quant path, and exercises both saturation polarities and
 //!   the high-frequency checkerboard case.
+//! * Round 24: §7.6.2.2 quarter-sample mode interpolation (Figures
+//!   7-31 / 7-32) + Table 7-13 chroma MV reduction. New
+//!   `src/quarter_sample.rs`. `split_quarter_pel(mv)` decomposes a
+//!   §7.6.3 quarter-pel MV into `(integer_part, qfrac ∈ 0..=3)` via
+//!   arithmetic shift by 2 (negative MVs floor toward `-∞`).
+//!   `fir_8tap_clip(samples, rc, bpp)` evaluates the §7.6.2.2.1 8-tap
+//!   symmetric FIR `(C[4], C[3], C[2], C[1], C[1], C[2], C[3], C[4])
+//!   / 256` with `C = [160, -48, 24, -8]`, the `+ 128 - rc` rounding
+//!   offset, and the `[0, 2^bpp - 1]` clip. `half_pel_b/c/d` are the
+//!   horizontal-, vertical-, and diagonal-FIR half-pel helpers (the
+//!   diagonal cascades a per-row horizontal FIR through a vertical
+//!   FIR, each independently clipped). `interpolate_quarter_pixel`
+//!   resolves any of the 16 sub-pel positions in Figure 7-32 (`a`,
+//!   `e_{-1}`, `b_{-1}`, `f_{-1}`, `g`, `h`, `i`, `j`, `c`, `k`,
+//!   `d`, `l`, `m`, `n`, `o`, `p`) via the §7.6.2.2.2 bilinear
+//!   blends with `+ 1 - rc` rounding. `interpolate_block_qpel(vop,
+//!   mv_x, mv_y, origin_x, origin_y, w, h, vop_rounding_type, bpp)`
+//!   and `interpolate_block_qpel_into(...)` fill a luma prediction
+//!   block. `reduce_qpel_to_half_pel_chroma(c)` applies Table 7-13
+//!   (quarter-pel-units luma → half-pel-units chroma) for the §6.1.3.4
+//!   4:2:0 chroma path, biasing any non-zero quarter fraction toward
+//!   the +0.5 chroma-pel position per the table.
 //! * Round 23: §7.6.2.1 half-sample bilinear interpolation (Figure
 //!   7-29). `interpolate_pixel(A, B, C, D, half_x, half_y,
 //!   rounding_control)` evaluates one of the four per-pixel formulas
@@ -264,6 +286,7 @@ pub mod motion;
 pub mod neighbour;
 pub mod obmc;
 pub mod predictor;
+pub mod quarter_sample;
 pub mod scan;
 pub mod texture;
 pub mod video_packet;
@@ -310,6 +333,11 @@ pub use predictor::{
     dc_scaler, default_neighbour_dc, predict_intra_ac_column, predict_intra_ac_row,
     predict_intra_dc, saturate_block, saturate_qf, select_dc_direction, NeighbourBlock,
     NeighbourPosition,
+};
+pub use quarter_sample::{
+    fir_8tap_clip, half_pel_b, half_pel_c, half_pel_d, interpolate_block_qpel,
+    interpolate_block_qpel_into, interpolate_quarter_pixel, reduce_qpel_to_half_pel_chroma,
+    split_quarter_pel, QPEL_FIR_C,
 };
 pub use scan::{
     events_to_pqf, events_to_qfs, inverse_scan, select_scan_type, DcPredictionDirection,

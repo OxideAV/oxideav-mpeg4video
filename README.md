@@ -5,13 +5,41 @@ A pure-Rust MPEG-4 Part 2 Video codec (ISO/IEC 14496-2) for the
 
 ## Status
 
-**Round 23 of the clean-room rebuild (2026-05-29).** The prior
+**Round 24 of the clean-room rebuild (2026-05-30).** The prior
 implementation was retired on 2026-05-18 under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md);
 the VLC tables admitted to sourcing their numeric entries from an
 external library. Master history was fully erased per the Hat-3 cold-
 enforcement procedure.
 
+* Round 24 — §7.6.2.2 quarter-sample mode interpolation (Figures 7-31
+  and 7-32) + Table 7-13 chroma motion-vector reduction. New
+  `src/quarter_sample.rs`. `split_quarter_pel(mv)` decomposes a §7.6.3
+  quarter-pel motion-vector component into `(integer_part, qfrac ∈
+  0..=3)` via arithmetic shift by 2 — negative MVs floor toward `-∞`
+  so the fractional pair is always non-negative.
+  `fir_8tap_clip(samples, rc, bpp)` evaluates the §7.6.2.2.1 8-tap
+  symmetric FIR `(C[4], C[3], C[2], C[1], C[1], C[2], C[3], C[4]) /
+  256` with `C = [160, -48, 24, -8]`, the `+ 128 - rc` rounding offset,
+  and the `[0, 2^bpp - 1]` clip. `half_pel_b` / `half_pel_c` /
+  `half_pel_d` cover the horizontal / vertical / diagonal half-pel
+  helpers; `half_pel_d` cascades the horizontal FIR through a vertical
+  FIR with each intermediate value independently clipped (matching the
+  spec's two-step description).
+  `interpolate_quarter_pixel(vop, int_x, int_y, qfrac_x, qfrac_y, rc,
+  bpp)` resolves any of the 16 Figure 7-32 sub-pel positions (`a`,
+  `e_{-1}`, `b_{-1}`, `f_{-1}`, `g`, `h`, `i`, `j`, `c`, `k`, `d`, `l`,
+  `m`, `n`, `o`, `p`) via the §7.6.2.2.2 bilinear `+ 1 - rc` blends.
+  `interpolate_block_qpel(vop, mv_x, mv_y, origin_x, origin_y, w, h,
+  vop_rounding_type, bpp)` and `interpolate_block_qpel_into(...)` fill
+  a luminance prediction block. `reduce_qpel_to_half_pel_chroma(c)`
+  applies Table 7-13's `{0, 1, 1, 1}` fractional mapping to convert a
+  quarter-pel luma component into a half-pel chrominance component
+  (the integer part doubles; non-zero quarter fractions round toward
+  the +0.5 chroma-pel position; negative inputs floor via
+  `split_quarter_pel`). §7.6.1 reference-VOP padding and field-based
+  interlaced motion compensation remain later-round work. 29 new unit
+  tests + 3 doctests; total crate test count now 472 + 5 doc.
 * Round 23 — §7.6.2.1 half-sample bilinear interpolation (Figure 7-29).
   New `src/half_sample.rs` with the four per-pixel formulas
   `a = A`, `b = (A+B+1-rc)/2`, `c = (A+C+1-rc)/2`,
