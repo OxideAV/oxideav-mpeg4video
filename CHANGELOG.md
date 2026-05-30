@@ -6,6 +6,37 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.5](https://github.com/OxideAV/oxideav-mpeg4video/releases/tag/v0.1.5) - 2026-05-30
+
+### Other
+
+- round 24: §7.6.2.2 quarter-sample mode interpolation (Figures 7-31, 7-32)
+- round 23: §7.6.2.1 half-sample bilinear interpolation (Figure 7-29)
+- round 22: §7.6.6 overlapped motion compensation (OBMC)
+- round 21: §6.2.7 block(i) driver for inter macroblocks
+- round 20: §6.2.2 VisualObject() header — verid/priority + video_signal_type()
+- relax averaged_motion_vector pel_denominator precondition
+- round 19: §7.8.7.3 S(GMC)-VOP averaged-vector substitution
+- round 18: §6.2.5 video_packet_header decode (rectangular shape)
+- round 17: §7.4.1.3 Type 4 escape (short_video_header == 1)
+- round 16: §7.4.3 / Figure 7-5 predictor candidate gathering
+- round 15: §6.2.7 block(i) intra macroblock-level assembly
+- Round 14: §7.4.5 + Annex A inverse DCT
+- round 13: §7.4.4 inverse quantisation pipeline (Figure 7-7)
+- round 12: §7.4.3 spatial DC/AC predictor for intra macroblocks
+- round 11: §7.4.2 inverse scan (QFS[n] → PQF[v][u])
+- round 10 — §7.4.1.2 AC-coefficient (EVENT) decode
+- round 9 — §7.4.1.1 intra-DC texture decode
+- §7.6.5 median-filter MV predictor (round 8)
+- mpeg4video r7: §6.2.6.2 motion_vector decode + §7.6.3 differential-MV reconstruction
+- round 6: §6.2.6 B-VOP macroblock header prefix (modb/mb_type/cbpb/dbquant)
+- round 5: §6.2.6 macroblock-layer header bit-walk (mcbpc/cbpy/dquant)
+- round 4: decode quant_type==1 quantiser-matrix load body (§6.2.3.3)
+- round 3: promote §6.2.3 VOL fields onto VolHeader; VopHeader::from_vol
+- round 2: §6.2.4 GOV + §6.2.5 VOP header parse
+- round 1: §6.2 VisualObjectSequence / VisualObject / VOL header parse
+- orphan rebuild: clean-room scaffold post 2026-05-18 audit
+
 ### Added
 
 - Round 24 of the clean-room rebuild: §7.6.2.2 quarter-sample mode
