@@ -39,6 +39,46 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 25 of the clean-room rebuild: §7.6.9.5.2 direct-mode forward
+  and backward motion-vector derivation for B-VOPs.
+  `direct_mode_motion_vector(co_located, mvd, trb, trd, units)`
+  linearly scales the co-located anchor-VOP MV by the §7.6.7
+  temporal-reference ratio and applies the delta vector via the
+  §7.6.9.5.2 formulas
+  `MVF = (TRB * MV) / TRD + MVD` and
+  `MVB = (MVD == 0) ? ((TRB - TRD) * MV) / TRD : MVF - MV`,
+  with the division `/` taken as §3.4 truncation-toward-zero
+  (matching Rust's `i32::Div` on signed operands).
+  `DirectCoLocatedMv::TransparentOrAbsent` substitutes
+  `MV = (0, 0)` per the §7.6.9.5.1 final-sentence fallback so direct
+  mode stays enabled when the reference slot is transparent or
+  out-of-bounds; the delta MVD passes through unchanged into both
+  `MVF` and `MVB`. `DirectMvUnits::QpelMvToHalfPel` covers the
+  §7.6.9.5.2 fourth-paragraph quarter-to-half-pel reduction (MV
+  halved component-wise plus Table 7-13 rounding) for the
+  `quarter_sample == 1` / half-pel-`MVD` mismatch case;
+  `direct_mode_reduce_qpel_to_half_pel(mv)` exposes the reduction
+  directly so callers can pre-apply it once per macroblock when the
+  reference is four block-vectors. `DirectMvError::{InvalidTrd,
+  TrbOutOfRange}` enforces the §7.6.7 preconditions `TRD > 0` and
+  `0 <= TRB <= TRD`. The returned `(MVF, MVB)` pair is intentionally
+  not clipped to the Table 7-9 `[low:high]` range — the §7.6.9.5.2
+  linear scaling factor `TRB / TRD ∈ [0, 1]` already keeps the
+  magnitude bounded relative to the co-located `MV`, and the
+  §7.6.9.5.3 prediction-block generator that follows consumes the
+  algebraic value directly. The reference-grid lookup (which
+  co-located MB sits at the current MB position in the temporally
+  next anchor VOP, plus the §7.6.1.6 vector padding step) remains
+  the caller's responsibility. 17 new unit tests cover: canonical
+  splits (`TRB == TRD`, `TRB == 0`, both zero-deltas), the §3.4
+  truncation-toward-zero division for both positive and negative
+  dividends, the transparent-with-zero-delta skipped-MB zero pair
+  (§7.6.9.6), the per-component branch independence (`dx != 0`
+  takes the subtract branch while `dy == 0` takes the scaled
+  formula), the QpelMvToHalfPel reduction matching
+  `quarter_sample::reduce_qpel_to_half_pel_chroma` componentwise,
+  and the end-to-end Direct-mode MVD round-trip with `f_code == 1`
+  per §7.6.3's closing paragraph. Crate test count now 491 + 5 doc.
 - Round 24 of the clean-room rebuild: §7.6.2.2 quarter-sample mode
   interpolation (Figures 7-31 and 7-32) for the luminance component
   of P-, S(GMC)-, and B-VOPs, plus Table 7-13 chroma motion-vector

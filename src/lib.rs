@@ -147,6 +147,30 @@
 //!   modifications), cross-validates against the §7.4.4 intra-DC
 //!   inverse-quant path, and exercises both saturation polarities and
 //!   the high-frequency checkerboard case.
+//! * Round 25: §7.6.9.5.2 direct-mode forward + backward motion-vector
+//!   derivation for B-VOPs.
+//!   `direct_mode_motion_vector(co_located, mvd, trb, trd, units)`
+//!   linearly scales the co-located anchor-VOP MV by the §7.6.7
+//!   temporal-reference ratio and applies the delta vector via the
+//!   §7.6.9.5.2 formulas
+//!   `MVF = (TRB * MV) / TRD + MVD` /
+//!   `MVB = (MVD == 0) ? ((TRB - TRD) * MV) / TRD : MVF - MV`,
+//!   with the division `/` taken as §3.4 truncation-toward-zero.
+//!   `DirectCoLocatedMv::TransparentOrAbsent` substitutes
+//!   `MV = (0, 0)` per the §7.6.9.5.1 final-sentence fallback so
+//!   direct mode stays enabled when the reference slot is unavailable.
+//!   `DirectMvUnits::QpelMvToHalfPel` covers the §7.6.9.5.2
+//!   fourth-paragraph quarter→half-pel reduction (MV halved
+//!   component-wise + Table 7-13 rounding) for the
+//!   `quarter_sample == 1` / half-pel-`MVD` mismatch case;
+//!   `direct_mode_reduce_qpel_to_half_pel` exposes the reduction
+//!   directly so callers can pre-apply it once per macroblock.
+//!   `DirectMvError::{InvalidTrd, TrbOutOfRange}` enforces the §7.6.7
+//!   preconditions `TRD > 0` and `0 <= TRB <= TRD`. The result is
+//!   intentionally not Table-7-9-clipped — §7.6.9.5.2's linear scaling
+//!   keeps the magnitude bounded relative to the co-located `MV` and
+//!   the §7.6.9.5.3 prediction-block generator consumes the algebraic
+//!   value directly. 17 new unit tests.
 //! * Round 24: §7.6.2.2 quarter-sample mode interpolation (Figures
 //!   7-31 / 7-32) + Table 7-13 chroma MV reduction. New
 //!   `src/quarter_sample.rs`. `split_quarter_pel(mv)` decomposes a
@@ -318,9 +342,10 @@ pub use macroblock::{
     dquant_value, parse_macroblock_header, DerivedMbType, MacroblockHeader, MacroblockParseError,
 };
 pub use motion::{
-    averaged_motion_vector, decode_motion_vector_delta, predict_motion_vector,
-    reconstruct_motion_vector, MotionParseError, MotionVector, MotionVectorDelta, MvMode,
-    AMV_PIXEL_COUNT,
+    averaged_motion_vector, decode_motion_vector_delta, direct_mode_motion_vector,
+    direct_mode_reduce_qpel_to_half_pel, predict_motion_vector, reconstruct_motion_vector,
+    DirectCoLocatedMv, DirectModeMv, DirectMvError, DirectMvUnits, MotionParseError, MotionVector,
+    MotionVectorDelta, MvMode, AMV_PIXEL_COUNT,
 };
 pub use neighbour::{
     block_grid_position, BlockGridPosition, BlockNeighbour, ChromaPlane, IntraBlockGrid,
@@ -403,6 +428,10 @@ pub enum Error {
     /// A §6.2.5 `video_packet_header` parse failed. See
     /// [`VideoPacketParseError`] for the discrimination.
     VideoPacket(VideoPacketParseError),
+    /// A §7.6.9.5.2 direct-mode motion-vector derivation precondition
+    /// (`TRD > 0`, `0 <= TRB <= TRD`) failed. See [`DirectMvError`]
+    /// for the discrimination.
+    DirectMv(DirectMvError),
 }
 
 impl core::fmt::Display for Error {
@@ -434,6 +463,9 @@ impl core::fmt::Display for Error {
             }
             Error::VideoPacket(err) => {
                 write!(f, "oxideav-mpeg4video: video_packet_header error: {err}")
+            }
+            Error::DirectMv(err) => {
+                write!(f, "oxideav-mpeg4video: direct-mode MV error: {err}")
             }
         }
     }
@@ -492,6 +524,12 @@ impl From<BlockAssemblyError> for Error {
 impl From<VideoPacketParseError> for Error {
     fn from(err: VideoPacketParseError) -> Self {
         Error::VideoPacket(err)
+    }
+}
+
+impl From<DirectMvError> for Error {
+    fn from(err: DirectMvError) -> Self {
+        Error::DirectMv(err)
     }
 }
 
@@ -577,5 +615,12 @@ mod tests {
             Error::VideoPacket(VideoPacketParseError::Truncated)
         ));
         assert!(format!("{e}").contains("video_packet_header error"));
+    }
+
+    #[test]
+    fn direct_mv_error_round_trip() {
+        let e: Error = DirectMvError::InvalidTrd(0).into();
+        assert!(matches!(e, Error::DirectMv(DirectMvError::InvalidTrd(0))));
+        assert!(format!("{e}").contains("direct-mode MV error"));
     }
 }

@@ -5,13 +5,40 @@ A pure-Rust MPEG-4 Part 2 Video codec (ISO/IEC 14496-2) for the
 
 ## Status
 
-**Round 24 of the clean-room rebuild (2026-05-30).** The prior
+**Round 25 of the clean-room rebuild (2026-05-30).** The prior
 implementation was retired on 2026-05-18 under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md);
 the VLC tables admitted to sourcing their numeric entries from an
 external library. Master history was fully erased per the Hat-3 cold-
 enforcement procedure.
 
+* Round 25 — §7.6.9.5.2 direct-mode forward + backward motion-vector
+  derivation for B-VOPs. `direct_mode_motion_vector(co_located, mvd,
+  trb, trd, units)` linearly scales the co-located anchor-VOP MV by
+  the §7.6.7 temporal-reference ratio and applies the delta vector via
+  `MVF = (TRB * MV) / TRD + MVD` and the §7.6.9.5.2 zero-vs-non-zero
+  backward branch `MVB = (MVD == 0) ? ((TRB - TRD) * MV) / TRD :
+  MVF - MV`, with the division `/` taken as §3.4
+  truncation-toward-zero. `DirectCoLocatedMv::TransparentOrAbsent`
+  substitutes `MV = (0, 0)` per the §7.6.9.5.1 final-sentence fallback
+  so direct mode stays enabled when the co-located reference slot is
+  unavailable. `DirectMvUnits::QpelMvToHalfPel` covers the
+  §7.6.9.5.2 fourth-paragraph quarter→half-pel reduction (`MV` halved
+  component-wise plus Table 7-13 rounding) for the `quarter_sample ==
+  1` / half-pel-`MVD` mismatch case; `direct_mode_reduce_qpel_to_half_pel`
+  exposes the reduction directly so callers can pre-apply it once per
+  macroblock. `DirectMvError::{InvalidTrd, TrbOutOfRange}` enforces the
+  §7.6.7 preconditions `TRD > 0` and `0 <= TRB <= TRD`. The result is
+  intentionally not Table-7-9-clipped — §7.6.9.5.2's linear scaling
+  keeps the magnitude bounded relative to the co-located `MV` and the
+  §7.6.9.5.3 prediction-block generator consumes the algebraic value
+  directly. Tests cover canonical splits (TRB == TRD, TRB == 0, both
+  zero deltas, mixed-axis delta branches), the §3.4 truncation-toward-
+  zero division for both positive and negative dividends, the
+  transparent-with-zero-delta skipped-MB zero pair (§7.6.9.6), and the
+  end-to-end Direct-mode MVD round-trip with `f_code == 1`. 17 new
+  unit tests + the lib-level Error round-trip; total crate test count
+  now 491 + 5 doc.
 * Round 24 — §7.6.2.2 quarter-sample mode interpolation (Figures 7-31
   and 7-32) + Table 7-13 chroma motion-vector reduction. New
   `src/quarter_sample.rs`. `split_quarter_pel(mv)` decomposes a §7.6.3

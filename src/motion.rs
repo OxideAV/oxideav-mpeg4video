@@ -552,6 +552,277 @@ pub fn averaged_motion_vector(
     })
 }
 
+// ---------------------------------------------------------------------------
+// §7.6.9.5.2 — Direct-mode forward + backward motion-vector derivation
+// (ISO/IEC 14496-2:2004 third edition).
+//
+// A direct-mode B-VOP macroblock does not carry its own forward / backward
+// MV pair on the wire. Instead, the spec linearly scales the motion vector
+// `MV` of the co-located macroblock in the temporally next anchor VOP
+// (the most recent I-, P-, or S(GMC)-VOP) by the §7.6.7 temporal-reference
+// difference `TRB / TRD`, then applies a single delta vector `MVD`
+// (decoded via `decode_motion_vector_delta` with `MvMode::Direct`):
+//
+//     MVF = (TRB * MV) / TRD + MVD
+//     MVB = (MVD == 0) ? ((TRB - TRD) * MV) / TRD
+//                      : MVF - MV
+//
+// where the division `/` is the §3.4 truncation-toward-zero integer
+// division (matching Rust's `i32::Div` semantics on signed operands).
+//
+// `MV` is the co-located block vector after §7.6.1.6 vector padding,
+// applied independently to each of the four luminance blocks
+// `i = 0,1,2,3` (Figure 6-8 sub-block order). When the co-located
+// macroblock is part of an S(GMC)-VOP with `mcsel == 1` the spec
+// substitutes the §7.8.7.3 averaged motion vector for `MV` (the caller
+// already produces that via `averaged_motion_vector`). When the
+// co-located macroblock is transparent or the slot is otherwise
+// unavailable, the spec falls back to `MV = (0, 0)` and direct mode
+// stays enabled (§7.6.9.5.1 final sentence).
+//
+// `TRB` is the temporal-reference difference between the current B-VOP
+// and the previous (forward) anchor VOP; `TRD` is the temporal-reference
+// difference between the temporally next (backward) anchor and the
+// previous anchor — `TRD` is therefore the full inter-anchor span and
+// is strictly positive whenever direct mode applies (the §7.6.7
+// numbering convention places consecutive B-VOPs strictly between two
+// anchors, so the next anchor's `modulo_time_base`-extended TR is
+// strictly greater than the previous anchor's).
+//
+// Quarter-sample handling (§7.6.9.5.2 fourth paragraph): when `MV` is
+// in quarter-pel units and `MVD` is in half-pel units, `MV` is first
+// halved component-wise and rounded to the nearest half-pel position
+// via Table 7-13 — exactly the same reduction
+// `quarter_sample::reduce_qpel_to_half_pel_chroma` performs for
+// chrominance MV reduction. The conversion happens **before** the
+// `TRB * MV / TRD` multiplication so the entire formula runs in a
+// single, consistent sub-pel grid.
+//
+// This module does not gather `MV` from the reference VOP's macroblock
+// grid (that bookkeeping is the caller's responsibility, alongside the
+// §7.6.1.6 vector padding); it expects a resolved `MV` and produces the
+// `(MVF, MVB)` pair the §7.6.9.5.3 prediction-block generator consumes.
+// ---------------------------------------------------------------------------
+
+/// Whether the supplied co-located MV is already on the same sub-pel
+/// grid as the delta MV, or needs the §7.6.9.5.2 quarter-to-half-pel
+/// conversion described in the fourth paragraph of the subclause.
+///
+/// `Match` covers the two homogeneous cases (`MV` and `MVD` both in
+/// half-pel units when `quarter_sample == 0`, or both in quarter-pel
+/// units when `quarter_sample == 1`). `QpelMvToHalfPel` covers the
+/// fourth-paragraph mismatch ("MV components of the co-located macroblock
+/// are given in quarter sample units and the components MVDx and MVDy of
+/// the delta vector are given in half sample units"), in which case
+/// `MV` is divided by 2 and rounded via Table 7-13 before the linear
+/// scaling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectMvUnits {
+    /// The co-located MV and the delta MV share the same sub-pel grid;
+    /// no pre-scaling conversion is needed.
+    Match,
+    /// The co-located MV is in quarter-pel units but the delta MV is
+    /// in half-pel units; halve `MV` componentwise via Table 7-13
+    /// before the `TRB * MV / TRD` linear scaling.
+    QpelMvToHalfPel,
+}
+
+/// Co-located reference-MV state for the §7.6.9.5.2 direct-mode
+/// derivation.
+///
+/// `Mv` carries the resolved block vector after the §7.6.1.6 vector
+/// padding step (or the §7.8.7.3 averaged MV for the
+/// co-located-`mcsel == 1` S(GMC)-VOP case — the caller decides which
+/// substitution applies and passes the resolved vector in).
+///
+/// `TransparentOrAbsent` covers the §7.6.9.5.1 final-sentence fallback:
+/// "If the co-located macroblock is transparent and thus the MVs are
+/// not available, the direct mode is still enabled by setting MV
+/// vectors to zero vectors." The caller uses this variant when the
+/// reference grid slot is transparent / out-of-bounds / unavailable;
+/// the derivation then runs with `MV = (0, 0)`, the delta MVD passing
+/// through unchanged into both `MVF` and `MVB`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectCoLocatedMv {
+    /// A resolved (and §7.6.1.6-padded) reference-block motion vector.
+    Mv(MotionVector),
+    /// The co-located block is transparent or otherwise unavailable;
+    /// substitute `MV = (0, 0)` per §7.6.9.5.1's final sentence.
+    TransparentOrAbsent,
+}
+
+/// Errors specific to the §7.6.9.5.2 direct-mode MV derivation.
+///
+/// Generic motion-vector parse errors (out-of-range `vop_fcode`,
+/// truncated bit stream) keep flowing through [`MotionParseError`];
+/// `DirectMvError` extends the surface with the temporal-reference
+/// preconditions §7.6.7 imposes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectMvError {
+    /// `trd` was zero (or non-positive). §7.6.7 places the next
+    /// anchor strictly after the previous anchor whenever direct mode
+    /// applies, so a `TRD` of zero indicates a stream-level error
+    /// (two consecutive anchors with identical extended TR).
+    InvalidTrd(i32),
+    /// `trb` was outside `0..=trd`. The B-VOP lies temporally between
+    /// the two anchors, so `0 <= trb <= trd` always holds — a
+    /// violation indicates a malformed temporal-reference sequence.
+    TrbOutOfRange {
+        /// The supplied `TRB` value.
+        trb: i32,
+        /// The supplied `TRD` value (the upper bound for `TRB`).
+        trd: i32,
+    },
+}
+
+impl core::fmt::Display for DirectMvError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            DirectMvError::InvalidTrd(v) => write!(
+                f,
+                "direct-mode TRD must be positive (§7.6.7), got TRD = {v}"
+            ),
+            DirectMvError::TrbOutOfRange { trb, trd } => write!(
+                f,
+                "direct-mode TRB must satisfy 0 <= TRB <= TRD, got TRB = {trb}, TRD = {trd}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DirectMvError {}
+
+/// Resolved §7.6.9.5.2 direct-mode (`MVF`, `MVB`) pair for one
+/// luminance sub-block.
+///
+/// `forward` is the forward motion vector `MVF` (predicted from the
+/// previous anchor); `backward` is `MVB` (predicted from the temporally
+/// next anchor). Units match the input delta MV's units (half-pel when
+/// `quarter_sample == 0`, quarter-pel when `quarter_sample == 1`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirectModeMv {
+    /// The forward motion vector `MVF` per §7.6.9.5.2.
+    pub forward: MotionVector,
+    /// The backward motion vector `MVB` per §7.6.9.5.2.
+    pub backward: MotionVector,
+}
+
+/// §7.6.9.5.2 fourth-paragraph quarter→half-pel reduction.
+///
+/// Halves each component of `mv` (truncating toward `-∞` to match the
+/// spec's `/ 2` on a quarter-pel grid) and applies Table 7-13's
+/// fractional rounding via
+/// [`crate::quarter_sample::reduce_qpel_to_half_pel_chroma`]. Public
+/// so callers can pre-apply the reduction once per macroblock (e.g.
+/// when the reference is four block-vectors and the delta `MVD` is
+/// half-pel) and pass an already-converted `MV` directly into
+/// [`direct_mode_motion_vector`] with [`DirectMvUnits::Match`].
+pub fn direct_mode_reduce_qpel_to_half_pel(mv: MotionVector) -> MotionVector {
+    use crate::quarter_sample::reduce_qpel_to_half_pel_chroma;
+    MotionVector {
+        x: reduce_qpel_to_half_pel_chroma(mv.x),
+        y: reduce_qpel_to_half_pel_chroma(mv.y),
+    }
+}
+
+/// Derive the §7.6.9.5.2 direct-mode forward + backward motion vectors
+/// for one luminance sub-block.
+///
+/// `co_located` is the resolved reference-MV state (a §7.6.1.6-padded
+/// block vector, the §7.8.7.3 averaged MV, or the transparent/absent
+/// zero-MV fallback). `mvd` is the single shared delta motion vector
+/// decoded via [`decode_motion_vector_delta`] with [`MvMode::Direct`].
+/// `trb` and `trd` are the §7.6.7 temporal-reference distances
+/// (`TRB`: current B-VOP to previous anchor; `TRD`: temporally next
+/// anchor to previous anchor — see §7.6.9.5.2 paragraph 3).
+///
+/// `units` selects the §7.6.9.5.2 fourth-paragraph quarter→half-pel
+/// reduction. Pass [`DirectMvUnits::Match`] when both `MV` and `MVD`
+/// share a sub-pel grid; pass [`DirectMvUnits::QpelMvToHalfPel`] when
+/// the bitstream is `quarter_sample == 1` but the delta MV is
+/// half-pel.
+///
+/// The result is **not** clipped to the Table 7-9 `[low:high]` range —
+/// the §7.6.9.5.2 formulas operate algebraically and rely on the
+/// linear-scaling factor `TRB / TRD ∈ [0, 1]` to keep the magnitude
+/// bounded relative to `MV`; the prediction-block-generator step that
+/// follows (§7.6.9.5.3) consumes the algebraic value directly.
+pub fn direct_mode_motion_vector(
+    co_located: DirectCoLocatedMv,
+    mvd: MotionVectorDelta,
+    trb: i32,
+    trd: i32,
+    units: DirectMvUnits,
+) -> Result<DirectModeMv, DirectMvError> {
+    if trd <= 0 {
+        return Err(DirectMvError::InvalidTrd(trd));
+    }
+    if trb < 0 || trb > trd {
+        return Err(DirectMvError::TrbOutOfRange { trb, trd });
+    }
+
+    // §7.6.9.5.1 final sentence: transparent / absent co-located block
+    // → MV = (0, 0). Direct mode stays enabled; delta passes through.
+    let mv = match co_located {
+        DirectCoLocatedMv::Mv(v) => v,
+        DirectCoLocatedMv::TransparentOrAbsent => MotionVector { x: 0, y: 0 },
+    };
+
+    // §7.6.9.5.2 fourth-paragraph quarter→half-pel reduction: when the
+    // co-located MV is in quarter-pel units and the delta is in
+    // half-pel units, MV is divided by 2 and rounded via Table 7-13
+    // before the linear scaling. The zero MV from the transparent-or-
+    // absent fallback is invariant under the reduction.
+    let mv = match units {
+        DirectMvUnits::Match => mv,
+        DirectMvUnits::QpelMvToHalfPel => direct_mode_reduce_qpel_to_half_pel(mv),
+    };
+
+    // The §7.6.9.5.2 linear-scaling formulas, in 64-bit signed
+    // arithmetic to keep the intermediate `TRB * MV` product safe for
+    // any combination of `vop_fcode <= 7` magnitudes and the largest
+    // permissible TR difference. The §3.4 `/` operator is integer
+    // division with truncation toward zero, matching Rust's `i32::Div`
+    // (and therefore `i64::Div`) on signed operands.
+    let trb_i = i64::from(trb);
+    let trd_i = i64::from(trd);
+    let mvx = i64::from(mv.x);
+    let mvy = i64::from(mv.y);
+    let mvdx = i64::from(mvd.dx);
+    let mvdy = i64::from(mvd.dy);
+
+    let mvfx = (trb_i * mvx) / trd_i + mvdx;
+    let mvfy = (trb_i * mvy) / trd_i + mvdy;
+
+    let mvbx = if mvdx == 0 {
+        ((trb_i - trd_i) * mvx) / trd_i
+    } else {
+        mvfx - mvx
+    };
+    let mvby = if mvdy == 0 {
+        ((trb_i - trd_i) * mvy) / trd_i
+    } else {
+        mvfy - mvy
+    };
+
+    // The four scaled components stay representable in i32: the
+    // unscaled MV is already bounded by Table 7-9's [-2048, 2047]
+    // half-pel range (worst case at `vop_fcode == 7`), `TRB <= TRD`
+    // keeps the multiply-and-divide factor in `[0, 1]`, and the delta
+    // MVD shares the same Table 7-9 range. Their algebraic sum sits
+    // comfortably inside i32 even at the worst-case extremes.
+    Ok(DirectModeMv {
+        forward: MotionVector {
+            x: mvfx as i32,
+            y: mvfy as i32,
+        },
+        backward: MotionVector {
+            x: mvbx as i32,
+            y: mvby as i32,
+        },
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1198,5 +1469,336 @@ mod tests {
     fn amv_pixel_count_constant_matches_spec() {
         // §7.8.7.3 note: "Nb is always 256 into the following expression".
         assert_eq!(AMV_PIXEL_COUNT, 256);
+    }
+
+    // ─────────────────── §7.6.9.5.2 direct-mode MV derivation ─────────
+
+    #[test]
+    fn direct_mv_trd_zero_rejected() {
+        let err = direct_mode_motion_vector(
+            DirectCoLocatedMv::Mv(MotionVector { x: 4, y: -2 }),
+            MotionVectorDelta { dx: 0, dy: 0 },
+            0,
+            0,
+            DirectMvUnits::Match,
+        )
+        .unwrap_err();
+        assert_eq!(err, DirectMvError::InvalidTrd(0));
+    }
+
+    #[test]
+    fn direct_mv_trd_negative_rejected() {
+        let err = direct_mode_motion_vector(
+            DirectCoLocatedMv::TransparentOrAbsent,
+            MotionVectorDelta { dx: 0, dy: 0 },
+            0,
+            -1,
+            DirectMvUnits::Match,
+        )
+        .unwrap_err();
+        assert_eq!(err, DirectMvError::InvalidTrd(-1));
+    }
+
+    #[test]
+    fn direct_mv_trb_out_of_range_rejected() {
+        let err = direct_mode_motion_vector(
+            DirectCoLocatedMv::TransparentOrAbsent,
+            MotionVectorDelta { dx: 0, dy: 0 },
+            5,
+            3,
+            DirectMvUnits::Match,
+        )
+        .unwrap_err();
+        assert_eq!(err, DirectMvError::TrbOutOfRange { trb: 5, trd: 3 });
+
+        let err = direct_mode_motion_vector(
+            DirectCoLocatedMv::TransparentOrAbsent,
+            MotionVectorDelta { dx: 0, dy: 0 },
+            -1,
+            3,
+            DirectMvUnits::Match,
+        )
+        .unwrap_err();
+        assert_eq!(err, DirectMvError::TrbOutOfRange { trb: -1, trd: 3 });
+    }
+
+    #[test]
+    fn direct_mv_trb_equals_trd_makes_forward_full_mv() {
+        // TRB == TRD: B-VOP coincides temporally with the next anchor.
+        // MVF = MV + MVD; MVB (when MVD == 0) = 0 * MV / TRD = 0.
+        let got = direct_mode_motion_vector(
+            DirectCoLocatedMv::Mv(MotionVector { x: 6, y: -4 }),
+            MotionVectorDelta { dx: 0, dy: 0 },
+            3,
+            3,
+            DirectMvUnits::Match,
+        )
+        .unwrap();
+        assert_eq!(got.forward, MotionVector { x: 6, y: -4 });
+        assert_eq!(got.backward, MotionVector { x: 0, y: 0 });
+    }
+
+    #[test]
+    fn direct_mv_trb_zero_makes_forward_only_mvd() {
+        // TRB == 0: B-VOP coincides temporally with the previous anchor.
+        // MVF = 0 + MVD = MVD; MVB (when MVD == 0) = (-TRD)*MV/TRD = -MV.
+        let got = direct_mode_motion_vector(
+            DirectCoLocatedMv::Mv(MotionVector { x: 6, y: -4 }),
+            MotionVectorDelta { dx: 0, dy: 0 },
+            0,
+            3,
+            DirectMvUnits::Match,
+        )
+        .unwrap();
+        assert_eq!(got.forward, MotionVector { x: 0, y: 0 });
+        assert_eq!(got.backward, MotionVector { x: -6, y: 4 });
+    }
+
+    #[test]
+    fn direct_mv_zero_delta_canonical_split() {
+        // Worked example: MV = 9, TRD = 3, TRB = 1, MVD = 0.
+        // MVF = (1*9)/3 = 3.
+        // MVB = ((1-3)*9)/3 = -6 (MVD==0 path).
+        let got = direct_mode_motion_vector(
+            DirectCoLocatedMv::Mv(MotionVector { x: 9, y: -9 }),
+            MotionVectorDelta { dx: 0, dy: 0 },
+            1,
+            3,
+            DirectMvUnits::Match,
+        )
+        .unwrap();
+        assert_eq!(got.forward, MotionVector { x: 3, y: -3 });
+        assert_eq!(got.backward, MotionVector { x: -6, y: 6 });
+        // Identity check: MVF + MVB = (TRB - TRD)*MV/TRD + TRB*MV/TRD
+        //              = ((TRB - TRD + TRB) * MV) / TRD  (because
+        // the divisions are both exact when TRD | MV).
+        assert_eq!(got.forward.x + got.backward.x, -3);
+    }
+
+    #[test]
+    fn direct_mv_nonzero_delta_uses_subtract_branch() {
+        // MVD != 0 → MVB = MVF - MV (not the scaled formula).
+        // MV = 9, TRD = 3, TRB = 2, MVDx = +1.
+        // MVF = (2*9)/3 + 1 = 6 + 1 = 7.
+        // MVB = MVF - MV = 7 - 9 = -2.
+        let got = direct_mode_motion_vector(
+            DirectCoLocatedMv::Mv(MotionVector { x: 9, y: 9 }),
+            MotionVectorDelta { dx: 1, dy: 0 },
+            2,
+            3,
+            DirectMvUnits::Match,
+        )
+        .unwrap();
+        assert_eq!(got.forward, MotionVector { x: 7, y: 6 });
+        // Note: dy == 0 still uses the scaled formula on the y axis.
+        // MVBx = MVF - MV = -2; MVBy = ((2-3)*9)/3 = -3.
+        assert_eq!(got.backward, MotionVector { x: -2, y: -3 });
+    }
+
+    #[test]
+    fn direct_mv_per_component_branch_independence() {
+        // Mixed deltas: dx != 0 takes the subtract branch, dy == 0
+        // takes the scaled-formula branch — independently per axis.
+        let got = direct_mode_motion_vector(
+            DirectCoLocatedMv::Mv(MotionVector { x: 12, y: -6 }),
+            MotionVectorDelta { dx: -3, dy: 0 },
+            1,
+            4,
+            DirectMvUnits::Match,
+        )
+        .unwrap();
+        // MVFx = (1*12)/4 + (-3) = 3 - 3 = 0; subtract branch → MVBx = 0 - 12 = -12.
+        // MVFy = (1*-6)/4 + 0 = -1 (truncation toward zero: -6/4 = -1, not -2);
+        // MVBy uses the scaled formula (dy == 0): ((1-4)*-6)/4 = 18/4 = 4.
+        assert_eq!(got.forward, MotionVector { x: 0, y: -1 });
+        assert_eq!(got.backward, MotionVector { x: -12, y: 4 });
+    }
+
+    #[test]
+    fn direct_mv_truncation_toward_zero_per_3_4() {
+        // §3.4 `/` is integer division with truncation toward zero
+        // (not floor!). Verify both signs of the dividend.
+        // MV = 7, TRD = 4, TRB = 1, MVD = 0.
+        // MVF = (1*7)/4 = 1 (7/4 truncates to 1, not 2).
+        // MV = -7 → MVF = (1*-7)/4 = -1 (-7/4 truncates to -1, not -2).
+        let pos = direct_mode_motion_vector(
+            DirectCoLocatedMv::Mv(MotionVector { x: 7, y: 0 }),
+            MotionVectorDelta { dx: 0, dy: 0 },
+            1,
+            4,
+            DirectMvUnits::Match,
+        )
+        .unwrap();
+        assert_eq!(pos.forward.x, 1);
+
+        let neg = direct_mode_motion_vector(
+            DirectCoLocatedMv::Mv(MotionVector { x: -7, y: 0 }),
+            MotionVectorDelta { dx: 0, dy: 0 },
+            1,
+            4,
+            DirectMvUnits::Match,
+        )
+        .unwrap();
+        assert_eq!(neg.forward.x, -1);
+    }
+
+    #[test]
+    fn direct_mv_transparent_co_located_uses_zero_mv() {
+        // §7.6.9.5.1 final sentence: transparent / absent co-located
+        // → substitute MV = (0, 0). MVF = MVD; MVB (MVD != 0) = MVD - 0 = MVD.
+        let got = direct_mode_motion_vector(
+            DirectCoLocatedMv::TransparentOrAbsent,
+            MotionVectorDelta { dx: 4, dy: -2 },
+            2,
+            5,
+            DirectMvUnits::Match,
+        )
+        .unwrap();
+        assert_eq!(got.forward, MotionVector { x: 4, y: -2 });
+        assert_eq!(got.backward, MotionVector { x: 4, y: -2 });
+    }
+
+    #[test]
+    fn direct_mv_transparent_with_zero_delta_yields_zero_pair() {
+        // Transparent + MVD == 0 → both MVF and MVB are zero (the
+        // §7.6.9.6 skipped-MB case the spec spells out explicitly).
+        let got = direct_mode_motion_vector(
+            DirectCoLocatedMv::TransparentOrAbsent,
+            MotionVectorDelta { dx: 0, dy: 0 },
+            1,
+            3,
+            DirectMvUnits::Match,
+        )
+        .unwrap();
+        assert_eq!(got.forward, MotionVector { x: 0, y: 0 });
+        assert_eq!(got.backward, MotionVector { x: 0, y: 0 });
+    }
+
+    #[test]
+    fn direct_mv_qpel_to_halfpel_halves_mv_via_table_7_13() {
+        // QpelMvToHalfPel: MV is halved per Table 7-13 BEFORE scaling.
+        // MV = (5, -5) quarter-pel → halved to (3, -3) half-pel
+        //   (per Table 7-13: 5 = 4 + 1 → 2*2 + 1 = 3; -5 → -3).
+        // Then with TRB = 1, TRD = 2, MVD = 0:
+        //   MVF = (1 * 3) / 2 = 1 (truncating); MVBy similarly.
+        //   MVBx = ((1 - 2) * 3) / 2 = -1.
+        let got = direct_mode_motion_vector(
+            DirectCoLocatedMv::Mv(MotionVector { x: 5, y: -5 }),
+            MotionVectorDelta { dx: 0, dy: 0 },
+            1,
+            2,
+            DirectMvUnits::QpelMvToHalfPel,
+        )
+        .unwrap();
+        // Sanity-check the conversion as exposed via the helper.
+        let halved = direct_mode_reduce_qpel_to_half_pel(MotionVector { x: 5, y: -5 });
+        assert_eq!(halved, MotionVector { x: 3, y: -3 });
+        // The derivation should match the manual computation above.
+        assert_eq!(got.forward, MotionVector { x: 1, y: -1 });
+        assert_eq!(got.backward, MotionVector { x: -1, y: 1 });
+    }
+
+    #[test]
+    fn direct_mv_qpel_match_path_does_not_reduce() {
+        // Same input as the QpelMvToHalfPel case but with Match: no
+        // reduction; the formula runs on the full quarter-pel MV.
+        // MV = (5, -5), TRB = 1, TRD = 2, MVD = 0.
+        // MVF = (1*5)/2 = 2 (truncates); MVB = ((1-2)*5)/2 = -2.
+        let got = direct_mode_motion_vector(
+            DirectCoLocatedMv::Mv(MotionVector { x: 5, y: -5 }),
+            MotionVectorDelta { dx: 0, dy: 0 },
+            1,
+            2,
+            DirectMvUnits::Match,
+        )
+        .unwrap();
+        assert_eq!(got.forward, MotionVector { x: 2, y: -2 });
+        assert_eq!(got.backward, MotionVector { x: -2, y: 2 });
+    }
+
+    #[test]
+    fn direct_mv_reduce_qpel_invariant_on_zero() {
+        // Sanity: reducing the zero MV stays zero (so transparent +
+        // QpelMvToHalfPel is a no-op against transparent + Match).
+        assert_eq!(
+            direct_mode_reduce_qpel_to_half_pel(MotionVector { x: 0, y: 0 }),
+            MotionVector { x: 0, y: 0 }
+        );
+    }
+
+    #[test]
+    fn direct_mv_reduce_qpel_matches_table_7_13_chroma_helper() {
+        // The helper must produce the same numeric reduction as
+        // `quarter_sample::reduce_qpel_to_half_pel_chroma`, component-wise.
+        use crate::quarter_sample::reduce_qpel_to_half_pel_chroma;
+        for &x in &[-9i32, -5, -4, -1, 0, 1, 4, 5, 9] {
+            for &y in &[-9i32, -5, -4, -1, 0, 1, 4, 5, 9] {
+                let got = direct_mode_reduce_qpel_to_half_pel(MotionVector { x, y });
+                assert_eq!(got.x, reduce_qpel_to_half_pel_chroma(x), "x = {x}");
+                assert_eq!(got.y, reduce_qpel_to_half_pel_chroma(y), "y = {y}");
+            }
+        }
+    }
+
+    #[test]
+    fn direct_mv_skipped_p_vop_reconstruction() {
+        // §7.6.9.6: "If the co-located macroblock in the most recently
+        // decoded I- or P-VOP is skipped, the current B-macroblock is
+        // treated as the forward mode with the zero motion vector
+        // (MVFx, MVFy). If the modb equals to '1' the current B-
+        // macroblock is reconstructed by using the direct mode with
+        // zero delta vector." A skipped P-VOP MB implies MV = (0, 0)
+        // and the direct-mode derivation with MVD = 0 must yield the
+        // zero MVF / MVB pair (the zero-delta forward-mode equivalent).
+        let got = direct_mode_motion_vector(
+            DirectCoLocatedMv::Mv(MotionVector { x: 0, y: 0 }),
+            MotionVectorDelta { dx: 0, dy: 0 },
+            1,
+            3,
+            DirectMvUnits::Match,
+        )
+        .unwrap();
+        assert_eq!(got.forward, MotionVector { x: 0, y: 0 });
+        assert_eq!(got.backward, MotionVector { x: 0, y: 0 });
+    }
+
+    #[test]
+    fn direct_mv_error_displays_format_human_readable() {
+        let s = format!("{}", DirectMvError::InvalidTrd(0));
+        assert!(s.contains("TRD"));
+        assert!(s.contains("0"));
+        let s = format!("{}", DirectMvError::TrbOutOfRange { trb: 5, trd: 3 });
+        assert!(s.contains("TRB"));
+        assert!(s.contains("TRD"));
+    }
+
+    #[test]
+    fn direct_mv_decoded_delta_round_trip_via_mvmode_direct() {
+        // End-to-end: read a direct-mode MVD off the wire. The spec
+        // pins `f_code == 1` for direct mode (§7.6.3 closing paragraph,
+        // "in the case of the direct mode the f_code is always one"),
+        // so f = 1 and `reconstruct_component` returns `mv_data`
+        // verbatim. h = +2 (code 0010), v = -2 (code 0011) → MVD = (2, -2).
+        // Then derive direct-mode MVs with MV = (4, -4), TRB = 1, TRD = 4.
+        // MVFx: dx != 0 path → (1*4)/4 + 2 = 1 + 2 = 3; MVBx = MVFx - MV = -1.
+        // MVFy: dy != 0 path → (1*-4)/4 + -2 = -1 + -2 = -3; MVBy = MVFy - MV = 1.
+        let mut w = BitWriter::new();
+        w.write_bits(0b0010, 4); // h_data = 2
+        w.write_bits(0b0011, 4); // v_data = -2
+        w.align();
+        let bytes = w.buf;
+        let mut br = BitReader::new(&bytes);
+        let mvd = decode_motion_vector_delta(&mut br, MvMode::Direct, 1).unwrap();
+        assert_eq!(mvd, MotionVectorDelta { dx: 2, dy: -2 });
+        let got = direct_mode_motion_vector(
+            DirectCoLocatedMv::Mv(MotionVector { x: 4, y: -4 }),
+            mvd,
+            1,
+            4,
+            DirectMvUnits::Match,
+        )
+        .unwrap();
+        assert_eq!(got.forward, MotionVector { x: 3, y: -3 });
+        assert_eq!(got.backward, MotionVector { x: -1, y: 1 });
     }
 }
