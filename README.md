@@ -5,13 +5,42 @@ A pure-Rust MPEG-4 Part 2 Video codec (ISO/IEC 14496-2) for the
 
 ## Status
 
-**Round 25 of the clean-room rebuild (2026-05-30).** The prior
+**Round 26 of the clean-room rebuild (2026-05-31).** The prior
 implementation was retired on 2026-05-18 under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md);
 the VLC tables admitted to sourcing their numeric entries from an
 external library. Master history was fully erased per the Hat-3 cold-
 enforcement procedure.
 
+* Round 26 — §7.6.9.5.3 B-VOP luminance prediction-block generation.
+  New `src/bvop_prediction.rs`.
+  `generate_b_vop_luma_prediction(forward_ref, backward_ref, mvs,
+  mb_origin_x, mb_origin_y, vop_rounding_type, mode, prediction_mode)`
+  builds the 16×16 luminance B-VOP prediction macroblock by running
+  per-sub-block §7.6.2.1 (`BVopSampleMode::HalfPel`) or §7.6.2.2
+  (`BVopSampleMode::QuarterPel { bits_per_pixel }`) interpolation on
+  four 8×8 Figure-6-8-ordered sub-blocks (TL, TR, BL, BR) and
+  averaging the forward / backward predictions pixel-by-pixel via
+  the §7.6.9.4 / §7.6.9.5.3 rule
+  `Pi[i][j] = (Pf[i][j] + Pb[i][j] + 1) >> 1`.
+  `BVopPredictionMode::{ForwardOnly, BackwardOnly, Bidirectional,
+  Direct}` selects the §7.6.9.2 / §7.6.9.3 / §7.6.9.4 / §7.6.9.5
+  per-MB mode: the three non-Direct modes replicate the single
+  bitstream MV across all four sub-blocks (§7.6.9.2 / §7.6.9.3 /
+  §7.6.9.4 each carry one MV per macroblock), Direct mode consumes
+  the four per-sub-block `MVF[i]` / `MVB[i]` pairs produced by
+  [`direct_mode_motion_vector`]. `average_bidirectional_into(a, b,
+  out)` exposes the §7.6.9.4 averaging primitive directly; arithmetic
+  is in `u16` so `(255 + 255 + 1) >> 1` reproduces 255 exactly.
+  Per the spec note in §7.6.9.5.3, four 8×8 sub-blocks with the same
+  vector in quarter-pel mode do NOT collapse to one 16×16 fetch
+  (§7.6.2.2 block-boundary mirroring), and this module preserves
+  that property by interpolating one sub-block at a time. The output
+  is the §7.3 step-1 `p[y][x]` prediction; the §7.3 step-2 residual
+  add and step-3 `[0, 2^bpp - 1]` clip happen one layer up. The
+  chroma per-block MV reduction (Tables 7-10..7-12 plus the existing
+  Table 7-13) and §7.6.1.6 vector padding remain follow-ups. 17 new
+  unit tests + 1 doctest; total crate test count now 508 + 6 doc.
 * Round 25 — §7.6.9.5.2 direct-mode forward + backward motion-vector
   derivation for B-VOPs. `direct_mode_motion_vector(co_located, mvd,
   trb, trd, units)` linearly scales the co-located anchor-VOP MV by
@@ -586,7 +615,11 @@ and reduced-resolution VOP extension bodies are typed-rejected via
 | `decode_inter_macroblock` (Inter / InterQ / Inter4V) | round 21 |
 | `nonintra_quant_matrix(vol)` `W[1]` resolver       | round 21 |
 | Motion compensation (`p[y][x]` + `f[y][x]` + §7.3 step-3 clip) | not yet |
-| B-VOP reconstruction (motion comp)                | not yet |
+| §7.6.9.5.3 B-VOP 8×8 luminance prediction-block generation | `generate_b_vop_luma_prediction` (round 26) |
+| §7.6.9.4 / §7.6.9.5.3 bidirectional averaging `(Pf + Pb + 1) >> 1` | `average_bidirectional_into` (round 26) |
+| §7.6.9.2 / §7.6.9.3 / §7.6.9.4 forward / backward / interpolated MB modes | `BVopPredictionMode::{ForwardOnly, BackwardOnly, Bidirectional}` (round 26) |
+| §7.6.9.5 direct mode 16×16 luma prediction              | `BVopPredictionMode::Direct` (round 26) |
+| B-VOP reconstruction (motion comp)                | luma: round 26; chroma + residual add still pending |
 | RVLC Tcoef tables (B.23..B.25) + Type 5 escape | not yet |
 | `sadct_disable == 0` modified inverse scan    | not yet |
 | §5.2.5 `next_resync_marker()` stuffing        | `consume_next_resync_marker` (round 18) |
@@ -596,7 +629,7 @@ and reduced-resolution VOP extension bodies are typed-rejected via
 | `header_extension_code == 1` rectangular body  | typed `VideoPacketHeader` (round 18) |
 | Encoder                                       | not yet |
 
-405 round-1..21 unit tests pass.
+508 round-1..26 unit tests + 6 doctests pass.
 
 ## Provenance
 
@@ -789,7 +822,30 @@ values of the VOP: `d[y][x] = p[y][x] + f[y][x]`" plus step 3 "the
 calculated luminance and chrominance values of the reconstructed VOP
 are saturated so that `0 ≤ d[y][x] ≤ 2^bpp - 1`" — fixing that the
 inter block-driver's output is the §7.3 step-2 residual `f[y][x]`,
-NOT the §7.3 step-3 display-clipped `d[y][x]`). The text was read from
+NOT the §7.3 step-3 display-clipped `d[y][x]`), and §7.6.9.2 /
+§7.6.9.3 / §7.6.9.4 / §7.6.9.5.3 (the round-26 B-VOP luminance
+prediction-block generation: §7.6.9.2's forward-mode "Only the
+forward vector (MVFx, MVFy) is applied in this mode. The prediction
+blocks Pf_Y, Pf_U, and Pf_V are…"; §7.6.9.3's backward-mode mirror
+formulation; §7.6.9.4's bi-directional rule "Both the forward vector
+(MVFx, MVFy) and the backward vector (MVBx, MVBy) are applied in
+this mode. The prediction blocks Pi_Y, Pi_U, and Pi_V are generated
+from the forward and backward reference VOPs by doing the forward
+prediction, the backward prediction and then averaging both
+predictions pixel by pixel" with the explicit `Pi[i][j] = (Pf[i][j]
++ Pb[i][j] + 1) >> 1` formula for luma 16×16 and chroma 8×8; and
+§7.6.9.5.3's "Motion compensation for luminance is performed
+individually on 8x8 blocks to generate a macroblock. The process of
+generating a prediction block consists of using computed forward
+and backward motion vectors {(MVFx[i], MVFy[i]), (MVBx[i],
+MVBy[i]), i = 0,1,2,3} to obtain appropriate blocks from reference
+VOPs and averaging these blocks, same as the case of bi-directional
+mode except that motion compensation is performed on 8x8 blocks",
+together with §7.6.9.5.3's note on §7.6.2.2 block-boundary
+mirroring in quarter-sample mode — four 8×8 sub-blocks with the
+same MV do not collapse to one 16×16 fetch — and Figure 6-8's
+TL/TR/BL/BR 8×8 sub-block ordering inside a 16×16 macroblock).
+The text was read from
 `docs/video/mpeg4-visual/ISO_IEC_14496-2-2004-3rd-edition.txt`. No
 third-party MPEG-4 source was consulted.
 

@@ -302,6 +302,7 @@ use oxideav_core::RuntimeContext;
 pub mod bitreader;
 pub mod block;
 pub mod bvop;
+pub mod bvop_prediction;
 pub mod half_sample;
 pub mod idct;
 pub mod inverse_quant;
@@ -327,6 +328,11 @@ pub use block::{
 pub use bvop::{
     default_b_mb_type, parse_b_vop_mb_header, parse_dbquant, BMbTypeTable, BVopMbHeader,
     BVopMbParseError, BVopMbType,
+};
+pub use bvop_prediction::{
+    average_bidirectional, average_bidirectional_into, generate_b_vop_luma_prediction,
+    generate_b_vop_luma_prediction_into, BVopMvPair, BVopPredictionMode, BVopSampleMode,
+    MB_LUMA_PIXELS, MB_LUMA_SIDE, MB_SUB_BLOCKS, SUB_BLOCK_OFFSETS, SUB_BLOCK_SIDE,
 };
 pub use half_sample::{
     fetch_clamped_sample, interpolate_block, interpolate_block_into, interpolate_pixel,

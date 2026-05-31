@@ -6,6 +6,37 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Round 26 of the clean-room rebuild: §7.6.9.5.3 B-VOP luminance
+  prediction-block generation. New `src/bvop_prediction.rs`.
+  `generate_b_vop_luma_prediction(forward_ref, backward_ref, mvs,
+  mb_origin_x, mb_origin_y, vop_rounding_type, mode, prediction_mode)`
+  builds the 16×16 luminance prediction macroblock by interpolating
+  four Figure-6-8-ordered 8×8 sub-blocks via the §7.6.2.1 (half-pel)
+  or §7.6.2.2 (quarter-pel) primitives and applying the §7.6.9.4 /
+  §7.6.9.5.3 rule `Pi[i][j] = (Pf[i][j] + Pb[i][j] + 1) >> 1`.
+  `BVopPredictionMode::{ForwardOnly, BackwardOnly, Bidirectional,
+  Direct}` selects the §7.6.9 mode: the three non-Direct modes
+  replicate the single bitstream MV across all four sub-blocks
+  (§7.6.9.2 / §7.6.9.3 / §7.6.9.4 carry one MV per macroblock);
+  Direct mode (§7.6.9.5) consumes the four per-sub-block
+  `MVF[i]` / `MVB[i]` pairs produced by
+  `direct_mode_motion_vector`. `BVopSampleMode::{HalfPel,
+  QuarterPel { bits_per_pixel }}` plumbs the VOL `quarter_sample`
+  flag through to the right interpolation primitive.
+  `average_bidirectional_into(a, b, out)` exposes the §7.6.9.4
+  averaging primitive directly (arithmetic in `u16` so the `+ 1`
+  cannot overflow even at `u8::MAX` in both operands). Per the
+  §7.6.9.5.3 explicit note, four 8×8 sub-blocks with the same MV
+  in quarter-sample mode do NOT collapse to one 16×16 fetch —
+  this module preserves the property by interpolating one sub-block
+  at a time. The output is the §7.3 step-1 `p[y][x]` prediction;
+  the §7.3 step-2 residual add and step-3 `[0, 2^bpp - 1]` clip
+  remain the caller's responsibility (deliberately separated to
+  keep each layer testable). 17 new unit tests + 1 doctest; total
+  crate test count now 508 + 6 doc.
+
 ## [0.1.5](https://github.com/OxideAV/oxideav-mpeg4video/releases/tag/v0.1.5) - 2026-05-30
 
 ### Other
