@@ -8,6 +8,40 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 27 of the clean-room rebuild: §7.6.5 chrominance motion-vector
+  derivation `MVDCHR` from `K ∈ {1, 2, 3, 4}` luminance sub-block
+  motion vectors (4:2:0 rectangular VOP). New `src/chroma_mv.rs`.
+  `chroma_mv_from_luma_blocks(&[MotionVector])` sums the K luma MVs
+  component-wise, divides by `2 * K` via floor (`i32::div_euclid`),
+  and applies the §7.6.5 fractional rounding by indexing one of four
+  newly-transcribed tables based on `K`:
+  * `TABLE_7_13` (K = 1, "fourth sample resolution", 4 entries
+    `[0, 1, 1, 1]`);
+  * `TABLE_7_12` (K = 2, "eighth sample resolution", 8 entries
+    `[0, 0, 1, 1, 1, 1, 1, 2]`);
+  * `TABLE_7_11` (K = 3, "twelfth sample resolution", 12 entries
+    `[0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 2, 2]`);
+  * `TABLE_7_10` (K = 4, "sixteenth sample resolution", 16 entries
+    `[0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2]`).
+  The table output `2` represents a carry into the next integer
+  chroma-pel (one full chroma-pel = 2 half-sample offsets). The
+  residue is pre-scaled by 2 so that the half-sample-grid sum
+  indexes the table's `1/(4 * K)`-sample grid. Floor division
+  (`div_euclid` / `rem_euclid`) keeps the residue non-negative for
+  negative MV inputs so the lookup is well-defined across the sign
+  range, matching the convention established by
+  `quarter_sample::reduce_qpel_to_half_pel_chroma`. The §7.6.5
+  "in quarter sample mode the vectors are divided by 2 before
+  summation" pre-divide rule is left to the caller (the spec text
+  doesn't pin the rounding for that pre-divide step); the module
+  documents the suggested componentwise
+  `reduce_qpel_to_half_pel_chroma` wrapping until the docs
+  collaborator confirms the rule. `ChromaMvError::InvalidBlockCount`
+  rejects `K = 0` and `K > 4`. Test coverage: 24 new unit tests
+  (table-shape checks, K = 1 / 2 / 3 / 4 worked examples
+  including the §7.6.5 worked spec example `(4, 4) * 4 → (2, 2)`,
+  negative-input floor-division symmetry, error display) + 1
+  doctest. Total crate test count now 532 + 7 doc.
 - Round 26 of the clean-room rebuild: §7.6.9.5.3 B-VOP luminance
   prediction-block generation. New `src/bvop_prediction.rs`.
   `generate_b_vop_luma_prediction(forward_ref, backward_ref, mvs,

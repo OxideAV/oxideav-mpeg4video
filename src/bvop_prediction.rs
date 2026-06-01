@@ -38,10 +38,10 @@
 //! ## What this module does NOT do
 //!
 //! * **Chrominance prediction.** §7.6.9.5.3 second paragraph references
-//!   Tables 7-10..7-13 for the chroma-MV reduction; only Table 7-13 is
-//!   currently transcribed (in [`crate::quarter_sample`]). The 8×8
-//!   chroma MC will land in a follow-up once Tables 7-10..7-12 are in
-//!   place.
+//!   Tables 7-10..7-13 for the chroma-MV reduction. The reduction
+//!   itself now lives in [`crate::chroma_mv::chroma_mv_from_luma_blocks`]
+//!   (round 27); the 8×8 chroma MC that *consumes* the reduced MV will
+//!   land in a follow-up once a chroma reference-plane wrapper exists.
 //! * **§7.6.1.6 vector padding.** The caller supplies already-padded
 //!   MVs.
 //! * **§7.6.2 interpolation primitives.** Delegated to

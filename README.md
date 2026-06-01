@@ -5,13 +5,37 @@ A pure-Rust MPEG-4 Part 2 Video codec (ISO/IEC 14496-2) for the
 
 ## Status
 
-**Round 26 of the clean-room rebuild (2026-05-31).** The prior
+**Round 27 of the clean-room rebuild (2026-06-01).** The prior
 implementation was retired on 2026-05-18 under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md);
 the VLC tables admitted to sourcing their numeric entries from an
 external library. Master history was fully erased per the Hat-3 cold-
 enforcement procedure.
 
+* Round 27 — §7.6.5 chrominance motion-vector derivation `MVDCHR`
+  from `K ∈ {1, 2, 3, 4}` luminance sub-block motion vectors. New
+  `src/chroma_mv.rs`.
+  `chroma_mv_from_luma_blocks(&[MotionVector])` sums the K luma MVs
+  component-wise, divides by `2 * K` via floor (`i32::div_euclid` so
+  the residue is well-defined for negative MVs), and applies the
+  §7.6.5 fractional rounding by indexing one of four newly-
+  transcribed tables based on `K`: `TABLE_7_13` (K = 1, "fourth
+  sample resolution"), `TABLE_7_12` (K = 2, "eighth"), `TABLE_7_11`
+  (K = 3, "twelfth"), `TABLE_7_10` (K = 4, "sixteenth"). Each table
+  outputs a per-component half-sample offset in `{0, 1, 2}` to add
+  to the integer half-sample part; an output of `2` represents a
+  carry into the next integer chroma-pel (one full chroma-pel = 2
+  half-sample offsets). The residue is pre-scaled by 2 so the
+  half-sample sum indexes the table's `1/(4 * K)`-sample-grid index
+  domain. `ChromaMvError::InvalidBlockCount` rejects `K = 0` and
+  `K > 4`. Half-sample-mode entry-point only this round; quarter-
+  sample-mode pre-divide ("in quarter sample mode the vectors are
+  divided by 2 before summation") is left to the caller — the spec
+  text doesn't pin the rounding for that pre-divide step, so
+  callers should componentwise apply
+  `quarter_sample::reduce_qpel_to_half_pel_chroma` until the docs
+  collaborator confirms the rule. 24 new unit tests + 1 doctest;
+  total crate test count now 532 + 7 doc.
 * Round 26 — §7.6.9.5.3 B-VOP luminance prediction-block generation.
   New `src/bvop_prediction.rs`.
   `generate_b_vop_luma_prediction(forward_ref, backward_ref, mvs,
@@ -39,8 +63,9 @@ enforcement procedure.
   is the §7.3 step-1 `p[y][x]` prediction; the §7.3 step-2 residual
   add and step-3 `[0, 2^bpp - 1]` clip happen one layer up. The
   chroma per-block MV reduction (Tables 7-10..7-12 plus the existing
-  Table 7-13) and §7.6.1.6 vector padding remain follow-ups. 17 new
-  unit tests + 1 doctest; total crate test count now 508 + 6 doc.
+  Table 7-13) landed in round 27 below; §7.6.1.6 vector padding
+  remains a follow-up. 17 new unit tests + 1 doctest; total crate
+  test count now 508 + 6 doc.
 * Round 25 — §7.6.9.5.2 direct-mode forward + backward motion-vector
   derivation for B-VOPs. `direct_mode_motion_vector(co_located, mvd,
   trb, trd, units)` linearly scales the co-located anchor-VOP MV by
@@ -619,7 +644,12 @@ and reduced-resolution VOP extension bodies are typed-rejected via
 | §7.6.9.4 / §7.6.9.5.3 bidirectional averaging `(Pf + Pb + 1) >> 1` | `average_bidirectional_into` (round 26) |
 | §7.6.9.2 / §7.6.9.3 / §7.6.9.4 forward / backward / interpolated MB modes | `BVopPredictionMode::{ForwardOnly, BackwardOnly, Bidirectional}` (round 26) |
 | §7.6.9.5 direct mode 16×16 luma prediction              | `BVopPredictionMode::Direct` (round 26) |
-| B-VOP reconstruction (motion comp)                | luma: round 26; chroma + residual add still pending |
+| B-VOP reconstruction (motion comp)                | luma: round 26; chroma derivation: round 27; chroma MC + residual add still pending |
+| §7.6.5 chrominance MV derivation from K = 1 luma MV (Table 7-13) | `chroma_mv_from_luma_blocks` (round 27) |
+| §7.6.5 chrominance MV derivation from K = 2 luma MVs (Table 7-12) | `chroma_mv_from_luma_blocks` (round 27) |
+| §7.6.5 chrominance MV derivation from K = 3 luma MVs (Table 7-11) | `chroma_mv_from_luma_blocks` (round 27) |
+| §7.6.5 chrominance MV derivation from K = 4 luma MVs (Table 7-10) | `chroma_mv_from_luma_blocks` (round 27) |
+| §7.6.5 quarter-sample-mode chroma-MV pre-divide rounding | caller-applied via `reduce_qpel_to_half_pel_chroma`; spec text gap |
 | RVLC Tcoef tables (B.23..B.25) + Type 5 escape | not yet |
 | `sadct_disable == 0` modified inverse scan    | not yet |
 | §5.2.5 `next_resync_marker()` stuffing        | `consume_next_resync_marker` (round 18) |
@@ -629,7 +659,7 @@ and reduced-resolution VOP extension bodies are typed-rejected via
 | `header_extension_code == 1` rectangular body  | typed `VideoPacketHeader` (round 18) |
 | Encoder                                       | not yet |
 
-508 round-1..26 unit tests + 6 doctests pass.
+532 round-1..27 unit tests + 7 doctests pass.
 
 ## Provenance
 
@@ -649,7 +679,11 @@ B.19/B.20 (LMAX, intra/inter), B.21/B.22 (RMAX, intra/inter), B.18 c
 (FLC for Type-4 escape LEVEL in the short-video-header path: 8-bit
 signed two's-complement with `0000 0000` and `1000 0000` reserved) — and
 Table 6-33 (dbquant),
-Table 7-9 (motion-vector range per vop_fcode), and the syntax tables of
+Table 7-9 (motion-vector range per vop_fcode), Table 7-10
+(sixteenth-sample chroma-MV rounding, 16 entries), Table 7-11
+(twelfth-sample chroma-MV rounding, 12 entries), Table 7-12
+(eighth-sample chroma-MV rounding, 8 entries), Table 7-13
+(fourth-sample chroma-MV rounding, 4 entries), and the syntax tables of
 §6.2.2 / §6.2.3 / §6.2.4 / §6.2.5 / §6.2.6 plus the semantics in
 §6.3.3 (including the `8*[2-64]` zigzag-ordered quant-matrix list,
 the zero-sentinel "remaining values set equal to the last non-zero
@@ -844,7 +878,25 @@ mode except that motion compensation is performed on 8x8 blocks",
 together with §7.6.9.5.3's note on §7.6.2.2 block-boundary
 mirroring in quarter-sample mode — four 8×8 sub-blocks with the
 same MV do not collapse to one 16×16 fetch — and Figure 6-8's
-TL/TR/BL/BR 8×8 sub-block ordering inside a 16×16 macroblock).
+TL/TR/BL/BR 8×8 sub-block ordering inside a 16×16 macroblock),
+and §7.6.5 (the round-27 chrominance MV derivation: the
+paragraph immediately above Tables 7-10..7-13 — "Motion vector
+MVDCHR for both chrominance blocks is derived by calculating the
+sum of the K luminance vectors, that corresponds to K 8x8 blocks
+that do not lie outside the VOP shape and dividing this sum by
+2*K ... The component values of the resulting
+sixteenth/twelfth/eighth/fourth sample resolution vectors are
+modified towards the nearest half sample position as indicated
+below." — plus the four tables themselves verbatim: Table 7-10
+(16 entries, sixteenth resolution → half), Table 7-11 (12
+entries, twelfth), Table 7-12 (8 entries, eighth), Table 7-13
+(4 entries, fourth), and the §7.6.9.5.3 closing reference "For
+the motion compensation of both chrominance blocks, the forward
+motion vector (MVFx_chro, MVFy_chro) is calculated by the sum
+of K forward luminance motion vectors dividing by 2K and then
+rounding toward the nearest half sample position as defined in
+Table 7-10 to Table 7-13" that ties the round-27 entry point
+into the B-VOP direct-mode chroma path).
 The text was read from
 `docs/video/mpeg4-visual/ISO_IEC_14496-2-2004-3rd-edition.txt`. No
 third-party MPEG-4 source was consulted.
