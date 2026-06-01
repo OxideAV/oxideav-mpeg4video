@@ -8,6 +8,47 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 28 of the clean-room rebuild: §7.6.1.6 vector padding technique.
+  New `src/vector_padding.rs`.
+  `pad_macroblock_vectors(vectors, transparencies, mode)` applies the
+  per-macroblock §7.6.1.6 procedure to a `[MotionVector; 4]` of luma
+  block MVs in Figure 6-8 / §6.1.3.4 raster order
+  (`0 = TL, 1 = TR, 2 = BL, 3 = BR`).
+  `MacroblockPaddingMode::AllZero` covers the §7.6.1.6 top-level branch
+  for INTRA-coded macroblocks and P-VOP `skipped` macroblocks — all
+  four `vectors[i]` are overwritten with `(0, 0)` regardless of
+  `transparencies[i]`. `MacroblockPaddingMode::PerBlock` runs the
+  per-block fallback branch: each `BlockTransparency::Transparent` block
+  walks the precedence-ordered table
+  `FALLBACK_CHAIN = [[1,2,3], [0,3,2], [3,0,1], [2,1,0]]` (the verbatim
+  transcription of the §7.6.1.6 nested `?:` expressions: horizontal
+  partner first, then diagonal / vertical in the alternating spec
+  order) until the first `Opaque` partner is found, and copies that
+  partner's MV in. Partner MVs come from a pre-padding snapshot so
+  the fallback chain always reads the §7.6.1.6 *input* vectors, not
+  the in-place-updated outputs of a prior iteration (the spec
+  pseudo-code reads `MVx[j]` on every `?:` RHS — these must be the
+  pre-padding values). `VectorPaddingError::AllTransparent` rejects a
+  fully-transparent macroblock under `PerBlock` per the §7.6.1.6
+  opening sentence ("applied to ... the transparent blocks within a
+  *non-transparent* macroblock"). The output feeds three downstream
+  consumers: the `K` luma MVs that flow into
+  `chroma_mv_from_luma_blocks` (§7.6.5 luma → chroma derivation),
+  the spatial MV predictor `MV1 / MV2 / MV3` candidate gathering
+  (§7.6.5), and the temporally-next anchor VOP's co-located MVs that
+  `direct_mode_motion_vector` linearly scales (§7.6.9.5 B-VOP direct
+  mode). Per the §7.6.1.6 closing paragraph, S(GMC) `mcsel == 1`
+  blocks must have the §7.8.7.3 averaged MV substituted into
+  `vectors[i]` before invocation — this module accepts the
+  post-substitution vectors and treats them as ordinary block MVs.
+  Test coverage: 21 new unit tests (fallback-table shape sanity,
+  AllZero branch overrides decoded MVs + ignores transparency
+  pattern, PerBlock identity for all-opaque, each block as the
+  single transparent slot, 2nd-choice fallback cases, 3rd-choice
+  fallback cases, snapshot semantics verification, AllTransparent
+  rejection without modifying vectors, negative-MV propagation,
+  error display contains the spec clause) + 1 doctest + 1
+  lib-level Error round-trip. Total crate test count now 553 + 8 doc.
 - Round 27 of the clean-room rebuild: §7.6.5 chrominance motion-vector
   derivation `MVDCHR` from `K ∈ {1, 2, 3, 4}` luminance sub-block
   motion vectors (4:2:0 rectangular VOP). New `src/chroma_mv.rs`.

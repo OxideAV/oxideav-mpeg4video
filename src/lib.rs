@@ -315,6 +315,7 @@ pub mod predictor;
 pub mod quarter_sample;
 pub mod scan;
 pub mod texture;
+pub mod vector_padding;
 pub mod video_packet;
 pub mod vol;
 pub mod vop;
@@ -383,6 +384,10 @@ pub use texture::{
     decode_ac_events_short_video_header, decode_intra_dc, AcEvent, DcComponent,
     IntraDcDifferential, TcoefTable, TextureParseError,
 };
+pub use vector_padding::{
+    pad_macroblock_vectors, BlockTransparency, MacroblockPaddingMode, VectorPaddingError,
+    LUMA_BLOCKS_PER_MB,
+};
 pub use video_packet::{
     consume_next_resync_marker, macroblock_number_bit_width, parse_video_packet_header,
     probe_resync_marker, resync_marker_length, total_macroblocks, VideoPacketContext,
@@ -442,6 +447,10 @@ pub enum Error {
     /// (`TRD > 0`, `0 <= TRB <= TRD`) failed. See [`DirectMvError`]
     /// for the discrimination.
     DirectMv(DirectMvError),
+    /// A §7.6.1.6 vector padding precondition (the macroblock must not
+    /// be fully transparent under [`MacroblockPaddingMode::PerBlock`])
+    /// failed. See [`VectorPaddingError`] for the discrimination.
+    VectorPadding(VectorPaddingError),
 }
 
 impl core::fmt::Display for Error {
@@ -476,6 +485,9 @@ impl core::fmt::Display for Error {
             }
             Error::DirectMv(err) => {
                 write!(f, "oxideav-mpeg4video: direct-mode MV error: {err}")
+            }
+            Error::VectorPadding(err) => {
+                write!(f, "oxideav-mpeg4video: vector padding error: {err}")
             }
         }
     }
@@ -540,6 +552,12 @@ impl From<VideoPacketParseError> for Error {
 impl From<DirectMvError> for Error {
     fn from(err: DirectMvError) -> Self {
         Error::DirectMv(err)
+    }
+}
+
+impl From<VectorPaddingError> for Error {
+    fn from(err: VectorPaddingError) -> Self {
+        Error::VectorPadding(err)
     }
 }
 
@@ -632,5 +650,15 @@ mod tests {
         let e: Error = DirectMvError::InvalidTrd(0).into();
         assert!(matches!(e, Error::DirectMv(DirectMvError::InvalidTrd(0))));
         assert!(format!("{e}").contains("direct-mode MV error"));
+    }
+
+    #[test]
+    fn vector_padding_error_round_trip() {
+        let e: Error = VectorPaddingError::AllTransparent.into();
+        assert!(matches!(
+            e,
+            Error::VectorPadding(VectorPaddingError::AllTransparent)
+        ));
+        assert!(format!("{e}").contains("vector padding error"));
     }
 }

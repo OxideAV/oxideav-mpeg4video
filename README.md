@@ -5,13 +5,42 @@ A pure-Rust MPEG-4 Part 2 Video codec (ISO/IEC 14496-2) for the
 
 ## Status
 
-**Round 27 of the clean-room rebuild (2026-06-01).** The prior
+**Round 28 of the clean-room rebuild (2026-06-02).** The prior
 implementation was retired on 2026-05-18 under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md);
 the VLC tables admitted to sourcing their numeric entries from an
 external library. Master history was fully erased per the Hat-3 cold-
 enforcement procedure.
 
+* Round 28 — §7.6.1.6 vector padding technique. New
+  `src/vector_padding.rs`.
+  `pad_macroblock_vectors(vectors, transparencies, mode)` applies the
+  per-macroblock §7.6.1.6 procedure to a `[MotionVector; 4]` of luma
+  block MVs (Figure 6-8 / §6.1.3.4 raster order: `0 = TL`, `1 = TR`,
+  `2 = BL`, `3 = BR`). `MacroblockPaddingMode::AllZero` covers the
+  §7.6.1.6 top-level branch for INTRA-coded macroblocks and P-VOP
+  `skipped` macroblocks — all four `vectors[i]` are overwritten with
+  `(0, 0)` regardless of `transparencies[i]`.
+  `MacroblockPaddingMode::PerBlock` covers the per-block fallback
+  branch: each `BlockTransparency::Transparent` block walks the
+  precedence-ordered table
+  `FALLBACK_CHAIN = [[1,2,3], [0,3,2], [3,0,1], [2,1,0]]` (the verbatim
+  transcription of the §7.6.1.6 nested `?:` expressions) until the first
+  `Opaque` partner is found, and copies that partner's MV in. The
+  partner MVs are read from a pre-padding snapshot so the fallback
+  chain reads the §7.6.1.6 *input* vectors, not the in-place-updated
+  outputs of a prior iteration. `VectorPaddingError::AllTransparent`
+  rejects a fully-transparent macroblock under `PerBlock` (§7.6.1.6
+  scopes itself to "the transparent blocks within a *non-transparent*
+  macroblock" — there is no fallback source for a fully-transparent
+  macroblock and the caller must not invoke this routine). The output
+  feeds three downstream consumers: §7.6.5 luma → chroma derivation
+  (the `K` luma MVs that flow into `chroma_mv_from_luma_blocks`), the
+  §7.6.5 spatial MV predictor candidate gathering (`MV1 / MV2 / MV3`
+  pulled from already-decoded neighbours), and §7.6.9.5 B-VOP direct
+  mode (the temporally-next anchor VOP's co-located MVs that
+  `direct_mode_motion_vector` linearly scales). 21 new unit tests +
+  1 doctest; total crate test count now 553 + 8 doc.
 * Round 27 — §7.6.5 chrominance motion-vector derivation `MVDCHR`
   from `K ∈ {1, 2, 3, 4}` luminance sub-block motion vectors. New
   `src/chroma_mv.rs`.
