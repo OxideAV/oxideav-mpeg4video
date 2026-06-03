@@ -8,6 +8,28 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 30 of the clean-room rebuild: §7.6.5 / Figure 7-34 spatial
+  motion-vector predictor candidate gathering. New module
+  `mv_predictor_grid` providing `MvGrid::new(mb_rows, mb_cols)` and
+  per-macroblock `record_one_mv` / `record_four_mv` / `record_absent`
+  setters (plus generic `record(mb_row, mb_col, MbMvRecord)`). The
+  `predictor_candidates(mb_row, mb_col, block_index)` query (also
+  available as the free function `gather_mv_predictor_candidates`)
+  resolves the three Figure 7-34 spatial positions for the current
+  8×8 luminance block (Figure 6-8 numbering: `0 = TL`, `1 = TR`,
+  `2 = BL`, `3 = BR`) into a `[Option<MotionVector>; 3]` triple ready
+  to feed directly into `predict_motion_vector`. New public types:
+  `MbMv ∈ {Absent, OneMv(MotionVector), FourMv([MotionVector; 4])}`,
+  `MbMvRecord { content, transparent: [bool; 4] }`, `MvGrid`,
+  `MvGridError`. The §7.6.5 boundary-substitution rule for
+  neighbours outside the current VOP / video packet / GOB is handled
+  by `MvGrid::record_absent` on the boundary MBs. Per-luma-block
+  transparency within an otherwise-opaque macroblock is handled by
+  the four-element `MbMvRecord::transparent` mask. The four
+  block-position cases follow the in-repo ASCII transcription of
+  Figure 7-34 in
+  `docs/video/mpeg4-visual/figure-7-34-mv-predictor-layout.md`. 22
+  new unit tests + 1 doctest; total crate test count now 587 + 9 doc.
 - Round 29 of the clean-room rebuild: §7.6.9.5.3 second-paragraph +
   §7.6.9.4 chrominance motion-compensation plane for B-VOPs.
   `generate_b_vop_chroma_prediction(forward_chroma_ref,

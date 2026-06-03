@@ -47,14 +47,13 @@
 //! ## Out of scope (this round)
 //!
 //! * **Gathering** the candidate predictors from the spatial
-//!   neighbourhood (the `MV1`/`MV2`/`MV3` block positions of
-//!   Figure 7-34, the four-MV vs single-MV cases, and the
-//!   S(GMC)-VOP `mcsel == '1'` averaged-vector substitution of
-//!   §7.8.7.3). Figure 7-34 is a diagram with no textual position list
-//!   in the spec, so the spatial layout is a later round; this module
-//!   resolves and medians candidates the caller has already gathered,
-//!   marking transparent / out-of-VOP / out-of-packet neighbours as
-//!   `None`.
+//!   neighbourhood is owned by [`crate::mv_predictor_grid`] (the
+//!   `MV1`/`MV2`/`MV3` block positions of Figure 7-34 and the four-MV
+//!   vs single-MV cases); this module resolves and medians candidates
+//!   the caller has already gathered, marking transparent / out-of-VOP
+//!   / out-of-packet neighbours as `None`. The S(GMC)-VOP
+//!   `mcsel == '1'` averaged-vector substitution of §7.8.7.3 is
+//!   handled by [`averaged_motion_vector`].
 //! * The "direct" mode's predictor scaling from the co-located P-VOP MV
 //!   (§7.6.6) — `"direct"` here decodes only its `mv_data` pair (no
 //!   residuals, exactly as the §6.2.6.2 syntax shows) and reconstructs
@@ -446,9 +445,8 @@ fn resolve_candidates(candidates: [Option<MotionVector>; 3]) -> [MotionVector; 3
 ///
 /// The returned vector is the `(Px, Py)` predictor that
 /// [`reconstruct_motion_vector`] adds to the decoded differential MV.
-/// Gathering the candidates from the spatial neighbourhood
-/// (Figure 7-34 positions) is the caller's responsibility and out of
-/// scope for this module.
+/// Gather the candidates from the spatial neighbourhood via
+/// [`crate::mv_predictor_grid::MvGrid::predictor_candidates`].
 pub fn predict_motion_vector(candidates: [Option<MotionVector>; 3]) -> MotionVector {
     let [mv1, mv2, mv3] = resolve_candidates(candidates);
     MotionVector {

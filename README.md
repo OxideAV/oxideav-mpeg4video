@@ -5,13 +5,50 @@ A pure-Rust MPEG-4 Part 2 Video codec (ISO/IEC 14496-2) for the
 
 ## Status
 
-**Round 29 of the clean-room rebuild (2026-06-03).** The prior
+**Round 30 of the clean-room rebuild (2026-06-03).** The prior
 implementation was retired on 2026-05-18 under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md);
 the VLC tables admitted to sourcing their numeric entries from an
 external library. Master history was fully erased per the Hat-3 cold-
 enforcement procedure.
 
+* Round 30 — §7.6.5 / Figure 7-34 spatial motion-vector predictor
+  candidate gathering. New `src/mv_predictor_grid.rs`. `MvGrid::new(
+  mb_rows, mb_cols)` allocates a per-VOP grid sized `mb_rows × mb_cols`
+  macroblocks; each cell carries an `MbMvRecord { content, transparent
+  }` where `content ∈ {Absent, OneMv(MV), FourMv([MV; 4])}` covers the
+  three §6.2.6.2 / §7.6.5 MB-level modes (1-MV inter, 4-MV inter4v,
+  and "outside current VOP / video packet / GOB / wholly-transparent
+  MB" per the §7.6.5 boundary-substitution rule). The four-element
+  `transparent` mask handles the per-block §7.6.1.6 transparency case
+  within a non-transparent macroblock — a set bit yields a `None`
+  candidate for the corresponding sub-block. `predictor_candidates(
+  mb_row, mb_col, block_index) -> [Option<MotionVector>; 3]` resolves
+  the three Figure 7-34 spatial positions for the current 8×8 luminance
+  block (Figure 6-8 numbering: `0 = TL`, `1 = TR`, `2 = BL`, `3 = BR`)
+  into a triple ready to feed straight into [`predict_motion_vector`].
+  The four block-position cases follow the in-repo ASCII transcription
+  of Figure 7-34 (`docs/video/mpeg4-visual/figure-7-34-mv-predictor-
+  layout.md`): block 0 pulls MV1 from the TR sub-block of the left MB,
+  MV2 from the BL sub-block of the above MB, and MV3 from the BL
+  sub-block of the above-right MB; block 1 pulls MV1 from block 0 of
+  the current MB, MV2 from the BR sub-block of the above MB, and MV3
+  from the BL sub-block of the above-right MB; block 2 pulls MV1 from
+  the BR sub-block of the left MB and MV2 / MV3 from blocks 0 / 1 of
+  the current MB; block 3 pulls MV1 / MV2 / MV3 from blocks 2 / 0 / 1
+  of the current MB respectively. The "1-MV current MB uses block 0's
+  layout" rule is the caller's responsibility (pass `block_index = 0`).
+  On the neighbour side a 1-MV MB returns the same MV for every
+  sub-block query inside it, so no special-casing on the gather side is
+  needed. Sub-grid coordinates negative or beyond `2 * mb_rows` /
+  `2 * mb_cols` collapse to `None`, exercising the VOP-boundary case.
+  Crossing a video-packet / GOB boundary is handled by the caller via
+  `record_absent` on the boundary-side MBs. The §7.6.5 four
+  substitution rules (one invalid → zero, two invalid → the third's
+  value, three invalid → all zero) continue to live in
+  [`predict_motion_vector`], which now has its candidate input
+  produced end-to-end against a Figure 7-34 layout. 22 new unit tests
+  + 1 doctest; total crate test count now 587 + 9 doc.
 * Round 29 — §7.6.9.5.3 second-paragraph + §7.6.9.4 chrominance
   motion-compensation plane for B-VOPs. Extends `src/bvop_prediction.rs`
   with `generate_b_vop_chroma_prediction(forward_chroma_ref,
@@ -643,7 +680,10 @@ and reduced-resolution VOP extension bodies are typed-rejected via
 | §7.6.3 differential-MV reconstruction         | `(Abs-1)*f + res + 1`, sign (round 7) |
 | §7.6.3 predictor add + Table 7-9 modulo wrap  | `reconstruct_motion_vector` (round 7) |
 | §7.6.5 median MV predictor + validity rules    | `predict_motion_vector` (round 8) |
-| MV-predictor candidate gathering (Figure 7-34) | not yet |
+| MV-predictor candidate gathering (Figure 7-34) | `MvGrid::predictor_candidates` / `gather_mv_predictor_candidates` (round 30) |
+| 1-MV vs 4-MV per-MB MV storage                 | `MbMv::{Absent, OneMv, FourMv}` (round 30) |
+| Per-luma-block transparency mask within an MB  | `MbMvRecord::transparent` (round 30) |
+| Video-packet / GOB boundary substitution       | `MvGrid::record_absent` (round 30) |
 | `dct_dc_size_luminance` Table B.13            | prefix-free VLC decode (round 9) |
 | `dct_dc_size_chrominance` Table B.14          | prefix-free VLC decode (round 9) |
 | `dct_dc_differential` Table B.15 sign-decode  | `decode_intra_dc` (round 9) |
@@ -717,7 +757,7 @@ and reduced-resolution VOP extension bodies are typed-rejected via
 | `header_extension_code == 1` rectangular body  | typed `VideoPacketHeader` (round 18) |
 | Encoder                                       | not yet |
 
-532 round-1..27 unit tests + 7 doctests pass.
+587 round-1..30 unit tests + 9 doctests pass.
 
 ## Provenance
 
@@ -761,7 +801,14 @@ four candidate-predictor validity rules, the `Px = Median(MV1x, MV2x,
 MV3x)` / `Py = Median(MV1y, MV2y, MV3y)` combination, and the worked
 example `MV1=(-2,3)`, `MV2=(1,5)`, `MV3=(-1,7)` → `Px=-1`, `Py=5`
 that fixes `Median(a, b, c)` as the middle of three since the §4.1
-operator clause does not define it), and §7.4.1.1 / §6.2.7 (`block(i)`)
+operator clause does not define it; plus Figure 7-34's per-current-block
+spatial layout of MV1 / MV2 / MV3 transcribed in
+`docs/video/mpeg4-visual/figure-7-34-mv-predictor-layout.md` as the
+authoritative source for the four block-position cases of the §7.6.5
+gather, the "1-MV macroblock uses the top-left case" rule from the
+paragraph preceding Figure 7-34, and the boundary-substitution rule
+that treats neighbouring MBs outside the current VOP / video packet /
+GOB as transparent), and §7.4.1.1 / §6.2.7 (`block(i)`)
 / §6.3.7 (the intra-DC texture decode: the `dct_dc_size_luminance`
 (`i < 4`) / `dct_dc_size_chrominance` (`i >= 4`) split, the
 `if (dct_dc_size != 0) dct_dc_differential` and

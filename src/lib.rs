@@ -309,6 +309,7 @@ pub mod idct;
 pub mod inverse_quant;
 pub mod macroblock;
 pub mod motion;
+pub mod mv_predictor_grid;
 pub mod neighbour;
 pub mod obmc;
 pub mod predictor;
@@ -357,6 +358,9 @@ pub use motion::{
     direct_mode_reduce_qpel_to_half_pel, predict_motion_vector, reconstruct_motion_vector,
     DirectCoLocatedMv, DirectModeMv, DirectMvError, DirectMvUnits, MotionParseError, MotionVector,
     MotionVectorDelta, MvMode, AMV_PIXEL_COUNT,
+};
+pub use mv_predictor_grid::{
+    gather_mv_predictor_candidates, MbMv, MbMvRecord, MvGrid, MvGridError,
 };
 pub use neighbour::{
     block_grid_position, BlockGridPosition, BlockNeighbour, ChromaPlane, IntraBlockGrid,
@@ -451,6 +455,10 @@ pub enum Error {
     /// be fully transparent under [`MacroblockPaddingMode::PerBlock`])
     /// failed. See [`VectorPaddingError`] for the discrimination.
     VectorPadding(VectorPaddingError),
+    /// A §7.6.5 / Figure 7-34 MV-predictor candidate-gathering call
+    /// referred to a macroblock or sub-block index outside the grid.
+    /// See [`MvGridError`] for the discrimination.
+    MvGrid(MvGridError),
 }
 
 impl core::fmt::Display for Error {
@@ -488,6 +496,9 @@ impl core::fmt::Display for Error {
             }
             Error::VectorPadding(err) => {
                 write!(f, "oxideav-mpeg4video: vector padding error: {err}")
+            }
+            Error::MvGrid(err) => {
+                write!(f, "oxideav-mpeg4video: MV-predictor grid error: {err}")
             }
         }
     }
@@ -558,6 +569,12 @@ impl From<DirectMvError> for Error {
 impl From<VectorPaddingError> for Error {
     fn from(err: VectorPaddingError) -> Self {
         Error::VectorPadding(err)
+    }
+}
+
+impl From<MvGridError> for Error {
+    fn from(err: MvGridError) -> Self {
+        Error::MvGrid(err)
     }
 }
 
@@ -660,5 +677,15 @@ mod tests {
             Error::VectorPadding(VectorPaddingError::AllTransparent)
         ));
         assert!(format!("{e}").contains("vector padding error"));
+    }
+
+    #[test]
+    fn mv_grid_error_round_trip() {
+        let e: Error = MvGridError::InvalidBlockIndex(7).into();
+        assert!(matches!(
+            e,
+            Error::MvGrid(MvGridError::InvalidBlockIndex(7))
+        ));
+        assert!(format!("{e}").contains("MV-predictor grid error"));
     }
 }
