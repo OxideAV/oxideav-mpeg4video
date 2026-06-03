@@ -314,6 +314,7 @@ pub mod neighbour;
 pub mod obmc;
 pub mod predictor;
 pub mod quarter_sample;
+pub mod reconstruct;
 pub mod scan;
 pub mod texture;
 pub mod vector_padding;
@@ -378,6 +379,12 @@ pub use quarter_sample::{
     fir_8tap_clip, half_pel_b, half_pel_c, half_pel_d, interpolate_block_qpel,
     interpolate_block_qpel_into, interpolate_quarter_pixel, reduce_qpel_to_half_pel_chroma,
     split_quarter_pel, QPEL_FIR_C,
+};
+pub use reconstruct::{
+    clip_display_sample, reconstruct_inter_block_8x8, reconstruct_inter_block_8x8_into,
+    reconstruct_inter_macroblock, reconstruct_inter_macroblock_into, reconstruct_intra_block_8x8,
+    reconstruct_intra_macroblock, InterPredictionMacroblock, ReconstructedMacroblock, BLOCK_SIDE,
+    MACROBLOCK_CHROMA_SIDE, MACROBLOCK_LUMA_SIDE,
 };
 pub use scan::{
     events_to_pqf, events_to_qfs, inverse_scan, select_scan_type, DcPredictionDirection,

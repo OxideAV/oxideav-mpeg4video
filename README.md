@@ -5,13 +5,48 @@ A pure-Rust MPEG-4 Part 2 Video codec (ISO/IEC 14496-2) for the
 
 ## Status
 
-**Round 30 of the clean-room rebuild (2026-06-03).** The prior
+**Round 31 of the clean-room rebuild (2026-06-03).** The prior
 implementation was retired on 2026-05-18 under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md);
 the VLC tables admitted to sourcing their numeric entries from an
 external library. Master history was fully erased per the Hat-3 cold-
 enforcement procedure.
 
+* Round 31 — §7.3 VOP reconstruction. New `src/reconstruct.rs`. The
+  module closes the per-pixel reconstruction pipeline by combining
+  the §7.4.x texture-chain output `f[y][x]` with the §7.6
+  motion-compensation output `p[y][x]`. `clip_display_sample(value,
+  bits_per_pixel)` is the per-sample §7.3 step-3 three-branch clip
+  (`2^bpp - 1` when `d > 2^bpp - 1`; `d` when `0 <= d <= 2^bpp - 1`;
+  `0` when `d < 0`). `reconstruct_inter_block_8x8(prediction,
+  residual, bits_per_pixel)` (plus the `_into` variant) applies §7.3
+  step-2 + step-3 to one 8×8 inter block: `out[y][x] =
+  clip(prediction[y][x] + residual[y][x], 0, 2^bpp - 1)`. The §7.3
+  step-1 intra branch is exposed as `reconstruct_intra_block_8x8(
+  sample, bits_per_pixel)` — there is no prediction add, just the
+  identity-plus-clip. At the 4:2:0 macroblock granularity,
+  `reconstruct_inter_macroblock(prediction, residual,
+  bits_per_pixel)` and `reconstruct_intra_macroblock(sample,
+  bits_per_pixel)` (plus the inter `_into` variant) consume the
+  existing 16×16-luma + 8×8-chroma `InterMacroblock` /
+  `IntraMacroblock` shapes (produced by `decode_inter_macroblock` /
+  `decode_intra_macroblock`) and the new
+  `InterPredictionMacroblock` shape (`luma: [[i32; 16]; 16]`, `cb /
+  cr: [[i32; 8]; 8]`) that holds the §7.6 motion-compensated
+  prediction. `InterPredictionMacroblock::zero()` is the all-zero
+  prediction shorthand for the §7.6.9.6 / boundary-substitution
+  fallback (`d` reduces to `clip(f, 0, 2^bpp - 1)`).
+  `ReconstructedMacroblock` is the `d[y][x]` output, ready to be
+  blitted into the VOP frame buffer with every sample already in the
+  §7.3 step-3 display range. Per-plane processing is independent: a
+  §7.3 step-3 clip on Cr cannot affect luma or Cb. Arithmetic uses
+  `i32` so the worst-case sum `(2^bpp - 1) + (2^bpp - 1) = 2^(bpp +
+  1) - 2` stays well inside the type for any practical
+  `bits_per_pixel`. The §6.3.3 `not_8_bit` / `bits_per_pixel != 8`
+  path is honoured by every entry point (a 10-bit case is exercised
+  in the tests). Public constants: `BLOCK_SIDE = 8`,
+  `MACROBLOCK_LUMA_SIDE = 16`, `MACROBLOCK_CHROMA_SIDE = 8`. 21 new
+  unit tests; total crate test count now 608 + 9 doc.
 * Round 30 — §7.6.5 / Figure 7-34 spatial motion-vector predictor
   candidate gathering. New `src/mv_predictor_grid.rs`. `MvGrid::new(
   mb_rows, mb_cols)` allocates a per-VOP grid sized `mb_rows × mb_cols`
@@ -737,7 +772,11 @@ and reduced-resolution VOP extension bodies are typed-rejected via
 | Inter MB residual assembly (16×16 luma + 8×8 Cb/Cr) | `InterMacroblock` (round 21) |
 | `decode_inter_macroblock` (Inter / InterQ / Inter4V) | round 21 |
 | `nonintra_quant_matrix(vol)` `W[1]` resolver       | round 21 |
-| Motion compensation (`p[y][x]` + `f[y][x]` + §7.3 step-3 clip) | not yet |
+| §7.3 step-2 inter `d[y][x] = p[y][x] + f[y][x]` sum     | `reconstruct_inter_block_8x8` / `reconstruct_inter_macroblock` (round 31) |
+| §7.3 step-3 display clip `[0, 2^bpp - 1]`               | `clip_display_sample` (round 31) |
+| §7.3 step-1 intra `d[y][x] = f[y][x]` + step-3 clip     | `reconstruct_intra_block_8x8` / `reconstruct_intra_macroblock` (round 31) |
+| Inter prediction macroblock plane container             | `InterPredictionMacroblock` (round 31) |
+| Reconstructed macroblock output (`d[y][x]` planes)      | `ReconstructedMacroblock` (round 31) |
 | §7.6.9.5.3 B-VOP 8×8 luminance prediction-block generation | `generate_b_vop_luma_prediction` (round 26) |
 | §7.6.9.4 / §7.6.9.5.3 bidirectional averaging `(Pf + Pb + 1) >> 1` | `average_bidirectional_into` (round 26) |
 | §7.6.9.2 / §7.6.9.3 / §7.6.9.4 forward / backward / interpolated MB modes | `BVopPredictionMode::{ForwardOnly, BackwardOnly, Bidirectional}` (round 26) |
@@ -757,7 +796,7 @@ and reduced-resolution VOP extension bodies are typed-rejected via
 | `header_extension_code == 1` rectangular body  | typed `VideoPacketHeader` (round 18) |
 | Encoder                                       | not yet |
 
-587 round-1..30 unit tests + 9 doctests pass.
+608 round-1..31 unit tests + 9 doctests pass.
 
 ## Provenance
 

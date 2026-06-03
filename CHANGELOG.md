@@ -8,6 +8,38 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 31 of the clean-room rebuild: §7.3 VOP reconstruction — the
+  per-pixel `d[y][x] = p[y][x] + f[y][x]` step-2 sum plus the step-3
+  `[0, 2^bits_per_pixel - 1]` display-range saturation that closes the
+  decoder pipeline. New module `reconstruct`. `clip_display_sample(
+  value, bits_per_pixel)` is the per-sample §7.3 step-3 primitive (the
+  three-branch clip "`2^bpp - 1` when `d > 2^bpp - 1`, `d` when
+  `0 <= d <= 2^bpp - 1`, `0` when `d < 0`").
+  `reconstruct_inter_block_8x8(prediction, residual, bits_per_pixel)`
+  (plus the `_into` buffer-out variant) applies §7.3 step-2 + step-3 to
+  one 8×8 inter block — `out[y][x] = clip(prediction[y][x] +
+  residual[y][x], 0, 2^bpp - 1)`. `reconstruct_intra_block_8x8(sample,
+  bits_per_pixel)` covers the §7.3 step-1 intra branch (`d = f`, then
+  the §7.3 step-3 clip). `reconstruct_inter_macroblock(prediction,
+  residual, bits_per_pixel)` and `reconstruct_intra_macroblock(sample,
+  bits_per_pixel)` (plus the `_into` variant for the inter path)
+  operate at the 4:2:0 macroblock granularity, consuming the existing
+  16×16-luma + 8×8-chroma `InterMacroblock` / `IntraMacroblock`
+  residual / sample shapes produced by `decode_inter_macroblock` /
+  `decode_intra_macroblock` and the new `InterPredictionMacroblock`
+  shape that holds the `p[y][x]` plane outputs from the §7.6
+  half-sample / quarter-sample / B-VOP prediction modules.
+  `InterPredictionMacroblock::zero()` constructs the all-zero
+  prediction macroblock for the §7.6.9.6 / boundary-substitution
+  fallback case. `ReconstructedMacroblock` carries the `d[y][x]`
+  output planes in the §7.3 step-3 display range `[0, 2^bpp - 1]`,
+  ready to be blitted into the VOP frame buffer. The luma / Cb / Cr
+  planes are processed independently — a §7.3 step-3 clip on one
+  plane does not affect the others. The §6.3.3 `not_8_bit` /
+  `bits_per_pixel != 8` path is honoured by every entry point. Public
+  constants `BLOCK_SIDE = 8`, `MACROBLOCK_LUMA_SIDE = 16`,
+  `MACROBLOCK_CHROMA_SIDE = 8`. 21 new unit tests; total crate test
+  count now 608 + 9 doc.
 - Round 30 of the clean-room rebuild: §7.6.5 / Figure 7-34 spatial
   motion-vector predictor candidate gathering. New module
   `mv_predictor_grid` providing `MvGrid::new(mb_rows, mb_cols)` and
