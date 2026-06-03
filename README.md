@@ -5,13 +5,50 @@ A pure-Rust MPEG-4 Part 2 Video codec (ISO/IEC 14496-2) for the
 
 ## Status
 
-**Round 31 of the clean-room rebuild (2026-06-03).** The prior
+**Round 32 of the clean-room rebuild (2026-06-04).** The prior
 implementation was retired on 2026-05-18 under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md);
 the VLC tables admitted to sourcing their numeric entries from an
 external library. Master history was fully erased per the Hat-3 cold-
 enforcement procedure.
 
+* Round 32 — §7.6.1.1 horizontal repetitive padding. New
+  `src/sample_padding.rs`. The module covers the first pass of the
+  §7.6.1 reference-VOP padding pipeline that fills the transparent
+  samples of a *boundary macroblock* (one straddling the VOP shape
+  mask) so the §7.6.2.1 / §7.6.2.2 sample-interpolation primitives can
+  fetch every position inside the bounding rectangle without a
+  per-sample transparency probe.
+  `horizontal_repetitive_padding_row::<N>(decoded, shape, out, s_prime)`
+  applies the spec's verbatim per-row procedure to any row size
+  (16 for luma per §6.1.3.4, 8 for each chrominance block per
+  §7.6.1.4): for each transparent sample, look left for the nearest
+  opaque sample at-or-before `x` (`x'`) and right for the nearest
+  opaque sample strictly after `x` (`x''`); both exist → fill with
+  `(d[x'] + d[x'']) // 2` (§3.4 truncation toward zero implemented via
+  `i32::div_euclid`); only one side exists → replicate that single
+  boundary sample; neither exists → the row-guard treats the row as
+  fully transparent and the §7.6.1.2 vertical pass handles it later.
+  The §7.6.1.1 fill sentinel `s'[y][x]` (initialised to 0 then flipped
+  to 1 on any fill) surfaces as a `SamplePresence` array so the
+  §7.6.1.2 vertical pass can pick up its row state. The per-row
+  return value `ShapeRowState ∈ {FullyFilled, FullyTransparent}`
+  distinguishes "row was filled by §7.6.1.1" from "row had no opaque
+  sample and was skipped per the row-guard". `SamplePresence ∈
+  {Opaque, Transparent}` is the per-sample `s[y][x]` flag.
+  `horizontal_repetitive_padding_luma(decoded, shape)` and
+  `horizontal_repetitive_padding_chroma(decoded, shape)` are the 16×16
+  / 8×8 macroblock-level entry points that loop the per-row routine
+  over the macroblock side and return the
+  `(hor_pad, s_prime, row_states)` triple ready to feed the §7.6.1.2
+  vertical pass. The averaging arithmetic uses `i32` so the worst-case
+  sum `(2^bpp - 1) + (2^bpp - 1) = 2^(bpp + 1) - 2` stays well inside
+  the type for any practical `bits_per_pixel`. Public constants:
+  `LUMA_SIDE = 16`, `CHROMA_SIDE = 8`. The §7.6.1.2 vertical pass,
+  §7.6.1.3 extended padding for exterior macroblocks, §7.6.1.4 chroma
+  shape decimation, and §7.6.1.5 interlaced per-field padding remain
+  later-round work. 15 new unit tests; total crate test count now
+  623 + 9 doc.
 * Round 31 — §7.3 VOP reconstruction. New `src/reconstruct.rs`. The
   module closes the per-pixel reconstruction pipeline by combining
   the §7.4.x texture-chain output `f[y][x]` with the §7.6

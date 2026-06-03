@@ -315,6 +315,7 @@ pub mod obmc;
 pub mod predictor;
 pub mod quarter_sample;
 pub mod reconstruct;
+pub mod sample_padding;
 pub mod scan;
 pub mod texture;
 pub mod vector_padding;
@@ -385,6 +386,11 @@ pub use reconstruct::{
     reconstruct_inter_macroblock, reconstruct_inter_macroblock_into, reconstruct_intra_block_8x8,
     reconstruct_intra_macroblock, InterPredictionMacroblock, ReconstructedMacroblock, BLOCK_SIDE,
     MACROBLOCK_CHROMA_SIDE, MACROBLOCK_LUMA_SIDE,
+};
+pub use sample_padding::{
+    horizontal_repetitive_padding_chroma, horizontal_repetitive_padding_luma,
+    horizontal_repetitive_padding_row, SamplePresence, ShapeRowState,
+    CHROMA_SIDE as PADDING_CHROMA_SIDE, LUMA_SIDE as PADDING_LUMA_SIDE,
 };
 pub use scan::{
     events_to_pqf, events_to_qfs, inverse_scan, select_scan_type, DcPredictionDirection,

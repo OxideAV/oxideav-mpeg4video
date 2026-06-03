@@ -8,6 +8,36 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 32 of the clean-room rebuild: §7.6.1.1 horizontal repetitive
+  padding — the first pass of the §7.6.1 reference-VOP padding
+  pipeline. New module `sample_padding` filling the transparent
+  samples of a boundary macroblock by replicating the VOP-boundary
+  samples of the same row.
+  `horizontal_repetitive_padding_row::<N>(decoded, shape, out,
+  s_prime)` applies the spec's verbatim per-row procedure to any row
+  size: for each transparent sample, look left for `x'` (nearest
+  opaque at-or-before `x`) and right for `x''` (nearest opaque
+  strictly after `x`); both exist → fill with `(d[x'] + d[x'']) // 2`
+  (§3.4 truncation toward zero via `i32::div_euclid`); only one side
+  exists → replicate that boundary sample; neither exists → the
+  row-guard reports `ShapeRowState::FullyTransparent` for the
+  §7.6.1.2 vertical pass to handle later.
+  `horizontal_repetitive_padding_luma(decoded, shape)` /
+  `horizontal_repetitive_padding_chroma(decoded, shape)` are the 16×16
+  / 8×8 macroblock-level entry points (matching the §6.1.3.4 luma side
+  and the §7.6.1.4 chroma side) that return the
+  `(hor_pad, s_prime, row_states)` triple. New public types:
+  `SamplePresence ∈ {Opaque, Transparent}` (the per-sample `s[y][x]`
+  flag) and `ShapeRowState ∈ {FullyFilled, FullyTransparent}` (the
+  per-row §7.6.1.1 row-guard outcome). Public constants `LUMA_SIDE =
+  16` and `CHROMA_SIDE = 8`. The §7.6.1.1 fill sentinel `s'[y][x]`
+  (initialised to 0 then flipped to 1 on any fill) surfaces directly
+  via the `s_prime` output so the §7.6.1.2 vertical pass can pick up
+  per-sample row state. The §7.6.1.2 vertical pass, §7.6.1.3 extended
+  padding for exterior macroblocks, §7.6.1.4 chroma shape decimation,
+  and §7.6.1.5 interlaced per-field padding remain later-round work.
+  15 new unit tests; total crate test count now 623 + 9 doc.
+
 - Round 31 of the clean-room rebuild: §7.3 VOP reconstruction — the
   per-pixel `d[y][x] = p[y][x] + f[y][x]` step-2 sum plus the step-3
   `[0, 2^bits_per_pixel - 1]` display-range saturation that closes the
