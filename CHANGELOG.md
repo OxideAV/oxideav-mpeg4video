@@ -8,6 +8,26 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 29 of the clean-room rebuild: §7.6.9.5.3 second-paragraph +
+  §7.6.9.4 chrominance motion-compensation plane for B-VOPs.
+  `generate_b_vop_chroma_prediction(forward_chroma_ref,
+  backward_chroma_ref, forward_chroma_mv, backward_chroma_mv,
+  chroma_mb_origin_x, chroma_mb_origin_y, vop_rounding_type,
+  prediction_mode)` (plus the `_into` buffer-out variant) fills one
+  8×8 chroma prediction block (Cb or Cr — the caller passes the
+  matching anchor-VOP plane and runs it once per component) by
+  applying §7.6.2.1 half-sample bilinear interpolation to the supplied
+  chroma MV against the forward and / or backward chroma reference
+  plane, then averages pixel-by-pixel via
+  `Pi[i][j] = (Pf[i][j] + Pb[i][j] + 1) >> 1` for `Bidirectional` and
+  `Direct` modes (the §7.6.9.5.3 last paragraph rule). Chroma uses
+  half-pel bilinear regardless of the VOL `quarter_sample` flag — the
+  round-27 `chroma_mv_from_luma_blocks` already reduced the K luma MVs
+  to a single half-pel chroma MV per direction, and §7.6.5 paragraph
+  above Table 7-13 fixes §7.6.2.1 bilinear (not §7.6.2.2 FIR) for
+  chroma. New public constants `CHROMA_BLOCK_SIDE = 8` and
+  `CHROMA_BLOCK_PIXELS = 64`. 12 new unit tests; total crate test
+  count now 565 + 8 doc.
 - Round 28 of the clean-room rebuild: §7.6.1.6 vector padding technique.
   New `src/vector_padding.rs`.
   `pad_macroblock_vectors(vectors, transparencies, mode)` applies the

@@ -35,15 +35,30 @@
 //! generally differ — they come from the four per-sub-block MVs of the
 //! co-located anchor MB scaled by §7.6.9.5.2.
 //!
+//! ## Chrominance prediction
+//!
+//! The companion entry point
+//! [`generate_b_vop_chroma_prediction_into`] (and its
+//! [`generate_b_vop_chroma_prediction`] allocator wrapper) produces the
+//! 8×8 Cb / Cr B-VOP prediction block per §7.6.9.5.3 second paragraph
+//! and §7.6.9.4 — the caller supplies the §7.6.5-reduced forward and
+//! backward chroma MVs in half-sample units (from
+//! [`crate::chroma_mv::chroma_mv_from_luma_blocks`]) plus a `ReferenceVop`
+//! wrapper over each anchor VOP's Cb or Cr plane. §6.1.3.4 places the
+//! chroma macroblock origin at half the luma macroblock origin per
+//! component (4:2:0). Chroma motion compensation is always half-sample
+//! bilinear regardless of the VOL `quarter_sample` flag — §7.6.5 reduces
+//! the quarter-pel luma MVs to half-pel chroma MVs before this routine
+//! ever sees them, and §7.6.5 paragraph above Table 7-13 spells out
+//! *"Half sample values are found using bilinear interpolation as
+//! described in subclause 7.6.2"* (i.e. §7.6.2.1, not §7.6.2.2).
+//!
 //! ## What this module does NOT do
 //!
-//! * **Chrominance prediction.** §7.6.9.5.3 second paragraph references
-//!   Tables 7-10..7-13 for the chroma-MV reduction. The reduction
-//!   itself now lives in [`crate::chroma_mv::chroma_mv_from_luma_blocks`]
-//!   (round 27); the 8×8 chroma MC that *consumes* the reduced MV will
-//!   land in a follow-up once a chroma reference-plane wrapper exists.
 //! * **§7.6.1.6 vector padding.** The caller supplies already-padded
 //!   MVs.
+//! * **§7.6.5 chroma-MV reduction.** Delegated to
+//!   [`crate::chroma_mv::chroma_mv_from_luma_blocks`].
 //! * **§7.6.2 interpolation primitives.** Delegated to
 //!   [`crate::half_sample::interpolate_block_into`] /
 //!   [`crate::quarter_sample::interpolate_block_qpel_into`].
@@ -429,6 +444,198 @@ pub fn generate_b_vop_luma_prediction(
         mb_origin_y,
         vop_rounding_type,
         mode,
+        prediction_mode,
+        &mut out,
+    );
+    out
+}
+
+/// Side length, in chrominance samples, of one B-VOP chroma prediction
+/// block (Cb or Cr) for a 4:2:0 macroblock.
+///
+/// §6.1.3.4: each 16×16 luma macroblock pairs with one 8×8 Cb block and
+/// one 8×8 Cr block in 4:2:0. §7.6.9.5.3 second paragraph treats the
+/// chrominance prediction as a single MC block (no per-sub-block split
+/// — the §7.6.5 reduction folds the K luma MVs into a single chroma MV
+/// per direction).
+pub const CHROMA_BLOCK_SIDE: usize = 8;
+
+/// `CHROMA_BLOCK_SIDE * CHROMA_BLOCK_SIDE`.
+pub const CHROMA_BLOCK_PIXELS: usize = CHROMA_BLOCK_SIDE * CHROMA_BLOCK_SIDE;
+
+/// Generate the §7.6.9.5.3 / §7.6.9.4 8×8 chrominance B-VOP prediction
+/// block (Cb or Cr) into a caller-supplied 64-sample buffer.
+///
+/// Chroma motion compensation in MPEG-4 Part 2 §7.6.9.5.3 follows two
+/// steps:
+///
+/// 1. **§7.6.5 reduction.** The K forward luma MVs `MVF[i]` are
+///    reduced to a single forward chroma MV via
+///    [`crate::chroma_mv::chroma_mv_from_luma_blocks`] (quarter-pel
+///    luma callers pre-apply
+///    [`crate::quarter_sample::reduce_qpel_to_half_pel_chroma`] per
+///    component first). The backward side is reduced the same way.
+///    The caller does this BEFORE calling this routine.
+///
+/// 2. **§7.6.2.1 bilinear interpolation + §7.6.9.4 averaging.** Each
+///    8×8 chroma block is filled by half-sample bilinear interpolation
+///    against the reduced chroma MV in the matching anchor VOP's
+///    chroma plane. `Bidirectional` and `Direct` modes average the
+///    forward and backward predictions pixel-by-pixel via
+///    `(Pf + Pb + 1) >> 1` (the same rule §7.6.9.4 specifies for
+///    `mb_type == interpolated` — §7.6.9.5.3 last paragraph says
+///    *"The rest process is the same as the chrominance motion
+///    compensation of the bi-directional mode described in
+///    subclause 7.6.9.4"*).
+///
+/// # Arguments
+///
+/// * `forward_chroma_ref` — §7.6.9.5.1-padded previous anchor VOP's
+///   chroma plane (Cb for the Cb call, Cr for the Cr call).
+///   `ReferenceVop::new(plane, chroma_w, chroma_h)` where
+///   `chroma_w = luma_w / 2` and `chroma_h = luma_h / 2` per §6.1.3.4
+///   4:2:0 sub-sampling. Consulted only when the mode actually needs
+///   the forward side (`ForwardOnly`, `Bidirectional`, `Direct`).
+/// * `backward_chroma_ref` — same for the temporally next anchor VOP.
+///   Consulted only when the mode needs the backward side
+///   (`BackwardOnly`, `Bidirectional`, `Direct`).
+/// * `forward_chroma_mv` / `backward_chroma_mv` — the §7.6.5-reduced
+///   chroma MVs in **half-sample units**. `Direct` and `Bidirectional`
+///   modes use both; `ForwardOnly` consults only forward; `BackwardOnly`
+///   consults only backward.
+/// * `chroma_mb_origin_x` / `chroma_mb_origin_y` — the chrominance
+///   macroblock's top-left integer-pel position within the *current*
+///   (predicted) B-VOP, in chrominance samples. §6.1.3.4 places the
+///   chroma origin at half the luma origin: macroblock column `c`,
+///   row `r` maps to `(8*c, 8*r)` in chroma units.
+/// * `vop_rounding_type ∈ {0, 1}` — the VOP-header field. For B-VOPs
+///   §6.3.5 / §7.6.2 fix `vop_rounding_type = 0`; the value is plumbed
+///   through unchanged so the caller can enforce that constraint
+///   independently.
+/// * `prediction_mode` — one of the four §7.6.9 modes. For B-VOPs
+///   §7.6.9.5.3 second paragraph treats forward / backward / bi-
+///   directional / direct identically for chroma except for which
+///   side(s) of the prediction equation are evaluated.
+/// * `out` — buffer of length ≥ [`CHROMA_BLOCK_PIXELS`] (64). Filled
+///   row-major as `out[j * CHROMA_BLOCK_SIDE + i]`.
+///
+/// Each chroma plane (Cb and Cr) is called separately with its own
+/// `forward_chroma_ref` / `backward_chroma_ref`. The reduced chroma MV
+/// is the same for Cb and Cr — the per-plane separation is only the
+/// reference data.
+///
+/// # Panics
+///
+/// Panics if `out.len() < CHROMA_BLOCK_PIXELS`.
+//
+// Inputs map one-for-one to the §7.6.9.5.3 / §7.6.9.4 chroma MC
+// equations — the four reference / MV slots, the two chroma origin
+// scalars, the rounding bit, the mode selector, and the output buffer.
+// Bundling into a struct would force a builder pattern around a
+// one-shot per-macroblock call.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_b_vop_chroma_prediction_into(
+    forward_chroma_ref: &ReferenceVop<'_>,
+    backward_chroma_ref: &ReferenceVop<'_>,
+    forward_chroma_mv: MotionVector,
+    backward_chroma_mv: MotionVector,
+    chroma_mb_origin_x: i32,
+    chroma_mb_origin_y: i32,
+    vop_rounding_type: u8,
+    prediction_mode: BVopPredictionMode,
+    out: &mut [u8],
+) {
+    assert!(
+        out.len() >= CHROMA_BLOCK_PIXELS,
+        "generate_b_vop_chroma_prediction_into: out.len() ({}) < {}",
+        out.len(),
+        CHROMA_BLOCK_PIXELS,
+    );
+
+    // Reusable scratch buffers for the per-side interpolation. Held in
+    // local arrays so the function stays allocation-free in the steady
+    // state — the caller-supplied `out` is filled at the end.
+    let mut buf_f = [0u8; CHROMA_BLOCK_PIXELS];
+    let mut buf_b = [0u8; CHROMA_BLOCK_PIXELS];
+
+    match prediction_mode {
+        BVopPredictionMode::ForwardOnly => {
+            interpolate_block_into(
+                forward_chroma_ref,
+                forward_chroma_mv.x,
+                forward_chroma_mv.y,
+                chroma_mb_origin_x,
+                chroma_mb_origin_y,
+                CHROMA_BLOCK_SIDE,
+                CHROMA_BLOCK_SIDE,
+                vop_rounding_type,
+                &mut out[..CHROMA_BLOCK_PIXELS],
+            );
+        }
+        BVopPredictionMode::BackwardOnly => {
+            interpolate_block_into(
+                backward_chroma_ref,
+                backward_chroma_mv.x,
+                backward_chroma_mv.y,
+                chroma_mb_origin_x,
+                chroma_mb_origin_y,
+                CHROMA_BLOCK_SIDE,
+                CHROMA_BLOCK_SIDE,
+                vop_rounding_type,
+                &mut out[..CHROMA_BLOCK_PIXELS],
+            );
+        }
+        BVopPredictionMode::Bidirectional | BVopPredictionMode::Direct => {
+            interpolate_block_into(
+                forward_chroma_ref,
+                forward_chroma_mv.x,
+                forward_chroma_mv.y,
+                chroma_mb_origin_x,
+                chroma_mb_origin_y,
+                CHROMA_BLOCK_SIDE,
+                CHROMA_BLOCK_SIDE,
+                vop_rounding_type,
+                &mut buf_f,
+            );
+            interpolate_block_into(
+                backward_chroma_ref,
+                backward_chroma_mv.x,
+                backward_chroma_mv.y,
+                chroma_mb_origin_x,
+                chroma_mb_origin_y,
+                CHROMA_BLOCK_SIDE,
+                CHROMA_BLOCK_SIDE,
+                vop_rounding_type,
+                &mut buf_b,
+            );
+            average_bidirectional_into(&buf_f, &buf_b, &mut out[..CHROMA_BLOCK_PIXELS]);
+        }
+    }
+}
+
+/// Convenience wrapper around [`generate_b_vop_chroma_prediction_into`]
+/// that returns a freshly allocated `Vec<u8>` of length
+/// [`CHROMA_BLOCK_PIXELS`].
+#[allow(clippy::too_many_arguments)]
+pub fn generate_b_vop_chroma_prediction(
+    forward_chroma_ref: &ReferenceVop<'_>,
+    backward_chroma_ref: &ReferenceVop<'_>,
+    forward_chroma_mv: MotionVector,
+    backward_chroma_mv: MotionVector,
+    chroma_mb_origin_x: i32,
+    chroma_mb_origin_y: i32,
+    vop_rounding_type: u8,
+    prediction_mode: BVopPredictionMode,
+) -> Vec<u8> {
+    let mut out = vec![0u8; CHROMA_BLOCK_PIXELS];
+    generate_b_vop_chroma_prediction_into(
+        forward_chroma_ref,
+        backward_chroma_ref,
+        forward_chroma_mv,
+        backward_chroma_mv,
+        chroma_mb_origin_x,
+        chroma_mb_origin_y,
+        vop_rounding_type,
         prediction_mode,
         &mut out,
     );
@@ -975,6 +1182,379 @@ mod tests {
                     _ => unreachable!(),
                 };
                 assert_eq!(mb[j * MB_LUMA_SIDE + i], expected, "(i, j) = ({i}, {j})");
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // generate_b_vop_chroma_prediction
+    // -----------------------------------------------------------------
+
+    /// Build a flat chrominance reference plane with every sample equal
+    /// to `value`. Chroma planes are half the size of luma per axis
+    /// under §6.1.3.4 4:2:0 sub-sampling; 32×32 is used here as a
+    /// stand-in for the mb-row-by-mb-row half-resolution layout.
+    fn flat_chroma_ref(value: u8) -> Vec<u8> {
+        vec![value; 32 * 32]
+    }
+
+    #[test]
+    fn chroma_constants_match_4_2_0_block_size() {
+        // §6.1.3.4: 4:2:0 places one 8×8 Cb and one 8×8 Cr block per
+        // 16×16 luma macroblock.
+        assert_eq!(CHROMA_BLOCK_SIDE, 8);
+        assert_eq!(CHROMA_BLOCK_PIXELS, 64);
+    }
+
+    #[test]
+    fn chroma_forward_only_zero_mv_returns_forward_reference() {
+        // Forward-only chroma with zero MV must return the forward
+        // chroma reference unchanged.
+        let fwd = flat_chroma_ref(70);
+        let bwd = flat_chroma_ref(200); // Must not be sampled.
+        let fwd_ref = ReferenceVop::new(&fwd, 32, 32).unwrap();
+        let bwd_ref = ReferenceVop::new(&bwd, 32, 32).unwrap();
+        let zero = MotionVector { x: 0, y: 0 };
+
+        let out = generate_b_vop_chroma_prediction(
+            &fwd_ref,
+            &bwd_ref,
+            zero,
+            zero,
+            4,
+            4,
+            0,
+            BVopPredictionMode::ForwardOnly,
+        );
+
+        assert_eq!(out.len(), CHROMA_BLOCK_PIXELS);
+        for sample in out.iter() {
+            assert_eq!(*sample, 70);
+        }
+    }
+
+    #[test]
+    fn chroma_backward_only_zero_mv_returns_backward_reference() {
+        // Symmetric to the forward-only case.
+        let fwd = flat_chroma_ref(11); // Must not be sampled.
+        let bwd = flat_chroma_ref(140);
+        let fwd_ref = ReferenceVop::new(&fwd, 32, 32).unwrap();
+        let bwd_ref = ReferenceVop::new(&bwd, 32, 32).unwrap();
+        let zero = MotionVector { x: 0, y: 0 };
+
+        let out = generate_b_vop_chroma_prediction(
+            &fwd_ref,
+            &bwd_ref,
+            zero,
+            zero,
+            4,
+            4,
+            0,
+            BVopPredictionMode::BackwardOnly,
+        );
+
+        for sample in out.iter() {
+            assert_eq!(*sample, 140);
+        }
+    }
+
+    #[test]
+    fn chroma_bidirectional_zero_mv_averages_flat_references() {
+        // (50 + 90 + 1) >> 1 = 70 per the §7.6.9.4 averaging rule.
+        let fwd = flat_chroma_ref(50);
+        let bwd = flat_chroma_ref(90);
+        let fwd_ref = ReferenceVop::new(&fwd, 32, 32).unwrap();
+        let bwd_ref = ReferenceVop::new(&bwd, 32, 32).unwrap();
+        let zero = MotionVector { x: 0, y: 0 };
+
+        let out = generate_b_vop_chroma_prediction(
+            &fwd_ref,
+            &bwd_ref,
+            zero,
+            zero,
+            4,
+            4,
+            0,
+            BVopPredictionMode::Bidirectional,
+        );
+
+        for sample in out.iter() {
+            assert_eq!(*sample, 70);
+        }
+    }
+
+    #[test]
+    fn chroma_direct_zero_mv_averages_flat_references() {
+        // §7.6.9.5.3 last paragraph: direct mode chroma falls back to
+        // the same §7.6.9.4 averaging rule as the bi-directional mode.
+        let fwd = flat_chroma_ref(20);
+        let bwd = flat_chroma_ref(40);
+        let fwd_ref = ReferenceVop::new(&fwd, 32, 32).unwrap();
+        let bwd_ref = ReferenceVop::new(&bwd, 32, 32).unwrap();
+        let zero = MotionVector { x: 0, y: 0 };
+
+        let out = generate_b_vop_chroma_prediction(
+            &fwd_ref,
+            &bwd_ref,
+            zero,
+            zero,
+            4,
+            4,
+            0,
+            BVopPredictionMode::Direct,
+        );
+
+        // (20 + 40 + 1) >> 1 = 30
+        for sample in out.iter() {
+            assert_eq!(*sample, 30);
+        }
+    }
+
+    #[test]
+    fn chroma_forward_only_half_pel_x_interpolates() {
+        // Plant a horizontal gradient in the chroma plane (column x
+        // has value `5 + x`). With MV = (1, 0) — one half-pel offset
+        // along x, no integer-pel shift — the §7.6.2.1 bilinear half-
+        // pel formula yields `(A + B + 1 - rc) >> 1` with rc=0, where
+        // A = column origin_x + i and B = column origin_x + i + 1.
+        let mut fwd = vec![0u8; 32 * 32];
+        for y in 0..32 {
+            for x in 0..32 {
+                fwd[y * 32 + x] = (5 + x) as u8;
+            }
+        }
+        let bwd = vec![0u8; 32 * 32];
+        let fwd_ref = ReferenceVop::new(&fwd, 32, 32).unwrap();
+        let bwd_ref = ReferenceVop::new(&bwd, 32, 32).unwrap();
+
+        let out = generate_b_vop_chroma_prediction(
+            &fwd_ref,
+            &bwd_ref,
+            MotionVector { x: 1, y: 0 }, // half-pel +x
+            MotionVector { x: 0, y: 0 },
+            4,
+            4,
+            0,
+            BVopPredictionMode::ForwardOnly,
+        );
+
+        for j in 0..CHROMA_BLOCK_SIDE {
+            for i in 0..CHROMA_BLOCK_SIDE {
+                let x = 4 + i;
+                let a = (5 + x) as u16;
+                let b = (5 + x + 1) as u16;
+                let expected = ((a + b + 1) >> 1) as u8; // rc = 0
+                assert_eq!(
+                    out[j * CHROMA_BLOCK_SIDE + i],
+                    expected,
+                    "(i, j) = ({i}, {j})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn chroma_bidirectional_half_pel_diagonal_then_average() {
+        // Both sides at the same diagonal half-pel position should
+        // produce identical bilinear results; their average is the
+        // common value. (x + x + 1) >> 1 = x for any x. The point of
+        // the test is that bilinear runs on both sides before the
+        // averaging step (i.e. averaging operates on the interpolated
+        // chrominance samples, not on the reference samples).
+        let mut plane = vec![0u8; 32 * 32];
+        for y in 0..32 {
+            for x in 0..32 {
+                // Deterministic non-flat content so the bilinear step
+                // is observable.
+                plane[y * 32 + x] = ((x * 7 + y * 11) % 256) as u8;
+            }
+        }
+        let fwd_ref = ReferenceVop::new(&plane, 32, 32).unwrap();
+        let bwd_ref = ReferenceVop::new(&plane, 32, 32).unwrap();
+        // Diagonal half-pel: x and y both 1 (half-pel-x, half-pel-y).
+        let diag = MotionVector { x: 1, y: 1 };
+
+        let out = generate_b_vop_chroma_prediction(
+            &fwd_ref,
+            &bwd_ref,
+            diag,
+            diag,
+            4,
+            4,
+            0,
+            BVopPredictionMode::Bidirectional,
+        );
+
+        // Independently compute the §7.6.2.1 diagonal bilinear
+        // `(A + B + C + D + 2 - rc) >> 2` for each output pixel and
+        // confirm both bilinear passes yielded that value, then
+        // average to the same.
+        for j in 0..CHROMA_BLOCK_SIDE {
+            for i in 0..CHROMA_BLOCK_SIDE {
+                let x = 4 + i;
+                let y = 4 + j;
+                let fetch = |xx: usize, yy: usize| -> u16 { u16::from(plane[yy * 32 + xx]) };
+                let a = fetch(x, y);
+                let b = fetch(x + 1, y);
+                let c = fetch(x, y + 1);
+                let d = fetch(x + 1, y + 1);
+                let interp = ((a + b + c + d + 2) >> 2) as u8; // rc = 0
+                let expected = ((u16::from(interp) + u16::from(interp) + 1) >> 1) as u8;
+                assert_eq!(
+                    out[j * CHROMA_BLOCK_SIDE + i],
+                    expected,
+                    "(i, j) = ({i}, {j})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn chroma_forward_only_uses_reduced_chroma_mv_from_chroma_mv_module() {
+        // End-to-end wiring sanity: take a K = 4 set of luma MVs,
+        // reduce via the round-27 entry point, and verify the chroma
+        // prediction is positioned per the reduced MV (rather than
+        // any single luma MV).
+        use crate::chroma_mv::chroma_mv_from_luma_blocks;
+
+        // Four identical luma MVs `(4, 4)` half-sample units. Sum =
+        // (16, 16). Divided by 2K = 8 → integer half-pel chroma MV =
+        // (2, 2), no fractional residue (Table 7-10 index 0 → 0).
+        let luma_mvs = [
+            MotionVector { x: 4, y: 4 },
+            MotionVector { x: 4, y: 4 },
+            MotionVector { x: 4, y: 4 },
+            MotionVector { x: 4, y: 4 },
+        ];
+        let chroma_mv = chroma_mv_from_luma_blocks(&luma_mvs).unwrap();
+        assert_eq!(chroma_mv, MotionVector { x: 2, y: 2 });
+
+        // Plant a value at the destination of the integer-pel shift
+        // (chroma_mb_origin + reduced_mv_integer = (4 + 1, 4 + 1) =
+        // (5, 5)).
+        let mut fwd = vec![0u8; 32 * 32];
+        for j in 0..8 {
+            for i in 0..8 {
+                fwd[(5 + j) * 32 + (5 + i)] = 200u8;
+            }
+        }
+        let bwd = vec![0u8; 32 * 32];
+        let fwd_ref = ReferenceVop::new(&fwd, 32, 32).unwrap();
+        let bwd_ref = ReferenceVop::new(&bwd, 32, 32).unwrap();
+
+        let out = generate_b_vop_chroma_prediction(
+            &fwd_ref,
+            &bwd_ref,
+            chroma_mv,
+            MotionVector { x: 0, y: 0 },
+            4,
+            4,
+            0,
+            BVopPredictionMode::ForwardOnly,
+        );
+
+        for sample in out.iter() {
+            assert_eq!(*sample, 200);
+        }
+    }
+
+    #[test]
+    fn chroma_forward_only_clamps_at_left_edge() {
+        // §7.6.4 last-full-pel clamp: a negative MV that walks off
+        // the left edge re-uses column 0. Use a column gradient
+        // (column x has value 100 + x) and MV (-10, 0) (= -5 integer
+        // pel) at origin x = 4. The first 5 output columns hit
+        // negative source-x and clamp to column 0 = 100; the
+        // remaining columns sample columns 0..3 of the plane.
+        let mut fwd = vec![0u8; 32 * 32];
+        for y in 0..32 {
+            for x in 0..32 {
+                fwd[y * 32 + x] = (100 + x) as u8;
+            }
+        }
+        let bwd = vec![0u8; 32 * 32];
+        let fwd_ref = ReferenceVop::new(&fwd, 32, 32).unwrap();
+        let bwd_ref = ReferenceVop::new(&bwd, 32, 32).unwrap();
+
+        let out = generate_b_vop_chroma_prediction(
+            &fwd_ref,
+            &bwd_ref,
+            // -10 half-pel = -5 integer pel.
+            MotionVector { x: -10, y: 0 },
+            MotionVector { x: 0, y: 0 },
+            4,
+            4,
+            0,
+            BVopPredictionMode::ForwardOnly,
+        );
+
+        for j in 0..CHROMA_BLOCK_SIDE {
+            for i in 0..CHROMA_BLOCK_SIDE {
+                // Source x = origin_x (4) + i + (-5) = i - 1.
+                let src_x = (i as i32) - 1;
+                let clamped = src_x.clamp(0, 31) as usize;
+                let expected = (100 + clamped) as u8;
+                assert_eq!(
+                    out[j * CHROMA_BLOCK_SIDE + i],
+                    expected,
+                    "(i, j) = ({i}, {j})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "out.len()")]
+    fn chroma_prediction_rejects_short_output_buffer() {
+        let fwd = flat_chroma_ref(0);
+        let bwd = flat_chroma_ref(0);
+        let fwd_ref = ReferenceVop::new(&fwd, 32, 32).unwrap();
+        let bwd_ref = ReferenceVop::new(&bwd, 32, 32).unwrap();
+        let zero = MotionVector { x: 0, y: 0 };
+        let mut tiny = [0u8; 32];
+        generate_b_vop_chroma_prediction_into(
+            &fwd_ref,
+            &bwd_ref,
+            zero,
+            zero,
+            0,
+            0,
+            0,
+            BVopPredictionMode::ForwardOnly,
+            &mut tiny,
+        );
+    }
+
+    #[test]
+    fn chroma_bidirectional_rounding_control_one_subtracts_one() {
+        // vop_rounding_type = 1 changes the half-pel-x bilinear to
+        // `(A + B + 1 - rc) >> 1` = `(A + B) >> 1`. For a constant 100
+        // / 200 plane pair (forward / backward), each side runs an
+        // integer-pel fetch (no half-pel — MV (0, 0)), so the §7.6.2.1
+        // rounding bit does not affect the per-side fetch. But the
+        // bidirectional averaging `(Pf + Pb + 1) >> 1` always uses
+        // `+ 1` regardless of vop_rounding_type — §7.6.9.4 fixes the
+        // averaging rule independently of the per-side rounding. So
+        // `(100 + 200 + 1) >> 1 = 150` for both rc values.
+        let fwd = flat_chroma_ref(100);
+        let bwd = flat_chroma_ref(200);
+        let fwd_ref = ReferenceVop::new(&fwd, 32, 32).unwrap();
+        let bwd_ref = ReferenceVop::new(&bwd, 32, 32).unwrap();
+        let zero = MotionVector { x: 0, y: 0 };
+
+        for rc in [0u8, 1u8] {
+            let out = generate_b_vop_chroma_prediction(
+                &fwd_ref,
+                &bwd_ref,
+                zero,
+                zero,
+                4,
+                4,
+                rc,
+                BVopPredictionMode::Bidirectional,
+            );
+            for sample in out.iter() {
+                assert_eq!(*sample, 150, "rc = {rc}");
             }
         }
     }

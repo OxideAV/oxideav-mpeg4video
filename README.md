@@ -5,13 +5,42 @@ A pure-Rust MPEG-4 Part 2 Video codec (ISO/IEC 14496-2) for the
 
 ## Status
 
-**Round 28 of the clean-room rebuild (2026-06-02).** The prior
+**Round 29 of the clean-room rebuild (2026-06-03).** The prior
 implementation was retired on 2026-05-18 under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md);
 the VLC tables admitted to sourcing their numeric entries from an
 external library. Master history was fully erased per the Hat-3 cold-
 enforcement procedure.
 
+* Round 29 — §7.6.9.5.3 second-paragraph + §7.6.9.4 chrominance
+  motion-compensation plane for B-VOPs. Extends `src/bvop_prediction.rs`
+  with `generate_b_vop_chroma_prediction(forward_chroma_ref,
+  backward_chroma_ref, forward_chroma_mv, backward_chroma_mv,
+  chroma_mb_origin_x, chroma_mb_origin_y, vop_rounding_type,
+  prediction_mode)` (plus the `_into` buffer-out variant). The function
+  fills one 8×8 chroma prediction block (Cb or Cr — the caller passes
+  the matching anchor-VOP plane and runs it once per component) by
+  applying §7.6.2.1 half-sample bilinear interpolation to the supplied
+  chroma MV against the forward and / or backward chroma reference
+  plane, then averages pixel-by-pixel via `Pi[i][j] = (Pf[i][j] +
+  Pb[i][j] + 1) >> 1` for `Bidirectional` and `Direct` modes (the
+  §7.6.9.5.3 last paragraph "*The rest process is the same as the
+  chrominance motion compensation of the bi-directional mode described
+  in subclause 7.6.9.4*" rule). The forward-only and backward-only
+  modes write the chosen single-side interpolation directly. Chroma
+  uses half-pel bilinear regardless of the VOL `quarter_sample` flag —
+  the round-27 `chroma_mv_from_luma_blocks` already reduced the four
+  luma MVs to a single half-pel chroma MV per direction, and §7.6.5
+  paragraph above Table 7-13 fixes the §7.6.2.1 bilinear (not §7.6.2.2
+  FIR) for chroma. The chrominance macroblock origin is in chroma
+  samples per §6.1.3.4: macroblock column `c`, row `r` maps to `(8*c,
+  8*r)` in 4:2:0. The output is the §7.3 step-1 `p[y][x]` chroma
+  prediction; the §7.3 step-2 residual add and step-3 `[0, 2^bpp - 1]`
+  clip happen one layer up. §7.6.1.6 vector padding remains the
+  caller's responsibility (the round-28 `pad_macroblock_vectors`
+  produces the K vectors that round-27 reduces). `CHROMA_BLOCK_SIDE`
+  = 8 and `CHROMA_BLOCK_PIXELS` = 64 surface as public constants. 12
+  new unit tests; total crate test count now 565 + 8 doc.
 * Round 28 — §7.6.1.6 vector padding technique. New
   `src/vector_padding.rs`.
   `pad_macroblock_vectors(vectors, transparencies, mode)` applies the
