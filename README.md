@@ -5,13 +5,51 @@ A pure-Rust MPEG-4 Part 2 Video codec (ISO/IEC 14496-2) for the
 
 ## Status
 
-**Round 32 of the clean-room rebuild (2026-06-04).** The prior
+**Round 33 of the clean-room rebuild (2026-06-04).** The prior
 implementation was retired on 2026-05-18 under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md);
 the VLC tables admitted to sourcing their numeric entries from an
 external library. Master history was fully erased per the Hat-3 cold-
 enforcement procedure.
 
+* Round 33 — §7.6.1.2 vertical repetitive padding. New
+  `src/vertical_padding.rs`. The module covers the second pass of
+  the §7.6.1 reference-VOP padding pipeline. It consumes the
+  `(hor_pad, s_prime, row_states)` triple produced by the §7.6.1.1
+  horizontal pass (rounds 32) and fills the remaining transparent
+  samples column-by-column.
+  `vertical_repetitive_padding_column::<M>(hor_pad, s_prime, out,
+  s_double_prime)` applies the spec's verbatim per-column procedure
+  to any column size (16 for luma per §6.1.3.4, 8 for each
+  chrominance block per §7.6.1.4): positions where `s'[y][x] == 1`
+  copy through to `hv_pad[y][x] = hor_pad[y][x]`; for transparent
+  positions look up for `y'` (nearest `s'==1` at-or-above `y`) and
+  down for `y''` (nearest `s'==1` strictly below `y`). Both exist →
+  fill with `(hor_pad[y'] + hor_pad[y'']) // 2` (§3.4 truncation
+  toward zero via `i32::div_euclid`); only one side exists →
+  replicate that single boundary sample; neither exists → the
+  column-guard reports `ColumnState::FullyTransparent` so the
+  caller can route the macroblock to §7.6.1.3 extended padding
+  later. The §7.6.1.2 fill sentinel `s''[y][x]` (initialised to 0
+  then flipped to 1 on any fill or pass-through) surfaces as a
+  `SamplePresence` array. The per-column return value
+  `ColumnState ∈ {FullyFilled, FullyTransparent}` distinguishes
+  "column was filled by §7.6.1.2" from "column had no opaque sample
+  after §7.6.1.1 and the §7.6.1.3 pass must handle it".
+  `vertical_repetitive_padding_luma(hor_pad, s_prime, row_states)`
+  and `vertical_repetitive_padding_chroma(hor_pad, s_prime,
+  row_states)` are the 16×16 / 8×8 macroblock-level entry points
+  that loop the per-column routine over the macroblock side and
+  return the `(hv_pad, s_double_prime, column_states)` triple
+  ready to feed the §7.6.1.3 extended-padding pass (and ultimately
+  the §7.6.2.1 / §7.6.2.2 sample interpolation modules). The
+  averaging arithmetic uses `i32` so the worst-case sum
+  `(2^bpp - 1) + (2^bpp - 1) = 2^(bpp + 1) - 2` stays well inside
+  the type for any practical `bits_per_pixel`. The §7.6.1.3
+  extended padding for exterior macroblocks, §7.6.1.4 chroma shape
+  decimation, and §7.6.1.5 interlaced per-field padding remain
+  later-round work. 17 new unit tests; total crate test count now
+  640 + 9 doc.
 * Round 32 — §7.6.1.1 horizontal repetitive padding. New
   `src/sample_padding.rs`. The module covers the first pass of the
   §7.6.1 reference-VOP padding pipeline that fills the transparent

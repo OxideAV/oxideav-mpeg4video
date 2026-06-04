@@ -8,6 +8,34 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 33 of the clean-room rebuild: §7.6.1.2 vertical repetitive
+  padding — the second pass of the §7.6.1 reference-VOP padding
+  pipeline. New module `vertical_padding` consuming the
+  `(hor_pad, s_prime, row_states)` triple produced by §7.6.1.1 and
+  filling the remaining transparent samples column-by-column.
+  `vertical_repetitive_padding_column::<M>(hor_pad, s_prime, out,
+  s_double_prime)` applies the spec's verbatim per-column procedure:
+  positions where `s'[y][x] == 1` map straight through; transparent
+  positions look up for `y'` (nearest `s'==1` at-or-above `y`) and
+  down for `y''` (nearest `s'==1` strictly below `y`), filling with
+  `(hor_pad[y'] + hor_pad[y'']) // 2` (§3.4 truncation toward zero
+  via `i32::div_euclid`) when both exist, or with the single
+  available neighbour when only one exists. Columns with no
+  `s'==1` sample fall through to the column-guard and report
+  `ColumnState::FullyTransparent` so the caller can route the
+  macroblock to §7.6.1.3 extended padding.
+  `vertical_repetitive_padding_luma(hor_pad, s_prime, row_states)` /
+  `vertical_repetitive_padding_chroma(hor_pad, s_prime, row_states)`
+  are the 16×16 / 8×8 macroblock-level entry points that loop the
+  per-column routine over the macroblock side and return the
+  `(hv_pad, s_double_prime, column_states)` triple. New public type:
+  `ColumnState ∈ {FullyFilled, FullyTransparent}` (the per-column
+  §7.6.1.2 outcome). The §7.6.1.2 fill sentinel `s''[y][x]` surfaces
+  directly via the `s_double_prime` output. The §7.6.1.3 extended
+  padding for exterior macroblocks, §7.6.1.4 chroma shape decimation,
+  and §7.6.1.5 interlaced per-field padding remain later-round work.
+  17 new unit tests; total crate test count now 640 + 9 doc.
+
 - Round 32 of the clean-room rebuild: §7.6.1.1 horizontal repetitive
   padding — the first pass of the §7.6.1 reference-VOP padding
   pipeline. New module `sample_padding` filling the transparent

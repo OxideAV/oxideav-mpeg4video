@@ -319,6 +319,7 @@ pub mod sample_padding;
 pub mod scan;
 pub mod texture;
 pub mod vector_padding;
+pub mod vertical_padding;
 pub mod video_packet;
 pub mod vol;
 pub mod vop;
@@ -404,6 +405,10 @@ pub use texture::{
 pub use vector_padding::{
     pad_macroblock_vectors, BlockTransparency, MacroblockPaddingMode, VectorPaddingError,
     LUMA_BLOCKS_PER_MB,
+};
+pub use vertical_padding::{
+    vertical_repetitive_padding_chroma, vertical_repetitive_padding_column,
+    vertical_repetitive_padding_luma, ColumnState,
 };
 pub use video_packet::{
     consume_next_resync_marker, macroblock_number_bit_width, parse_video_packet_header,
