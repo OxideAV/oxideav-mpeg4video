@@ -8,6 +8,44 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 34 of the clean-room rebuild: §7.6.1.3 extended padding — the
+  third (and final) pass of the §7.6.1 reference-VOP padding pipeline.
+  New module `extended_padding`. After §7.6.1.1 + §7.6.1.2 have left
+  every boundary macroblock fully opaque, the §7.6.1.3 pass fills the
+  remaining *exterior* macroblocks (every `s[y][x] == 0`) by
+  replicating the border row / column of a neighbouring boundary
+  macroblock, falling through to the `2^(bits_per_pixel - 1)` mid-grey
+  fill when no side-adjacent boundary neighbour exists.
+  `extended_padding_macroblock::<N>(neighbours, bits_per_pixel)`
+  consumes a `BoundaryNeighbours<N>` (the four optional side-adjacent
+  post-§7.6.1.2 boundary macroblocks: `left` / `above` / `right` /
+  `below`) and the channel's `bits_per_pixel`, picks the highest-
+  priority present neighbour per Figure 7-28 (`3 > 2 > 1 > 0` — left,
+  above, right, below in that order), and replicates the matching
+  border into the exterior MB: left → rightmost column rightwards;
+  above → bottom row downwards; right → leftmost column leftwards;
+  below → top row upwards. With no neighbour present, every sample is
+  set to `mid_grey_value(bits_per_pixel) = 2^(bits_per_pixel - 1)`
+  (128 for the canonical 8-bit case, 512 for 10-bit).
+  `extended_padding_luma(neighbours, bits_per_pixel)` /
+  `extended_padding_chroma(neighbours, bits_per_pixel)` are the 16×16
+  / 8×8 macroblock-level entry points. New public types:
+  `ExteriorNeighbourPosition ∈ {Left, Above, Right, Below}` (named to
+  not collide with the existing intra-DC `predictor::NeighbourPosition`),
+  `BoundaryNeighbours<'a, N>` (the four optional side-adjacent
+  post-§7.6.1.2 neighbour grids), `ExteriorPaddingOutcome ∈
+  {FromNeighbour(ExteriorNeighbourPosition), MidGrey}` (per-MB outcome
+  reporting which §7.6.1.3 branch fired). `BoundaryNeighbours::none()`
+  builds an all-absent neighbour set in const context;
+  `BoundaryNeighbours::highest_priority_position()` returns the
+  Figure 7-28 winner; `ExteriorNeighbourPosition::priority()` exposes
+  the numeric priority (`3..=0`) so callers building a custom selector
+  don't have to duplicate the table. The §7.6.1.4 chroma shape
+  decimation (§6.1.3.6) and the §7.6.1.5 interlaced per-field
+  application remain caller-level routing concerns; §7.6.1.3 itself
+  is field-independent. 21 new unit tests; total crate test count now
+  661 + 9 doc.
+
 - Round 33 of the clean-room rebuild: §7.6.1.2 vertical repetitive
   padding — the second pass of the §7.6.1 reference-VOP padding
   pipeline. New module `vertical_padding` consuming the

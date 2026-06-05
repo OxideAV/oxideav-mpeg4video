@@ -5,13 +5,52 @@ A pure-Rust MPEG-4 Part 2 Video codec (ISO/IEC 14496-2) for the
 
 ## Status
 
-**Round 33 of the clean-room rebuild (2026-06-04).** The prior
+**Round 34 of the clean-room rebuild (2026-06-05).** The prior
 implementation was retired on 2026-05-18 under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md);
 the VLC tables admitted to sourcing their numeric entries from an
 external library. Master history was fully erased per the Hat-3 cold-
 enforcement procedure.
 
+* Round 34 — §7.6.1.3 extended padding. New
+  `src/extended_padding.rs`. The module covers the third (and
+  final) pass of the §7.6.1 reference-VOP padding pipeline. After
+  the §7.6.1.1 horizontal pass (round 32) and the §7.6.1.2 vertical
+  pass (round 33) have left every boundary macroblock fully opaque,
+  the §7.6.1.3 pass fills the remaining *exterior* macroblocks
+  (every `s[y][x] == 0`) by replicating the border row / column of
+  a neighbouring boundary macroblock, falling through to the
+  `2^(bits_per_pixel - 1)` mid-grey fill when no side-adjacent
+  boundary neighbour exists.
+  `extended_padding_macroblock::<N>(neighbours, bits_per_pixel)`
+  consumes a `BoundaryNeighbours<N>` (the four optional side-
+  adjacent post-§7.6.1.2 boundary macroblocks: `left` / `above` /
+  `right` / `below`) plus the channel's `bits_per_pixel` and picks
+  the highest-priority present neighbour per Figure 7-28
+  (`3 > 2 > 1 > 0` — left, above, right, below in that order):
+  left → rightmost column rightwards (`out[y][x] = left[y][N-1]`);
+  above → bottom row downwards (`out[y][x] = above[N-1][x]`); right
+  → leftmost column leftwards (`out[y][x] = right[y][0]`); below →
+  top row upwards (`out[y][x] = below[0][x]`). With no neighbour
+  present, every sample is set to
+  `mid_grey_value(bits_per_pixel) = 2^(bits_per_pixel - 1)` (128
+  for the canonical 8-bit case, 512 for 10-bit, 8 for the
+  §6.3.3 `not_8_bit` 4-bit floor).
+  `extended_padding_luma(neighbours, bits_per_pixel)` and
+  `extended_padding_chroma(neighbours, bits_per_pixel)` are the
+  16×16 / 8×8 macroblock-level entry points. The per-MB outcome
+  surfaces as `ExteriorPaddingOutcome ∈
+  {FromNeighbour(ExteriorNeighbourPosition), MidGrey}` so the
+  caller can attribute each filled MB to its source. The §7.6.1.3
+  pass is field-independent (the §7.6.1.5 interlaced wrapper
+  applies it to each field independently) and identical for luma
+  and chroma channels (the §7.6.1.4 chroma shape decimation step
+  itself stays in the caller per §6.1.3.6). The §7.6.1 padding
+  pipeline now covers every macroblock class — boundary
+  (§7.6.1.1 + §7.6.1.2) and exterior (§7.6.1.3) — leaving only the
+  §7.6.1.4 caller-level chroma routing and the §7.6.1.5
+  interlaced per-field wrapper for later rounds. 21 new unit
+  tests; total crate test count now 661 + 9 doc.
 * Round 33 — §7.6.1.2 vertical repetitive padding. New
   `src/vertical_padding.rs`. The module covers the second pass of
   the §7.6.1 reference-VOP padding pipeline. It consumes the

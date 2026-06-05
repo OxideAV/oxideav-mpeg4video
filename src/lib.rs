@@ -304,6 +304,7 @@ pub mod block;
 pub mod bvop;
 pub mod bvop_prediction;
 pub mod chroma_mv;
+pub mod extended_padding;
 pub mod half_sample;
 pub mod idct;
 pub mod inverse_quant;
@@ -342,6 +343,10 @@ pub use bvop_prediction::{
 };
 pub use chroma_mv::{
     chroma_mv_from_luma_blocks, ChromaMvError, TABLE_7_10, TABLE_7_11, TABLE_7_12, TABLE_7_13,
+};
+pub use extended_padding::{
+    extended_padding_chroma, extended_padding_luma, extended_padding_macroblock, mid_grey_value,
+    BoundaryNeighbours, ExteriorNeighbourPosition, ExteriorPaddingOutcome,
 };
 pub use half_sample::{
     fetch_clamped_sample, interpolate_block, interpolate_block_into, interpolate_pixel,
