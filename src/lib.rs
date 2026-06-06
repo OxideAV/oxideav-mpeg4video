@@ -304,6 +304,7 @@ pub mod block;
 pub mod bvop;
 pub mod bvop_prediction;
 pub mod chroma_mv;
+pub mod chroma_shape;
 pub mod extended_padding;
 pub mod half_sample;
 pub mod idct;
@@ -343,6 +344,11 @@ pub use bvop_prediction::{
 };
 pub use chroma_mv::{
     chroma_mv_from_luma_blocks, ChromaMvError, TABLE_7_10, TABLE_7_11, TABLE_7_12, TABLE_7_13,
+};
+pub use chroma_shape::{
+    decimate_chroma_shape, decimate_chroma_shape_interlaced_field,
+    decimate_chroma_shape_progressive, decimate_chroma_shape_sample, split_luma_shape_into_fields,
+    stack_interlaced_chroma_shape, CHROMA_FIELD_LINES,
 };
 pub use extended_padding::{
     extended_padding_chroma, extended_padding_luma, extended_padding_macroblock, mid_grey_value,
