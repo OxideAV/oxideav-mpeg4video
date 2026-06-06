@@ -8,6 +8,46 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 36 of the clean-room rebuild: §7.6.1.5 padding of interlaced
+  macroblocks — luminance boundary path. New module
+  `interlaced_padding`. §7.6.1.5 says verbatim "Macroblocks of
+  interlaced VOP (interlaced = 1) are padded according to subclauses
+  7.6.1.1 through 7.6.1.3. The vertical padding of the luminance
+  component, however, is performed for each field independently. A
+  sample outside of a VOP is therefore filled with the value of the
+  nearest boundary sample of the same field." The carve-out names only
+  the vertical pass, so the §7.6.1.1 horizontal pass keeps its
+  frame-mode behaviour and the §7.6.1.2 vertical pass runs per field.
+  `interlaced_boundary_padding_luma(decoded, shape)` is the
+  end-to-end §7.6.1.5 boundary entry point for a 16×16 luma
+  macroblock: §7.6.1.1 frame-mode horizontal pass, then per-field
+  §7.6.1.2 vertical pass on the top + bottom field views (rows
+  `0, 2, …, 14` / `1, 3, …, 15`), then re-interleave back into a
+  16×16 frame. `per_field_vertical_padding_luma(hor_pad, s_prime)`
+  exposes the per-field §7.6.1.2 step as a standalone primitive for
+  callers that have already run §7.6.1.1 themselves. The returned
+  `InterlacedBoundaryOutcome { Padded { top_column_states,
+  bottom_column_states }, CompletelyTransparent }` discriminates the
+  three cases the §7.6.1.5 routing cares about: at least one field
+  filled (each `ColumnState` array reports which per-field columns
+  completed); every row fully transparent (the caller routes the
+  macroblock to the `2 ^ (bits_per_pixel - 1)` fill via the §7.6.1.3
+  `extended_padding` entry points). `LUMA_FIELD_LINES = LUMA_SIDE / 2`
+  is the per-field row count (8 of the macroblock's 16 luma rows per
+  field). The §7.6.1.5 chrominance "based on fields" carve-out and
+  the exterior-MB per-field §7.6.1.3 path are intentionally out of
+  scope for this round (the §6.1.3.7.1 +
+  `decimate_chroma_shape_interlaced_field` infrastructure shipped in
+  round 35 already gives the chroma wrapper its shape-decimation
+  prerequisite, and §7.6.1.3 itself is unchanged in the frame-mode
+  sense — the carve-out only replaces the §7.6.1.3 mid-grey fallback
+  by the `2 ^ (bits_per_pixel - 1)` fill for completely-transparent
+  macroblocks, which is the §7.6.1.3 mid-grey case verbatim). 15 new
+  unit tests including a cross-check against a manually-composed
+  §7.6.1.1 + per-field §7.6.1.2 reassembly and an explicit
+  progressive-vs-interlaced divergence on a macroblock whose two
+  fields differ in their nearest-neighbour candidates; total crate
+  test count now 695 + 9 doc.
 - Round 35 of the clean-room rebuild: §6.1.3.7.1 binary-shape decimation
   driving the §7.6.1.4 chrominance-padding shape mask. New module
   `chroma_shape`. §7.6.1.4 says verbatim "Chrominance components are

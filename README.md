@@ -5,13 +5,55 @@ A pure-Rust MPEG-4 Part 2 Video codec (ISO/IEC 14496-2) for the
 
 ## Status
 
-**Round 35 of the clean-room rebuild (2026-06-06).** The prior
+**Round 36 of the clean-room rebuild (2026-06-07).** The prior
 implementation was retired on 2026-05-18 under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md);
 the VLC tables admitted to sourcing their numeric entries from an
 external library. Master history was fully erased per the Hat-3 cold-
 enforcement procedure.
 
+* Round 36 — §7.6.1.5 padding of interlaced macroblocks (luminance
+  boundary path). New `src/interlaced_padding.rs`. §7.6.1.5 carves
+  out the §7.6.1 reference-VOP padding pipeline for `interlaced == 1`
+  macroblocks: "Macroblocks of interlaced VOP (interlaced = 1) are
+  padded according to subclauses 7.6.1.1 through 7.6.1.3. The
+  vertical padding of the luminance component, however, is performed
+  for each field independently. A sample outside of a VOP is
+  therefore filled with the value of the nearest boundary sample of
+  the same field." The carve-out names only the vertical pass, so
+  §7.6.1.1 keeps frame-mode behaviour and §7.6.1.2 runs per field.
+  `interlaced_boundary_padding_luma(decoded_16x16, shape_16x16)` is
+  the end-to-end boundary entry point: it runs §7.6.1.1 over the
+  whole frame macroblock, splits the post-§7.6.1.1 grid into top
+  (rows `0, 2, …, 14`) and bottom (rows `1, 3, …, 15`) field views,
+  runs §7.6.1.2 per field on each 16×8 buffer (the per-field column
+  scan thus picks `y'` / `y''` from within the same field, matching
+  the "of the same field" rule verbatim), and re-interleaves the
+  outputs back into a 16×16 frame. The
+  `per_field_vertical_padding_luma(hor_pad, s_prime)` primitive
+  exposes the per-field §7.6.1.2 step for callers that already ran
+  §7.6.1.1 themselves. `InterlacedBoundaryOutcome { Padded {
+  top_column_states, bottom_column_states },
+  CompletelyTransparent }` discriminates between "at least one field
+  filled" (per-field `ColumnState` arrays attached) and "every row
+  fully transparent — caller routes to the
+  `2 ^ (bits_per_pixel - 1)` fill". The §7.6.1.5 chrominance "based
+  on fields" carve-out and the per-field §7.6.1.3 exterior-MB path
+  are intentionally out of scope for this round — the round-35
+  `decimate_chroma_shape_interlaced_field` +
+  `split_luma_shape_into_fields` /
+  `stack_interlaced_chroma_shape` helpers already give the chroma
+  wrapper its shape-decimation prerequisite, and §7.6.1.3 itself is
+  unchanged in the frame-mode sense (the §7.6.1.5 text replaces only
+  the §7.6.1.3 mid-grey fallback by the `2 ^ (bits_per_pixel - 1)`
+  fill for completely-transparent macroblocks, which is the
+  §7.6.1.3 mid-grey case verbatim). `LUMA_FIELD_LINES = LUMA_SIDE / 2`
+  is the per-field row count (8 of the macroblock's 16 luma rows
+  per field). 15 new unit tests including a cross-check against a
+  manually-composed §7.6.1.1 + per-field §7.6.1.2 reassembly and an
+  explicit progressive-vs-interlaced divergence on a macroblock
+  whose two fields disagree on their nearest-neighbour candidates;
+  total crate test count now 695 + 9 doc.
 * Round 35 — §6.1.3.7.1 binary-shape decimation feeding §7.6.1.4
   chrominance padding. New `src/chroma_shape.rs`. §7.6.1.4 specifies
   that chrominance components are padded by routing the §7.6.1.1

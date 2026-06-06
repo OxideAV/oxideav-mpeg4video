@@ -308,6 +308,7 @@ pub mod chroma_shape;
 pub mod extended_padding;
 pub mod half_sample;
 pub mod idct;
+pub mod interlaced_padding;
 pub mod inverse_quant;
 pub mod macroblock;
 pub mod motion;
@@ -359,6 +360,10 @@ pub use half_sample::{
     split_half_pel, ReferenceVop,
 };
 pub use idct::{idct_8x8, idct_saturation_bounds, saturate_idct_sample};
+pub use interlaced_padding::{
+    interlaced_boundary_padding_luma, per_field_vertical_padding_luma, InterlacedBoundaryOutcome,
+    PerFieldVerticalPaddingResult, LUMA_FIELD_LINES,
+};
 pub use inverse_quant::{
     inverse_quant_intra_dc, inverse_quant_method1, inverse_quant_method1_coef,
     inverse_quant_method2, inverse_quant_method2_coef, saturate_fprime, saturation_bounds,
