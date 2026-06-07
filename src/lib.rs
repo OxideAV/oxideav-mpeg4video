@@ -374,9 +374,10 @@ pub use macroblock::{
 };
 pub use motion::{
     averaged_motion_vector, decode_motion_vector_delta, decode_p_macroblock_motion_vectors,
-    direct_mode_motion_vector, direct_mode_reduce_qpel_to_half_pel, motion_coding,
-    predict_motion_vector, reconstruct_motion_vector, DirectCoLocatedMv, DirectModeMv,
-    DirectMvError, DirectMvUnits, MotionCodingDeltas, MotionParseError, MotionVector,
+    decode_p_macroblock_motion_vectors_with_shape, direct_mode_motion_vector,
+    direct_mode_reduce_qpel_to_half_pel, motion_coding, predict_motion_vector,
+    reconstruct_motion_vector, BinaryShapeBlockOpacity, BinaryShapeFourMv, DirectCoLocatedMv,
+    DirectModeMv, DirectMvError, DirectMvUnits, MotionCodingDeltas, MotionParseError, MotionVector,
     MotionVectorDelta, MvMode, TypeOfMb, AMV_PIXEL_COUNT,
 };
 pub use mv_predictor_grid::{

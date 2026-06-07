@@ -965,6 +965,210 @@ pub fn decode_p_macroblock_motion_vectors(
     Ok(Some(deltas))
 }
 
+// ---------------------------------------------------------------------------
+// §6.2.6 binary-shape `transparent_block(j)` elision for the four-MV branch
+// ---------------------------------------------------------------------------
+//
+// §6.2.6 P-VOP / S(GMC)-VOP macroblock-layer text spells the `inter4v`
+// branch (`derived_mb_type == 2`) as:
+//
+//   if (derived_mb_type == 2) {
+//         for (j = 0; j < 4; j++)
+//             if (!transparent_block(j))
+//                   motion_vector("forward")
+//   }
+//
+// The §5.2.7 definition of `transparent_block(j)` returns 1 when the j-th
+// 8x8 sub-block consists only of transparent pixels (the §6.1.3.4 binary-
+// shape grid spells the per-block opacity from the decimated luma shape).
+// When the shape is rectangular, every j is opaque and the loop fires four
+// `motion_vector("forward")` invocations — exactly the existing
+// [`decode_p_macroblock_motion_vectors`] / [`motion_coding`] behaviour for
+// [`TypeOfMb::Four`].
+//
+// For binary-shape VOPs some sub-blocks can be transparent, and the
+// bitstream omits the `motion_vector("forward")` body for those sub-blocks
+// entirely. The §6.2.5 `motion_coding(mode, type_of_mb)` syntax is *not*
+// what fires for the four-MV inter4v case under binary shape — §6.2.6
+// inlines the `if (!transparent_block(j))` guard directly, so the four
+// sub-block bodies are not bundled into a single `motion_coding` call.
+//
+// This module exposes the per-sub-block guard. The 8x8 block index `j`
+// follows the §6.2.6 / Figure 6-8 raster order (`0 = TL`, `1 = TR`,
+// `2 = BL`, `3 = BR`) — the same convention used by
+// [`MotionCodingDeltas::FourMv`] and by [`crate::scan`] / Figure 6-8.
+
+/// Per-sub-block opacity mask for the §6.2.6 four-MV inter4v branch.
+///
+/// Each entry corresponds to one 8x8 luma sub-block of the §6.2.6
+/// macroblock in Figure 6-8 raster order (`0 = TL`, `1 = TR`, `2 = BL`,
+/// `3 = BR`). The boolean encodes the §5.2.7 `transparent_block(j)`
+/// **negation** — `opaque[j] == true` means "block j carries at least one
+/// opaque pixel" (`!transparent_block(j)`).
+///
+/// Rectangular-shape VOPs always pass `[true; 4]` (§6.1.3.4 NOTE 2 —
+/// every sub-block of a rectangular-shape macroblock is opaque); binary-
+/// shape VOPs derive the four flags from the §6.1.3.4 decoded binary
+/// shape (one entry per 8x8 luma quadrant — opaque if any of the 64
+/// shape samples is opaque).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BinaryShapeBlockOpacity {
+    /// Figure 6-8 raster-order opacity flags (`!transparent_block(j)`).
+    pub opaque: [bool; 4],
+}
+
+impl BinaryShapeBlockOpacity {
+    /// All four sub-blocks opaque — the §6.1.3.4 NOTE 2 rectangular case.
+    /// Equivalent to passing this mask through
+    /// [`decode_p_macroblock_motion_vectors_with_shape`] and producing
+    /// four `motion_vector("forward")` bodies, matching the existing
+    /// [`decode_p_macroblock_motion_vectors`] behaviour for
+    /// [`crate::macroblock::DerivedMbType::Inter4V`].
+    pub const ALL_OPAQUE: Self = Self { opaque: [true; 4] };
+
+    /// Build from a per-sub-block opacity array. `opaque[j] == true`
+    /// means sub-block `j` (Figure 6-8 raster order) carries at least
+    /// one opaque pixel.
+    pub const fn new(opaque: [bool; 4]) -> Self {
+        Self { opaque }
+    }
+
+    /// Number of `motion_vector("forward")` bodies the §6.2.6 inter4v
+    /// branch will decode under this opacity mask. Equals
+    /// `opaque.iter().filter(|o| **o).count()` — zero through four.
+    pub const fn motion_vector_invocation_count(self) -> usize {
+        let mut n = 0;
+        let mut i = 0;
+        while i < 4 {
+            if self.opaque[i] {
+                n += 1;
+            }
+            i += 1;
+        }
+        n
+    }
+}
+
+/// Per-sub-block decoded motion-vector deltas for the §6.2.6 four-MV
+/// inter4v branch under binary-shape `transparent_block(j)` elision.
+///
+/// Each slot corresponds to one 8x8 luma sub-block in Figure 6-8 raster
+/// order (`0 = TL`, `1 = TR`, `2 = BL`, `3 = BR`). A `Some` entry holds
+/// the §7.6.3 reconstructed [`MotionVectorDelta`]; a `None` entry means
+/// the §6.2.6 `if (!transparent_block(j))` guard suppressed the
+/// `motion_vector("forward")` body for that sub-block (no bits were read
+/// from the bitstream for it).
+///
+/// For a fully-opaque mask (rectangular shape or
+/// [`BinaryShapeBlockOpacity::ALL_OPAQUE`]) this is the same four
+/// `MotionVectorDelta`s as
+/// [`MotionCodingDeltas::FourMv`] — converted via
+/// [`BinaryShapeFourMv::to_motion_coding_deltas`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BinaryShapeFourMv {
+    /// Optional per-sub-block delta in Figure 6-8 raster order.
+    pub deltas: [Option<MotionVectorDelta>; 4],
+}
+
+impl BinaryShapeFourMv {
+    /// Iterate over the populated `(j, delta)` pairs (`j` in Figure 6-8
+    /// raster order).
+    pub fn iter_present(&self) -> impl Iterator<Item = (usize, MotionVectorDelta)> + '_ {
+        self.deltas
+            .iter()
+            .enumerate()
+            .filter_map(|(j, d)| d.map(|d| (j, d)))
+    }
+
+    /// Convert to a [`MotionCodingDeltas::FourMv`] view when **all four
+    /// slots are populated**. Returns `None` when any sub-block was
+    /// elided by `transparent_block(j) == 1`.
+    ///
+    /// Use this on the rectangular-shape / all-opaque path to share the
+    /// downstream reconstruction logic with
+    /// [`decode_p_macroblock_motion_vectors`] (§6.1.3.4 NOTE 2).
+    pub fn to_motion_coding_deltas(&self) -> Option<MotionCodingDeltas> {
+        match self.deltas {
+            [Some(a), Some(b), Some(c), Some(d)] => Some(MotionCodingDeltas::FourMv([a, b, c, d])),
+            _ => None,
+        }
+    }
+}
+
+/// Binary-shape-aware variant of [`decode_p_macroblock_motion_vectors`]
+/// for the §6.2.6 four-MV inter4v branch.
+///
+/// This implements the §6.2.6 line `for (j = 0; j < 4; j++) if
+/// (!transparent_block(j)) motion_vector("forward")` directly: the
+/// caller supplies the four-block opacity mask derived from the
+/// §6.1.3.4 decoded binary shape (or
+/// [`BinaryShapeBlockOpacity::ALL_OPAQUE`] for rectangular VOPs), and
+/// this routine reads one `motion_vector("forward")` body per opaque
+/// sub-block, skipping transparent ones outright (no bits are consumed
+/// for elided sub-blocks).
+///
+/// `derived_mb_type` is from the §6.2.6 / §7.4.4 macroblock layer.
+///
+/// * [`crate::macroblock::DerivedMbType::Inter4V`] — fires the
+///   §6.2.6 `if (derived_mb_type == 2)` loop, returning
+///   `Ok(Some(BinaryShapeFourMv))` with one delta per opaque
+///   sub-block.
+/// * [`crate::macroblock::DerivedMbType::Inter`] /
+///   [`crate::macroblock::DerivedMbType::InterQ`] — the single-MV
+///   branch; this variant is **not** the right routine (the
+///   single-MV macroblock-level body has no per-sub-block
+///   `transparent_block` gate per §6.2.6, just the macroblock-level
+///   `transparent_mb()` gate handled by the macroblock-layer
+///   walker). Callers must route these through
+///   [`decode_p_macroblock_motion_vectors`] /
+///   [`motion_coding`] with [`TypeOfMb::One`]; this function returns
+///   `Ok(None)` so the caller can detect the misroute.
+/// * [`crate::macroblock::DerivedMbType::Intra`] /
+///   [`crate::macroblock::DerivedMbType::IntraQ`] — no MV body per
+///   §6.2.6; returns `Ok(None)`.
+///
+/// **Out of scope (this round):**
+/// * Interlaced `field_prediction` — the §6.2.6 inter4v branch is the
+///   non-interlaced four-MV path; the `if (interlaced && field_prediction)`
+///   line follows the §6.2.6 single-MV branch instead and is later-round
+///   work.
+/// * S(GMC)-VOP `mcsel == 1` macroblocks — gated out the same way as
+///   in [`decode_p_macroblock_motion_vectors`]; the caller must check
+///   `mcsel` first.
+/// * Computing the opacity mask from the decoded binary shape — this
+///   function takes the mask as input. The §6.1.3.4 binary-shape
+///   decoder and the §6.2.6 mapping to per-sub-block opacity are
+///   later-round work; [`crate::chroma_shape`] handles the related
+///   luma-to-chroma shape decimation but not the luma-to-block
+///   `transparent_block(j)` derivation.
+pub fn decode_p_macroblock_motion_vectors_with_shape(
+    br: &mut BitReader<'_>,
+    derived_mb_type: crate::macroblock::DerivedMbType,
+    vop_fcode_forward: u8,
+    opacity: BinaryShapeBlockOpacity,
+) -> Result<Option<BinaryShapeFourMv>, MotionParseError> {
+    use crate::macroblock::DerivedMbType;
+    match derived_mb_type {
+        DerivedMbType::Inter4V => {
+            let mut deltas: [Option<MotionVectorDelta>; 4] = [None; 4];
+            for (j, slot) in deltas.iter_mut().enumerate() {
+                if opacity.opaque[j] {
+                    *slot = Some(decode_motion_vector_delta(
+                        br,
+                        MvMode::Forward,
+                        vop_fcode_forward,
+                    )?);
+                }
+            }
+            Ok(Some(BinaryShapeFourMv { deltas }))
+        }
+        DerivedMbType::Inter
+        | DerivedMbType::InterQ
+        | DerivedMbType::Intra
+        | DerivedMbType::IntraQ => Ok(None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2217,6 +2421,170 @@ mod tests {
             let mut br = BitReader::new(&zero_inter_bytes);
             let got = decode_p_macroblock_motion_vectors(&mut br, ty, 1).unwrap();
             assert_eq!(got.map(|d| d.as_slice().len()), expected_len, "ty={:?}", ty);
+        }
+    }
+
+    // ---- §6.2.6 binary-shape transparent_block(j) elision ----
+
+    #[test]
+    fn binary_shape_block_opacity_count_helper() {
+        assert_eq!(
+            BinaryShapeBlockOpacity::ALL_OPAQUE.motion_vector_invocation_count(),
+            4
+        );
+        assert_eq!(
+            BinaryShapeBlockOpacity::new([false; 4]).motion_vector_invocation_count(),
+            0
+        );
+        assert_eq!(
+            BinaryShapeBlockOpacity::new([true, false, true, false])
+                .motion_vector_invocation_count(),
+            2
+        );
+        assert_eq!(
+            BinaryShapeBlockOpacity::new([true, true, true, false])
+                .motion_vector_invocation_count(),
+            3
+        );
+    }
+
+    #[test]
+    fn shape_aware_decode_matches_existing_path_on_all_opaque_mask() {
+        // With ALL_OPAQUE, the shape-aware Inter4V routine must consume
+        // the same bits and produce the same per-sub-block deltas as
+        // decode_p_macroblock_motion_vectors (TypeOfMb::Four). Compare
+        // bit position after decode + each slot.
+        use crate::macroblock::DerivedMbType;
+        // Four MV bodies at fcode == 1: each is two 4-bit codes (h=2 /
+        // v=-2 from MVD_TABLE — code 0010 / 0011). Four pairs = 32 bits.
+        let mut w = BitWriter::new();
+        for _ in 0..4 {
+            w.write_bits(0b0010, 4); // h = 2
+            w.write_bits(0b0011, 4); // v = -2
+        }
+        w.align();
+        let data = w.buf;
+
+        let mut br_existing = BitReader::new(&data);
+        let existing =
+            decode_p_macroblock_motion_vectors(&mut br_existing, DerivedMbType::Inter4V, 1)
+                .unwrap()
+                .unwrap();
+
+        let mut br_new = BitReader::new(&data);
+        let new = decode_p_macroblock_motion_vectors_with_shape(
+            &mut br_new,
+            DerivedMbType::Inter4V,
+            1,
+            BinaryShapeBlockOpacity::ALL_OPAQUE,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            br_existing.bit_position(),
+            br_new.bit_position(),
+            "both paths must consume the same bits",
+        );
+        let lifted = new
+            .to_motion_coding_deltas()
+            .expect("all four slots populated under ALL_OPAQUE mask");
+        assert_eq!(lifted, existing);
+    }
+
+    #[test]
+    fn shape_aware_decode_elides_transparent_blocks() {
+        // Mask: only j=0 (TL) and j=2 (BL) opaque — two MV bodies decoded,
+        // j=1 / j=3 slots stay None. Bit consumption must equal exactly
+        // two MV bodies' worth (no bits read for the elided slots).
+        use crate::macroblock::DerivedMbType;
+
+        let mut w = BitWriter::new();
+        // j=0 (TL): h = 2, v = -2 (8 bits at fcode 1).
+        w.write_bits(0b0010, 4);
+        w.write_bits(0b0011, 4);
+        // j=2 (BL): h = -2, v = 2 (codes 0011 / 0010).
+        w.write_bits(0b0011, 4);
+        w.write_bits(0b0010, 4);
+        w.align();
+        let data = w.buf;
+
+        let mut br = BitReader::new(&data);
+        let opacity = BinaryShapeBlockOpacity::new([true, false, true, false]);
+        let got = decode_p_macroblock_motion_vectors_with_shape(
+            &mut br,
+            DerivedMbType::Inter4V,
+            1,
+            opacity,
+        )
+        .unwrap()
+        .unwrap();
+
+        // Two slots populated, two elided.
+        assert_eq!(got.deltas[0], Some(MotionVectorDelta { dx: 2, dy: -2 }));
+        assert_eq!(got.deltas[1], None);
+        assert_eq!(got.deltas[2], Some(MotionVectorDelta { dx: -2, dy: 2 }));
+        assert_eq!(got.deltas[3], None);
+
+        // Exactly 16 bits consumed (two MV pairs × 8 bits each).
+        assert_eq!(br.bit_position(), 16);
+
+        // The lift-to-FourMv conversion must refuse when slots are elided.
+        assert!(got.to_motion_coding_deltas().is_none());
+
+        // iter_present yields exactly the two populated entries in order.
+        let present: Vec<_> = got.iter_present().collect();
+        assert_eq!(present.len(), 2);
+        assert_eq!(present[0].0, 0);
+        assert_eq!(present[1].0, 2);
+    }
+
+    #[test]
+    fn shape_aware_decode_all_transparent_consumes_no_bits() {
+        // §6.2.6 with every sub-block transparent: the inter4v loop fires
+        // zero motion_vector("forward") bodies — no bits are consumed.
+        use crate::macroblock::DerivedMbType;
+        let data: Vec<u8> = vec![0xAA, 0xBB, 0xCC];
+        let mut br = BitReader::new(&data);
+        let got = decode_p_macroblock_motion_vectors_with_shape(
+            &mut br,
+            DerivedMbType::Inter4V,
+            1,
+            BinaryShapeBlockOpacity::new([false; 4]),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(got.deltas, [None, None, None, None]);
+        assert_eq!(br.bit_position(), 0);
+        assert!(got.to_motion_coding_deltas().is_none());
+        assert_eq!(got.iter_present().count(), 0);
+    }
+
+    #[test]
+    fn shape_aware_decode_routes_non_inter4v_to_none() {
+        // §6.2.6 only routes derived_mb_type == 2 through the
+        // transparent_block(j) loop. Inter / InterQ / Intra / IntraQ
+        // must surface Ok(None) so the caller routes to the single-MV
+        // (decode_p_macroblock_motion_vectors) or no-MV path instead —
+        // and no bits get consumed regardless of the supplied mask.
+        use crate::macroblock::DerivedMbType;
+        for ty in [
+            DerivedMbType::Inter,
+            DerivedMbType::InterQ,
+            DerivedMbType::Intra,
+            DerivedMbType::IntraQ,
+        ] {
+            let data: Vec<u8> = vec![0xFF, 0xFF];
+            let mut br = BitReader::new(&data);
+            let got = decode_p_macroblock_motion_vectors_with_shape(
+                &mut br,
+                ty,
+                1,
+                BinaryShapeBlockOpacity::ALL_OPAQUE,
+            )
+            .unwrap();
+            assert!(got.is_none(), "ty={:?}", ty);
+            assert_eq!(br.bit_position(), 0, "ty={:?} consumed bits", ty);
         }
     }
 }

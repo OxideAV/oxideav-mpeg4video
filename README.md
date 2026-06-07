@@ -5,13 +5,44 @@ A pure-Rust MPEG-4 Part 2 Video codec (ISO/IEC 14496-2) for the
 
 ## Status
 
-**Round 37 of the clean-room rebuild (2026-06-07).** The prior
+**Round 38 of the clean-room rebuild (2026-06-08).** The prior
 implementation was retired on 2026-05-18 under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md);
 the VLC tables admitted to sourcing their numeric entries from an
 external library. Master history was fully erased per the Hat-3 cold-
 enforcement procedure.
 
+* Round 38 — §6.2.6 binary-shape `transparent_block(j)` elision for
+  the four-MV inter4v branch. The §6.2.6 P-VOP macroblock-layer text
+  spells the `derived_mb_type == 2` branch as `for (j=0; j<4; j++) if
+  (!transparent_block(j)) motion_vector("forward")` — when the §6.1.3.4
+  binary shape leaves an 8x8 sub-block fully transparent, that
+  sub-block's MV body is omitted from the bitstream entirely. Round 37
+  handled the rectangular case (§6.1.3.4 NOTE 2 — every sub-block
+  opaque, four `motion_vector("forward")` invocations); round 38 adds
+  `decode_p_macroblock_motion_vectors_with_shape(br, derived_mb_type,
+  vop_fcode_forward, BinaryShapeBlockOpacity)` so binary-shape VOPs
+  can elide transparent sub-block MV bodies without consuming bits for
+  them. `BinaryShapeBlockOpacity { opaque: [bool; 4] }` encodes the
+  §5.2.7 `transparent_block(j)` **negation** per sub-block in Figure
+  6-8 raster order (`0 = TL`, `1 = TR`, `2 = BL`, `3 = BR`); the
+  `ALL_OPAQUE` const is the rectangular-shape default.
+  `BinaryShapeFourMv { deltas: [Option<MotionVectorDelta>; 4] }`
+  surfaces the decoded result with `None` for elided slots, and
+  `to_motion_coding_deltas()` lifts the all-opaque case into the
+  existing round-37 `MotionCodingDeltas::FourMv` view so the
+  rectangular-shape predictor chain (§7.6.5 + §7.6.3) is unchanged.
+  Single-MV / intra `derived_mb_type` values return `Ok(None)` without
+  consuming bits — the §6.2.6 `transparent_block(j)` guard only fires
+  inside `if (derived_mb_type == 2)`. Out of scope (later rounds): the
+  §6.1.3.4 binary-shape decoder that produces the per-sub-block
+  opacity flags, the interlaced `field_prediction` second-invocation
+  gate, and the S(GMC)-VOP `mcsel == 1` sprite-warping route. 5 new
+  unit tests covering the all-opaque equivalence with round 37's
+  driver, the partial-elision case (TL+BL opaque, TR+BR transparent —
+  exactly 16 bits consumed, two MV pairs at fcode 1), the
+  all-transparent zero-bit case, and the non-Inter4V routing
+  guard; total crate test count now 712 + 9 doc.
 * Round 37 — §6.2.5 `motion_coding(mode, type_of_mb)` driver +
   §6.2.6 P-VOP macroblock-level MV-body walker. The §6.2.5 syntax
   wraps one or four invocations of the §6.2.6.2 `motion_vector(mode)`
