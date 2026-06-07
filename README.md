@@ -5,13 +5,51 @@ A pure-Rust MPEG-4 Part 2 Video codec (ISO/IEC 14496-2) for the
 
 ## Status
 
-**Round 36 of the clean-room rebuild (2026-06-07).** The prior
+**Round 37 of the clean-room rebuild (2026-06-07).** The prior
 implementation was retired on 2026-05-18 under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md);
 the VLC tables admitted to sourcing their numeric entries from an
 external library. Master history was fully erased per the Hat-3 cold-
 enforcement procedure.
 
+* Round 37 — §6.2.5 `motion_coding(mode, type_of_mb)` driver +
+  §6.2.6 P-VOP macroblock-level MV-body walker. The §6.2.5 syntax
+  wraps one or four invocations of the §6.2.6.2 `motion_vector(mode)`
+  body: `motion_coding(mode, type_of_mb) { motion_vector(mode); if
+  (type_of_mb == 2) for (i = 0; i < 3; i++) motion_vector(mode) }`.
+  `motion_coding(br, mode, type_of_mb, vop_fcode)` decodes the body
+  list against the round-7 `decode_motion_vector_delta` per-call
+  primitive, returning `MotionCodingDeltas::{OneMv(MotionVectorDelta),
+  FourMv([MotionVectorDelta; 4])}`. `TypeOfMb::{One, Four}` encodes
+  the §6.2.5 `type_of_mb` integer (the `type_of_mb == 2` branch fires
+  four total invocations — one unconditional opening call plus three
+  loop iterations). The four `FourMv` slots map to Figure 6-8 raster
+  order (`0 = TL`, `1 = TR`, `2 = BL`, `3 = BR`) — the same numbering
+  round 30's `MvGrid::FourMv` consumes.
+  `decode_p_macroblock_motion_vectors(br, derived_mb_type,
+  vop_fcode_forward)` is the §6.2.6 P-VOP macroblock-level driver:
+  it dispatches on `derived_mb_type` per the §6.2.6 syntax
+  (`derived_mb_type == 0 || 1` → `motion_coding("forward",
+  TypeOfMb::One)`; `derived_mb_type == 2` → `motion_coding("forward",
+  TypeOfMb::Four)`; `derived_mb_type == 3 || 4` → no MV body, returns
+  `Ok(None)`). The intra branches return `Ok(None)` without consuming
+  bits — the §6.2.6 gates `(derived_mb_type == 0 || derived_mb_type ==
+  1)` and `(derived_mb_type == 2)` both exclude `Intra` / `IntraQ`,
+  so the caller skips straight to the `for (i = 0; i < block_count;
+  i++) block(i)` loop. The interlaced `field_prediction` second-
+  invocation, the S(GMC)-VOP `mcsel == 1` sprite-warping route, and
+  the binary-shape `transparent_block(j)` elision are intentionally
+  out of scope — rectangular shape (§6.1.3.4 NOTE 2) guarantees every
+  8x8 sub-block is opaque so the §6.2.6 transparency guard always
+  fires. The §7.6.5 predictor add stays at the caller layer: each
+  decoded `MotionVectorDelta` pairs with its block-position-specific
+  Figure 7-34 predictor via the round-7 `reconstruct_motion_vector`
+  + round-8 `predict_motion_vector` + round-30
+  `MvGrid::predictor_candidates` chain. 12 new unit tests including
+  an Inter / InterQ / Inter4V / Intra / IntraQ exhaustive cross-check
+  and an end-to-end `motion_coding → reconstruct_motion_vector`
+  composition test that validates the §6.2.6.2 + §7.6.3 + §6.2.5
+  call chain together; total crate test count now 707 + 9 doc.
 * Round 36 — §7.6.1.5 padding of interlaced macroblocks (luminance
   boundary path). New `src/interlaced_padding.rs`. §7.6.1.5 carves
   out the §7.6.1 reference-VOP padding pipeline for `interlaced == 1`
@@ -913,6 +951,9 @@ and reduced-resolution VOP extension bodies are typed-rejected via
 | `*_mv_residual` (`r_size = vop_fcode-1`)      | gated read per §6.2.6.2 (round 7) |
 | §7.6.3 differential-MV reconstruction         | `(Abs-1)*f + res + 1`, sign (round 7) |
 | §7.6.3 predictor add + Table 7-9 modulo wrap  | `reconstruct_motion_vector` (round 7) |
+| §6.2.5 `motion_coding(mode, type_of_mb)` wrapper | `motion_coding` (round 37) |
+| §6.2.6 P-VOP MB-level MV-body dispatch (`derived_mb_type`) | `decode_p_macroblock_motion_vectors` (round 37) |
+| `TypeOfMb::{One, Four}` 1-MV vs Inter4V cardinality | round 37 |
 | §7.6.5 median MV predictor + validity rules    | `predict_motion_vector` (round 8) |
 | MV-predictor candidate gathering (Figure 7-34) | `MvGrid::predictor_candidates` / `gather_mv_predictor_candidates` (round 30) |
 | 1-MV vs 4-MV per-MB MV storage                 | `MbMv::{Absent, OneMv, FourMv}` (round 30) |
@@ -995,7 +1036,7 @@ and reduced-resolution VOP extension bodies are typed-rejected via
 | `header_extension_code == 1` rectangular body  | typed `VideoPacketHeader` (round 18) |
 | Encoder                                       | not yet |
 
-608 round-1..31 unit tests + 9 doctests pass.
+707 round-1..37 unit tests + 9 doctests pass.
 
 ## Provenance
 

@@ -8,6 +8,47 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 37 of the clean-room rebuild: §6.2.5
+  `motion_coding(mode, type_of_mb)` driver + §6.2.6 P-VOP
+  macroblock-level MV-body walker. The §6.2.5 syntax wraps one or four
+  invocations of the §6.2.6.2 `motion_vector(mode)` body: the
+  unconditional opening call plus a `if (type_of_mb == 2) for (i = 0;
+  i < 3; i++) motion_vector(mode)` loop for the `inter4v`-cardinality
+  case. `motion_coding(br, mode, type_of_mb, vop_fcode)` decodes the
+  body list against the round-7 `decode_motion_vector_delta`
+  per-invocation primitive, returning
+  `MotionCodingDeltas::{OneMv(MotionVectorDelta), FourMv([MotionVectorDelta; 4])}`.
+  `TypeOfMb::{One, Four}` encodes the §6.2.5 `type_of_mb` integer. The
+  four `FourMv` slots map to Figure 6-8 raster order (`0 = TL`,
+  `1 = TR`, `2 = BL`, `3 = BR`) — the same numbering round 30's
+  `MvGrid::FourMv` consumes, so the round-37 output of `motion_coding`
+  feeds directly into round-30's `MvGrid::record` without
+  re-permutation. `decode_p_macroblock_motion_vectors(br,
+  derived_mb_type, vop_fcode_forward)` is the §6.2.6 P-VOP
+  macroblock-level MV-body driver: it dispatches on `derived_mb_type`
+  per the §6.2.6 syntax — `Inter` / `InterQ` (`derived_mb_type == 0
+  || 1`) → `motion_coding("forward", TypeOfMb::One)`; `Inter4V`
+  (`derived_mb_type == 2`) → `motion_coding("forward",
+  TypeOfMb::Four)`; `Intra` / `IntraQ` (`derived_mb_type == 3 || 4`)
+  → no MV body, returns `Ok(None)` without consuming bits. The
+  §6.2.6 gates `(derived_mb_type == 0 || derived_mb_type == 1)` and
+  `(derived_mb_type == 2)` both exclude the intra branches; the
+  caller skips straight to the `for (i = 0; i < block_count; i++)
+  block(i)` loop on the `Ok(None)` return. The §7.6.5 predictor add
+  stays at the caller layer: each decoded `MotionVectorDelta` pairs
+  with its block-position-specific Figure 7-34 predictor via the
+  existing round-7 `reconstruct_motion_vector` + round-8
+  `predict_motion_vector` + round-30
+  `MvGrid::predictor_candidates` chain. The interlaced
+  `field_prediction` second-invocation, the S(GMC)-VOP `mcsel == 1`
+  sprite-warping route, and the binary-shape `transparent_block(j)`
+  elision are intentionally out of scope — rectangular shape
+  (§6.1.3.4 NOTE 2) guarantees every 8x8 sub-block is opaque so the
+  §6.2.6 transparency guard always fires. 12 new unit tests including
+  an Inter / InterQ / Inter4V / Intra / IntraQ exhaustive cross-check
+  and an end-to-end `motion_coding → reconstruct_motion_vector`
+  composition test that validates the §6.2.6.2 + §7.6.3 + §6.2.5 call
+  chain together; total crate test count now 707 + 9 doc.
 - Round 36 of the clean-room rebuild: §7.6.1.5 padding of interlaced
   macroblocks — luminance boundary path. New module
   `interlaced_padding`. §7.6.1.5 says verbatim "Macroblocks of

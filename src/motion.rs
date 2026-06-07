@@ -821,6 +821,150 @@ pub fn direct_mode_motion_vector(
     })
 }
 
+// ---------------------------------------------------------------------------
+// §6.2.5 `motion_coding(mode, type_of_mb)` / §6.2.6 P-VOP MB-level MV-body driver
+// ---------------------------------------------------------------------------
+//
+// The §6.2.5 `motion_coding(mode, type_of_mb)` syntax wraps one or four
+// invocations of the §6.2.6.2 `motion_vector(mode)` body. The §6.2.6 P-VOP
+// macroblock-layer text inlines the same pattern:
+//
+//   if ((derived_mb_type == 0 || derived_mb_type == 1)
+//       && (vop_coding_type == "P" || (vop_coding_type == "S" && !mcsel))) {
+//         motion_vector("forward")
+//         // [interlaced field_prediction repeat — later round]
+//   }
+//   if (derived_mb_type == 2) {
+//         for (j = 0; j < 4; j++)
+//             if (!transparent_block(j))
+//                   motion_vector("forward")
+//   }
+//
+// This module decodes that block list. For the rectangular shape the
+// transparency mask is statically all-opaque (§6.2.6 + §6.1.3.4 NOTE 2 — every
+// 8x8 sub-block is opaque), so the §6.2.6 "if (!transparent_block(j))" guard
+// always evaluates true; binary-shape transparent-sub-block elision is later-
+// round work.
+
+/// One macroblock's worth of decoded `motion_vector(mode)` bodies, after
+/// §7.6.3 differential-component reconstruction. The number of populated
+/// slots is the §6.2.5 `type_of_mb`-1 cardinality: one for 1-MV macroblocks
+/// (`derived_mb_type == 0 / 1`), four for the `inter4v` case
+/// (`derived_mb_type == 2`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MotionCodingDeltas {
+    /// `type_of_mb == 1` — the per-macroblock single `MotionVectorDelta`.
+    OneMv(MotionVectorDelta),
+    /// `type_of_mb == 2` — four 8x8 per-sub-block `MotionVectorDelta`s in
+    /// Figure 6-8 raster order (`0 = TL`, `1 = TR`, `2 = BL`, `3 = BR`).
+    FourMv([MotionVectorDelta; 4]),
+}
+
+impl MotionCodingDeltas {
+    /// Return the deltas as a slice (1 or 4 entries) regardless of variant.
+    pub fn as_slice(&self) -> &[MotionVectorDelta] {
+        match self {
+            MotionCodingDeltas::OneMv(d) => core::slice::from_ref(d),
+            MotionCodingDeltas::FourMv(arr) => arr,
+        }
+    }
+}
+
+/// `type_of_mb` argument for [`motion_coding`] — the §6.2.5 cardinality.
+///
+/// The numeric value matches the spec's `type_of_mb` integer, where the
+/// `type_of_mb == 2` branch fires four `motion_vector(mode)` invocations
+/// per the §6.2.5 syntax `if (type_of_mb == 2) for (i = 0; i < 3; i++)
+/// motion_vector(mode)` (the unconditional opening call counts as the
+/// first, the loop adds three more for a total of four).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypeOfMb {
+    /// `type_of_mb == 1` — one `motion_vector(mode)` invocation.
+    One,
+    /// `type_of_mb == 2` — four `motion_vector(mode)` invocations.
+    Four,
+}
+
+/// Decode the §6.2.5 `motion_coding(mode, type_of_mb)` body — one (or four)
+/// `motion_vector(mode)` invocations, each producing a reconstructed
+/// `MotionVectorDelta` per §6.2.6.2 + §7.6.3.
+///
+/// `vop_fcode` is `vop_fcode_forward` for [`MvMode::Forward`] /
+/// [`MvMode::Direct`] and `vop_fcode_backward` for [`MvMode::Backward`];
+/// the caller picks the right one from the VOP header. The deltas are not
+/// added to a predictor here — the caller pairs each delta with the right
+/// §7.6.5 predictor via [`reconstruct_motion_vector`] (the predictor is a
+/// block-level concept and the per-block predictor depends on previously-
+/// decoded MBs, which is out of scope for the syntax-walk this function
+/// performs).
+///
+/// On return the bit reader is positioned immediately after the last
+/// component's residual / `mv_data`.
+pub fn motion_coding(
+    br: &mut BitReader<'_>,
+    mode: MvMode,
+    type_of_mb: TypeOfMb,
+    vop_fcode: u8,
+) -> Result<MotionCodingDeltas, MotionParseError> {
+    // The first invocation always fires (§6.2.5 unconditional opening call).
+    let first = decode_motion_vector_delta(br, mode, vop_fcode)?;
+    match type_of_mb {
+        TypeOfMb::One => Ok(MotionCodingDeltas::OneMv(first)),
+        TypeOfMb::Four => {
+            let second = decode_motion_vector_delta(br, mode, vop_fcode)?;
+            let third = decode_motion_vector_delta(br, mode, vop_fcode)?;
+            let fourth = decode_motion_vector_delta(br, mode, vop_fcode)?;
+            Ok(MotionCodingDeltas::FourMv([first, second, third, fourth]))
+        }
+    }
+}
+
+/// Decode the §6.2.6 P-VOP macroblock-level motion-vector body for a
+/// non-interlaced rectangular-shape macroblock, dispatching on
+/// `derived_mb_type` per the §6.2.6 syntax:
+///
+/// * `Inter` / `InterQ` (`derived_mb_type == 0 || 1`) → one
+///   `motion_vector("forward")` body.
+/// * `Inter4V` (`derived_mb_type == 2`) → four `motion_vector("forward")`
+///   bodies (one per 8x8 luma sub-block).
+/// * `Intra` / `IntraQ` → no MV body; returns `None`.
+///
+/// Intra macroblocks carry no motion vectors per §6.2.6 (the
+/// `(derived_mb_type == 0 || derived_mb_type == 1)` and
+/// `(derived_mb_type == 2)` gates exclude the intra branches), so the
+/// function returns `Ok(None)` for them — the caller skips straight to the
+/// `for (i = 0; i < block_count; i++) block(i)` loop.
+///
+/// `vop_fcode` is `vop_fcode_forward` from the VOP header (the §6.2.6
+/// P-VOP MB-level MV body is always forward).
+///
+/// **Out of scope (this round):**
+/// * Interlaced `field_prediction` — the §6.2.6 line
+///   `if (interlaced && field_prediction) motion_vector("forward")` fires
+///   a second invocation per field; this driver assumes
+///   `interlaced == false` and returns the frame-mode result.
+/// * S(GMC)-VOP `mcsel == 1` macroblocks — the §6.2.6 outer gate
+///   `(vop_coding_type == "S" && !mcsel)` excludes them; the caller must
+///   check `mcsel` and route the macroblock to the §7.8.5 sprite-warping
+///   path instead of invoking this function.
+/// * Binary-shape `transparent_block(j)` elision — rectangular shape
+///   guarantees every sub-block is opaque (§6.1.3.4 NOTE 2 / §6.2.6
+///   rectangular branch).
+pub fn decode_p_macroblock_motion_vectors(
+    br: &mut BitReader<'_>,
+    derived_mb_type: crate::macroblock::DerivedMbType,
+    vop_fcode_forward: u8,
+) -> Result<Option<MotionCodingDeltas>, MotionParseError> {
+    use crate::macroblock::DerivedMbType;
+    let type_of_mb = match derived_mb_type {
+        DerivedMbType::Inter | DerivedMbType::InterQ => TypeOfMb::One,
+        DerivedMbType::Inter4V => TypeOfMb::Four,
+        DerivedMbType::Intra | DerivedMbType::IntraQ => return Ok(None),
+    };
+    let deltas = motion_coding(br, MvMode::Forward, type_of_mb, vop_fcode_forward)?;
+    Ok(Some(deltas))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1798,5 +1942,281 @@ mod tests {
         .unwrap();
         assert_eq!(got.forward, MotionVector { x: 3, y: -3 });
         assert_eq!(got.backward, MotionVector { x: -1, y: 1 });
+    }
+
+    // -----------------------------------------------------------------
+    // §6.2.5 motion_coding / §6.2.6 P-VOP MV-body driver tests.
+    // -----------------------------------------------------------------
+
+    /// Write one Table B.12 row by `mv_data`. Panics if `mv_data` is
+    /// outside `-32..=32` — the table only ranges over the on-wire
+    /// doubled-integer domain.
+    fn write_mv_data(w: &mut BitWriter, mv_data: i32) {
+        let (code, len, _) = MVD_TABLE
+            .iter()
+            .copied()
+            .find(|&(_, _, v)| v == mv_data)
+            .unwrap_or_else(|| panic!("mv_data {mv_data} not in MVD_TABLE"));
+        w.write_bits(u32::from(code), usize::from(len));
+    }
+
+    #[test]
+    fn motion_coding_one_mv_forward_fcode_one() {
+        // Single motion_vector("forward") body, vop_fcode == 1 → no
+        // residuals. Encode (h=+2, v=-2) on the wire.
+        let mut w = BitWriter::new();
+        write_mv_data(&mut w, 2); // 0010 → +1 vector difference (mv_data 2)
+        write_mv_data(&mut w, -2); // 0011 → -1 vector difference (mv_data -2)
+        w.align();
+        let bytes = w.buf;
+        let mut br = BitReader::new(&bytes);
+        let got = motion_coding(&mut br, MvMode::Forward, TypeOfMb::One, 1).unwrap();
+        assert_eq!(
+            got,
+            MotionCodingDeltas::OneMv(MotionVectorDelta { dx: 2, dy: -2 })
+        );
+        assert_eq!(got.as_slice().len(), 1);
+    }
+
+    #[test]
+    fn motion_coding_four_mv_forward_fcode_one() {
+        // Four motion_vector("forward") bodies, all (h=0, v=0). fcode == 1
+        // means no residuals are read; the on-wire encoding is just 8
+        // copies of the zero VLC (`1`).
+        let mut w = BitWriter::new();
+        for _ in 0..8 {
+            write_mv_data(&mut w, 0);
+        }
+        w.align();
+        let bytes = w.buf;
+        let mut br = BitReader::new(&bytes);
+        let got = motion_coding(&mut br, MvMode::Forward, TypeOfMb::Four, 1).unwrap();
+        let zeros = MotionVectorDelta { dx: 0, dy: 0 };
+        assert_eq!(
+            got,
+            MotionCodingDeltas::FourMv([zeros, zeros, zeros, zeros])
+        );
+        assert_eq!(got.as_slice().len(), 4);
+    }
+
+    #[test]
+    fn motion_coding_four_mv_distinct_deltas() {
+        // Four distinct (dx, dy) deltas: (0,0) (1,-1) (-1,1) (0,1).
+        // All at fcode == 1 to avoid the residual gate.
+        let mut w = BitWriter::new();
+        let deltas = [(0i32, 0i32), (2, -2), (-2, 2), (0, 2)];
+        for &(h, v) in &deltas {
+            write_mv_data(&mut w, h);
+            write_mv_data(&mut w, v);
+        }
+        w.align();
+        let bytes = w.buf;
+        let mut br = BitReader::new(&bytes);
+        let got = motion_coding(&mut br, MvMode::Forward, TypeOfMb::Four, 1).unwrap();
+        if let MotionCodingDeltas::FourMv(four) = got {
+            assert_eq!(four[0], MotionVectorDelta { dx: 0, dy: 0 });
+            assert_eq!(four[1], MotionVectorDelta { dx: 2, dy: -2 });
+            assert_eq!(four[2], MotionVectorDelta { dx: -2, dy: 2 });
+            assert_eq!(four[3], MotionVectorDelta { dx: 0, dy: 2 });
+        } else {
+            panic!("expected FourMv variant");
+        }
+    }
+
+    #[test]
+    fn motion_coding_with_fcode_two_reads_residuals() {
+        // vop_fcode == 2 → r_size = 1 bit; residuals are read when
+        // mv_data != 0. Encode one component as mv_data = 2 + residual 1,
+        // the other as mv_data = -2 + residual 0.
+        // Reconstruction (§7.6.3): |mv_data| = 2 → (2-1)*f + res + 1 = f + res + 1.
+        // With f = 2: h = (2-1)*2 + 1 + 1 = 4; v = -((2-1)*2 + 0 + 1) = -3.
+        let mut w = BitWriter::new();
+        write_mv_data(&mut w, 2); // h_data
+        w.write_bits(1, 1); // h_residual
+        write_mv_data(&mut w, -2); // v_data
+        w.write_bits(0, 1); // v_residual
+        w.align();
+        let bytes = w.buf;
+        let mut br = BitReader::new(&bytes);
+        let got = motion_coding(&mut br, MvMode::Forward, TypeOfMb::One, 2).unwrap();
+        assert_eq!(
+            got,
+            MotionCodingDeltas::OneMv(MotionVectorDelta { dx: 4, dy: -3 })
+        );
+    }
+
+    #[test]
+    fn motion_coding_truncated_mid_third_block() {
+        // Encode three valid (h, v) pairs and an h_data for the fourth
+        // block — the fourth block's v_data is missing, and the encoded
+        // pattern leaves zero remaining bits in the reader so the next
+        // VLC attempt reports Truncated. The (0,0) zero VLC at fcode==1
+        // is a single `1` bit per component; 7 of them is 7 bits, but
+        // we deliberately use a (h,v) pair whose v_data needs more
+        // bits than the buffer has left after byte alignment.
+        let mut w = BitWriter::new();
+        // First three blocks: 6 zero VLCs (1 bit each) = 6 bits.
+        for _ in 0..6 {
+            write_mv_data(&mut w, 0);
+        }
+        // Fourth block's h_data: another zero (1 bit, total 7 bits).
+        write_mv_data(&mut w, 0);
+        // Now align (pads to 8 bits with `0`s — these padding bits do
+        // NOT match any non-empty Table B.12 prefix on a fresh decode).
+        w.align();
+        // Truncate the buffer to exactly the bits we wrote (no spare
+        // byte), so the fourth block's v_data has only one zero-padding
+        // bit available; a single `0` is not a valid Table B.12 prefix
+        // and a longer prefix triggers Truncated.
+        let bytes = w.buf;
+        let mut br = BitReader::new(&bytes);
+        let err = motion_coding(&mut br, MvMode::Forward, TypeOfMb::Four, 1).unwrap_err();
+        // The fourth-block v_data is either InvalidMvData (when the
+        // padding bit aligns to a non-VLC pattern) or Truncated (when
+        // the decoder runs off the end of the buffer). Both are valid
+        // error signatures for a malformed stream; we only need to
+        // confirm the wrapper propagates *some* MotionParseError from
+        // the fourth invocation rather than treating it as a successful
+        // decode.
+        assert!(
+            matches!(
+                err,
+                MotionParseError::Truncated | MotionParseError::InvalidMvData { .. }
+            ),
+            "expected Truncated or InvalidMvData, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn motion_coding_rejects_invalid_fcode_eagerly() {
+        // fcode == 0 is rejected by `decode_motion_vector_delta` even
+        // before the first VLC read; the wrapper must propagate it.
+        let bytes = [0u8; 4];
+        let mut br = BitReader::new(&bytes);
+        let err = motion_coding(&mut br, MvMode::Forward, TypeOfMb::One, 0).unwrap_err();
+        assert!(matches!(err, MotionParseError::InvalidFcode(0)));
+        // The reader must not have advanced.
+        assert_eq!(br.bit_position(), 0);
+    }
+
+    #[test]
+    fn decode_p_mb_mvs_inter_one_mv() {
+        use crate::macroblock::DerivedMbType;
+        let mut w = BitWriter::new();
+        write_mv_data(&mut w, 2);
+        write_mv_data(&mut w, -2);
+        w.align();
+        let bytes = w.buf;
+        let mut br = BitReader::new(&bytes);
+        let got = decode_p_macroblock_motion_vectors(&mut br, DerivedMbType::Inter, 1).unwrap();
+        assert_eq!(
+            got,
+            Some(MotionCodingDeltas::OneMv(MotionVectorDelta {
+                dx: 2,
+                dy: -2
+            }))
+        );
+    }
+
+    #[test]
+    fn decode_p_mb_mvs_interq_one_mv() {
+        // InterQ (derived_mb_type == 1) also fires a single
+        // motion_vector("forward").
+        use crate::macroblock::DerivedMbType;
+        let mut w = BitWriter::new();
+        write_mv_data(&mut w, 0);
+        write_mv_data(&mut w, 0);
+        w.align();
+        let bytes = w.buf;
+        let mut br = BitReader::new(&bytes);
+        let got = decode_p_macroblock_motion_vectors(&mut br, DerivedMbType::InterQ, 1).unwrap();
+        assert_eq!(
+            got,
+            Some(MotionCodingDeltas::OneMv(MotionVectorDelta {
+                dx: 0,
+                dy: 0
+            }))
+        );
+    }
+
+    #[test]
+    fn decode_p_mb_mvs_inter4v_four_mvs() {
+        use crate::macroblock::DerivedMbType;
+        let mut w = BitWriter::new();
+        for _ in 0..8 {
+            write_mv_data(&mut w, 0);
+        }
+        w.align();
+        let bytes = w.buf;
+        let mut br = BitReader::new(&bytes);
+        let got = decode_p_macroblock_motion_vectors(&mut br, DerivedMbType::Inter4V, 1).unwrap();
+        let zeros = MotionVectorDelta { dx: 0, dy: 0 };
+        assert_eq!(
+            got,
+            Some(MotionCodingDeltas::FourMv([zeros, zeros, zeros, zeros]))
+        );
+    }
+
+    #[test]
+    fn decode_p_mb_mvs_intra_no_mv_no_bits_consumed() {
+        // Intra and IntraQ both return Ok(None) without touching the
+        // reader; the macroblock walker proceeds straight to block(i).
+        use crate::macroblock::DerivedMbType;
+        let bytes = [0xFFu8; 4];
+        for ty in [DerivedMbType::Intra, DerivedMbType::IntraQ] {
+            let mut br = BitReader::new(&bytes);
+            let got = decode_p_macroblock_motion_vectors(&mut br, ty, 1).unwrap();
+            assert_eq!(got, None);
+            assert_eq!(br.bit_position(), 0, "must not consume bits for {:?}", ty);
+        }
+    }
+
+    #[test]
+    fn motion_coding_one_mv_round_trips_with_reconstruct_motion_vector() {
+        // End-to-end: wire bytes → motion_coding → reconstruct_motion_vector
+        // composes the §6.2.6.2 + §7.6.3 path with a caller predictor.
+        // fcode=2, mv_data=+2 with residual 0 → (2-1)*2 + 0 + 1 = 3.
+        // Predictor (Px, Py) = (5, -5) → final MV = (5+3, -5+3) = (8, -2)
+        // (no Table 7-9 wrap at fcode=2 / range = 128).
+        let mut w = BitWriter::new();
+        write_mv_data(&mut w, 2);
+        w.write_bits(0, 1);
+        write_mv_data(&mut w, 2);
+        w.write_bits(0, 1);
+        w.align();
+        let bytes = w.buf;
+        let mut br = BitReader::new(&bytes);
+        let deltas = motion_coding(&mut br, MvMode::Forward, TypeOfMb::One, 2).unwrap();
+        let MotionCodingDeltas::OneMv(d) = deltas else {
+            panic!("expected OneMv");
+        };
+        assert_eq!(d, MotionVectorDelta { dx: 3, dy: 3 });
+        let mv = reconstruct_motion_vector(d, 5, -5, 2).unwrap();
+        assert_eq!(mv, MotionVector { x: 8, y: -2 });
+    }
+
+    #[test]
+    fn type_of_mb_distinct_from_intra_returns_none() {
+        // Sanity property: a derived_mb_type that has TypeOfMb::None
+        // (intra) must yield Ok(None); a derived_mb_type that has
+        // TypeOfMb::One or Four must yield Ok(Some) with the matching
+        // cardinality. Exhaustive over the 5 variants.
+        use crate::macroblock::DerivedMbType;
+        let zero_inter_bytes = {
+            // 8 zero VLC `1`s = 8 bits = 0xFF; enough to satisfy any
+            // 1-MV or 4-MV decode at fcode == 1.
+            vec![0xFFu8, 0xFFu8]
+        };
+        for (ty, expected_len) in [
+            (DerivedMbType::Inter, Some(1)),
+            (DerivedMbType::InterQ, Some(1)),
+            (DerivedMbType::Inter4V, Some(4)),
+            (DerivedMbType::Intra, None),
+            (DerivedMbType::IntraQ, None),
+        ] {
+            let mut br = BitReader::new(&zero_inter_bytes);
+            let got = decode_p_macroblock_motion_vectors(&mut br, ty, 1).unwrap();
+            assert_eq!(got.map(|d| d.as_slice().len()), expected_len, "ty={:?}", ty);
+        }
     }
 }
