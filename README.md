@@ -5,13 +5,69 @@ A pure-Rust MPEG-4 Part 2 Video codec (ISO/IEC 14496-2) for the
 
 ## Status
 
-**Round 38 of the clean-room rebuild (2026-06-08).** The prior
+**Round 39 of the clean-room rebuild (2026-06-09).** The prior
 implementation was retired on 2026-05-18 under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md);
 the VLC tables admitted to sourcing their numeric entries from an
 external library. Master history was fully erased per the Hat-3 cold-
 enforcement procedure.
 
+* Round 39 — §6.2.6.3 `interlaced_information()` body. New
+  `src/interlaced_information.rs`. The §6.2.6.3 body carries two
+  independent gates: a `dct_type` bit (when `derived_mb_type ∈ {3, 4}`
+  or `cbp != 0`) and a `field_prediction` block (when one of the three
+  §6.2.6.3 disjuncts — `P-VOP && derived_mb_type < 2`, `S(GMC)-VOP &&
+  derived_mb_type < 2 && !mcsel`, `B-VOP && mb_type != "1"` — fires).
+  When `field_prediction == 1`, up to four reference bits follow:
+  `forward_top_field_reference` + `forward_bottom_field_reference`
+  (P-VOP / S-VOP / B-VOP with `mb_type != "001"`) and
+  `backward_top_field_reference` + `backward_bottom_field_reference`
+  (B-VOP only, with `mb_type != "0001"`).
+  `parse_interlaced_information(br, &InterlacedInfoContext)` decodes
+  `0..=6` bits depending on which gates fire and never emits a flag
+  whose syntax-level guard is not satisfied. `InterlacedInfoContext`
+  is a checked enum: `i_vop` refuses inter `mb_type` rows per §6.2.5's
+  I-VOP intra-only invariant, `s_gmc_vop` refuses `derived_mb_type >= 2`
+  and surfaces `None` when `mcsel == McSel::On` (the §6.2.6.3
+  S-disjunct's `!mcsel` requirement is encoded structurally — there
+  is no constructor for `mcsel == 1`). `DctType::{Frame, Field}`
+  decodes the §6.3.6.3 `dct_type` semantics (frame-DCT vs field-DCT
+  coding of the macroblock's luminance). `FieldReference::{Top,
+  Bottom}` decodes one of the four reference bits (the §6.3.6.3
+  "top field" / "bottom field" semantics). `FieldPrediction { forward,
+  backward }` exposes the two pairs as `Option<(FieldReference,
+  FieldReference)>`. `InterlacedInformation { dct_type:
+  Option<DctType>, field_prediction: Option<FieldPrediction>,
+  field_prediction_guard_fired: bool }` is the body's typed return;
+  the `_guard_fired` flag distinguishes "the §6.2.6.3 second gate
+  fired but `field_prediction == 0`" from "the gate didn't fire at
+  all" so callers know whether to skip the §6.2.6 `if (interlaced &&
+  field_prediction) motion_vector("forward")` second-invocation.
+  `dct_type_present` and `field_prediction_present` are pure
+  predicates that surface the two gates without parsing. Out of scope
+  (later rounds): the §6.2.6 outer `if (interlaced)
+  interlaced_information()` dispatch from the P-VOP /
+  B-VOP / S-VOP macroblock parsers (the body parser itself is now
+  ready; only the wiring into `parse_macroblock_header` /
+  `parse_b_vop_mb_header` remains), and the §7.6.5 / §7.6.2.5
+  consumption of `dct_type` (block-grouping for field-DCT coded
+  macroblocks) and `field_prediction` (per-field MV pair + per-field
+  reference selection). 28 new unit tests: exhaustive presence-gate
+  cross-checks across the five `DerivedMbType` rows × `cbp ∈ {0, 1}`
+  × {I, P, B, S(GMC)}-VOP cartesian, all four `BVopMbType` rows
+  walking the forward / backward / interpolated reference-pair
+  presence rules, a P-VOP Inter-MB end-to-end roundtrip (`cbp != 0`,
+  `field_prediction == 1` → exactly 4 bits consumed), a B-VOP
+  Interpolated MB roundtrip (6 bits — dct + fp + forward pair +
+  backward pair), B-VOP Forward MB with `cbp == 0` (forward pair only,
+  no backward, 3 bits), B-VOP Backward MB (backward pair only, 3
+  bits), S(GMC)-VOP `mcsel == 0` full-body roundtrip, S(GMC)-VOP
+  `mcsel == 1` constructor surfaces `None`, S-VOP / I-VOP /
+  Inter4V / B-VOP-Direct zero-bit paths, a truncated-input
+  `EndOfStream` test, and a sweep that verifies `InterlacedInformation::
+  bit_count()` matches `BitReader::bit_position()` across all 24
+  reachable contexts under a worst-case all-ones payload; total
+  crate test count now 740 + 9 doc.
 * Round 38 — §6.2.6 binary-shape `transparent_block(j)` elision for
   the four-MV inter4v branch. The §6.2.6 P-VOP macroblock-layer text
   spells the `derived_mb_type == 2` branch as `for (j=0; j<4; j++) if
@@ -1065,9 +1121,14 @@ and reduced-resolution VOP extension bodies are typed-rejected via
 | Table 6-27 `macroblock_number` bit width       | `macroblock_number_bit_width` (round 18) |
 | §6.2.5 `video_packet_header` (rectangular)     | `parse_video_packet_header` (round 18) |
 | `header_extension_code == 1` rectangular body  | typed `VideoPacketHeader` (round 18) |
+| §6.2.6.3 `dct_type` gate (`derived_mb_type ∈ {3,4}` ∨ `cbp != 0`)  | `dct_type_present` (round 39) |
+| §6.2.6.3 `field_prediction` gate (P / S(GMC) / B disjunction)        | `field_prediction_present` (round 39) |
+| §6.2.6.3 four field-reference bits (forward / backward pairs)        | `FieldReference::{Top, Bottom}` (round 39) |
+| §6.2.6.3 `interlaced_information()` body (0..=6 bits)                 | `parse_interlaced_information` (round 39) |
+| `mcsel == 1` S(GMC) suppression of §6.2.6.3 second gate               | structural via `McSel` / `s_gmc_vop` (round 39) |
 | Encoder                                       | not yet |
 
-707 round-1..37 unit tests + 9 doctests pass.
+740 round-1..39 unit tests + 9 doctests pass.
 
 ## Provenance
 

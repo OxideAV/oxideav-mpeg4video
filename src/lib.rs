@@ -308,6 +308,7 @@ pub mod chroma_shape;
 pub mod extended_padding;
 pub mod half_sample;
 pub mod idct;
+pub mod interlaced_information;
 pub mod interlaced_padding;
 pub mod inverse_quant;
 pub mod macroblock;
@@ -360,6 +361,11 @@ pub use half_sample::{
     split_half_pel, ReferenceVop,
 };
 pub use idct::{idct_8x8, idct_saturation_bounds, saturate_idct_sample};
+pub use interlaced_information::{
+    dct_type_present, field_prediction_present, parse_interlaced_information, DctType,
+    FieldPrediction, FieldReference, InterlacedInfoContext, InterlacedInfoContextError,
+    InterlacedInformation, McSel,
+};
 pub use interlaced_padding::{
     interlaced_boundary_padding_luma, per_field_vertical_padding_luma, InterlacedBoundaryOutcome,
     PerFieldVerticalPaddingResult, LUMA_FIELD_LINES,

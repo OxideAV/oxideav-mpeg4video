@@ -8,6 +8,49 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 39 of the clean-room rebuild: §6.2.6.3
+  `interlaced_information()` body parser. New
+  `src/interlaced_information.rs` decodes the two §6.2.6.3 gates —
+  the optional `dct_type` bit (fires when `derived_mb_type ∈ {3, 4}`
+  or `cbp != 0`) and the optional `field_prediction` block (fires
+  under one of the three §6.2.6.3 disjuncts: P-VOP with
+  `derived_mb_type < 2`, S(GMC)-VOP with `derived_mb_type < 2` and
+  `!mcsel`, or B-VOP with `mb_type != "1"`). When `field_prediction
+  == 1`, up to four reference bits follow — the forward pair
+  (`forward_top_field_reference` + `forward_bottom_field_reference`,
+  present for P / S / B-non-backward) and the backward pair
+  (`backward_top_field_reference` + `backward_bottom_field_reference`,
+  B-non-forward only). `parse_interlaced_information(br, ctx)`
+  consumes 0..=6 bits depending on which gates fire and never emits
+  a flag whose syntax-level guard is not satisfied.
+  `InterlacedInfoContext::{i_vop, p_vop, b_vop, s_gmc_vop}` are
+  checked constructors that encode the spec's coding-type-specific
+  preconditions structurally: I-VOP refuses inter `mb_type`,
+  S(GMC)-VOP refuses `derived_mb_type >= 2`, and `s_gmc_vop` with
+  `McSel::On` surfaces `None` (the §6.2.6.3 S-disjunct's `!mcsel`
+  requirement). `DctType::{Frame, Field}` and `FieldReference::{Top,
+  Bottom}` carry the §6.3.6.3 semantics directly.
+  `InterlacedInformation::field_prediction_guard_fired` discriminates
+  "second gate fired but bit value was 0" from "gate didn't fire" so
+  callers know whether to skip the §6.2.6 `if (interlaced &&
+  field_prediction) motion_vector("forward")` second invocation.
+  `dct_type_present` and `field_prediction_present` are pure
+  predicates that surface the gates without parsing. Out of scope
+  (later rounds): the §6.2.6 outer `if (interlaced)
+  interlaced_information()` dispatch from the macroblock-header
+  parsers, and the §7.6.5 / §7.6.2.5 consumption of `dct_type` and
+  `field_prediction` by the motion-compensation / block-grouping
+  paths. 28 new unit tests covering all 24 reachable
+  `InterlacedInfoContext` permutations, the four B-VOP `BVopMbType`
+  rows × reference-pair presence rules, an end-to-end Interpolated
+  B-VOP roundtrip (6 bits — dct + fp + forward pair + backward pair),
+  partial-presence Forward / Backward B-VOP roundtrips (3 bits each),
+  a P-VOP Inter MB roundtrip (4 bits), a zero-bit Inter4V path, the
+  S(GMC) `mcsel == 1` `None`-yielding constructor, a truncated-input
+  `EndOfStream` error, and a sweep that verifies
+  `InterlacedInformation::bit_count()` matches
+  `BitReader::bit_position()` across every reachable context under
+  a worst-case payload; total crate test count now 740 + 9 doc.
 - Round 38 of the clean-room rebuild: §6.2.6 binary-shape
   `transparent_block(j)` elision for the four-MV inter4v branch. The
   §6.2.6 P-VOP macroblock-layer text spells the `derived_mb_type == 2`
