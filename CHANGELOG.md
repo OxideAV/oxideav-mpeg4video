@@ -8,6 +8,38 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 40 of the clean-room rebuild: §6.2.6 `if (interlaced)
+  interlaced_information()` dispatch wiring. `parse_macroblock_header`
+  now consumes the §6.2.6.3 body (round 39's
+  `parse_interlaced_information`) for I- and P-VOP macroblocks when the
+  VOL header carries `interlaced == 1`. The call fires immediately
+  after `dquant` and before the (later-round) motion / texture data,
+  per the §6.2.6 syntax line `if (interlaced)
+  interlaced_information()`. The §6.2.6.3 first gate's `cbp != 0`
+  predicate is derived from the macroblock header's coded-block
+  pattern (`cbpy != 0 || cbpc != 0`, both already in the §6.3.7
+  "1 == coded" convention — the inter `cbpy` column of Table B.8 is
+  stored in coded-block-pattern form). A new
+  `MacroblockHeader::interlaced_info: Option<InterlacedInformation>`
+  field surfaces the decoded body: `None` for progressive VOLs and for
+  `not_coded` macroblocks (the §6.2.6 not-coded short-circuit returns
+  before the `interlaced_information()` call), `Some(_)` for every
+  coded macroblock in an interlaced VOL (possibly a zero-bit body when
+  neither §6.2.6.3 gate fires). The I-VOP context is built via the
+  round-39 checked `InterlacedInfoContext::i_vop` (always carries the
+  `dct_type` gate, never `field_prediction`); the P-VOP context via
+  `InterlacedInfoContext::p_vop`. A defensive
+  `MacroblockParseError::InvalidInterlacedContext` guards an
+  inconsistent I-VOP context construction. The S(GMC)-VOP `mcsel`
+  route and the §6.2.6 `if (interlaced && field_prediction)
+  motion_vector("forward")` second invocation remain out of scope (the
+  header parser rejects S-VOPs and stops before motion vectors). 8 new
+  unit tests: progressive-VOL no-body, I-VOP dct_type-only, P-VOP
+  inter `cbp == 0` field_prediction bit, P-VOP inter `cbp != 0` full
+  forward-pair body, P-VOP inter4v zero-bit body with bit-position
+  check, P-VOP intra dct_type-only, not_coded skip, and an interlaced
+  body truncation that surfaces `Truncated`. Total crate test count now
+  748 + 9 doc.
 - Round 39 of the clean-room rebuild: §6.2.6.3
   `interlaced_information()` body parser. New
   `src/interlaced_information.rs` decodes the two §6.2.6.3 gates —

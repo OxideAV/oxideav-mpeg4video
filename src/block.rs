@@ -945,6 +945,7 @@ mod tests {
             ac_pred_flag: false,
             cbpy: 0,
             dquant_delta: None,
+            interlaced_info: None,
         };
         let ctx = MacroblockTextureContext {
             quantiser_scale: 8,
@@ -1082,6 +1083,7 @@ mod tests {
             ac_pred_flag: false,
             cbpy: 0,
             dquant_delta: None,
+            interlaced_info: None,
         };
         let ctx = MacroblockTextureContext {
             quantiser_scale: 8,
@@ -1212,6 +1214,7 @@ mod tests {
             ac_pred_flag: false,
             cbpy: 0,
             dquant_delta: None,
+            interlaced_info: None,
         };
         let ctx = MacroblockTextureContext {
             quantiser_scale: 8,
@@ -1253,6 +1256,7 @@ mod tests {
             ac_pred_flag: false,
             cbpy: 0b1000, // only block 0 coded
             dquant_delta: None,
+            interlaced_info: None,
         };
         let ctx = MacroblockTextureContext {
             quantiser_scale: 5,
@@ -1315,6 +1319,7 @@ mod tests {
             ac_pred_flag: false,
             cbpy: 0,
             dquant_delta: None,
+            interlaced_info: None,
         };
         let ctx = MacroblockTextureContext {
             quantiser_scale: 8,
@@ -1342,6 +1347,7 @@ mod tests {
             ac_pred_flag: false,
             cbpy: 0,
             dquant_delta: None,
+            interlaced_info: None,
         };
         let ctx = MacroblockTextureContext {
             quantiser_scale: 8,

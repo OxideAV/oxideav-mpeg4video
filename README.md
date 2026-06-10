@@ -5,13 +5,45 @@ A pure-Rust MPEG-4 Part 2 Video codec (ISO/IEC 14496-2) for the
 
 ## Status
 
-**Round 39 of the clean-room rebuild (2026-06-09).** The prior
+**Round 40 of the clean-room rebuild (2026-06-11).** The prior
 implementation was retired on 2026-05-18 under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md);
 the VLC tables admitted to sourcing their numeric entries from an
 external library. Master history was fully erased per the Hat-3 cold-
 enforcement procedure.
 
+* Round 40 — §6.2.6 `if (interlaced) interlaced_information()`
+  dispatch wiring. `parse_macroblock_header` now consumes the round-39
+  §6.2.6.3 body (`parse_interlaced_information`) for I- and P-VOP
+  macroblocks when the VOL header carries `interlaced == 1`. The call
+  fires immediately after `dquant` and before the (later-round)
+  motion / texture data, matching the §6.2.6 syntax line `if
+  (interlaced) interlaced_information()`. The §6.2.6.3 first gate's
+  `cbp != 0` predicate is derived from the macroblock header's
+  coded-block pattern (`cbpy != 0 || cbpc != 0` — both already in the
+  §6.3.7 "1 == coded" convention, the inter `cbpy` column of Table B.8
+  being stored in coded-block-pattern form). New field
+  `MacroblockHeader::interlaced_info: Option<InterlacedInformation>`
+  surfaces the decoded body: `None` for progressive VOLs and
+  `not_coded` macroblocks (the §6.2.6 not-coded short-circuit returns
+  before the call), `Some(_)` for every coded macroblock in an
+  interlaced VOL — possibly a zero-bit body when neither gate fires.
+  The I-VOP context uses the round-39 checked
+  `InterlacedInfoContext::i_vop` (always carries the `dct_type` gate,
+  never `field_prediction`); the P-VOP context uses
+  `InterlacedInfoContext::p_vop`. A defensive
+  `MacroblockParseError::InvalidInterlacedContext` guards an
+  inconsistent I-VOP context. Out of scope (later rounds): the
+  S(GMC)-VOP `mcsel` route (the header parser rejects S-VOPs up front)
+  and the §6.2.6 `if (interlaced && field_prediction)
+  motion_vector("forward")` second invocation (the header parser stops
+  before motion vectors). The B-VOP `parse_b_vop_mb_header` dispatch
+  (its own §6.2.6 `if (interlaced) interlaced_information()` line at
+  the B-VOP layer) is the remaining wiring. 8 new unit tests covering
+  progressive no-body, I-VOP dct-only, P-VOP inter `cbp == 0` /
+  `cbp != 0`, inter4v zero-bit, P-VOP intra dct-only, not_coded skip,
+  and an interlaced-body truncation; total crate test count now 748 + 9
+  doc.
 * Round 39 — §6.2.6.3 `interlaced_information()` body. New
   `src/interlaced_information.rs`. The §6.2.6.3 body carries two
   independent gates: a `dct_type` bit (when `derived_mb_type ∈ {3, 4}`

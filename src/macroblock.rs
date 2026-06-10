@@ -42,12 +42,34 @@
 //!   Annex P); not in scope here.
 //! * Sprite-piece / GMC sprite branches — already rejected by the
 //!   VOP-header parser via `VopContext::sprite_*`.
-//! * `interlaced_information()` block — not invoked, since the
-//!   header walk stops before motion + texture data.
 //! * `mcsel`, motion vectors, DCT, block stuffing within the data
 //!   partitioned bitstream.
+//!
+//! ## §6.2.6 `interlaced_information()` dispatch
+//!
+//! When the VOL header carries `interlaced == 1`, the §6.2.6 syntax
+//! invokes `interlaced_information()` immediately after `dquant` and
+//! before the motion / texture data:
+//!
+//! > `if (interlaced) interlaced_information()`
+//!
+//! For the I- and P-VOP macroblock types this module handles, the
+//! body parser ([`parse_interlaced_information`]) is now wired into
+//! [`parse_macroblock_header`]: the §6.2.6.3 `dct_type` /
+//! `field_prediction` body is consumed here so the bit reader stays
+//! aligned for the (later-round) motion-vector / `block(i)` loop. The
+//! decoded body is surfaced on [`MacroblockHeader::interlaced_info`].
+//! The §6.2.6 `if (interlaced && field_prediction)
+//! motion_vector("forward")` second invocation that the decoded
+//! `field_prediction` bit gates stays at the motion layer (the header
+//! parser stops before motion vectors). The S(GMC)-VOP `mcsel` route
+//! is out of scope — the parser rejects S-VOPs up front, so the
+//! §6.2.6.3 S-disjunct is unreachable here.
 
 use crate::bitreader::{BitReader, BitReaderError};
+use crate::interlaced_information::{
+    parse_interlaced_information, InterlacedInfoContext, InterlacedInformation,
+};
 use crate::vol::VolHeader;
 use crate::vop::VopCodingType;
 
@@ -148,6 +170,17 @@ pub struct MacroblockHeader {
     /// `None` when the macroblock type doesn't carry a dquant
     /// (`!mb_type.has_dquant()`) — defaults to "no change".
     pub dquant_delta: Option<i8>,
+    /// The §6.2.6.3 `interlaced_information()` body, decoded when the
+    /// VOL header's `interlaced` flag is set (the §6.2.6 `if
+    /// (interlaced) interlaced_information()` gate). `None` when the
+    /// VOL is progressive (`interlaced == 0`) or the macroblock is
+    /// `not_coded` (the §6.2.6 not-coded short-circuit returns before
+    /// reaching the `interlaced_information()` call). A coded
+    /// macroblock in an interlaced VOL always carries
+    /// `Some(InterlacedInformation)`, though both of its inner gates
+    /// may be unfired (a zero-bit body — see
+    /// [`InterlacedInformation::bit_count`]).
+    pub interlaced_info: Option<InterlacedInformation>,
 }
 
 impl MacroblockHeader {
@@ -161,6 +194,7 @@ impl MacroblockHeader {
         ac_pred_flag: false,
         cbpy: 0,
         dquant_delta: None,
+        interlaced_info: None,
     };
 }
 
@@ -193,6 +227,12 @@ pub enum MacroblockParseError {
     /// non-rectangular shapes, so this error is a defensive double
     /// check.
     UnsupportedShape(u8),
+    /// Constructing the §6.2.6.3 [`InterlacedInfoContext`] failed —
+    /// the macroblock type was inconsistent with the VOP coding type
+    /// (e.g. an inter macroblock in an I-VOP). This is a defensive
+    /// guard; the I/P macroblock-type decode paths in this module only
+    /// produce types the context accepts.
+    InvalidInterlacedContext,
 }
 
 impl core::fmt::Display for MacroblockParseError {
@@ -212,6 +252,12 @@ impl core::fmt::Display for MacroblockParseError {
                 write!(
                     f,
                     "macroblock parsing requires rectangular shape (shape={s})"
+                )
+            }
+            MacroblockParseError::InvalidInterlacedContext => {
+                write!(
+                    f,
+                    "§6.2.6.3 interlaced_information() context inconsistent with VOP coding type"
                 )
             }
         }
@@ -508,6 +554,29 @@ pub fn parse_macroblock_header(
             None
         };
 
+        // §6.2.6: `if (interlaced) interlaced_information()` — fires
+        // immediately after `dquant` and before the motion / texture
+        // data. The §6.2.6.3 first gate (`dct_type`) checks `cbp != 0`
+        // (any of the six 4:2:0 blocks coded). The stored `cbpy` /
+        // `cbpc` use the §6.3.7 "1 == coded" convention (the inter
+        // `cbpy` column of Table B.8 is already in coded-block-pattern
+        // form), so `cbp != 0` reduces to `cbpy != 0 || cbpc != 0`.
+        let interlaced_info = if vol.interlaced {
+            let any_block_coded = cbpy != 0 || cbpc != 0;
+            let ctx = match vop_coding_type {
+                VopCodingType::I => InterlacedInfoContext::i_vop(mb_type)
+                    .map_err(|_| MacroblockParseError::InvalidInterlacedContext)?,
+                VopCodingType::P => InterlacedInfoContext::p_vop(mb_type, any_block_coded),
+                // B / S were rejected before the parse loop began.
+                VopCodingType::B | VopCodingType::S => {
+                    return Err(MacroblockParseError::UnsupportedVopKind(vop_coding_type));
+                }
+            };
+            Some(parse_interlaced_information(br, &ctx)?)
+        } else {
+            None
+        };
+
         return Ok(MacroblockHeader {
             not_coded: false,
             mb_type: Some(mb_type),
@@ -515,6 +584,7 @@ pub fn parse_macroblock_header(
             ac_pred_flag,
             cbpy,
             dquant_delta,
+            interlaced_info,
         });
     }
 }
@@ -522,6 +592,7 @@ pub fn parse_macroblock_header(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::interlaced_information::{DctType, FieldReference};
     use crate::vol::{AspectRatio, SpriteEnable, VolHeader};
 
     /// Helper to build a minimal-fields VolHeader for tests that
@@ -982,5 +1053,204 @@ mod tests {
             let mb2 = parse_macroblock_header(&mut br2, VopCodingType::I, &make_vol()).unwrap();
             assert_eq!(mb2.cbpy, cbpy_intra, "code={code:b}");
         }
+    }
+
+    // -----------------------------------------------------------------
+    // §6.2.6 `if (interlaced) interlaced_information()` dispatch.
+    // -----------------------------------------------------------------
+
+    /// Progressive VOLs (`interlaced == 0`) never read the
+    /// §6.2.6.3 body — `interlaced_info` stays `None`.
+    #[test]
+    fn progressive_vol_has_no_interlaced_info() {
+        let mut w = BitWriter::new();
+        w.write_bits(0b1, 1); // I-VOP mcbpc → mb_type 3
+        w.write_bits(0, 1); // ac_pred
+        w.write_bits(0b0011, 4); // cbpy_intra=0000
+        w.align();
+        let data = w.buf;
+        let mut br = BitReader::new(&data);
+        let mb = parse_macroblock_header(&mut br, VopCodingType::I, &make_vol()).unwrap();
+        assert_eq!(mb.interlaced_info, None);
+    }
+
+    /// I-VOP, interlaced: the §6.2.6.3 first gate always fires
+    /// (I-VOP MBs are intra-coded → `derived_mb_type ∈ {3, 4}`), so a
+    /// single `dct_type` bit follows `dquant`. field_prediction never
+    /// fires for an I-VOP.
+    #[test]
+    fn i_vop_interlaced_reads_dct_type_only() {
+        let mut vol = make_vol();
+        vol.interlaced = true;
+        let mut w = BitWriter::new();
+        w.write_bits(0b1, 1); // mcbpc → mb_type 3, cbpc 00
+        w.write_bits(0, 1); // ac_pred
+        w.write_bits(0b0011, 4); // cbpy_intra=0000
+        w.write_bits(1, 1); // dct_type = 1 → Field
+        w.align();
+        let data = w.buf;
+        let mut br = BitReader::new(&data);
+        let mb = parse_macroblock_header(&mut br, VopCodingType::I, &vol).unwrap();
+        let info = mb.interlaced_info.expect("interlaced VOL → body present");
+        assert_eq!(info.dct_type, Some(DctType::Field));
+        assert_eq!(info.field_prediction, None);
+        assert!(!info.field_prediction_guard_fired);
+        assert_eq!(info.bit_count(), 1);
+    }
+
+    /// P-VOP inter MB with `cbp == 0`: the `dct_type` gate does NOT
+    /// fire (not intra, no coded blocks), but the field_prediction
+    /// gate DOES (derived_mb_type ∈ {0, 1}). A single
+    /// `field_prediction == 0` bit follows.
+    #[test]
+    fn p_vop_interlaced_inter_cbp_zero_reads_field_prediction_bit() {
+        let mut vol = make_vol();
+        vol.interlaced = true;
+        let mut w = BitWriter::new();
+        w.write_bits(0, 1); // not_coded
+        w.write_bits(0b1, 1); // mcbpc → mb_type 0 (inter), cbpc 00
+        w.write_bits(0b11, 2); // cbpy_inter=0000 → cbp == 0
+        w.write_bits(0, 1); // field_prediction = 0
+        w.align();
+        let data = w.buf;
+        let mut br = BitReader::new(&data);
+        let mb = parse_macroblock_header(&mut br, VopCodingType::P, &vol).unwrap();
+        assert_eq!(mb.cbpy, 0);
+        assert_eq!(mb.cbpc, 0);
+        let info = mb.interlaced_info.unwrap();
+        assert_eq!(info.dct_type, None);
+        assert_eq!(info.field_prediction, None);
+        assert!(info.field_prediction_guard_fired);
+        assert_eq!(info.bit_count(), 1);
+    }
+
+    /// P-VOP inter MB with `cbp != 0` and `field_prediction == 1`:
+    /// the full body is `dct_type` + `field_prediction` + the forward
+    /// reference pair (P-VOPs have no backward pair) — 4 bits.
+    #[test]
+    fn p_vop_interlaced_inter_cbp_nonzero_full_field_body() {
+        let mut vol = make_vol();
+        vol.interlaced = true;
+        let mut w = BitWriter::new();
+        w.write_bits(0, 1); // not_coded
+        w.write_bits(0b1, 1); // mcbpc → mb_type 0 (inter), cbpc 00
+        w.write_bits(0b0011, 4); // cbpy_inter=1111 → cbp != 0
+        w.write_bits(0, 1); // dct_type = 0 → Frame
+        w.write_bits(1, 1); // field_prediction = 1
+        w.write_bits(1, 1); // forward_top_field_reference = 1 → Bottom
+        w.write_bits(0, 1); // forward_bottom_field_reference = 0 → Top
+        w.align();
+        let data = w.buf;
+        let mut br = BitReader::new(&data);
+        let mb = parse_macroblock_header(&mut br, VopCodingType::P, &vol).unwrap();
+        assert_eq!(mb.cbpy, 0b1111);
+        let info = mb.interlaced_info.unwrap();
+        assert_eq!(info.dct_type, Some(DctType::Frame));
+        let fp = info.field_prediction.expect("field_prediction == 1");
+        assert_eq!(
+            fp.forward,
+            Some((FieldReference::Bottom, FieldReference::Top))
+        );
+        assert_eq!(fp.backward, None);
+        assert_eq!(info.bit_count(), 4);
+    }
+
+    /// P-VOP inter4v MB (`derived_mb_type == 2`) with `cbp == 0`:
+    /// neither §6.2.6.3 gate fires — the body is empty (zero bits)
+    /// but still surfaces as `Some` for a coded MB in an interlaced
+    /// VOL.
+    #[test]
+    fn p_vop_interlaced_inter4v_cbp_zero_empty_body() {
+        let mut vol = make_vol();
+        vol.interlaced = true;
+        let mut w = BitWriter::new();
+        w.write_bits(0, 1); // not_coded
+        w.write_bits(0b010, 3); // mcbpc → mb_type 2 (inter4v), cbpc 00
+        w.write_bits(0b11, 2); // cbpy_inter=0000 → cbp == 0
+                               // No interlaced bits follow (both gates unfired).
+                               // Append a sentinel so the reader doesn't run dry mid-test.
+        w.write_bits(0b1, 1);
+        w.align();
+        let data = w.buf;
+        let pos_before = {
+            let mut br = BitReader::new(&data);
+            let mb = parse_macroblock_header(&mut br, VopCodingType::P, &vol).unwrap();
+            let info = mb.interlaced_info.unwrap();
+            assert_eq!(info.dct_type, None);
+            assert_eq!(info.field_prediction, None);
+            assert!(!info.field_prediction_guard_fired);
+            assert_eq!(info.bit_count(), 0);
+            br.bit_position()
+        };
+        // The sentinel bit must remain unconsumed: not_coded(1) +
+        // mcbpc(3) + cbpy(2) = 6 bits, no interlaced bits.
+        assert_eq!(pos_before, 6);
+    }
+
+    /// P-VOP intra MB in an interlaced VOL: `dct_type` fires (intra),
+    /// field_prediction does NOT (derived_mb_type ∈ {3, 4} excludes
+    /// the P-VOP disjunct's `{0, 1}`). One bit follows `dquant`'s
+    /// absence.
+    #[test]
+    fn p_vop_interlaced_intra_dct_type_only() {
+        let mut vol = make_vol();
+        vol.interlaced = true;
+        let mut w = BitWriter::new();
+        w.write_bits(0, 1); // not_coded
+        w.write_bits(0b00011, 5); // mcbpc → mb_type 3 (intra), cbpc 00
+        w.write_bits(1, 1); // ac_pred_flag
+        w.write_bits(0b0101, 4); // cbpy_intra=1010
+        w.write_bits(1, 1); // dct_type = 1 → Field
+        w.align();
+        let data = w.buf;
+        let mut br = BitReader::new(&data);
+        let mb = parse_macroblock_header(&mut br, VopCodingType::P, &vol).unwrap();
+        assert_eq!(mb.mb_type, Some(DerivedMbType::Intra));
+        let info = mb.interlaced_info.unwrap();
+        assert_eq!(info.dct_type, Some(DctType::Field));
+        assert_eq!(info.field_prediction, None);
+        assert_eq!(info.bit_count(), 1);
+    }
+
+    /// A `not_coded` P-VOP MB in an interlaced VOL skips the
+    /// §6.2.6.3 body entirely (the §6.2.6 not-coded short-circuit
+    /// returns before the `interlaced_information()` call).
+    #[test]
+    fn p_vop_interlaced_not_coded_skips_body() {
+        let mut vol = make_vol();
+        vol.interlaced = true;
+        let mut w = BitWriter::new();
+        w.write_bits(1, 1); // not_coded
+        w.align();
+        let data = w.buf;
+        let mut br = BitReader::new(&data);
+        let mb = parse_macroblock_header(&mut br, VopCodingType::P, &vol).unwrap();
+        assert!(mb.not_coded);
+        assert_eq!(mb.interlaced_info, None);
+    }
+
+    /// A §6.2.6.3 body that overruns the bit slice surfaces
+    /// `Truncated` rather than a partial header. A P-VOP inter MB with
+    /// `cbp != 0`, `dct_type`, and `field_prediction == 1` demands the
+    /// two forward reference bits; ending the slice exactly at the
+    /// `field_prediction` bit (a whole byte) forces the forward-pair
+    /// read past the end.
+    #[test]
+    fn interlaced_body_truncation_is_reported() {
+        let mut vol = make_vol();
+        vol.interlaced = true;
+        let mut w = BitWriter::new();
+        w.write_bits(0, 1); // not_coded
+        w.write_bits(0b1, 1); // mcbpc → inter, cbpc 00
+        w.write_bits(0b0011, 4); // cbpy_inter=1111 → cbp != 0
+        w.write_bits(0, 1); // dct_type
+        w.write_bits(1, 1); // field_prediction = 1 → forward pair must follow
+                            // 1 + 1 + 4 + 1 + 1 = 8 bits = exactly one byte. The forward
+                            // reference pair (2 bits) overruns the slice.
+        let data = w.buf;
+        assert_eq!(data.len(), 1);
+        let mut br = BitReader::new(&data);
+        let err = parse_macroblock_header(&mut br, VopCodingType::P, &vol).unwrap_err();
+        assert_eq!(err, MacroblockParseError::Truncated);
     }
 }
