@@ -10,10 +10,11 @@
 //! optionally pulls in the 1-or-2-bit `dbquant` differential
 //! (Table 6-33).
 //!
-//! This module decodes exactly that prefix and stops there. Per the
-//! round-94 brief it does **not** consume any motion-vector body
-//! (Forward / Backward / Direct / Interpolated MV components) — those
-//! land in a later round. Likewise `interlaced_information()` /
+//! This module decodes exactly that prefix plus — since round 41 —
+//! the §6.2.6 `if (interlaced) interlaced_information()` body that
+//! follows `dbquant`, and stops there. It does **not** consume any
+//! motion-vector body (Forward / Backward / Direct / Interpolated MV
+//! components) — those land in a later round. Likewise
 //! `transparent_mb()` / `co_located_not_coded` branches are gated out
 //! ahead of the call.
 //!
@@ -38,17 +39,18 @@
 //! ## Out of scope (this round)
 //!
 //! * Motion-vector bodies — `motion_vector("forward" / "backward" /
-//!   "direct")` and the interlaced field-prediction extension are not
-//!   read; the bit reader stops at the end of `dbquant`.
-//! * `interlaced_information()` — only invoked when `vol.interlaced ==
-//!   true` and again sits between `dbquant` and the motion vectors,
-//!   inside the unreached MV body region.
+//!   "direct")` and the interlaced field-prediction second invocations
+//!   are not read; the bit reader stops at the end of the
+//!   `interlaced_information()` body (when present) or `dbquant`.
 //! * `transparent_mb()` / `co_located_not_coded` — both come from a
 //!   wider VOP-level state machine and are the caller's job to gate.
 //! * Sprite / grayscale / data-partitioned / FGS overlays — out of the
 //!   rectangular-shape clean-room scope.
 
 use crate::bitreader::{BitReader, BitReaderError};
+use crate::interlaced_information::{
+    parse_interlaced_information, InterlacedInfoContext, InterlacedInformation,
+};
 use crate::vol::VolHeader;
 use crate::vop::VopCodingType;
 
@@ -138,10 +140,12 @@ pub fn parse_dbquant(br: &mut BitReader<'_>) -> Result<(u8, i8), BVopMbParseErro
 
 /// Typed view of a B-VOP macroblock header prefix.
 ///
-/// The structure captures the bits up to and including `dbquant`. The
-/// motion-vector bodies (`mvdf`, `mvdb`, "direct" MV, interlaced
-/// field-prediction extra MVs) are out of scope this round and the
-/// bit reader is left positioned at their start.
+/// The structure captures the bits up to and including `dbquant` and
+/// — when the §6.2.6 dispatch is reached — the
+/// `interlaced_information()` body. The motion-vector bodies (`mvdf`,
+/// `mvdb`, "direct" MV, interlaced field-prediction extra MVs) are
+/// out of scope this round and the bit reader is left positioned at
+/// their start.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BVopMbHeader {
     /// Raw `modb` code from Table B.3:
@@ -172,6 +176,19 @@ pub struct BVopMbHeader {
     /// `mb_type != direct && cbpb != 0` gate in §6.2.6 was satisfied).
     /// `None` otherwise.
     pub dbquant_delta: Option<i8>,
+    /// The §6.2.6.3 `interlaced_information()` body, decoded when the
+    /// §6.2.6 `if (interlaced) interlaced_information()` line is
+    /// reached. That line sits inside two enclosing gates: the
+    /// `if (modb != '1')` subtree (a `modb == '1'` macroblock skips
+    /// everything after `modb`, including this body) and the
+    /// `if (ref_select_code != '00' || !scalability)` branch (the
+    /// Table B.4 path — the scalable enhancement-layer Table B.5
+    /// branch carries **no** `interlaced_information()` line in
+    /// §6.2.6). `None` when the VOL is progressive (`interlaced ==
+    /// 0`), when `modb == '1'`, or on the Table B.5 path; `Some(_)`
+    /// otherwise — possibly a zero-bit body (a Direct macroblock with
+    /// `cbpb == 0` fires neither §6.2.6.3 gate).
+    pub interlaced_info: Option<InterlacedInformation>,
 }
 
 /// Errors produced by the B-VOP macroblock header parser.
@@ -346,10 +363,10 @@ fn decode_mb_type(
 /// shape + 4:2:0 chroma; both are validated up-front and yield a
 /// typed error if violated.
 ///
-/// On return, the bit reader is positioned immediately after `dbquant`
-/// (when present) or immediately after the final preceding field. The
-/// caller continues with `interlaced_information()` /
-/// `motion_vector("…")` in the next round.
+/// On return, the bit reader is positioned immediately after the
+/// `interlaced_information()` body (when reached), after `dbquant`
+/// (when present), or immediately after the final preceding field.
+/// The caller continues with `motion_vector("…")` in a later round.
 pub fn parse_b_vop_mb_header(
     br: &mut BitReader<'_>,
     vol: &VolHeader,
@@ -410,6 +427,29 @@ pub fn parse_b_vop_mb_header(
         None
     };
 
+    // §6.2.6: `if (interlaced) interlaced_information()` — fires
+    // immediately after the (optional) `dbquant` and before the
+    // motion-vector bodies, but only inside the `if (modb != '1')`
+    // subtree (gated here via `mb_type_present` — the raw `modb`
+    // values 0b1 and 0b01 are numerically identical) and only on the
+    // `ref_select_code != '00' || !scalability` branch (Table B.4
+    // path). The scalable enhancement-layer branch (Table B.5) has no
+    // `interlaced_information()` line in §6.2.6. The §6.2.6.3 first
+    // gate's `cbp != 0` predicate is `cbpb != 0` — a `modb == '01'`
+    // macroblock carries no `cbpb`, meaning no block is coded, so the
+    // absent case collapses to `cbp == 0`. Note the dispatch fires
+    // for Direct macroblocks too (the §6.2.6 line is unconditional
+    // within the branch); §6.2.6.3 then suppresses `field_prediction`
+    // via its `mb_type != "1"` clause.
+    let interlaced_info = if vol.interlaced && mb_type_present && matches!(table, BMbTypeTable::B4)
+    {
+        let any_block_coded = matches!(cbpb, Some(v) if v != 0);
+        let ctx = InterlacedInfoContext::b_vop(mb_type, any_block_coded);
+        Some(parse_interlaced_information(br, &ctx)?)
+    } else {
+        None
+    };
+
     Ok(BVopMbHeader {
         modb,
         mb_type,
@@ -417,6 +457,7 @@ pub fn parse_b_vop_mb_header(
         mvdf_present: mb_type.has_forward_mv(),
         mvdb_present: mb_type.has_backward_mv(),
         dbquant_delta,
+        interlaced_info,
     })
 }
 
@@ -938,5 +979,289 @@ mod tests {
         // verify we see our sentinel 0xAA.
         let next = br.read_bits(8).unwrap();
         assert_eq!(next, 0xAA, "parser stopped at the wrong bit position");
+    }
+
+    // -----------------------------------------------------------------
+    // §6.2.6 `if (interlaced) interlaced_information()` dispatch.
+    // -----------------------------------------------------------------
+
+    use crate::interlaced_information::{DctType, FieldReference};
+
+    fn make_interlaced_vol() -> VolHeader {
+        let mut vol = make_vol();
+        vol.interlaced = true;
+        vol
+    }
+
+    /// Progressive VOLs (`interlaced == 0`) never read the §6.2.6.3
+    /// body — `interlaced_info` stays `None`.
+    #[test]
+    fn progressive_vol_has_no_interlaced_info() {
+        let mut w = BitWriter::new();
+        w.write_bits(0b00, 2); // modb
+        w.write_bits(0b01, 2); // mb_type → Interpolated
+        w.write_bits(0b100000, 6); // cbpb (non-zero)
+        w.write_bits(0b0, 1); // dbquant = 0
+        w.align();
+        let data = w.buf;
+        let mut br = BitReader::new(&data);
+        let hdr = parse_b_vop_mb_header(&mut br, &make_vol(), VopCodingType::B, BMbTypeTable::B4)
+            .unwrap();
+        assert_eq!(hdr.interlaced_info, None);
+    }
+
+    /// `modb == '1'` skips the entire `if (modb != '1')` subtree —
+    /// including the `interlaced_information()` line — even in an
+    /// interlaced VOL. The bit reader must stop right after `modb`.
+    #[test]
+    fn interlaced_modb_1_skips_interlaced_information() {
+        let mut w = BitWriter::new();
+        w.write_bits(0b1, 1); // modb = 1
+        w.write_bits(0b1010_1010, 8); // sentinel
+        w.align();
+        let data = w.buf;
+        let mut br = BitReader::new(&data);
+        let hdr = parse_b_vop_mb_header(
+            &mut br,
+            &make_interlaced_vol(),
+            VopCodingType::B,
+            BMbTypeTable::B4,
+        )
+        .unwrap();
+        assert_eq!(hdr.mb_type, BVopMbType::Direct);
+        assert_eq!(hdr.interlaced_info, None);
+        assert_eq!(br.read_bits(8).unwrap(), 0xAA);
+    }
+
+    /// Direct macroblock with `cbpb != 0`: the §6.2.6 dispatch still
+    /// fires (the line is unconditional within the Table B.4 branch),
+    /// but §6.2.6.3 emits only `dct_type` — the `field_prediction`
+    /// guard's `mb_type != "1"` clause excludes Direct. No `dbquant`
+    /// either (its own `mb_type != "1"` gate).
+    #[test]
+    fn interlaced_direct_cbpb_nonzero_reads_dct_type_only() {
+        let mut w = BitWriter::new();
+        w.write_bits(0b00, 2); // modb → mb_type + cbpb
+        w.write_bits(0b1, 1); // mb_type → Direct
+        w.write_bits(0b000001, 6); // cbpb (non-zero)
+        w.write_bits(0b1, 1); // dct_type = 1 → Field
+        w.write_bits(0b1010_1010, 8); // sentinel
+        w.align();
+        let data = w.buf;
+        let mut br = BitReader::new(&data);
+        let hdr = parse_b_vop_mb_header(
+            &mut br,
+            &make_interlaced_vol(),
+            VopCodingType::B,
+            BMbTypeTable::B4,
+        )
+        .unwrap();
+        assert_eq!(hdr.mb_type, BVopMbType::Direct);
+        assert_eq!(hdr.dbquant_delta, None);
+        let info = hdr.interlaced_info.unwrap();
+        assert_eq!(info.dct_type, Some(DctType::Field));
+        assert_eq!(info.field_prediction, None);
+        assert!(!info.field_prediction_guard_fired);
+        assert_eq!(info.bit_count(), 1);
+        assert_eq!(br.read_bits(8).unwrap(), 0xAA);
+    }
+
+    /// Direct macroblock with `cbpb == 0`: neither §6.2.6.3 gate fires
+    /// — the body is zero bits but still surfaced as `Some(_)` (the
+    /// dispatch was reached).
+    #[test]
+    fn interlaced_direct_cbpb_zero_zero_bit_body() {
+        let mut w = BitWriter::new();
+        w.write_bits(0b00, 2); // modb → mb_type + cbpb
+        w.write_bits(0b1, 1); // mb_type → Direct
+        w.write_bits(0b000000, 6); // cbpb = 0
+        w.write_bits(0b1010_1010, 8); // sentinel
+        w.align();
+        let data = w.buf;
+        let mut br = BitReader::new(&data);
+        let hdr = parse_b_vop_mb_header(
+            &mut br,
+            &make_interlaced_vol(),
+            VopCodingType::B,
+            BMbTypeTable::B4,
+        )
+        .unwrap();
+        let info = hdr.interlaced_info.unwrap();
+        assert_eq!(info.dct_type, None);
+        assert_eq!(info.field_prediction, None);
+        assert!(!info.field_prediction_guard_fired);
+        assert_eq!(info.bit_count(), 0);
+        assert_eq!(br.read_bits(8).unwrap(), 0xAA);
+    }
+
+    /// Interpolated macroblock, `cbpb != 0`, `field_prediction == 1`:
+    /// the full 6-bit §6.2.6.3 body — `dct_type` + `field_prediction`
+    /// + forward pair + backward pair — follows `dbquant`.
+    #[test]
+    fn interlaced_interpolated_full_body_after_dbquant() {
+        let mut w = BitWriter::new();
+        w.write_bits(0b00, 2); // modb → mb_type + cbpb
+        w.write_bits(0b01, 2); // mb_type → Interpolated
+        w.write_bits(0b100000, 6); // cbpb (non-zero)
+        w.write_bits(0b11, 2); // dbquant = +2
+        w.write_bits(0b1, 1); // dct_type = 1 → Field
+        w.write_bits(0b1, 1); // field_prediction = 1
+        w.write_bits(0b0, 1); // forward_top_field_reference → Top
+        w.write_bits(0b1, 1); // forward_bottom_field_reference → Bottom
+        w.write_bits(0b1, 1); // backward_top_field_reference → Bottom
+        w.write_bits(0b0, 1); // backward_bottom_field_reference → Top
+        w.write_bits(0b1010_1010, 8); // sentinel
+        w.align();
+        let data = w.buf;
+        let mut br = BitReader::new(&data);
+        let hdr = parse_b_vop_mb_header(
+            &mut br,
+            &make_interlaced_vol(),
+            VopCodingType::B,
+            BMbTypeTable::B4,
+        )
+        .unwrap();
+        assert_eq!(hdr.mb_type, BVopMbType::Interpolated);
+        assert_eq!(hdr.dbquant_delta, Some(2));
+        let info = hdr.interlaced_info.unwrap();
+        assert_eq!(info.dct_type, Some(DctType::Field));
+        assert!(info.field_prediction_guard_fired);
+        let fp = info.field_prediction.unwrap();
+        assert_eq!(
+            fp.forward,
+            Some((FieldReference::Top, FieldReference::Bottom))
+        );
+        assert_eq!(
+            fp.backward,
+            Some((FieldReference::Bottom, FieldReference::Top))
+        );
+        assert_eq!(info.bit_count(), 6);
+        assert_eq!(br.read_bits(8).unwrap(), 0xAA);
+    }
+
+    /// Forward macroblock with `modb == '01'` (no `cbpb` → `cbp == 0`):
+    /// no `dct_type`, but the `field_prediction` guard fires (`mb_type
+    /// != "1"`). A `field_prediction == 0` bit yields a 1-bit body
+    /// with the guard flag set.
+    #[test]
+    fn interlaced_forward_no_cbpb_field_prediction_zero() {
+        let mut w = BitWriter::new();
+        w.write_bits(0b01, 2); // modb → mb_type, no cbpb
+        w.write_bits(0b0001, 4); // mb_type → Forward
+        w.write_bits(0b0, 1); // field_prediction = 0
+        w.write_bits(0b1010_1010, 8); // sentinel
+        w.align();
+        let data = w.buf;
+        let mut br = BitReader::new(&data);
+        let hdr = parse_b_vop_mb_header(
+            &mut br,
+            &make_interlaced_vol(),
+            VopCodingType::B,
+            BMbTypeTable::B4,
+        )
+        .unwrap();
+        assert_eq!(hdr.mb_type, BVopMbType::Forward);
+        assert_eq!(hdr.cbpb, None);
+        let info = hdr.interlaced_info.unwrap();
+        assert_eq!(info.dct_type, None);
+        assert_eq!(info.field_prediction, None);
+        assert!(info.field_prediction_guard_fired);
+        assert_eq!(info.bit_count(), 1);
+        assert_eq!(br.read_bits(8).unwrap(), 0xAA);
+    }
+
+    /// Backward macroblock with `cbpb != 0` and `field_prediction ==
+    /// 1`: the §6.2.6.3 forward sub-gate's `mb_type != "001"` clause
+    /// suppresses the forward pair; only the backward pair follows
+    /// (4-bit body: dct + fp + 2 backward reference bits).
+    #[test]
+    fn interlaced_backward_fp_one_backward_pair_only() {
+        let mut w = BitWriter::new();
+        w.write_bits(0b00, 2); // modb → mb_type + cbpb
+        w.write_bits(0b001, 3); // mb_type → Backward
+        w.write_bits(0b010000, 6); // cbpb (non-zero)
+        w.write_bits(0b10, 2); // dbquant = -2
+        w.write_bits(0b0, 1); // dct_type = 0 → Frame
+        w.write_bits(0b1, 1); // field_prediction = 1
+        w.write_bits(0b1, 1); // backward_top_field_reference → Bottom
+        w.write_bits(0b1, 1); // backward_bottom_field_reference → Bottom
+        w.write_bits(0b1010_1010, 8); // sentinel
+        w.align();
+        let data = w.buf;
+        let mut br = BitReader::new(&data);
+        let hdr = parse_b_vop_mb_header(
+            &mut br,
+            &make_interlaced_vol(),
+            VopCodingType::B,
+            BMbTypeTable::B4,
+        )
+        .unwrap();
+        assert_eq!(hdr.mb_type, BVopMbType::Backward);
+        assert_eq!(hdr.dbquant_delta, Some(-2));
+        let info = hdr.interlaced_info.unwrap();
+        assert_eq!(info.dct_type, Some(DctType::Frame));
+        let fp = info.field_prediction.unwrap();
+        assert_eq!(fp.forward, None);
+        assert_eq!(
+            fp.backward,
+            Some((FieldReference::Bottom, FieldReference::Bottom))
+        );
+        assert_eq!(info.bit_count(), 4);
+        assert_eq!(br.read_bits(8).unwrap(), 0xAA);
+    }
+
+    /// The scalable enhancement-layer branch (`ref_select_code == '00'
+    /// && scalability` — the Table B.5 path) carries no
+    /// `interlaced_information()` line in §6.2.6: even in an
+    /// interlaced VOL the parser must not consume body bits there.
+    #[test]
+    fn scalable_b5_branch_has_no_interlaced_information() {
+        let mut w = BitWriter::new();
+        w.write_bits(0b01, 2); // modb → mb_type, no cbpb
+        w.write_bits(0b1, 1); // mb_type → Forward (Table B.5 row 1)
+        w.write_bits(0b1010_1010, 8); // sentinel
+        w.align();
+        let data = w.buf;
+        let mut br = BitReader::new(&data);
+        let hdr = parse_b_vop_mb_header(
+            &mut br,
+            &make_interlaced_vol(),
+            VopCodingType::B,
+            BMbTypeTable::B5,
+        )
+        .unwrap();
+        assert_eq!(hdr.mb_type, BVopMbType::Forward);
+        assert_eq!(hdr.interlaced_info, None);
+        assert_eq!(br.read_bits(8).unwrap(), 0xAA);
+    }
+
+    /// Truncation inside the §6.2.6.3 body surfaces as `Truncated`.
+    #[test]
+    fn interlaced_truncated_mid_body() {
+        let mut w = BitWriter::new();
+        w.write_bits(0b00, 2); // modb → mb_type + cbpb
+        w.write_bits(0b01, 2); // mb_type → Interpolated
+        w.write_bits(0b100000, 6); // cbpb (non-zero)
+        w.write_bits(0b0, 1); // dbquant = 0 — prefix = 11 bits
+        w.write_bits(0b1, 1); // dct_type (bit 11)
+        w.write_bits(0b1, 1); // field_prediction = 1 (bit 12)
+        w.write_bits(0b0, 1); // forward_top_field_reference (bit 13)
+        w.write_bits(0b1, 1); // forward_bottom_field_reference (bit 14)
+        w.write_bits(0b1, 1); // backward_top_field_reference (bit 15)
+        w.write_bits(0b0, 1); // backward_bottom_field_reference (bit 16)
+        w.align();
+        // Truncate to 2 bytes (16 bits): the backward_bottom read —
+        // the body's final reference bit — runs out mid-body.
+        let mut data = w.buf;
+        data.truncate(2);
+        let mut br = BitReader::new(&data);
+        let err = parse_b_vop_mb_header(
+            &mut br,
+            &make_interlaced_vol(),
+            VopCodingType::B,
+            BMbTypeTable::B4,
+        )
+        .unwrap_err();
+        assert_eq!(err, BVopMbParseError::Truncated);
     }
 }

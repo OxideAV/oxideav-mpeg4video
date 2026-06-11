@@ -5,13 +5,46 @@ A pure-Rust MPEG-4 Part 2 Video codec (ISO/IEC 14496-2) for the
 
 ## Status
 
-**Round 40 of the clean-room rebuild (2026-06-11).** The prior
+**Round 41 of the clean-room rebuild (2026-06-11).** The prior
 implementation was retired on 2026-05-18 under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md);
 the VLC tables admitted to sourcing their numeric entries from an
 external library. Master history was fully erased per the Hat-3 cold-
 enforcement procedure.
 
+* Round 41 — §6.2.6 B-VOP `if (interlaced) interlaced_information()`
+  dispatch wiring. `parse_b_vop_mb_header` now consumes the round-39
+  §6.2.6.3 body (`parse_interlaced_information`) immediately after the
+  (optional) `dbquant` and before the (later-round) motion-vector
+  bodies, completing the dispatch work round 40 left open. The §6.2.6
+  B-VOP layer places the call inside two enclosing gates that the
+  I/P-VOP layer does not have: the `if (modb != '1')` subtree (a
+  `modb == '1'` macroblock skips everything after `modb`, including
+  the body) and the `if (ref_select_code != '00' || !scalability)`
+  branch — the scalable enhancement-layer path (Table B.5,
+  `BMbTypeTable::B5`) carries **no** `interlaced_information()` line,
+  so an interlaced VOL on that path still yields `None`. The gate is
+  driven by `mb_type_present` rather than the raw `modb` value (the
+  Table B.3 raw codes `1` and `01` are numerically identical as
+  integers). The §6.2.6.3 first gate's `cbp != 0` predicate is
+  `cbpb != 0`, with an absent `cbpb` (`modb == '01'`) collapsing to
+  `cbp == 0`. The dispatch fires for Direct macroblocks too (the
+  §6.2.6 line is unconditional within the Table B.4 branch);
+  §6.2.6.3 then suppresses `field_prediction` via its `mb_type != "1"`
+  clause, so a Direct MB carries at most the `dct_type` bit. New field
+  `BVopMbHeader::interlaced_info: Option<InterlacedInformation>`
+  surfaces the decoded body via the round-39
+  `InterlacedInfoContext::b_vop` context. Out of scope (later rounds):
+  the B-VOP motion-vector bodies and their `if (interlaced &&
+  field_prediction) motion_vector(…)` second invocations. With this,
+  every macroblock-header parser in the crate (I-VOP / P-VOP / B-VOP)
+  routes the §6.2.6 interlaced dispatch. 9 new unit tests covering
+  progressive no-body, `modb == '1'` skip, Direct `cbpb != 0`
+  dct-only, Direct `cbpb == 0` zero-bit body, Interpolated full 6-bit
+  body after `dbquant`, Forward `modb == '01'` 1-bit
+  `field_prediction == 0` body, Backward backward-pair-only body,
+  Table B.5 no-dispatch, and a mid-body truncation — each with a
+  sentinel bit-position check; total crate test count now 757 + 9 doc.
 * Round 40 — §6.2.6 `if (interlaced) interlaced_information()`
   dispatch wiring. `parse_macroblock_header` now consumes the round-39
   §6.2.6.3 body (`parse_interlaced_information`) for I- and P-VOP

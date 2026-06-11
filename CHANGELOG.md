@@ -8,6 +8,41 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 41 of the clean-room rebuild: §6.2.6 B-VOP `if (interlaced)
+  interlaced_information()` dispatch wiring. `parse_b_vop_mb_header`
+  now consumes the §6.2.6.3 body (round 39's
+  `parse_interlaced_information`) immediately after the (optional)
+  `dbquant` and before the (later-round) motion-vector bodies,
+  completing the dispatch work round 40 left open. The §6.2.6 B-VOP
+  layer places the call inside two enclosing gates the I/P-VOP layer
+  does not have: the `if (modb != '1')` subtree (a `modb == '1'`
+  macroblock skips everything after `modb`, including the body) and
+  the `if (ref_select_code != '00' || !scalability)` branch — the
+  scalable enhancement-layer path (Table B.5, `BMbTypeTable::B5`)
+  carries no `interlaced_information()` line in §6.2.6, so an
+  interlaced VOL on that path still yields `None`. The gate is driven
+  by `mb_type_present` rather than the raw `modb` value (the Table
+  B.3 raw codes `1` and `01` are numerically identical as integers).
+  The §6.2.6.3 first gate's `cbp != 0` predicate is `cbpb != 0`, with
+  an absent `cbpb` (`modb == '01'`) collapsing to `cbp == 0`. The
+  dispatch fires for Direct macroblocks too (the §6.2.6 line is
+  unconditional within the Table B.4 branch); §6.2.6.3 then
+  suppresses `field_prediction` via its `mb_type != "1"` clause, so a
+  Direct MB carries at most the `dct_type` bit. New field
+  `BVopMbHeader::interlaced_info: Option<InterlacedInformation>`
+  surfaces the decoded body via the round-39
+  `InterlacedInfoContext::b_vop` context. Out of scope (later
+  rounds): the B-VOP motion-vector bodies and their `if (interlaced
+  && field_prediction) motion_vector(…)` second invocations. With
+  this, every macroblock-header parser in the crate (I-VOP / P-VOP /
+  B-VOP) routes the §6.2.6 interlaced dispatch. 9 new unit tests:
+  progressive-VOL no-body, `modb == '1'` skip, Direct `cbpb != 0`
+  dct-only, Direct `cbpb == 0` zero-bit body, Interpolated full
+  6-bit body after `dbquant`, Forward `modb == '01'` 1-bit
+  `field_prediction == 0` body, Backward backward-pair-only body,
+  Table B.5 no-dispatch, and a mid-body truncation — each with a
+  sentinel bit-position check. Total crate test count now 757 + 9
+  doc.
 - Round 40 of the clean-room rebuild: §6.2.6 `if (interlaced)
   interlaced_information()` dispatch wiring. `parse_macroblock_header`
   now consumes the §6.2.6.3 body (round 39's
