@@ -336,8 +336,8 @@ pub use block::{
     MacroblockTextureContext, DEFAULT_INTRA_QUANT_MATRIX, DEFAULT_NONINTRA_QUANT_MATRIX,
 };
 pub use bvop::{
-    default_b_mb_type, parse_b_vop_mb_header, parse_dbquant, BMbTypeTable, BVopMbHeader,
-    BVopMbParseError, BVopMbType,
+    decode_b_vop_mb_motion_vectors, default_b_mb_type, parse_b_vop_mb_header, parse_dbquant,
+    BMbTypeTable, BVopMbHeader, BVopMbParseError, BVopMbType, BVopMotionVectors, BVopMvBody,
 };
 pub use bvop_prediction::{
     average_bidirectional, average_bidirectional_into, generate_b_vop_luma_prediction,
@@ -379,12 +379,13 @@ pub use macroblock::{
     dquant_value, parse_macroblock_header, DerivedMbType, MacroblockHeader, MacroblockParseError,
 };
 pub use motion::{
-    averaged_motion_vector, decode_motion_vector_delta, decode_p_macroblock_motion_vectors,
+    averaged_motion_vector, decode_field_motion_vector_pair, decode_motion_vector_delta,
+    decode_p_macroblock_motion_vectors, decode_p_macroblock_motion_vectors_interlaced,
     decode_p_macroblock_motion_vectors_with_shape, direct_mode_motion_vector,
     direct_mode_reduce_qpel_to_half_pel, motion_coding, predict_motion_vector,
     reconstruct_motion_vector, BinaryShapeBlockOpacity, BinaryShapeFourMv, DirectCoLocatedMv,
-    DirectModeMv, DirectMvError, DirectMvUnits, MotionCodingDeltas, MotionParseError, MotionVector,
-    MotionVectorDelta, MvMode, TypeOfMb, AMV_PIXEL_COUNT,
+    DirectModeMv, DirectMvError, DirectMvUnits, FieldMvPair, MotionCodingDeltas, MotionParseError,
+    MotionVector, MotionVectorDelta, MvMode, PMbMotionVectors, TypeOfMb, AMV_PIXEL_COUNT,
 };
 pub use mv_predictor_grid::{
     gather_mv_predictor_candidates, MbMv, MbMvRecord, MvGrid, MvGridError,

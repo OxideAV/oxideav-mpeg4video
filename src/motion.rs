@@ -97,6 +97,14 @@ pub enum MotionParseError {
     /// value of `0` is forbidden by §6.3.5; values above `7` exceed the
     /// table.
     InvalidFcode(u8),
+    /// `field_prediction == 1` was supplied in a context the §6.2.6 /
+    /// §6.2.6.3 syntax cannot produce — a direct-mode body (the
+    /// §6.2.6.3 `mb_type != "1"` clause keeps the bit from ever being
+    /// coded for a direct macroblock and the §6.2.6 direct line has no
+    /// second invocation), a four-MV `inter4v` macroblock, or an intra
+    /// macroblock (the §6.2.6.3 outer guard requires
+    /// `derived_mb_type < 2`).
+    InvalidFieldPredictionContext,
 }
 
 impl core::fmt::Display for MotionParseError {
@@ -108,6 +116,12 @@ impl core::fmt::Display for MotionParseError {
             }
             MotionParseError::InvalidFcode(c) => {
                 write!(f, "vop_fcode {c} outside valid range 1..=7")
+            }
+            MotionParseError::InvalidFieldPredictionContext => {
+                write!(
+                    f,
+                    "field_prediction set in a context §6.2.6/§6.2.6.3 cannot produce"
+                )
             }
         }
     }
@@ -1169,6 +1183,136 @@ pub fn decode_p_macroblock_motion_vectors_with_shape(
     }
 }
 
+// ---------------------------------------------------------------------------
+// §6.2.6 interlaced field-prediction second `motion_vector(mode)` invocation
+// ---------------------------------------------------------------------------
+//
+// The §6.2.6 macroblock syntax fires a second body right after the first
+// whenever the macroblock is field predicted:
+//
+//   motion_vector("forward")
+//   if (interlaced && field_prediction)
+//         motion_vector("forward")
+//
+// (P-VOP / S(GMC)-VOP 1-MV branch; the B-VOP branch has the analogous
+// forward and backward pairs). §7.7.2.1 fixes the pair's order: the
+// decoder "shall first extract the differential motion vectors
+// ((MVDx f1, MVDy f1) and (MVDx f2, MVDy f2) for top and bottom fields of
+// a field predicted macroblock, respectively)" — the first body is the
+// top-field differential, the second the bottom-field differential.
+// Table 7-14 and the §7.7.2.2 field-mode pseudo code (`MVD[0]` updates
+// `PMV[0]` = top field forward, `MVD[1]` updates `PMV[1]` = bottom field
+// forward; backward uses `PMV[2]`/`PMV[3]` in the same top-then-bottom
+// order, and the field-bidirectional loop walks `MVD[0..3]` as forward
+// top, forward bottom, backward top, backward bottom) confirm the same
+// ordering for B-VOPs.
+//
+// Both invocations of a pair share the direction's single fcode
+// (`vop_fcode_forward` for the forward pair, `vop_fcode_backward` for the
+// backward pair) — the §6.2.6.2 residual gating depends only on `mode`.
+//
+// Semantics deferred to a later round: the §7.7.2.1 reconstruction
+// `MVx fi = MVDx fi + Px` / `MVy fi = 2 * (MVDy fi + (Py / 2))` (both
+// fields share one predictor; the vertical differential is coded in
+// field coordinates and the reconstructed vertical component is always
+// an even frame-coordinate integer) and the §7.7.2 field motion
+// compensation itself.
+
+/// The two §6.2.6.2 bodies of one field-predicted prediction direction,
+/// in bitstream order — §7.7.2.1: first body = top-field differential
+/// (`MVD f1`), second body = bottom-field differential (`MVD f2`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FieldMvPair {
+    /// Top-field differential (`MVDx f1`, `MVDy f1`) — the first body.
+    pub top: MotionVectorDelta,
+    /// Bottom-field differential (`MVDx f2`, `MVDy f2`) — the second
+    /// body.
+    pub bottom: MotionVectorDelta,
+}
+
+/// Decode the §6.2.6 field-predicted pair of `motion_vector(mode)`
+/// bodies — the unconditional first invocation plus the `if (interlaced
+/// && field_prediction)` second one — assigning top/bottom per §7.7.2.1.
+///
+/// `mode` must be [`MvMode::Forward`] or [`MvMode::Backward`]; the
+/// §6.2.6 direct line has no second invocation and §6.2.6.3's
+/// `mb_type != "1"` clause keeps `field_prediction` from ever being
+/// coded for a direct macroblock, so [`MvMode::Direct`] yields
+/// [`MotionParseError::InvalidFieldPredictionContext`] without
+/// consuming bits.
+pub fn decode_field_motion_vector_pair(
+    br: &mut BitReader<'_>,
+    mode: MvMode,
+    vop_fcode: u8,
+) -> Result<FieldMvPair, MotionParseError> {
+    if mode == MvMode::Direct {
+        return Err(MotionParseError::InvalidFieldPredictionContext);
+    }
+    let top = decode_motion_vector_delta(br, mode, vop_fcode)?;
+    let bottom = decode_motion_vector_delta(br, mode, vop_fcode)?;
+    Ok(FieldMvPair { top, bottom })
+}
+
+/// A P-VOP macroblock's decoded MV bodies, frame- or field-predicted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PMbMotionVectors {
+    /// Frame prediction (`field_prediction == 0`, or a progressive
+    /// VOL) — the one-or-four delta view of [`MotionCodingDeltas`].
+    Frame(MotionCodingDeltas),
+    /// Field prediction (`field_prediction == 1`) — one forward
+    /// differential per field, top then bottom (§7.7.2.1).
+    Field(FieldMvPair),
+}
+
+/// Decode the §6.2.6 P-VOP macroblock-level motion-vector body for a
+/// rectangular-shape macroblock in an interlaced VOL, honouring the
+/// `if (interlaced && field_prediction) motion_vector("forward")`
+/// second invocation.
+///
+/// `field_prediction` is the §6.2.6.3 bit the caller obtained from the
+/// macroblock header's `interlaced_information()` body
+/// (`InterlacedInformation::field_prediction.is_some()`); passing
+/// `false` reproduces [`decode_p_macroblock_motion_vectors`] exactly
+/// (the second invocation never fires). Since §6.2.6.3 only codes the
+/// bit when `derived_mb_type < 2`, a `true` flag combined with an
+/// `inter4v` or intra `derived_mb_type` is rejected with
+/// [`MotionParseError::InvalidFieldPredictionContext`] before any bit
+/// is consumed.
+pub fn decode_p_macroblock_motion_vectors_interlaced(
+    br: &mut BitReader<'_>,
+    derived_mb_type: crate::macroblock::DerivedMbType,
+    vop_fcode_forward: u8,
+    field_prediction: bool,
+) -> Result<Option<PMbMotionVectors>, MotionParseError> {
+    use crate::macroblock::DerivedMbType;
+    match derived_mb_type {
+        DerivedMbType::Inter | DerivedMbType::InterQ => {
+            if field_prediction {
+                let pair = decode_field_motion_vector_pair(br, MvMode::Forward, vop_fcode_forward)?;
+                Ok(Some(PMbMotionVectors::Field(pair)))
+            } else {
+                let delta = decode_motion_vector_delta(br, MvMode::Forward, vop_fcode_forward)?;
+                Ok(Some(PMbMotionVectors::Frame(MotionCodingDeltas::OneMv(
+                    delta,
+                ))))
+            }
+        }
+        DerivedMbType::Inter4V => {
+            if field_prediction {
+                return Err(MotionParseError::InvalidFieldPredictionContext);
+            }
+            let deltas = motion_coding(br, MvMode::Forward, TypeOfMb::Four, vop_fcode_forward)?;
+            Ok(Some(PMbMotionVectors::Frame(deltas)))
+        }
+        DerivedMbType::Intra | DerivedMbType::IntraQ => {
+            if field_prediction {
+                return Err(MotionParseError::InvalidFieldPredictionContext);
+            }
+            Ok(None)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1495,6 +1639,7 @@ mod tests {
             MotionParseError::Truncated,
             MotionParseError::InvalidMvData { window: 0 },
             MotionParseError::InvalidFcode(9),
+            MotionParseError::InvalidFieldPredictionContext,
         ];
         for e in cases {
             assert!(!format!("{e}").is_empty());
@@ -2586,5 +2731,205 @@ mod tests {
             assert!(got.is_none(), "ty={:?}", ty);
             assert_eq!(br.bit_position(), 0, "ty={:?} consumed bits", ty);
         }
+    }
+
+    // -----------------------------------------------------------------
+    // §6.2.6 field-prediction second-invocation tests.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn field_mv_pair_orders_top_then_bottom() {
+        // §7.7.2.1: first body = top field, second = bottom field.
+        // fcode == 1 → no residuals. Encode top (h=+2, v=-2), bottom
+        // (h=0, v=+2): 4+4+1+4 = 13 bits.
+        let mut w = BitWriter::new();
+        write_mv_data(&mut w, 2);
+        write_mv_data(&mut w, -2);
+        write_mv_data(&mut w, 0);
+        write_mv_data(&mut w, 2);
+        w.align();
+        let bytes = w.buf;
+        let mut br = BitReader::new(&bytes);
+        let got = decode_field_motion_vector_pair(&mut br, MvMode::Forward, 1).unwrap();
+        assert_eq!(got.top, MotionVectorDelta { dx: 2, dy: -2 });
+        assert_eq!(got.bottom, MotionVectorDelta { dx: 0, dy: 2 });
+        assert_eq!(br.bit_position(), 13);
+    }
+
+    #[test]
+    fn field_mv_pair_fcode_two_reads_residuals_in_both_bodies() {
+        // vop_fcode == 2 → r_size = 1; residual read per non-zero
+        // mv_data in BOTH bodies (the pair shares the direction's
+        // fcode). Top: h_data=2 + res 1 → (2-1)*2+1+1 = +4; v_data=0
+        // (no residual) → 0. Bottom: h_data=-2 + res 0 → -3;
+        // v_data=2 + res 1 → +4.
+        let mut w = BitWriter::new();
+        write_mv_data(&mut w, 2);
+        w.write_bits(1, 1);
+        write_mv_data(&mut w, 0);
+        write_mv_data(&mut w, -2);
+        w.write_bits(0, 1);
+        write_mv_data(&mut w, 2);
+        w.write_bits(1, 1);
+        w.align();
+        let bytes = w.buf;
+        let mut br = BitReader::new(&bytes);
+        let got = decode_field_motion_vector_pair(&mut br, MvMode::Backward, 2).unwrap();
+        assert_eq!(got.top, MotionVectorDelta { dx: 4, dy: 0 });
+        assert_eq!(got.bottom, MotionVectorDelta { dx: -3, dy: 4 });
+        // 4+1+1 + 4+1+4+1 = 16 bits.
+        assert_eq!(br.bit_position(), 16);
+    }
+
+    #[test]
+    fn field_mv_pair_rejects_direct_mode_without_consuming_bits() {
+        // §6.2.6 has no second invocation on the direct line; §6.2.6.3
+        // never codes field_prediction when mb_type == "1".
+        let data: Vec<u8> = vec![0xFF, 0xFF];
+        let mut br = BitReader::new(&data);
+        let got = decode_field_motion_vector_pair(&mut br, MvMode::Direct, 1);
+        assert_eq!(
+            got.unwrap_err(),
+            MotionParseError::InvalidFieldPredictionContext
+        );
+        assert_eq!(br.bit_position(), 0);
+    }
+
+    #[test]
+    fn field_mv_pair_truncated_mid_second_body() {
+        // Top body complete (h=+2, v=-2 → 8 bits), bottom h_data an
+        // 8-bit code (mv_data -6) so the buffer ends exactly on a byte
+        // boundary — the bottom v_data then has zero bits left →
+        // Truncated.
+        let mut w = BitWriter::new();
+        write_mv_data(&mut w, 2);
+        write_mv_data(&mut w, -2);
+        write_mv_data(&mut w, -6);
+        w.align();
+        let bytes = w.buf;
+        assert_eq!(bytes.len(), 2);
+        let mut br = BitReader::new(&bytes);
+        let got = decode_field_motion_vector_pair(&mut br, MvMode::Forward, 1);
+        assert_eq!(got.unwrap_err(), MotionParseError::Truncated);
+    }
+
+    #[test]
+    fn p_mb_interlaced_inter_field_prediction_decodes_pair() {
+        // P-VOP Inter MB, field_prediction == 1 → the §6.2.6 second
+        // invocation fires: two forward bodies, top then bottom.
+        use crate::macroblock::DerivedMbType;
+        let mut w = BitWriter::new();
+        write_mv_data(&mut w, -2);
+        write_mv_data(&mut w, 0);
+        write_mv_data(&mut w, 2);
+        write_mv_data(&mut w, 2);
+        w.align();
+        let bytes = w.buf;
+        let mut br = BitReader::new(&bytes);
+        let got =
+            decode_p_macroblock_motion_vectors_interlaced(&mut br, DerivedMbType::Inter, 1, true)
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            got,
+            PMbMotionVectors::Field(FieldMvPair {
+                top: MotionVectorDelta { dx: -2, dy: 0 },
+                bottom: MotionVectorDelta { dx: 2, dy: 2 },
+            })
+        );
+        assert_eq!(br.bit_position(), 13);
+    }
+
+    #[test]
+    fn p_mb_interlaced_frame_matches_progressive_walker() {
+        // field_prediction == 0 → identical decode to the round-37
+        // progressive walker on the same bytes.
+        use crate::macroblock::DerivedMbType;
+        let mut w = BitWriter::new();
+        write_mv_data(&mut w, 2);
+        write_mv_data(&mut w, -2);
+        w.align();
+        let bytes = w.buf;
+
+        let mut br_a = BitReader::new(&bytes);
+        let interlaced = decode_p_macroblock_motion_vectors_interlaced(
+            &mut br_a,
+            DerivedMbType::InterQ,
+            1,
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        let mut br_b = BitReader::new(&bytes);
+        let progressive = decode_p_macroblock_motion_vectors(&mut br_b, DerivedMbType::InterQ, 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(interlaced, PMbMotionVectors::Frame(progressive));
+        assert_eq!(br_a.bit_position(), br_b.bit_position());
+    }
+
+    #[test]
+    fn p_mb_interlaced_inter4v_frame_decodes_four_bodies() {
+        // inter4v never field-predicts; with field_prediction == 0 the
+        // four-body §6.2.5 motion_coding path runs unchanged.
+        use crate::macroblock::DerivedMbType;
+        let mut w = BitWriter::new();
+        for _ in 0..8 {
+            write_mv_data(&mut w, 0);
+        }
+        w.align();
+        let bytes = w.buf;
+        let mut br = BitReader::new(&bytes);
+        let got = decode_p_macroblock_motion_vectors_interlaced(
+            &mut br,
+            DerivedMbType::Inter4V,
+            1,
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        let zeros = MotionVectorDelta { dx: 0, dy: 0 };
+        assert_eq!(
+            got,
+            PMbMotionVectors::Frame(MotionCodingDeltas::FourMv([zeros; 4]))
+        );
+        assert_eq!(br.bit_position(), 8);
+    }
+
+    #[test]
+    fn p_mb_interlaced_rejects_field_prediction_on_inter4v_and_intra() {
+        // §6.2.6.3 only codes field_prediction when derived_mb_type < 2
+        // — a true flag with inter4v / intra rows is a caller bug and
+        // must not consume bits.
+        use crate::macroblock::DerivedMbType;
+        for ty in [
+            DerivedMbType::Inter4V,
+            DerivedMbType::Intra,
+            DerivedMbType::IntraQ,
+        ] {
+            let data: Vec<u8> = vec![0xFF, 0xFF];
+            let mut br = BitReader::new(&data);
+            let got = decode_p_macroblock_motion_vectors_interlaced(&mut br, ty, 1, true);
+            assert_eq!(
+                got.unwrap_err(),
+                MotionParseError::InvalidFieldPredictionContext,
+                "ty={:?}",
+                ty
+            );
+            assert_eq!(br.bit_position(), 0, "ty={:?} consumed bits", ty);
+        }
+    }
+
+    #[test]
+    fn p_mb_interlaced_intra_frame_yields_none() {
+        // Intra rows carry no MV body regardless of interlacing.
+        use crate::macroblock::DerivedMbType;
+        let data: Vec<u8> = vec![0xFF, 0xFF];
+        let mut br = BitReader::new(&data);
+        let got =
+            decode_p_macroblock_motion_vectors_interlaced(&mut br, DerivedMbType::Intra, 1, false)
+                .unwrap();
+        assert!(got.is_none());
+        assert_eq!(br.bit_position(), 0);
     }
 }

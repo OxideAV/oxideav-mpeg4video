@@ -8,6 +8,30 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 42 of the clean-room rebuild: §6.2.6 B-VOP motion-vector
+  bodies + interlaced field-prediction second `motion_vector()`
+  invocations. `decode_field_motion_vector_pair` decodes the
+  unconditional body plus the `if (interlaced && field_prediction)`
+  second one into `FieldMvPair { top, bottom }` (§7.7.2.1 ordering:
+  top-field differential first; both bodies share the direction's
+  fcode). `decode_p_macroblock_motion_vectors_interlaced` extends the
+  round-37 P-VOP walker with the field route
+  (`PMbMotionVectors::{Frame, Field}`); the new
+  `MotionParseError::InvalidFieldPredictionContext` rejects
+  `field_prediction` combinations §6.2.6.3 cannot code (inter4v /
+  intra rows, direct mode) without consuming bits.
+  `decode_b_vop_mb_motion_vectors` walks the §6.2.6 Table B.4 branch
+  after `parse_b_vop_mb_header`: forward body for `mb_type == '01' ||
+  '0001'`, backward for `'01' || '001'` (syntax order, backward gated
+  on `vop_fcode_backward`), single residual-less
+  `motion_vector("direct")` for `'1'`; each direction surfaces
+  `BVopMvBody::Frame` or `::Field`, with field-interpolated
+  macroblocks decoding four bodies in the §7.7.2.2 / Table 7-14
+  `MVD[0..3]` order (forward-top, forward-bottom, backward-top,
+  backward-bottom). New `BVopMbParseError::Motion` wraps body-level
+  failures. Reconstruction (`MVy fi = 2 * (MVDy fi + (Py / 2))`) and
+  §7.7.2 field motion compensation stay later-round work. 17 new unit
+  tests; total crate test count now 774 + 9 doc.
 - Round 41 of the clean-room rebuild: §6.2.6 B-VOP `if (interlaced)
   interlaced_information()` dispatch wiring. `parse_b_vop_mb_header`
   now consumes the §6.2.6.3 body (round 39's

@@ -12,11 +12,12 @@
 //!
 //! This module decodes exactly that prefix plus — since round 41 —
 //! the §6.2.6 `if (interlaced) interlaced_information()` body that
-//! follows `dbquant`, and stops there. It does **not** consume any
-//! motion-vector body (Forward / Backward / Direct / Interpolated MV
-//! components) — those land in a later round. Likewise
-//! `transparent_mb()` / `co_located_not_coded` branches are gated out
-//! ahead of the call.
+//! follows `dbquant`; `parse_b_vop_mb_header` stops there. Since
+//! round 42 the motion-vector bodies that follow are covered by the
+//! separate [`decode_b_vop_mb_motion_vectors`] walker (see its docs
+//! for the §6.2.6 Table B.4-branch dispatch and the interlaced
+//! field-prediction second invocations). `transparent_mb()` /
+//! `co_located_not_coded` branches are gated out ahead of either call.
 //!
 //! ## Spec references
 //!
@@ -25,8 +26,13 @@
 //! `docs/video/mpeg4-visual/ISO_IEC_14496-2-2004-3rd-edition.txt`:
 //!
 //! * §6.2.6 `macroblock()` — B-VOP branch (the `else { if (modb …) }`
-//!   sub-tree that starts at `modb 1-2 vlclbf`).
+//!   sub-tree that starts at `modb 1-2 vlclbf`), including its
+//!   `motion_vector("forward" / "backward" / "direct")` lines and
+//!   their `if (interlaced && field_prediction)` second invocations.
 //! * §6.3.6 — `modb`, `mb_type`, `cbpb`, `dbquant` semantics for B-VOPs.
+//! * §7.7.2.1 / §7.7.2.2 + Tables 7-14 / 7-15 — field-differential
+//!   ordering (top field first, bottom field second; forward pair
+//!   before backward pair).
 //! * Table B.3 — VLC for `modb` (`1` / `01` / `00`).
 //! * Table B.4 — `mb_type` for B-VOPs (ref_select_code != '00' or
 //!   scalability == 0): codes `1 / 01 / 001 / 0001` → direct /
@@ -38,10 +44,12 @@
 //!
 //! ## Out of scope (this round)
 //!
-//! * Motion-vector bodies — `motion_vector("forward" / "backward" /
-//!   "direct")` and the interlaced field-prediction second invocations
-//!   are not read; the bit reader stops at the end of the
-//!   `interlaced_information()` body (when present) or `dbquant`.
+//! * The §7.7.2.2 motion-vector *reconstruction* (PMV add, the
+//!   even-vertical field recovery `MVy fi = 2 * (MVDy fi + (Py / 2))`)
+//!   and motion compensation — the walker surfaces differentials only.
+//! * The Table B.5 scalable enhancement-layer MV line (§6.2.6's
+//!   separate `ref_select_code == '00' && scalability` branch carries
+//!   its own dbquant + single-forward-MV gating).
 //! * `transparent_mb()` / `co_located_not_coded` — both come from a
 //!   wider VOP-level state machine and are the caller's job to gate.
 //! * Sprite / grayscale / data-partitioned / FGS overlays — out of the
@@ -50,6 +58,10 @@
 use crate::bitreader::{BitReader, BitReaderError};
 use crate::interlaced_information::{
     parse_interlaced_information, InterlacedInfoContext, InterlacedInformation,
+};
+use crate::motion::{
+    decode_field_motion_vector_pair, decode_motion_vector_delta, FieldMvPair, MotionParseError,
+    MotionVectorDelta, MvMode,
 };
 use crate::vol::VolHeader;
 use crate::vop::VopCodingType;
@@ -222,6 +234,10 @@ pub enum BVopMbParseError {
     /// different cbpb width and a different `block_count` and are out
     /// of scope this round.
     UnsupportedChromaFormat(u8),
+    /// A §6.2.6.2 `motion_vector(mode)` body failed to decode (or
+    /// `field_prediction` was supplied for a direct macroblock, which
+    /// the §6.2.6.3 `mb_type != "1"` clause forbids).
+    Motion(MotionParseError),
 }
 
 impl core::fmt::Display for BVopMbParseError {
@@ -252,6 +268,9 @@ impl core::fmt::Display for BVopMbParseError {
                     "B-VOP macroblock parsing requires 4:2:0 chroma (chroma_format={c})"
                 )
             }
+            BVopMbParseError::Motion(e) => {
+                write!(f, "B-VOP motion-vector body: {e}")
+            }
         }
     }
 }
@@ -261,6 +280,12 @@ impl std::error::Error for BVopMbParseError {}
 impl From<BitReaderError> for BVopMbParseError {
     fn from(_: BitReaderError) -> Self {
         BVopMbParseError::Truncated
+    }
+}
+
+impl From<MotionParseError> for BVopMbParseError {
+    fn from(e: MotionParseError) -> Self {
+        BVopMbParseError::Motion(e)
     }
 }
 
@@ -458,6 +483,147 @@ pub fn parse_b_vop_mb_header(
         mvdb_present: mb_type.has_backward_mv(),
         dbquant_delta,
         interlaced_info,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// §6.2.6 B-VOP macroblock-level motion-vector bodies
+// ---------------------------------------------------------------------------
+//
+// The §6.2.6 Table B.4 branch follows the `interlaced_information()` body
+// with three guarded motion-vector blocks, in this syntax order:
+//
+//   if (mb_type == '01' || mb_type == '0001') {
+//         motion_vector("forward")
+//         if (interlaced && field_prediction)
+//               motion_vector("forward")
+//   }
+//   if (mb_type == '01' || mb_type == '001') {
+//         motion_vector("backward")
+//         if (interlaced && field_prediction)
+//               motion_vector("backward")
+//   }
+//   if (mb_type == "1")
+//         motion_vector("direct")
+//
+// Mapping the raw codes through Table B.4: '01' = interpolate, '001' =
+// backward, '0001' = forward, '1' = direct — i.e. the forward block fires
+// exactly when `BVopMbType::has_forward_mv()`, the backward block exactly
+// when `BVopMbType::has_backward_mv()`, and an interpolated macroblock
+// reads its forward body (or field pair) before its backward one.
+//
+// §7.7.2.2 fixes the field-pair ordering (Table 7-14: PMV 0 = top field
+// forward, 1 = bottom field forward, 2 = top field backward, 3 = bottom
+// field backward; the field-bidirectional pseudo code walks `MVD[0..3]`
+// against `PMV[0..3]` in that order), so a field-predicted interpolated
+// macroblock's four bodies decode as forward-top, forward-bottom,
+// backward-top, backward-bottom.
+//
+// The direct body has no residual components (§6.2.6.2's `mode ==
+// "direct"` branch reads only the two `mv_data` VLCs), which is the
+// fcode-1 reconstruction; §7.6.9.5.1 calls it the single delta vector
+// `MVD` shared by all four direct-mode block vectors.
+
+/// One decoded prediction direction of a B-VOP macroblock — a single
+/// frame differential, or the top/bottom field pair when
+/// `field_prediction == 1`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BVopMvBody {
+    /// Frame prediction — one §6.2.6.2 body.
+    Frame(MotionVectorDelta),
+    /// Field prediction — two §6.2.6.2 bodies, top then bottom
+    /// (§7.7.2.1 / §7.7.2.2).
+    Field(FieldMvPair),
+}
+
+/// All motion-vector bodies of one §6.2.6 B-VOP macroblock (Table B.4
+/// branch), as decoded by [`decode_b_vop_mb_motion_vectors`].
+///
+/// Exactly one of the three patterns is populated per Table B.4 row:
+/// forward only (`mb_type == '0001'`), backward only (`'001'`), forward
+/// + backward (`'01'`, interpolated), or direct only (`'1'`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BVopMotionVectors {
+    /// `mvdf` — present for Forward and Interpolated macroblocks.
+    pub forward: Option<BVopMvBody>,
+    /// `mvdb` — present for Backward and Interpolated macroblocks.
+    pub backward: Option<BVopMvBody>,
+    /// `mvdb`-direct — the single §7.6.9.5.1 delta vector, present for
+    /// Direct macroblocks only. Never a field pair (§6.2.6 has no
+    /// second invocation on the direct line).
+    pub direct: Option<MotionVectorDelta>,
+}
+
+/// Decode the §6.2.6 B-VOP macroblock-level motion-vector bodies that
+/// follow the [`parse_b_vop_mb_header`] prefix on the Table B.4
+/// (non-scalable / `ref_select_code != '00'`) branch.
+///
+/// `field_prediction` is the §6.2.6.3 bit from the header's
+/// `interlaced_information()` body
+/// (`BVopMbHeader::interlaced_info` →
+/// `InterlacedInformation::field_prediction.is_some()`); pass `false`
+/// for progressive VOLs or frame-predicted macroblocks. When `true`,
+/// each populated direction decodes the §6.2.6 second invocation into
+/// a [`FieldMvPair`]. A `true` flag with a Direct macroblock is
+/// rejected without consuming bits — the §6.2.6.3 `mb_type != "1"`
+/// clause never codes `field_prediction` for direct.
+///
+/// The forward bodies use `vop_fcode_forward`, the backward bodies
+/// `vop_fcode_backward` (§6.2.6.2 residual gating). The caller must
+/// skip this walker entirely for `modb == '1'` macroblocks — the
+/// whole `if (modb != '1')` subtree, motion vectors included, is
+/// absent from the bitstream.
+pub fn decode_b_vop_mb_motion_vectors(
+    br: &mut BitReader<'_>,
+    mb_type: BVopMbType,
+    field_prediction: bool,
+    vop_fcode_forward: u8,
+    vop_fcode_backward: u8,
+) -> Result<BVopMotionVectors, BVopMbParseError> {
+    if field_prediction && mb_type == BVopMbType::Direct {
+        return Err(BVopMbParseError::Motion(
+            MotionParseError::InvalidFieldPredictionContext,
+        ));
+    }
+
+    let decode_direction =
+        |br: &mut BitReader<'_>, mode: MvMode, fcode: u8| -> Result<BVopMvBody, BVopMbParseError> {
+            if field_prediction {
+                Ok(BVopMvBody::Field(decode_field_motion_vector_pair(
+                    br, mode, fcode,
+                )?))
+            } else {
+                Ok(BVopMvBody::Frame(decode_motion_vector_delta(
+                    br, mode, fcode,
+                )?))
+            }
+        };
+
+    // §6.2.6 syntax order: forward block, then backward block, then
+    // direct.
+    let forward = if mb_type.has_forward_mv() {
+        Some(decode_direction(br, MvMode::Forward, vop_fcode_forward)?)
+    } else {
+        None
+    };
+    let backward = if mb_type.has_backward_mv() {
+        Some(decode_direction(br, MvMode::Backward, vop_fcode_backward)?)
+    } else {
+        None
+    };
+    let direct = if mb_type == BVopMbType::Direct {
+        // The direct body never reads residuals (§6.2.6.2), so its
+        // reconstruction is the fcode-1 case regardless of the VOP
+        // header fcodes.
+        Some(decode_motion_vector_delta(br, MvMode::Direct, 1)?)
+    } else {
+        None
+    };
+
+    Ok(BVopMotionVectors {
+        forward,
+        backward,
+        direct,
     })
 }
 
@@ -951,6 +1117,7 @@ mod tests {
             BVopMbParseError::NotBVop(VopCodingType::I),
             BVopMbParseError::UnsupportedShape(2),
             BVopMbParseError::UnsupportedChromaFormat(0b10),
+            BVopMbParseError::Motion(MotionParseError::Truncated),
         ];
         for e in cases {
             let s = format!("{e}");
@@ -1263,5 +1430,217 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err, BVopMbParseError::Truncated);
+    }
+
+    // -----------------------------------------------------------------
+    // §6.2.6 B-VOP motion-vector body walker tests.
+    // -----------------------------------------------------------------
+
+    /// Write one Table B.12 `mv_data` VLC. Only the small doubled-
+    /// integer values these tests need are mapped; the full table
+    /// lives in `crate::motion`.
+    fn write_mvd(w: &mut BitWriter, mv_data: i32) {
+        let (code, len) = match mv_data {
+            0 => (0b1, 1),
+            1 => (0b010, 3),
+            -1 => (0b011, 3),
+            2 => (0b0010, 4),
+            -2 => (0b0011, 4),
+            _ => panic!("mv_data {mv_data} not mapped in test helper"),
+        };
+        w.write_bits(code, len);
+    }
+
+    #[test]
+    fn b_mv_direct_single_body_no_residuals() {
+        // mb_type == "1" → one motion_vector("direct") body. The
+        // §6.2.6.2 direct branch reads no residuals even with
+        // fcode > 1, and the delta reconstructs as the bare mv_data
+        // (fcode-1 case).
+        let mut w = BitWriter::new();
+        write_mvd(&mut w, 2); // horizontal_mv_data
+        write_mvd(&mut w, -2); // vertical_mv_data
+        w.align();
+        let bytes = w.buf;
+        let mut br = BitReader::new(&bytes);
+        let got = decode_b_vop_mb_motion_vectors(&mut br, BVopMbType::Direct, false, 3, 2).unwrap();
+        assert_eq!(got.forward, None);
+        assert_eq!(got.backward, None);
+        assert_eq!(got.direct, Some(MotionVectorDelta { dx: 2, dy: -2 }));
+        assert_eq!(br.bit_position(), 8);
+    }
+
+    #[test]
+    fn b_mv_direct_rejects_field_prediction_without_consuming_bits() {
+        // §6.2.6.3's `mb_type != "1"` clause never codes
+        // field_prediction for a direct macroblock.
+        let data: Vec<u8> = vec![0xFF, 0xFF];
+        let mut br = BitReader::new(&data);
+        let err =
+            decode_b_vop_mb_motion_vectors(&mut br, BVopMbType::Direct, true, 1, 1).unwrap_err();
+        assert_eq!(
+            err,
+            BVopMbParseError::Motion(MotionParseError::InvalidFieldPredictionContext)
+        );
+        assert_eq!(br.bit_position(), 0);
+    }
+
+    #[test]
+    fn b_mv_forward_frame_single_forward_body() {
+        // mb_type == '0001' (Forward) → forward body only.
+        let mut w = BitWriter::new();
+        write_mvd(&mut w, -1);
+        write_mvd(&mut w, 1);
+        w.align();
+        let bytes = w.buf;
+        let mut br = BitReader::new(&bytes);
+        let got =
+            decode_b_vop_mb_motion_vectors(&mut br, BVopMbType::Forward, false, 1, 1).unwrap();
+        assert_eq!(
+            got.forward,
+            Some(BVopMvBody::Frame(MotionVectorDelta { dx: -1, dy: 1 }))
+        );
+        assert_eq!(got.backward, None);
+        assert_eq!(got.direct, None);
+        assert_eq!(br.bit_position(), 6);
+    }
+
+    #[test]
+    fn b_mv_forward_field_prediction_decodes_pair() {
+        // Forward MB with field_prediction == 1 → the §6.2.6 second
+        // invocation fires: top then bottom (§7.7.2.1).
+        let mut w = BitWriter::new();
+        write_mvd(&mut w, 2);
+        write_mvd(&mut w, 0);
+        write_mvd(&mut w, -2);
+        write_mvd(&mut w, 1);
+        w.align();
+        let bytes = w.buf;
+        let mut br = BitReader::new(&bytes);
+        let got = decode_b_vop_mb_motion_vectors(&mut br, BVopMbType::Forward, true, 1, 1).unwrap();
+        assert_eq!(
+            got.forward,
+            Some(BVopMvBody::Field(FieldMvPair {
+                top: MotionVectorDelta { dx: 2, dy: 0 },
+                bottom: MotionVectorDelta { dx: -2, dy: 1 },
+            }))
+        );
+        assert_eq!(got.backward, None);
+        assert_eq!(br.bit_position(), 12);
+    }
+
+    #[test]
+    fn b_mv_backward_field_pair_uses_backward_fcode() {
+        // Backward MB at fcode_forward == 1 / fcode_backward == 2: the
+        // backward bodies must gate residuals on vop_fcode_backward.
+        // Top: h_data=2 + res 1 → (2-1)*2+1+1 = +4; v_data=0 → 0.
+        // Bottom: h_data=0 → 0; v_data=-2 + res 0 → -3.
+        let mut w = BitWriter::new();
+        write_mvd(&mut w, 2);
+        w.write_bits(1, 1); // h residual (r_size = 1)
+        write_mvd(&mut w, 0);
+        write_mvd(&mut w, 0);
+        write_mvd(&mut w, -2);
+        w.write_bits(0, 1); // v residual
+        w.align();
+        let bytes = w.buf;
+        let mut br = BitReader::new(&bytes);
+        let got =
+            decode_b_vop_mb_motion_vectors(&mut br, BVopMbType::Backward, true, 1, 2).unwrap();
+        assert_eq!(got.forward, None);
+        assert_eq!(
+            got.backward,
+            Some(BVopMvBody::Field(FieldMvPair {
+                top: MotionVectorDelta { dx: 4, dy: 0 },
+                bottom: MotionVectorDelta { dx: 0, dy: -3 },
+            }))
+        );
+        assert_eq!(br.bit_position(), 12);
+    }
+
+    #[test]
+    fn b_mv_interpolated_frame_forward_then_backward() {
+        // mb_type == '01' (Interpolated) → forward body first, then
+        // backward (§6.2.6 syntax order). Distinct deltas prove the
+        // assignment.
+        let mut w = BitWriter::new();
+        write_mvd(&mut w, 1); // forward h
+        write_mvd(&mut w, -1); // forward v
+        write_mvd(&mut w, -2); // backward h
+        write_mvd(&mut w, 2); // backward v
+        w.align();
+        let bytes = w.buf;
+        let mut br = BitReader::new(&bytes);
+        let got =
+            decode_b_vop_mb_motion_vectors(&mut br, BVopMbType::Interpolated, false, 1, 1).unwrap();
+        assert_eq!(
+            got.forward,
+            Some(BVopMvBody::Frame(MotionVectorDelta { dx: 1, dy: -1 }))
+        );
+        assert_eq!(
+            got.backward,
+            Some(BVopMvBody::Frame(MotionVectorDelta { dx: -2, dy: 2 }))
+        );
+        assert_eq!(got.direct, None);
+        assert_eq!(br.bit_position(), 14);
+    }
+
+    #[test]
+    fn b_mv_interpolated_field_four_bodies_in_pmv_order() {
+        // Field bidirectional: four bodies in Table 7-14 / §7.7.2.2
+        // MVD[0..3] order — forward-top, forward-bottom, backward-top,
+        // backward-bottom.
+        let mut w = BitWriter::new();
+        let deltas = [(1, 0), (-1, 0), (2, 0), (-2, 0)];
+        for &(h, v) in &deltas {
+            write_mvd(&mut w, h);
+            write_mvd(&mut w, v);
+        }
+        w.align();
+        let bytes = w.buf;
+        let mut br = BitReader::new(&bytes);
+        let got =
+            decode_b_vop_mb_motion_vectors(&mut br, BVopMbType::Interpolated, true, 1, 1).unwrap();
+        assert_eq!(
+            got.forward,
+            Some(BVopMvBody::Field(FieldMvPair {
+                top: MotionVectorDelta { dx: 1, dy: 0 },
+                bottom: MotionVectorDelta { dx: -1, dy: 0 },
+            }))
+        );
+        assert_eq!(
+            got.backward,
+            Some(BVopMvBody::Field(FieldMvPair {
+                top: MotionVectorDelta { dx: 2, dy: 0 },
+                bottom: MotionVectorDelta { dx: -2, dy: 0 },
+            }))
+        );
+        assert_eq!(got.direct, None);
+        // (3+1) + (3+1) + (4+1) + (4+1) = 18 bits.
+        assert_eq!(br.bit_position(), 18);
+    }
+
+    #[test]
+    fn b_mv_truncated_mid_backward_pair() {
+        // Interpolated field MB cut off exactly at a byte boundary in
+        // the middle of the backward-top body → Truncated, surfaced
+        // through the BVopMbParseError::Motion wrapper. The forward
+        // pair (four zero VLCs, 4 bits) plus the backward-top h_data
+        // (-2, 4 bits) consume the whole first byte, so the
+        // backward-top v_data read starts with zero bits remaining.
+        let mut w = BitWriter::new();
+        for _ in 0..4 {
+            write_mvd(&mut w, 0); // fwd pair (0,0)(0,0) → 4 bits
+        }
+        write_mvd(&mut w, -2); // bwd top h_data → bit 8 boundary
+        write_mvd(&mut w, 0); // filler (second byte, truncated away)
+        write_mvd(&mut w, 0);
+        w.align();
+        let mut data = w.buf;
+        data.truncate(1);
+        let mut br = BitReader::new(&data);
+        let err = decode_b_vop_mb_motion_vectors(&mut br, BVopMbType::Interpolated, true, 1, 1)
+            .unwrap_err();
+        assert_eq!(err, BVopMbParseError::Motion(MotionParseError::Truncated));
     }
 }

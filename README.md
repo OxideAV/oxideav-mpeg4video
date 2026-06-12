@@ -5,13 +5,51 @@ A pure-Rust MPEG-4 Part 2 Video codec (ISO/IEC 14496-2) for the
 
 ## Status
 
-**Round 41 of the clean-room rebuild (2026-06-11).** The prior
+**Round 42 of the clean-room rebuild (2026-06-12).** The prior
 implementation was retired on 2026-05-18 under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md);
 the VLC tables admitted to sourcing their numeric entries from an
 external library. Master history was fully erased per the Hat-3 cold-
 enforcement procedure.
 
+* Round 42 — §6.2.6 B-VOP motion-vector bodies + interlaced
+  field-prediction second `motion_vector()` invocations. Two walkers
+  close the followups rounds 38–41 each named next. (1)
+  `decode_field_motion_vector_pair(br, mode, vop_fcode)` decodes the
+  §6.2.6 `motion_vector(mode)` + `if (interlaced && field_prediction)
+  motion_vector(mode)` pair into `FieldMvPair { top, bottom }` — the
+  §7.7.2.1 ordering ("(MVDx f1, MVDy f1) and (MVDx f2, MVDy f2) for
+  top and bottom fields … respectively") puts the top-field
+  differential first; both invocations share the direction's single
+  fcode. `decode_p_macroblock_motion_vectors_interlaced(br,
+  derived_mb_type, vop_fcode_forward, field_prediction)` extends the
+  round-37 P-VOP walker: `PMbMotionVectors::Field(FieldMvPair)` when
+  the §6.2.6.3 bit fired, `PMbMotionVectors::Frame(MotionCodingDeltas)`
+  otherwise (bit-identical to the progressive walker), and a typed
+  `MotionParseError::InvalidFieldPredictionContext` for combinations
+  §6.2.6.3 cannot code (`field_prediction` with inter4v / intra rows,
+  or any direct-mode pair). (2) `decode_b_vop_mb_motion_vectors(br,
+  mb_type, field_prediction, vop_fcode_forward, vop_fcode_backward)`
+  walks the §6.2.6 Table B.4 branch after `parse_b_vop_mb_header`:
+  forward body for `mb_type == '01' || '0001'`, backward body for
+  `'01' || '001'` (forward block first, syntax order; backward gated
+  on `vop_fcode_backward`), single `motion_vector("direct")` for
+  `'1'` (no residuals per §6.2.6.2 — fcode-1 reconstruction of the
+  §7.6.9.5.1 shared delta). Each direction yields `BVopMvBody::Frame`
+  or `::Field`; a field-predicted interpolated macroblock decodes
+  four bodies in the §7.7.2.2 / Table 7-14 `MVD[0..3]` order
+  (forward-top, forward-bottom, backward-top, backward-bottom). Out
+  of scope (later rounds): the §7.7.2.1/§7.7.2.2 reconstruction
+  (`MVx fi = MVDx fi + Px`, `MVy fi = 2 * (MVDy fi + (Py / 2))` —
+  both fields share one predictor, vertical differentials are coded
+  in field coordinates), §7.7.2 field motion compensation, the Table
+  B.5 scalable-branch MV line, and the S(GMC)-VOP `mcsel` route. 17
+  new unit tests (pair ordering, per-body residual gating at fcode 2,
+  direct/inter4v/intra rejection without bit consumption,
+  frame-path equivalence with the progressive walker, B-VOP
+  per-mb_type body presence, backward-fcode selection, four-body
+  field-interpolated order, byte-boundary truncations); total crate
+  test count now 774 + 9 doc.
 * Round 41 — §6.2.6 B-VOP `if (interlaced) interlaced_information()`
   dispatch wiring. `parse_b_vop_mb_header` now consumes the round-39
   §6.2.6.3 body (`parse_interlaced_information`) immediately after the
