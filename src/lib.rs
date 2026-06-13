@@ -306,6 +306,7 @@ pub mod bvop_prediction;
 pub mod chroma_mv;
 pub mod chroma_shape;
 pub mod extended_padding;
+pub mod field_motion;
 pub mod half_sample;
 pub mod idct;
 pub mod interlaced_information;
@@ -355,6 +356,10 @@ pub use chroma_shape::{
 pub use extended_padding::{
     extended_padding_chroma, extended_padding_luma, extended_padding_macroblock, mid_grey_value,
     BoundaryNeighbours, ExteriorNeighbourPosition, ExteriorPaddingOutcome,
+};
+pub use field_motion::{
+    div2_round, field_motion_compensate_one_reference, mc, reconstruct_field_motion_vectors,
+    FieldMotionVectors,
 };
 pub use half_sample::{
     fetch_clamped_sample, interpolate_block, interpolate_block_into, interpolate_pixel,

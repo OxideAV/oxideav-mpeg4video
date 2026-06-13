@@ -8,6 +8,31 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 43 of the clean-room rebuild: §7.7.2.1 field-MV reconstruction
+  + the field motion-compensation driver (`src/field_motion.rs`), so an
+  interlaced P-VOP field-predicted macroblock reconstructs pixels.
+  `reconstruct_field_motion_vectors(pair, px, py)` turns a decoded
+  `FieldMvPair` differential + the shared `(Px, Py)` predictor into the
+  two final field MVs per `MVx fi = MVDx fi + Px`,
+  `MVy fi = 2 * (MVDy fi + (Py / 2))` (vertical component always even in
+  half-pel frame coordinates). `mc(...)` reproduces the §7.7.2.1 /
+  §7.6.2 half-sample reference routine verbatim with the `pred_y0` /
+  `ref_y0` / `y_incr` field parameters — `y_incr = 2` writes only every
+  other destination line and averages the two adjacent same-field
+  reference lines (`y_ref`, `y_ref + 2`). `div2_round(x) =
+  (x >> 1) | (x & 1)` derives the chrominance field MVs.
+  `field_motion_compensate_one_reference(...)` issues the six §7.7.2.1
+  `mc` calls (top/bottom luma, then top/bottom Cb / Cr) and assembles an
+  `InterPredictionMacroblock` ready for the §7.3 residual add. The
+  output field is selected by `pred_y0`; the reference field by the
+  `forward_top_field_reference` / `forward_bottom_field_reference`
+  flags through `ref_y0`. 12 tests pin the path (Div2Round bit
+  definition, even-vertical reconstruction, truncation-toward-0 of
+  `Py / 2`, frame/field `mc` equivalence, same-field vertical half-pel
+  averaging, independent top/bottom reference-field selection, and the
+  end-to-end field-MC + §7.3 residual-add reconstruction with display
+  clip). Half-sample mode only; quarter-sample field MC is a follow-up.
+
 - Round 42 of the clean-room rebuild: §6.2.6 B-VOP motion-vector
   bodies + interlaced field-prediction second `motion_vector()`
   invocations. `decode_field_motion_vector_pair` decodes the

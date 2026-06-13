@@ -5,12 +5,37 @@ A pure-Rust MPEG-4 Part 2 Video codec (ISO/IEC 14496-2) for the
 
 ## Status
 
-**Round 42 of the clean-room rebuild (2026-06-12).** The prior
+**Round 43 of the clean-room rebuild (2026-06-13).** The prior
 implementation was retired on 2026-05-18 under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md);
 the VLC tables admitted to sourcing their numeric entries from an
 external library. Master history was fully erased per the Hat-3 cold-
 enforcement procedure.
+
+* Round 43 — §7.7.2.1 field-MV reconstruction + the field
+  motion-compensation driver (`src/field_motion.rs`): the parsed
+  field-MV pairs now flow through the MC driver to reconstruct an
+  interlaced P-VOP field-predicted macroblock's pixels.
+  `reconstruct_field_motion_vectors(pair, px, py)` reconstructs the two
+  final field MVs — `MVx fi = MVDx fi + Px`,
+  `MVy fi = 2 * (MVDy fi + (Py / 2))` (`/` truncates toward 0, so the
+  vertical component is always even in half-pel frame coordinates).
+  `mc(...)` reproduces the §7.7.2.1 / §7.6.2 half-sample reference
+  routine verbatim with the `pred_y0` / `ref_y0` / `y_incr` field
+  parameters: `y_incr = 2` writes only every other destination line and
+  averages the two adjacent same-field reference lines (`y_ref`,
+  `y_ref + 2`). `field_motion_compensate_one_reference(...)` issues the
+  six §7.7.2.1 `mc` calls (top/bottom luma, then top/bottom Cb / Cr,
+  chroma MVs via `div2_round(x) = (x >> 1) | (x & 1)`) and assembles an
+  `InterPredictionMacroblock` ready for the §7.3 residual add — the
+  output field is selected by `pred_y0`, the reference field by the
+  `forward_top_field_reference` / `forward_bottom_field_reference`
+  flags through `ref_y0`. The reference VOP is the single progressive
+  plane whose even lines are the top field and odd lines the bottom.
+  12 tests pin the path, including the end-to-end field-MC + §7.3
+  residual-add reconstruction with the display clip. Half-sample mode
+  only; quarter-sample field MC (§7.6.2.2 on the field grid) remains a
+  follow-up. (786 lib tests, +12.)
 
 * Round 42 — §6.2.6 B-VOP motion-vector bodies + interlaced
   field-prediction second `motion_vector()` invocations. Two walkers

@@ -1,0 +1,682 @@
+//! §7.7.2.1 field-based motion-compensated reconstruction for
+//! interlaced P-VOPs.
+//!
+//! When a P-VOP macroblock is field predicted (`field_prediction == 1`,
+//! §6.2.6.3), its 16×16 luminance area is reconstructed from **two**
+//! motion vectors — one per output field. The top output field (even
+//! lines 0, 2, 4, …) is predicted by the top-field MV, the bottom output
+//! field (odd lines 1, 3, 5, …) by the bottom-field MV. Each field MV
+//! independently selects which **reference** field (top or bottom) it
+//! draws from, via the `forward_top_field_reference` /
+//! `forward_bottom_field_reference` flags (§6.3.7.2). The reference VOP
+//! is a single progressive plane in which the even lines are the top
+//! field and the odd lines are the bottom field (§7.7.2.1 final
+//! paragraph).
+//!
+//! ## §7.7.2.1 final motion-vector reconstruction
+//!
+//! The decoded differentials `(MVDx f1, MVDy f1)` / `(MVDx f2, MVDy f2)`
+//! (the [`crate::motion::FieldMvPair`] top/bottom bodies) and the single
+//! shared predictor `(Px, Py)` reconstruct the two field motion vectors:
+//!
+//! ```text
+//!   MVx f1 = MVDx f1 + Px
+//!   MVy f1 = 2 * (MVDy f1 + (Py / 2))
+//!   MVx f2 = MVDx f2 + Px
+//!   MVy f2 = 2 * (MVDy f2 + (Py / 2))
+//! ```
+//!
+//! where `/` is integer division with truncation toward 0 (§7.7.2.1).
+//! The vertical component of a field motion vector is therefore always
+//! even in half-pel frame coordinates: vertical half-pel interpolation
+//! happens between adjacent lines **of the same field**, which are two
+//! frame lines apart. [`reconstruct_field_motion_vectors`] performs this
+//! reconstruction.
+//!
+//! ## §7.7.2.1 `field_motion_compensate_one_reference`
+//!
+//! The prediction macroblock is then assembled by the spec's
+//! `field_motion_compensate_one_reference` pseudo code, which issues six
+//! [`mc`] calls: top-field luma, bottom-field luma, then top/bottom Cb
+//! and Cr. The chrominance motion vectors are `Div2Round` of the luma
+//! field MVs (§7.7.2.1 — [`div2_round`]). Each [`mc`] call uses
+//! `y_incr = 2` so it writes only every other destination line, the
+//! `pred_y0` field offset selecting top (0) or bottom (1).
+//!
+//! ## `mc` — the §7.7.2.1 / §7.6.2 half-sample reference routine
+//!
+//! [`mc`] reproduces the spec's `mc(pred, ref, x, y, width, height,
+//! dx_halfpel, dy_halfpel, rounding, pred_y0, ref_y0, y_incr)` verbatim.
+//! With `y_incr = 1` and `pred_y0 = ref_y0 = 0` it is the ordinary frame
+//! half-sample fetch (equivalent to
+//! [`crate::half_sample::interpolate_block_into`]); with `y_incr = 2` it
+//! is the field fetch where the two vertically-averaged reference lines
+//! are `y_ref` and `y_ref + 2` (the next line of the same reference
+//! field).
+//!
+//! The §7.6.4 last-full-pel edge clamp is applied through
+//! [`crate::half_sample::ReferenceVop`].
+//!
+//! ## Scope
+//!
+//! * Half-sample field MC (`quarter_sample == 0`). Quarter-sample field
+//!   MC (§7.6.2.2 with the field reference grid) is a follow-up.
+//! * The predictor `(Px, Py)` is supplied by the caller — the §7.7.2.1
+//!   CASE 1 / 2 / 3 median selection over field-aware neighbour vectors
+//!   is the motion-vector-prediction module's responsibility; this
+//!   module consumes the finished predictor and the decoded
+//!   differentials.
+
+use crate::half_sample::ReferenceVop;
+use crate::motion::{FieldMvPair, MotionVector};
+use crate::reconstruct::{InterPredictionMacroblock, MACROBLOCK_CHROMA_SIDE, MACROBLOCK_LUMA_SIDE};
+
+/// `Div2Round(x) = (x >> 1) | (x & 1)` (§7.7.2.1).
+///
+/// Halves a motion-vector component while keeping any half-pel residue —
+/// the `| (x & 1)` term forces an odd input to round its fractional bit
+/// up into the result's LSB rather than truncating it. Used both to
+/// reconstruct the §7.7.2.1 chrominance field MVs from the luminance
+/// field MVs and (in the CASE 2 / 3 predictor derivation, elsewhere) to
+/// average two field MVs into a frame predictor candidate.
+///
+/// The shift is arithmetic (`>>` on `i32`), so negative inputs round
+/// toward `-∞` before the `| (x & 1)` adjustment, matching the spec's
+/// bit-level definition.
+///
+/// # Examples
+///
+/// ```
+/// use oxideav_mpeg4video::field_motion::div2_round;
+/// assert_eq!(div2_round(0), 0);
+/// assert_eq!(div2_round(4), 2);
+/// assert_eq!(div2_round(3), 1); // (3 >> 1) | (3 & 1) = 1 | 1 = 1
+/// assert_eq!(div2_round(-3), -1); // (-2) | (1) = -1
+/// ```
+#[inline]
+pub const fn div2_round(x: i32) -> i32 {
+    (x >> 1) | (x & 1)
+}
+
+/// The two reconstructed field motion vectors of one prediction
+/// direction (§7.7.2.1) — top-field `MV f1` and bottom-field `MV f2`,
+/// both in half-pel frame coordinates with even vertical components.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FieldMotionVectors {
+    /// Top-field motion vector (`MVx f1`, `MVy f1`).
+    pub top: MotionVector,
+    /// Bottom-field motion vector (`MVx f2`, `MVy f2`).
+    pub bottom: MotionVector,
+}
+
+/// Reconstruct the §7.7.2.1 field motion vectors from a decoded
+/// [`FieldMvPair`] differential and the shared predictor `(px, py)`.
+///
+/// Both fields share the single predictor; the vertical component is
+/// reconstructed as `2 * (MVDy + (Py / 2))` so it is always even in
+/// half-pel frame coordinates (the predictor's vertical half is taken
+/// in field coordinates, the differential added there, then doubled
+/// back to frame coordinates). `/` is integer division truncating
+/// toward 0, matching `i32::div_euclid` only for non-negative `py`; the
+/// spec's truncation-toward-0 is reproduced with Rust's `/` operator
+/// directly (which truncates toward 0).
+pub fn reconstruct_field_motion_vectors(pair: FieldMvPair, px: i32, py: i32) -> FieldMotionVectors {
+    // Py / 2 with truncation toward 0 — Rust's `/` already truncates
+    // toward 0, matching §7.7.2.1's stated convention.
+    let py_half = py / 2;
+    let top = MotionVector {
+        x: pair.top.dx + px,
+        y: 2 * (pair.top.dy + py_half),
+    };
+    let bottom = MotionVector {
+        x: pair.bottom.dx + px,
+        y: 2 * (pair.bottom.dy + py_half),
+    };
+    FieldMotionVectors { top, bottom }
+}
+
+/// The §7.7.2.1 / §7.6.2 half-sample motion-compensation routine `mc`.
+///
+/// Fills the `width × height` block of `pred` (a row-major plane of
+/// `stride` width) anchored at destination column `x` with the
+/// half-sample-interpolated reference samples, stepping the destination
+/// rows by `y_incr` and offsetting by `pred_y0`. The reference is read
+/// through `reference` with the §7.6.4 last-full-pel clamp.
+///
+/// Parameters map one-for-one to the spec's `mc(...)`:
+///
+/// * `x`, `y` — destination/reference block coordinates for `MV = (0,0)`.
+/// * `width`, `height` — block dimensions (16×16 luma, 8×8 chroma).
+/// * `dx_halfpel`, `dy_halfpel` — the half-pel-resolution motion vector.
+/// * `rounding` — `vop_rounding_type` (0 or 1).
+/// * `pred_y0` — destination field offset (0 = top, 1 = bottom).
+/// * `ref_y0` — reference field offset (0 = top ref, 1 = bottom ref).
+/// * `y_incr` — vertical increment (1 = frame, 2 = field).
+///
+/// The vertical half-pel test is `dy_halfpel & y_incr`: for the frame
+/// case (`y_incr = 1`) the LSB; for the field case (`y_incr = 2`) the
+/// bit-1 weight, so the two averaged reference lines (`y_ref`,
+/// `y_ref + y_incr`) are adjacent lines of the same field.
+///
+/// # Panics
+///
+/// Panics if a written sample index would fall outside `pred`.
+#[allow(clippy::too_many_arguments)]
+pub fn mc(
+    pred: &mut [u8],
+    pred_stride: usize,
+    reference: &ReferenceVop<'_>,
+    x: i32,
+    y: i32,
+    width: usize,
+    height: usize,
+    dx_halfpel: i32,
+    dy_halfpel: i32,
+    rounding: u8,
+    pred_y0: usize,
+    ref_y0: i32,
+    y_incr: i32,
+) {
+    let rc = (rounding & 1) as i32;
+    // dx = dx_halfpel >> 1 (arithmetic shift → floor for negatives).
+    let dx = dx_halfpel >> 1;
+    // dy = y_incr * (dy_halfpel >> y_incr).
+    let dy = y_incr * (dy_halfpel >> y_incr);
+    let half_x = (dx_halfpel & 1) != 0;
+    let half_y = (dy_halfpel & y_incr) != 0;
+    let y_incr_u = y_incr as usize;
+
+    let mut iy: usize = 0;
+    while iy < height {
+        for ix in 0..width {
+            let x_ref = x + dx + ix as i32;
+            let y_ref = y + dy + iy as i32 + ref_y0;
+            let value: i32 = match (half_y, half_x) {
+                (true, true) => {
+                    (reference.fetch_clamped(x_ref, y_ref) as i32
+                        + reference.fetch_clamped(x_ref + 1, y_ref) as i32
+                        + reference.fetch_clamped(x_ref, y_ref + y_incr) as i32
+                        + reference.fetch_clamped(x_ref + 1, y_ref + y_incr) as i32
+                        + 2
+                        - rc)
+                        >> 2
+                }
+                (true, false) => {
+                    (reference.fetch_clamped(x_ref, y_ref) as i32
+                        + reference.fetch_clamped(x_ref, y_ref + y_incr) as i32
+                        + 1
+                        - rc)
+                        >> 1
+                }
+                (false, true) => {
+                    (reference.fetch_clamped(x_ref, y_ref) as i32
+                        + reference.fetch_clamped(x_ref + 1, y_ref) as i32
+                        + 1
+                        - rc)
+                        >> 1
+                }
+                (false, false) => reference.fetch_clamped(x_ref, y_ref) as i32,
+            };
+            let dst_row = iy + pred_y0;
+            pred[dst_row * pred_stride + ix] = value as u8;
+        }
+        iy += y_incr_u;
+    }
+}
+
+/// §7.7.2.1 `field_motion_compensate_one_reference` — assemble the
+/// field-predicted 4:2:0 prediction macroblock from a single reference
+/// VOP and the two reconstructed field motion vectors.
+///
+/// `luma_ref` / `cb_ref` / `cr_ref` are the reference VOP planes
+/// (even lines = top field, odd lines = bottom field). `(x, y)` is the
+/// luma top-left coordinate of the current macroblock; chroma uses
+/// `(x/2, y/2)`. `top_field_ref` / `bottom_field_ref` are the
+/// §6.3.7.2 `forward_top_field_reference` /
+/// `forward_bottom_field_reference` flags (`false` = top ref field,
+/// `true` = bottom ref field), wired into `mc`'s `ref_y0`.
+///
+/// Per §7.7.2.1 the chroma field MVs are `Div2Round` of the
+/// corresponding luma field MV components.
+///
+/// Returns the assembled [`InterPredictionMacroblock`] (`p[y][x]` in
+/// the display range), ready for the §7.3 residual add in
+/// [`crate::reconstruct::reconstruct_inter_macroblock_into`].
+#[allow(clippy::too_many_arguments)]
+pub fn field_motion_compensate_one_reference(
+    luma_ref: &ReferenceVop<'_>,
+    cb_ref: &ReferenceVop<'_>,
+    cr_ref: &ReferenceVop<'_>,
+    mvs: FieldMotionVectors,
+    top_field_ref: bool,
+    bottom_field_ref: bool,
+    x: i32,
+    y: i32,
+    rounding_type: u8,
+) -> InterPredictionMacroblock {
+    let top_ref_y0 = top_field_ref as i32;
+    let bot_ref_y0 = bottom_field_ref as i32;
+
+    let mut luma = [0u8; MACROBLOCK_LUMA_SIDE * MACROBLOCK_LUMA_SIDE];
+    let mut cb = [0u8; MACROBLOCK_CHROMA_SIDE * MACROBLOCK_CHROMA_SIDE];
+    let mut cr = [0u8; MACROBLOCK_CHROMA_SIDE * MACROBLOCK_CHROMA_SIDE];
+
+    // Luma: top field (pred_y0 = 0) then bottom field (pred_y0 = 1).
+    mc(
+        &mut luma,
+        MACROBLOCK_LUMA_SIDE,
+        luma_ref,
+        x,
+        y,
+        MACROBLOCK_LUMA_SIDE,
+        MACROBLOCK_LUMA_SIDE,
+        mvs.top.x,
+        mvs.top.y,
+        rounding_type,
+        0,
+        top_ref_y0,
+        2,
+    );
+    mc(
+        &mut luma,
+        MACROBLOCK_LUMA_SIDE,
+        luma_ref,
+        x,
+        y,
+        MACROBLOCK_LUMA_SIDE,
+        MACROBLOCK_LUMA_SIDE,
+        mvs.bottom.x,
+        mvs.bottom.y,
+        rounding_type,
+        1,
+        bot_ref_y0,
+        2,
+    );
+
+    let cx = x / 2;
+    let cy = y / 2;
+    let top_cx = div2_round(mvs.top.x);
+    let top_cy = div2_round(mvs.top.y);
+    let bot_cx = div2_round(mvs.bottom.x);
+    let bot_cy = div2_round(mvs.bottom.y);
+
+    for (plane, reference) in [(&mut cb, cb_ref), (&mut cr, cr_ref)] {
+        mc(
+            plane,
+            MACROBLOCK_CHROMA_SIDE,
+            reference,
+            cx,
+            cy,
+            MACROBLOCK_CHROMA_SIDE,
+            MACROBLOCK_CHROMA_SIDE,
+            top_cx,
+            top_cy,
+            rounding_type,
+            0,
+            top_ref_y0,
+            2,
+        );
+        mc(
+            plane,
+            MACROBLOCK_CHROMA_SIDE,
+            reference,
+            cx,
+            cy,
+            MACROBLOCK_CHROMA_SIDE,
+            MACROBLOCK_CHROMA_SIDE,
+            bot_cx,
+            bot_cy,
+            rounding_type,
+            1,
+            bot_ref_y0,
+            2,
+        );
+    }
+
+    let mut out = InterPredictionMacroblock::zero();
+    for row in 0..MACROBLOCK_LUMA_SIDE {
+        for col in 0..MACROBLOCK_LUMA_SIDE {
+            out.luma[row][col] = luma[row * MACROBLOCK_LUMA_SIDE + col] as i32;
+        }
+    }
+    for row in 0..MACROBLOCK_CHROMA_SIDE {
+        for col in 0..MACROBLOCK_CHROMA_SIDE {
+            out.cb[row][col] = cb[row * MACROBLOCK_CHROMA_SIDE + col] as i32;
+            out.cr[row][col] = cr[row * MACROBLOCK_CHROMA_SIDE + col] as i32;
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::motion::MotionVectorDelta;
+
+    fn pair(top: (i32, i32), bottom: (i32, i32)) -> FieldMvPair {
+        FieldMvPair {
+            top: MotionVectorDelta {
+                dx: top.0,
+                dy: top.1,
+            },
+            bottom: MotionVectorDelta {
+                dx: bottom.0,
+                dy: bottom.1,
+            },
+        }
+    }
+
+    #[test]
+    fn div2_round_matches_spec_bit_definition() {
+        // Div2Round(x) = (x >> 1) | (x & 1).
+        assert_eq!(div2_round(0), 0);
+        assert_eq!(div2_round(1), 1); // (0) | (1)
+        assert_eq!(div2_round(2), 1); // (1) | (0)
+        assert_eq!(div2_round(3), 1); // (1) | (1) = 1
+        assert_eq!(div2_round(4), 2);
+        assert_eq!(div2_round(5), 3); // (2) | (1) = 3
+        assert_eq!(div2_round(-1), -1); // (-1) | (1) = -1
+        assert_eq!(div2_round(-2), -1); // (-1) | (0) = -1
+        assert_eq!(div2_round(-3), -1); // (-2) | (1) = -1
+        assert_eq!(div2_round(-4), -2);
+    }
+
+    #[test]
+    fn reconstruct_field_mvs_even_vertical_zero_predictor() {
+        // Zero predictor → MVy fi = 2 * MVDy fi, always even.
+        let mvs = reconstruct_field_motion_vectors(pair((3, 1), (-2, -1)), 0, 0);
+        assert_eq!(mvs.top, MotionVector { x: 3, y: 2 });
+        assert_eq!(mvs.bottom, MotionVector { x: -2, y: -2 });
+        // Both vertical components are even.
+        assert_eq!(mvs.top.y % 2, 0);
+        assert_eq!(mvs.bottom.y % 2, 0);
+    }
+
+    #[test]
+    fn reconstruct_field_mvs_shared_predictor() {
+        // §7.7.2.1: both fields use the same predictor (px, py).
+        // MVx fi = MVDx fi + Px; MVy fi = 2 * (MVDy fi + Py/2).
+        let mvs = reconstruct_field_motion_vectors(pair((1, 2), (0, -1)), 4, 6);
+        // py/2 = 3.
+        assert_eq!(
+            mvs.top,
+            MotionVector {
+                x: 5,
+                y: 2 * (2 + 3)
+            }
+        ); // (5, 10)
+        assert_eq!(
+            mvs.bottom,
+            MotionVector {
+                x: 4,
+                y: 2 * (-1 + 3)
+            }
+        ); // (4, 4)
+    }
+
+    #[test]
+    fn reconstruct_field_mvs_negative_predictor_truncates_toward_zero() {
+        // Py = -3 → Py/2 = -1 (truncation toward 0, not floor → -2).
+        let mvs = reconstruct_field_motion_vectors(pair((0, 0), (0, 0)), 0, -3);
+        // MVDy = 0, Py/2 = -1 → 2 * (0 + -1) = -2 (not -4 from floor).
+        assert_eq!(mvs.top.y, -2);
+        assert_eq!(mvs.bottom.y, -2);
+    }
+
+    // ---------------------------------------------------------------
+    // `mc` field/frame equivalence + interleave behaviour.
+    // ---------------------------------------------------------------
+
+    /// A 16×16 reference whose sample at (x, y) is a deterministic
+    /// function of its coordinates, so the fetched value pins which
+    /// reference line a field MC read.
+    fn ramp_plane(side: usize) -> Vec<u8> {
+        let mut v = vec![0u8; side * side];
+        for y in 0..side {
+            for x in 0..side {
+                v[y * side + x] = ((y * 7 + x * 3) & 0xff) as u8;
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn mc_frame_integer_mv_copies_reference() {
+        // y_incr = 1, integer MV (0,0): pred[ix][iy] = ref[x+ix][y+iy].
+        let plane = ramp_plane(16);
+        let reference = ReferenceVop::new(&plane, 16, 16).unwrap();
+        let mut pred = vec![0u8; 16 * 16];
+        mc(&mut pred, 16, &reference, 0, 0, 16, 16, 0, 0, 0, 0, 0, 1);
+        assert_eq!(pred, plane);
+    }
+
+    #[test]
+    fn mc_field_top_reads_even_lines_only_with_zero_mv() {
+        // Field top MC (pred_y0 = 0, ref_y0 = 0, y_incr = 2, MV = 0):
+        // pred top-field line iy (iy even) = ref line iy.
+        let side = 16;
+        let plane = ramp_plane(side);
+        let reference = ReferenceVop::new(&plane, side, side).unwrap();
+        let mut pred = vec![0u8; side * side];
+        mc(
+            &mut pred, side, &reference, 0, 0, side, side, 0, 0, 0, 0, 0, 2,
+        );
+        // Only even destination rows written; pred[even][x] == ref[even][x].
+        for y in (0..side).step_by(2) {
+            for x in 0..side {
+                assert_eq!(pred[y * side + x], plane[y * side + x]);
+            }
+        }
+        // Odd destination rows untouched (still 0).
+        for y in (1..side).step_by(2) {
+            for x in 0..side {
+                assert_eq!(pred[y * side + x], 0);
+            }
+        }
+    }
+
+    #[test]
+    fn mc_field_bottom_ref_offset_reads_odd_reference_lines() {
+        // Field bottom MC with bottom reference (ref_y0 = 1), MV = 0,
+        // y_incr = 2, pred_y0 = 1: destination odd line iy+1 reads
+        // ref line (iy + 1) — the odd (bottom) reference field.
+        let side = 16;
+        let plane = ramp_plane(side);
+        let reference = ReferenceVop::new(&plane, side, side).unwrap();
+        let mut pred = vec![0u8; side * side];
+        mc(
+            &mut pred, side, &reference, 0, 0, side, side, 0, 0, 0, 1, 1, 2,
+        );
+        for iy in (0..side).step_by(2) {
+            let dst_row = iy + 1;
+            if dst_row >= side {
+                break;
+            }
+            for x in 0..side {
+                // y_ref = y + dy + iy + ref_y0 = 0 + 0 + iy + 1.
+                assert_eq!(pred[dst_row * side + x], plane[(iy + 1) * side + x]);
+            }
+        }
+    }
+
+    #[test]
+    fn mc_field_vertical_half_pel_averages_same_field_lines() {
+        // dy_halfpel = 2 sets the field vertical half-pel bit
+        // (dy_halfpel & y_incr, y_incr = 2). The two averaged
+        // reference lines are y_ref and y_ref + 2 — adjacent lines of
+        // the same field. dy = 2 * (2 >> 2) = 0.
+        let side = 16;
+        // Plane where each line is a constant equal to its row index,
+        // so the same-field average of lines L and L+2 is L+1.
+        let mut plane = vec![0u8; side * side];
+        for y in 0..side {
+            for x in 0..side {
+                plane[y * side + x] = y as u8;
+            }
+        }
+        let reference = ReferenceVop::new(&plane, side, side).unwrap();
+        let mut pred = vec![0u8; side * side];
+        // Top field, top reference, rounding 0.
+        mc(
+            &mut pred, side, &reference, 0, 0, side, side, 0, 2, 0, 0, 0, 2,
+        );
+        for iy in (0..side - 2).step_by(2) {
+            for x in 0..side {
+                // (line iy + line iy+2 + 1 - 0) >> 1 = (iy + iy+2 +1)>>1
+                let expected = ((iy + (iy + 2) + 1) >> 1) as u8;
+                assert_eq!(pred[iy * side + x], expected, "iy={iy} x={x}");
+            }
+        }
+    }
+
+    #[test]
+    fn field_mc_macroblock_flat_reference_reproduces_flat_prediction() {
+        // A flat reference predicts a flat macroblock regardless of MV /
+        // field references / rounding.
+        let side = 48;
+        let plane = vec![123u8; side * side];
+        let cplane = vec![200u8; (side / 2) * (side / 2)];
+        let luma_ref = ReferenceVop::new(&plane, side, side).unwrap();
+        let cb_ref = ReferenceVop::new(&cplane, side / 2, side / 2).unwrap();
+        let cr_ref = ReferenceVop::new(&cplane, side / 2, side / 2).unwrap();
+        let mvs = reconstruct_field_motion_vectors(pair((3, 1), (-4, -2)), 2, 4);
+        let pred = field_motion_compensate_one_reference(
+            &luma_ref, &cb_ref, &cr_ref, mvs, true, false, 16, 16, 0,
+        );
+        for row in 0..MACROBLOCK_LUMA_SIDE {
+            for col in 0..MACROBLOCK_LUMA_SIDE {
+                assert_eq!(pred.luma[row][col], 123);
+            }
+        }
+        for row in 0..MACROBLOCK_CHROMA_SIDE {
+            for col in 0..MACROBLOCK_CHROMA_SIDE {
+                assert_eq!(pred.cb[row][col], 200);
+                assert_eq!(pred.cr[row][col], 200);
+            }
+        }
+    }
+
+    #[test]
+    fn field_mc_macroblock_top_and_bottom_select_independent_fields() {
+        // Reference whose top field (even lines) is all 10 and bottom
+        // field (odd lines) is all 200. With zero MVs and top→top,
+        // bottom→bottom references, the predicted macroblock's even
+        // lines must be 10 and odd lines 200.
+        let side = 48;
+        let mut plane = vec![0u8; side * side];
+        for y in 0..side {
+            let val = if y % 2 == 0 { 10u8 } else { 200u8 };
+            for x in 0..side {
+                plane[y * side + x] = val;
+            }
+        }
+        // Chroma plane: flat (chroma field interleave tested via luma).
+        let cplane = vec![128u8; (side / 2) * (side / 2)];
+        let luma_ref = ReferenceVop::new(&plane, side, side).unwrap();
+        let cb_ref = ReferenceVop::new(&cplane, side / 2, side / 2).unwrap();
+        let cr_ref = ReferenceVop::new(&cplane, side / 2, side / 2).unwrap();
+        // Zero differentials, zero predictor → zero field MVs. With
+        // MV = 0 the reference line read is `iy + ref_y0`, so the
+        // chosen reference field is purely the *_field_ref flag.
+        let mvs = reconstruct_field_motion_vectors(pair((0, 0), (0, 0)), 0, 0);
+        // top output field → top reference (false → even ref lines = 10),
+        // bottom output field → bottom reference (true → odd ref lines
+        // = 200). The destination top field (even dst rows) gets 10, the
+        // destination bottom field (odd dst rows) gets 200.
+        let pred = field_motion_compensate_one_reference(
+            &luma_ref, &cb_ref, &cr_ref, mvs, false, true, 0, 0, 0,
+        );
+        for row in 0..MACROBLOCK_LUMA_SIDE {
+            let expected = if row % 2 == 0 { 10 } else { 200 };
+            for col in 0..MACROBLOCK_LUMA_SIDE {
+                assert_eq!(pred.luma[row][col], expected, "row={row}");
+            }
+        }
+    }
+
+    #[test]
+    fn field_mc_bottom_field_ref_flag_selects_bottom_reference_field() {
+        // Same striped reference, but now force BOTH output fields to
+        // read the bottom reference field via the field-reference flags.
+        // top_field_ref = true, bottom_field_ref = true → every output
+        // line reads an odd reference line → all 200.
+        let side = 48;
+        let mut plane = vec![0u8; side * side];
+        for y in 0..side {
+            let val = if y % 2 == 0 { 10u8 } else { 200u8 };
+            for x in 0..side {
+                plane[y * side + x] = val;
+            }
+        }
+        let cplane = vec![128u8; (side / 2) * (side / 2)];
+        let luma_ref = ReferenceVop::new(&plane, side, side).unwrap();
+        let cb_ref = ReferenceVop::new(&cplane, side / 2, side / 2).unwrap();
+        let cr_ref = ReferenceVop::new(&cplane, side / 2, side / 2).unwrap();
+        let mvs = reconstruct_field_motion_vectors(pair((0, 0), (0, 0)), 0, 0);
+        let pred = field_motion_compensate_one_reference(
+            &luma_ref, &cb_ref, &cr_ref, mvs, true, true, 0, 0, 0,
+        );
+        for row in 0..MACROBLOCK_LUMA_SIDE {
+            for col in 0..MACROBLOCK_LUMA_SIDE {
+                assert_eq!(pred.luma[row][col], 200, "row={row}");
+            }
+        }
+    }
+
+    #[test]
+    fn field_mc_then_residual_add_reconstructs_interlaced_macroblock() {
+        // End-to-end §7.7.2.1 → §7.3: a field-predicted P-VOP
+        // macroblock reconstructs pixels by adding the decoded texture
+        // residual to the field-motion-compensated prediction.
+        use crate::block::InterMacroblock;
+        use crate::reconstruct::reconstruct_inter_macroblock;
+
+        // Striped reference: even (top) ref lines 60, odd (bottom) ref
+        // lines 90. Flat chroma at 128.
+        let side = 48;
+        let mut plane = vec![0u8; side * side];
+        for y in 0..side {
+            let val = if y % 2 == 0 { 60u8 } else { 90u8 };
+            for x in 0..side {
+                plane[y * side + x] = val;
+            }
+        }
+        let cplane = vec![128u8; (side / 2) * (side / 2)];
+        let luma_ref = ReferenceVop::new(&plane, side, side).unwrap();
+        let cb_ref = ReferenceVop::new(&cplane, side / 2, side / 2).unwrap();
+        let cr_ref = ReferenceVop::new(&cplane, side / 2, side / 2).unwrap();
+
+        // Zero field MVs; top output → top ref (60), bottom output →
+        // bottom ref (90).
+        let mvs = reconstruct_field_motion_vectors(pair((0, 0), (0, 0)), 0, 0);
+        let pred = field_motion_compensate_one_reference(
+            &luma_ref, &cb_ref, &cr_ref, mvs, false, true, 0, 0, 0,
+        );
+
+        // Residual: +5 luma everywhere, +1 Cb / -1 Cr.
+        let mut residual = InterMacroblock {
+            luma: [[5i32; 16]; 16],
+            cb: [[1i32; 8]; 8],
+            cr: [[-1i32; 8]; 8],
+        };
+        // One sample driven past the display range to exercise the §7.3
+        // step-3 clip: top-field sample 60 + 250 = 310 → 255.
+        residual.luma[0][0] = 250;
+
+        let recon = reconstruct_inter_macroblock(&pred, &residual, 8);
+
+        // Top (even) lines: 60 + 5 = 65 (except the clipped sample).
+        // Bottom (odd) lines: 90 + 5 = 95.
+        assert_eq!(recon.luma[0][0], 255); // clipped
+        assert_eq!(recon.luma[0][1], 65);
+        assert_eq!(recon.luma[2][3], 65);
+        assert_eq!(recon.luma[1][0], 95);
+        assert_eq!(recon.luma[3][7], 95);
+        for row in 0..MACROBLOCK_CHROMA_SIDE {
+            for col in 0..MACROBLOCK_CHROMA_SIDE {
+                assert_eq!(recon.cb[row][col], 129);
+                assert_eq!(recon.cr[row][col], 127);
+            }
+        }
+    }
+}
