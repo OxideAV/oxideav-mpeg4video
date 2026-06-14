@@ -57,10 +57,23 @@
 //! The §7.6.4 last-full-pel edge clamp is applied through
 //! [`crate::half_sample::ReferenceVop`].
 //!
+//! ## §7.6.2.2 quarter-sample field MC
+//!
+//! When `quarter_sample == 1` the spec replaces the two luma [`mc`]
+//! calls with the §7.6.2.2 quarter-pel interpolation "accordingly"
+//! (§7.7.2.1, `field_motion_compensate_one_reference`), still on the
+//! field reference grid (vertical neighbours are same-field lines).
+//! [`field_motion_compensate_one_reference_qpel`] issues two
+//! [`crate::quarter_sample::interpolate_block_qpel_field_into`] luma
+//! field-block calls (top then bottom output field) and keeps the four
+//! [`mc`] chroma calls. Per §7.7.2.2 the quarter-sample chroma vectors
+//! are `Div2Round` of the luma field MV **divided by 2** (quarter →
+//! half), i.e. [`div2_round`]`(`[`half_pel_chroma_mv_from_qpel`]`)`,
+//! and chroma is interpolated in half-sample mode exactly as in the
+//! half-sample driver.
+//!
 //! ## Scope
 //!
-//! * Half-sample field MC (`quarter_sample == 0`). Quarter-sample field
-//!   MC (§7.6.2.2 with the field reference grid) is a follow-up.
 //! * The predictor `(Px, Py)` is supplied by the caller — the §7.7.2.1
 //!   CASE 1 / 2 / 3 median selection over field-aware neighbour vectors
 //!   is the motion-vector-prediction module's responsibility; this
@@ -69,6 +82,7 @@
 
 use crate::half_sample::ReferenceVop;
 use crate::motion::{FieldMvPair, MotionVector};
+use crate::quarter_sample::interpolate_block_qpel_field_into;
 use crate::reconstruct::{InterPredictionMacroblock, MACROBLOCK_CHROMA_SIDE, MACROBLOCK_LUMA_SIDE};
 
 /// `Div2Round(x) = (x >> 1) | (x & 1)` (§7.7.2.1).
@@ -337,6 +351,149 @@ pub fn field_motion_compensate_one_reference(
     for row in 0..MACROBLOCK_LUMA_SIDE {
         for col in 0..MACROBLOCK_LUMA_SIDE {
             out.luma[row][col] = luma[row * MACROBLOCK_LUMA_SIDE + col] as i32;
+        }
+    }
+    for row in 0..MACROBLOCK_CHROMA_SIDE {
+        for col in 0..MACROBLOCK_CHROMA_SIDE {
+            out.cb[row][col] = cb[row * MACROBLOCK_CHROMA_SIDE + col] as i32;
+            out.cr[row][col] = cr[row * MACROBLOCK_CHROMA_SIDE + col] as i32;
+        }
+    }
+    out
+}
+
+/// Half-pel-units equivalent of a quarter-pel luma field motion-vector
+/// component (§7.7.2.2): the luma quarter-pel value "divided by 2 in
+/// case of quarter_sample mode" before the [`div2_round`] chroma
+/// scaling. `/` truncates toward 0 per §3.4, which for an even input
+/// (the always-even vertical field component, §7.7.2.1) is exact.
+///
+/// For the horizontal component this rounds an odd quarter-pel value
+/// toward zero into half-pel units; the subsequent [`div2_round`] then
+/// performs the §6.1.3.4 4:2:0 chroma sub-sampling halve-with-residue.
+#[inline]
+pub const fn half_pel_chroma_mv_from_qpel(qpel_component: i32) -> i32 {
+    qpel_component / 2
+}
+
+/// §7.7.2.1 `field_motion_compensate_one_reference` in **quarter-sample
+/// mode** (`quarter_sample == 1`).
+///
+/// Identical to [`field_motion_compensate_one_reference`] except the two
+/// luma field blocks are interpolated with the §7.6.2.2 quarter-pel
+/// cascade on the field reference grid
+/// ([`interpolate_block_qpel_field_into`]) rather than the half-sample
+/// [`mc`] routine. The luma field MVs (`mvs.top` / `mvs.bottom`) are in
+/// quarter-pel frame coordinates with even vertical components
+/// (§7.7.2.1).
+///
+/// Chrominance is unchanged from the half-sample path: the four [`mc`]
+/// calls run in half-sample field mode with the §7.7.2.2 chroma MV
+/// `div2_round(half_pel_chroma_mv_from_qpel(component))` — the luma
+/// quarter-pel value divided by 2 (quarter → half) then `Div2Round`
+/// (the 4:2:0 sub-sampling halve).
+///
+/// `bits_per_pixel` is the VOL `bits_per_pixel` (8 for `not_8_bit ==
+/// 0`); it drives the §7.6.2.2.1 FIR clip.
+#[allow(clippy::too_many_arguments)]
+pub fn field_motion_compensate_one_reference_qpel(
+    luma_ref: &ReferenceVop<'_>,
+    cb_ref: &ReferenceVop<'_>,
+    cr_ref: &ReferenceVop<'_>,
+    mvs: FieldMotionVectors,
+    top_field_ref: bool,
+    bottom_field_ref: bool,
+    x: i32,
+    y: i32,
+    rounding_type: u8,
+    bits_per_pixel: u32,
+) -> InterPredictionMacroblock {
+    let top_ref_y0 = top_field_ref as i32;
+    let bot_ref_y0 = bottom_field_ref as i32;
+
+    // --- Luma: two 16×8 field blocks via §7.6.2.2 quarter-pel. ---
+    // The field interpolator returns the 8 lines of one field; the top
+    // field's lines land on even destination rows, the bottom field's
+    // on odd rows.
+    let half_h = MACROBLOCK_LUMA_SIDE / 2;
+    let mut top_field = [0u8; MACROBLOCK_LUMA_SIDE * (MACROBLOCK_LUMA_SIDE / 2)];
+    let mut bot_field = [0u8; MACROBLOCK_LUMA_SIDE * (MACROBLOCK_LUMA_SIDE / 2)];
+    interpolate_block_qpel_field_into(
+        luma_ref,
+        mvs.top.x,
+        mvs.top.y,
+        x,
+        y,
+        MACROBLOCK_LUMA_SIDE,
+        half_h,
+        top_ref_y0,
+        rounding_type,
+        bits_per_pixel,
+        &mut top_field,
+    );
+    interpolate_block_qpel_field_into(
+        luma_ref,
+        mvs.bottom.x,
+        mvs.bottom.y,
+        x,
+        y,
+        MACROBLOCK_LUMA_SIDE,
+        half_h,
+        bot_ref_y0,
+        rounding_type,
+        bits_per_pixel,
+        &mut bot_field,
+    );
+
+    // --- Chroma: half-sample field mc with Div2Round(qpel / 2) MVs. ---
+    let top_cx = div2_round(half_pel_chroma_mv_from_qpel(mvs.top.x));
+    let top_cy = div2_round(half_pel_chroma_mv_from_qpel(mvs.top.y));
+    let bot_cx = div2_round(half_pel_chroma_mv_from_qpel(mvs.bottom.x));
+    let bot_cy = div2_round(half_pel_chroma_mv_from_qpel(mvs.bottom.y));
+    let cx = x / 2;
+    let cy = y / 2;
+    let mut cb = [0u8; MACROBLOCK_CHROMA_SIDE * MACROBLOCK_CHROMA_SIDE];
+    let mut cr = [0u8; MACROBLOCK_CHROMA_SIDE * MACROBLOCK_CHROMA_SIDE];
+    for (plane, reference) in [(&mut cb, cb_ref), (&mut cr, cr_ref)] {
+        mc(
+            plane,
+            MACROBLOCK_CHROMA_SIDE,
+            reference,
+            cx,
+            cy,
+            MACROBLOCK_CHROMA_SIDE,
+            MACROBLOCK_CHROMA_SIDE,
+            top_cx,
+            top_cy,
+            rounding_type,
+            0,
+            top_ref_y0,
+            2,
+        );
+        mc(
+            plane,
+            MACROBLOCK_CHROMA_SIDE,
+            reference,
+            cx,
+            cy,
+            MACROBLOCK_CHROMA_SIDE,
+            MACROBLOCK_CHROMA_SIDE,
+            bot_cx,
+            bot_cy,
+            rounding_type,
+            1,
+            bot_ref_y0,
+            2,
+        );
+    }
+
+    let mut out = InterPredictionMacroblock::zero();
+    for r in 0..half_h {
+        for col in 0..MACROBLOCK_LUMA_SIDE {
+            // Top field's line r → destination even row 2r.
+            out.luma[2 * r][col] = top_field[r * MACROBLOCK_LUMA_SIDE + col] as i32;
+            // Bottom field's line r → destination odd row 2r + 1.
+            out.luma[2 * r + 1][col] = bot_field[r * MACROBLOCK_LUMA_SIDE + col] as i32;
         }
     }
     for row in 0..MACROBLOCK_CHROMA_SIDE {
@@ -671,6 +828,189 @@ mod tests {
         assert_eq!(recon.luma[0][1], 65);
         assert_eq!(recon.luma[2][3], 65);
         assert_eq!(recon.luma[1][0], 95);
+        assert_eq!(recon.luma[3][7], 95);
+        for row in 0..MACROBLOCK_CHROMA_SIDE {
+            for col in 0..MACROBLOCK_CHROMA_SIDE {
+                assert_eq!(recon.cb[row][col], 129);
+                assert_eq!(recon.cr[row][col], 127);
+            }
+        }
+    }
+
+    // ───────────────── quarter-sample field MC ───────────────────────
+
+    #[test]
+    fn half_pel_chroma_mv_from_qpel_truncates_toward_zero() {
+        // §7.7.2.2: luma qpel divided by 2 (quarter → half), `/`
+        // truncating toward 0. Even inputs (the field vertical
+        // component) are exact.
+        assert_eq!(half_pel_chroma_mv_from_qpel(0), 0);
+        assert_eq!(half_pel_chroma_mv_from_qpel(2), 1);
+        assert_eq!(half_pel_chroma_mv_from_qpel(4), 2);
+        assert_eq!(half_pel_chroma_mv_from_qpel(3), 1); // toward 0
+        assert_eq!(half_pel_chroma_mv_from_qpel(-3), -1); // toward 0
+        assert_eq!(half_pel_chroma_mv_from_qpel(-4), -2);
+    }
+
+    #[test]
+    fn field_mc_qpel_flat_reference_reproduces_flat_prediction() {
+        // A flat reference predicts a flat macroblock regardless of MV /
+        // field references / rounding, even through the 8-tap FIR
+        // (coefficients sum 256).
+        let side = 48;
+        let plane = vec![123u8; side * side];
+        let cplane = vec![200u8; (side / 2) * (side / 2)];
+        let luma_ref = ReferenceVop::new(&plane, side, side).unwrap();
+        let cb_ref = ReferenceVop::new(&cplane, side / 2, side / 2).unwrap();
+        let cr_ref = ReferenceVop::new(&cplane, side / 2, side / 2).unwrap();
+        // Field MVs with even vertical components (§7.7.2.1 invariant).
+        let mvs = reconstruct_field_motion_vectors(pair((5, 1), (-6, -2)), 2, 4);
+        for &rc in &[0u8, 1] {
+            let pred = field_motion_compensate_one_reference_qpel(
+                &luma_ref, &cb_ref, &cr_ref, mvs, true, false, 16, 16, rc, 8,
+            );
+            for row in 0..MACROBLOCK_LUMA_SIDE {
+                for col in 0..MACROBLOCK_LUMA_SIDE {
+                    assert_eq!(pred.luma[row][col], 123, "rc={rc} row={row} col={col}");
+                }
+            }
+            for row in 0..MACROBLOCK_CHROMA_SIDE {
+                for col in 0..MACROBLOCK_CHROMA_SIDE {
+                    assert_eq!(pred.cb[row][col], 200);
+                    assert_eq!(pred.cr[row][col], 200);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn field_mc_qpel_top_and_bottom_select_independent_fields() {
+        // Reference whose top field (even lines) is 10 and bottom field
+        // (odd lines) is 200. Zero field MVs (full-pel), top→top and
+        // bottom→bottom reference fields: even output rows = 10, odd
+        // output rows = 200 — confirming the luma field interleave and
+        // that the 8-tap FIR never crosses field parity at full pel.
+        let side = 48;
+        let mut plane = vec![0u8; side * side];
+        for y in 0..side {
+            let val = if y % 2 == 0 { 10u8 } else { 200u8 };
+            for x in 0..side {
+                plane[y * side + x] = val;
+            }
+        }
+        let cplane = vec![128u8; (side / 2) * (side / 2)];
+        let luma_ref = ReferenceVop::new(&plane, side, side).unwrap();
+        let cb_ref = ReferenceVop::new(&cplane, side / 2, side / 2).unwrap();
+        let cr_ref = ReferenceVop::new(&cplane, side / 2, side / 2).unwrap();
+        let mvs = reconstruct_field_motion_vectors(pair((0, 0), (0, 0)), 0, 0);
+        let pred = field_motion_compensate_one_reference_qpel(
+            &luma_ref, &cb_ref, &cr_ref, mvs, false, true, 0, 0, 0, 8,
+        );
+        for row in 0..MACROBLOCK_LUMA_SIDE {
+            let expected = if row % 2 == 0 { 10 } else { 200 };
+            for col in 0..MACROBLOCK_LUMA_SIDE {
+                assert_eq!(pred.luma[row][col], expected, "row={row}");
+            }
+        }
+    }
+
+    #[test]
+    fn field_mc_qpel_full_pel_mv_equals_half_sample_path() {
+        // At a full-pel (integer) field MV there is no sub-pel
+        // interpolation in either mode, so the quarter-sample driver
+        // must produce the exact same prediction as the half-sample
+        // driver. Use a non-trivial striped reference and a full-pel
+        // field MV (MVx multiple of 4, MVy multiple of 8 in qpel; but
+        // since the half-sample path takes half-pel MVs, compare with
+        // the same *integer* displacement expressed in each unit).
+        let side = 48;
+        let mut plane = vec![0u8; side * side];
+        for y in 0..side {
+            for x in 0..side {
+                plane[y * side + x] = ((y * 5 + x * 3) & 0xff) as u8;
+            }
+        }
+        let mut cplane = vec![0u8; (side / 2) * (side / 2)];
+        for y in 0..side / 2 {
+            for x in 0..side / 2 {
+                cplane[y * (side / 2) + x] = ((y * 9 + x * 4) & 0xff) as u8;
+            }
+        }
+        let luma_ref = ReferenceVop::new(&plane, side, side).unwrap();
+        let cb_ref = ReferenceVop::new(&cplane, side / 2, side / 2).unwrap();
+        let cr_ref = ReferenceVop::new(&cplane, side / 2, side / 2).unwrap();
+
+        // Half-sample MVs: top = (+2, +4 half-pel), i.e. +1 full pel
+        // horizontally, +2 full field lines (MVy / 2 = 2 → even). The
+        // equivalent quarter-pel MVs are double: (+4, +8).
+        let mvs_half = FieldMotionVectors {
+            top: MotionVector { x: 2, y: 4 },
+            bottom: MotionVector { x: -2, y: -8 },
+        };
+        let mvs_qpel = FieldMotionVectors {
+            top: MotionVector { x: 4, y: 8 },
+            bottom: MotionVector { x: -4, y: -16 },
+        };
+        let half = field_motion_compensate_one_reference(
+            &luma_ref, &cb_ref, &cr_ref, mvs_half, true, false, 16, 16, 0,
+        );
+        let qpel = field_motion_compensate_one_reference_qpel(
+            &luma_ref, &cb_ref, &cr_ref, mvs_qpel, true, false, 16, 16, 0, 8,
+        );
+        for row in 0..MACROBLOCK_LUMA_SIDE {
+            for col in 0..MACROBLOCK_LUMA_SIDE {
+                assert_eq!(
+                    qpel.luma[row][col], half.luma[row][col],
+                    "luma mismatch at ({row},{col})"
+                );
+            }
+        }
+        for row in 0..MACROBLOCK_CHROMA_SIDE {
+            for col in 0..MACROBLOCK_CHROMA_SIDE {
+                assert_eq!(qpel.cb[row][col], half.cb[row][col], "cb ({row},{col})");
+                assert_eq!(qpel.cr[row][col], half.cr[row][col], "cr ({row},{col})");
+            }
+        }
+    }
+
+    #[test]
+    fn field_mc_qpel_then_residual_add_reconstructs_macroblock() {
+        // End-to-end §7.6.2.2 field-qpel MC → §7.3 residual add, with
+        // the §7.3 step-3 display clip exercised.
+        use crate::block::InterMacroblock;
+        use crate::reconstruct::reconstruct_inter_macroblock;
+
+        let side = 48;
+        let mut plane = vec![0u8; side * side];
+        for y in 0..side {
+            let val = if y % 2 == 0 { 60u8 } else { 90u8 };
+            for x in 0..side {
+                plane[y * side + x] = val;
+            }
+        }
+        let cplane = vec![128u8; (side / 2) * (side / 2)];
+        let luma_ref = ReferenceVop::new(&plane, side, side).unwrap();
+        let cb_ref = ReferenceVop::new(&cplane, side / 2, side / 2).unwrap();
+        let cr_ref = ReferenceVop::new(&cplane, side / 2, side / 2).unwrap();
+
+        // Zero field MVs; top → top ref (60), bottom → bottom ref (90).
+        let mvs = reconstruct_field_motion_vectors(pair((0, 0), (0, 0)), 0, 0);
+        let pred = field_motion_compensate_one_reference_qpel(
+            &luma_ref, &cb_ref, &cr_ref, mvs, false, true, 0, 0, 0, 8,
+        );
+
+        let mut residual = InterMacroblock {
+            luma: [[5i32; 16]; 16],
+            cb: [[1i32; 8]; 8],
+            cr: [[-1i32; 8]; 8],
+        };
+        residual.luma[0][0] = 250; // 60 + 250 = 310 → clip to 255.
+
+        let recon = reconstruct_inter_macroblock(&pred, &residual, 8);
+        assert_eq!(recon.luma[0][0], 255); // clipped
+        assert_eq!(recon.luma[0][1], 65); // top field 60 + 5
+        assert_eq!(recon.luma[2][3], 65);
+        assert_eq!(recon.luma[1][0], 95); // bottom field 90 + 5
         assert_eq!(recon.luma[3][7], 95);
         for row in 0..MACROBLOCK_CHROMA_SIDE {
             for col in 0..MACROBLOCK_CHROMA_SIDE {

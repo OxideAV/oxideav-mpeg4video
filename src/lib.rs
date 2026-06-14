@@ -192,7 +192,15 @@
 //!   block. `reduce_qpel_to_half_pel_chroma(c)` applies Table 7-13
 //!   (quarter-pel-units luma → half-pel-units chroma) for the §6.1.3.4
 //!   4:2:0 chroma path, biasing any non-zero quarter fraction toward
-//!   the +0.5 chroma-pel position per the table.
+//!   the +0.5 chroma-pel position per the table. For the §7.6.2
+//!   interlaced case, `FieldRefView` adapts the progressive reference
+//!   plane to one field's line grid (vertical neighbours are
+//!   same-field lines two frame-lines apart),
+//!   `field_mvy_to_field_grid(mvy)` halves the always-even
+//!   frame-coordinate field MVy into a field-grid quarter-pel
+//!   coordinate, and `interpolate_block_qpel_field[_into](...)`
+//!   interpolates one 16×8 luma field block through the identical
+//!   quarter-pel cascade.
 //! * Round 23: §7.6.2.1 half-sample bilinear interpolation (Figure
 //!   7-29). `interpolate_pixel(A, B, C, D, half_x, half_y,
 //!   rounding_control)` evaluates one of the four per-pixel formulas
@@ -358,8 +366,8 @@ pub use extended_padding::{
     BoundaryNeighbours, ExteriorNeighbourPosition, ExteriorPaddingOutcome,
 };
 pub use field_motion::{
-    div2_round, field_motion_compensate_one_reference, mc, reconstruct_field_motion_vectors,
-    FieldMotionVectors,
+    div2_round, field_motion_compensate_one_reference, field_motion_compensate_one_reference_qpel,
+    half_pel_chroma_mv_from_qpel, mc, reconstruct_field_motion_vectors, FieldMotionVectors,
 };
 pub use half_sample::{
     fetch_clamped_sample, interpolate_block, interpolate_block_into, interpolate_pixel,
@@ -408,9 +416,10 @@ pub use predictor::{
     NeighbourPosition,
 };
 pub use quarter_sample::{
-    fir_8tap_clip, half_pel_b, half_pel_c, half_pel_d, interpolate_block_qpel,
+    field_mvy_to_field_grid, fir_8tap_clip, half_pel_b, half_pel_c, half_pel_d,
+    interpolate_block_qpel, interpolate_block_qpel_field, interpolate_block_qpel_field_into,
     interpolate_block_qpel_into, interpolate_quarter_pixel, reduce_qpel_to_half_pel_chroma,
-    split_quarter_pel, QPEL_FIR_C,
+    split_quarter_pel, FieldRefView, QPEL_FIR_C,
 };
 pub use reconstruct::{
     clip_display_sample, reconstruct_inter_block_8x8, reconstruct_inter_block_8x8_into,

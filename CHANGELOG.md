@@ -8,6 +8,32 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 44 of the clean-room rebuild: §7.6.2.2 quarter-sample field
+  motion compensation, closing the round-43 follow-up. A new
+  `FieldRefView` (`src/quarter_sample.rs`) presents one field of the
+  progressive reference plane as a contiguous line grid (field-line `n`
+  → frame line `field_y0 + 2n`, §7.6.4 clamp applied in field-line
+  space), realising the §7.6.2 interlaced rule "vertically interpolated
+  between two successive lines of the same field … the vertical
+  coordinates of the integer samples differ by 2". The §7.6.2.2.1/.2
+  8-tap-FIR + bilinear quarter-pel cascade is now generic over a
+  `QpelSource` trait — the same math runs on the frame plane or a
+  `FieldRefView` with no duplication, and the public `half_pel_b/c/d`,
+  `interpolate_quarter_pixel`, and `interpolate_block_qpel*` signatures
+  are unchanged. `field_mvy_to_field_grid(mvy)` halves the always-even
+  (§7.7.2.1) frame-coordinate field MVy into a field-grid quarter-pel
+  coordinate. `interpolate_block_qpel_field[_into](…, ref_field_y0, …)`
+  interpolates a 16×8 luma field block.
+  `field_motion_compensate_one_reference_qpel(…, bits_per_pixel)`
+  (`src/field_motion.rs`) replaces the two luma `mc` calls of the
+  half-sample driver with quarter-pel field-block interpolation (top
+  output field → even rows, bottom → odd) and keeps the four §7.7.2.1
+  chroma `mc` calls in half-sample field mode; per §7.7.2.2 the
+  quarter-sample chroma MV is
+  `div2_round(half_pel_chroma_mv_from_qpel(c))` (`Div2Round` of the
+  luma qpel component divided by 2, `/` truncating toward 0). 17 tests
+  pin the path. (803 lib tests, +17.)
+
 - Round 43 of the clean-room rebuild: §7.7.2.1 field-MV reconstruction
   + the field motion-compensation driver (`src/field_motion.rs`), so an
   interlaced P-VOP field-predicted macroblock reconstructs pixels.

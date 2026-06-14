@@ -100,16 +100,127 @@
 //! pair is non-negative — same `floor`-of-`/4` convention §3.4 uses
 //! for division.
 //!
+//! ## Interlaced field-based quarter-sample interpolation (§7.6.2)
+//!
+//! For interlaced macroblocks (§7.7.2.1) the half- and quarter-sample
+//! values are "vertically interpolated between two successive lines of
+//! the same field" (§7.6.2), so the vertical FIR taps and bilinear
+//! neighbours step by **two** reference lines, not one. The field
+//! motion vectors are given in frame coordinates with an always-even
+//! vertical component (§7.7.2.1): a multiple of `8` quarter-pels is a
+//! full field pel (no vertical interpolation), an odd multiple of `2`
+//! selects a vertical sub-pel between adjacent same-field lines.
+//!
+//! [`FieldRefView`] adapts a progressive reference plane (even lines =
+//! top field, odd lines = bottom field) into a single field's line
+//! grid: field-line `n` maps to frame line `field_y0 + 2 n`, with the
+//! §7.6.4 clamp applied in **field-line space** (the field has
+//! `ceil((height - field_y0) / 2)` lines). The same §7.6.2.2 cascade
+//! then runs on this grid. The caller halves the frame-coordinate
+//! field MVy to obtain the field-grid quarter-pel coordinate
+//! ([`field_mvy_to_field_grid`]); the even-MVy invariant makes this an
+//! exact (lossless) division.
+//!
 //! ## Out of scope (this round)
 //!
 //! * §7.6.1 reference-VOP padding — the caller hands us a fully
 //!   reconstructed and padded reference plane.
-//! * Interlaced field-based motion compensation. The §7.6.2.2 note
-//!   for half-sample mode ("vertically interpolated between two
-//!   successive lines of the same field") extends here; needs a
-//!   field-aware sample fetcher, deferred.
 
 use crate::half_sample::ReferenceVop;
+
+/// A sample source for the §7.6.2.2 quarter-pel cascade. Both the
+/// progressive (frame) reference and the [`FieldRefView`] same-field
+/// adapter implement it so the FIR/bilinear math is written once.
+///
+/// `fetch(x, y)` returns the §7.6.4-clamped integer-pel sample at the
+/// source's `(x, y)`; for [`FieldRefView`] the `y` axis is a single
+/// field's line index.
+trait QpelSource {
+    fn fetch(&self, x: i32, y: i32) -> u8;
+}
+
+impl QpelSource for ReferenceVop<'_> {
+    #[inline]
+    fn fetch(&self, x: i32, y: i32) -> u8 {
+        self.fetch_clamped(x, y)
+    }
+}
+
+/// View of one interlaced field within a progressive reference plane
+/// (§7.6.2 / §7.7.2.1). Field-line `n` is frame line `field_y0 + 2 n`;
+/// the §7.6.4 last-full-pel clamp is applied to the field-line index so
+/// vertical interpolation never crosses into the other field or off the
+/// plane.
+#[derive(Debug, Clone, Copy)]
+pub struct FieldRefView<'a, 'b> {
+    vop: &'b ReferenceVop<'a>,
+    /// Frame-line offset of this field's first line: 0 = top field
+    /// (even frame lines), 1 = bottom field (odd frame lines).
+    field_y0: i32,
+    /// Number of lines in this field = `ceil((height - field_y0) / 2)`.
+    field_lines: i32,
+}
+
+impl<'a, 'b> FieldRefView<'a, 'b> {
+    /// Build a field view selecting the top (`field_y0 = 0`) or bottom
+    /// (`field_y0 = 1`) field of `vop`. `field_y0` is masked to its low
+    /// bit.
+    #[inline]
+    pub fn new(vop: &'b ReferenceVop<'a>, field_y0: i32) -> Self {
+        let field_y0 = field_y0 & 1;
+        let height = vop.height() as i32;
+        // ceil((height - field_y0) / 2): number of frame lines with the
+        // given parity. For field_y0 = 0 this is ceil(h/2); for
+        // field_y0 = 1 it is floor(h/2).
+        let field_lines = (height - field_y0 + 1) / 2;
+        Self {
+            vop,
+            field_y0,
+            field_lines: field_lines.max(1),
+        }
+    }
+}
+
+impl QpelSource for FieldRefView<'_, '_> {
+    #[inline]
+    fn fetch(&self, x: i32, y_field: i32) -> u8 {
+        // Clamp the field-line index to [0, field_lines - 1] (§7.6.4
+        // last-full-pel, in field-line space), then map to the frame
+        // line. Horizontal clamping is handled by the underlying VOP.
+        let cy = y_field.clamp(0, self.field_lines - 1);
+        let frame_y = self.field_y0 + 2 * cy;
+        self.vop.fetch_clamped(x, frame_y)
+    }
+}
+
+/// Convert an §7.7.2.1 field motion-vector vertical component (in
+/// quarter-pel *frame* coordinates, always even) to the field-grid
+/// quarter-pel coordinate consumed by [`interpolate_block_qpel_field`].
+///
+/// The field grid has half the vertical density of the frame, so a
+/// frame-coordinate displacement of `MVy fi` quarter-pels equals
+/// `MVy fi / 2` field-grid quarter-pels. Because `MVy fi` is always
+/// even (§7.7.2.1) the division is exact for the arithmetic right
+/// shift used here; for an (illegal) odd input the shift floors toward
+/// `-∞`, keeping the field-grid fraction non-negative.
+///
+/// # Examples
+///
+/// ```
+/// use oxideav_mpeg4video::quarter_sample::field_mvy_to_field_grid;
+/// // 8 frame quarter-pels (one full field pel) → 4 field-grid
+/// // quarter-pels (one full field-grid pel, no interpolation).
+/// assert_eq!(field_mvy_to_field_grid(8), 4);
+/// // 2 frame quarter-pels (an odd multiple of 2) → 1 field-grid
+/// // quarter-pel (a vertical sub-pel between same-field lines).
+/// assert_eq!(field_mvy_to_field_grid(2), 1);
+/// assert_eq!(field_mvy_to_field_grid(6), 3);
+/// assert_eq!(field_mvy_to_field_grid(-2), -1);
+/// ```
+#[inline]
+pub const fn field_mvy_to_field_grid(mvy_frame: i32) -> i32 {
+    mvy_frame >> 1
+}
 
 /// 8-tap FIR coefficients `C[1..=4] = [160, -48, 24, -8]`. The full
 /// symmetric kernel is `(C[4], C[3], C[2], C[1], C[1], C[2], C[3],
@@ -251,21 +362,23 @@ pub fn fir_8tap_clip(s: &[u8; 8], rounding_control: u8, bits_per_pixel: u32) -> 
 /// position; in plane coordinates the eight `x` indices are
 /// `int_x - 3 .. int_x + 5`).
 #[inline]
-fn horiz_taps(vop: &ReferenceVop<'_>, int_x: i32, int_y: i32) -> [u8; 8] {
+fn horiz_taps<S: QpelSource>(vop: &S, int_x: i32, int_y: i32) -> [u8; 8] {
     let mut out = [0u8; 8];
     for (k, dx) in (-3i32..=4).enumerate() {
-        out[k] = vop.fetch_clamped(int_x + dx, int_y);
+        out[k] = vop.fetch(int_x + dx, int_y);
     }
     out
 }
 
 /// Read eight vertical samples centred on the half-pel position
 /// between integer cells `(int_x, int_y)` and `(int_x, int_y + 1)`.
+/// For a [`FieldRefView`] the `int_y` axis is field-line indices, so
+/// the taps are eight lines of the same field.
 #[inline]
-fn vert_taps(vop: &ReferenceVop<'_>, int_x: i32, int_y: i32) -> [u8; 8] {
+fn vert_taps<S: QpelSource>(vop: &S, int_x: i32, int_y: i32) -> [u8; 8] {
     let mut out = [0u8; 8];
     for (k, dy) in (-3i32..=4).enumerate() {
-        out[k] = vop.fetch_clamped(int_x, int_y + dy);
+        out[k] = vop.fetch(int_x, int_y + dy);
     }
     out
 }
@@ -278,6 +391,17 @@ fn vert_taps(vop: &ReferenceVop<'_>, int_x: i32, int_y: i32) -> [u8; 8] {
 #[inline]
 pub fn half_pel_b(
     vop: &ReferenceVop<'_>,
+    int_x: i32,
+    int_y: i32,
+    rounding_control: u8,
+    bits_per_pixel: u32,
+) -> u8 {
+    half_pel_b_src(vop, int_x, int_y, rounding_control, bits_per_pixel)
+}
+
+#[inline]
+fn half_pel_b_src<S: QpelSource>(
+    vop: &S,
     int_x: i32,
     int_y: i32,
     rounding_control: u8,
@@ -300,6 +424,17 @@ pub fn half_pel_c(
     rounding_control: u8,
     bits_per_pixel: u32,
 ) -> u8 {
+    half_pel_c_src(vop, int_x, int_y, rounding_control, bits_per_pixel)
+}
+
+#[inline]
+fn half_pel_c_src<S: QpelSource>(
+    vop: &S,
+    int_x: i32,
+    int_y: i32,
+    rounding_control: u8,
+    bits_per_pixel: u32,
+) -> u8 {
     let taps = vert_taps(vop, int_x, int_y);
     fir_8tap_clip(&taps, rounding_control, bits_per_pixel)
 }
@@ -317,9 +452,20 @@ pub fn half_pel_d(
     rounding_control: u8,
     bits_per_pixel: u32,
 ) -> u8 {
+    half_pel_d_src(vop, int_x, int_y, rounding_control, bits_per_pixel)
+}
+
+#[inline]
+fn half_pel_d_src<S: QpelSource>(
+    vop: &S,
+    int_x: i32,
+    int_y: i32,
+    rounding_control: u8,
+    bits_per_pixel: u32,
+) -> u8 {
     let mut col = [0u8; 8];
     for (k, dy) in (-3i32..=4).enumerate() {
-        col[k] = half_pel_b(vop, int_x, int_y + dy, rounding_control, bits_per_pixel);
+        col[k] = half_pel_b_src(vop, int_x, int_y + dy, rounding_control, bits_per_pixel);
     }
     fir_8tap_clip(&col, rounding_control, bits_per_pixel)
 }
@@ -362,10 +508,38 @@ pub fn interpolate_quarter_pixel(
     rounding_control: u8,
     bits_per_pixel: u32,
 ) -> u8 {
+    interpolate_quarter_pixel_src(
+        vop,
+        int_x,
+        int_y,
+        qfrac_x,
+        qfrac_y,
+        rounding_control,
+        bits_per_pixel,
+    )
+}
+
+/// Generic §7.6.2.2 quarter-pel cascade over any [`QpelSource`]. With a
+/// [`ReferenceVop`] the `int_y` axis is frame lines (progressive); with
+/// a [`FieldRefView`] it is a single field's line indices, so every
+/// vertical neighbour is one line of the same field (§7.6.2 interlaced
+/// rule). The arithmetic is identical either way.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn interpolate_quarter_pixel_src<S: QpelSource>(
+    vop: &S,
+    int_x: i32,
+    int_y: i32,
+    qfrac_x: u8,
+    qfrac_y: u8,
+    rounding_control: u8,
+    bits_per_pixel: u32,
+) -> u8 {
     // Figure 7-32 origin: A_{-1,-1} is the integer-pel anchor and
     // sits at plane coordinate (int_x, int_y); A_{1,-1} is at
     // (int_x + 1, int_y); A_{-1, 1} is at (int_x, int_y + 1); and
-    // A_{1, 1} is at (int_x + 1, int_y + 1).
+    // A_{1, 1} is at (int_x + 1, int_y + 1). For a FieldRefView the
+    // "+ 1" vertical step is the next line of the same field.
     let rc = rounding_control & 1;
     let bpp = bits_per_pixel;
     let qx = qfrac_x & 3;
@@ -373,27 +547,27 @@ pub fn interpolate_quarter_pixel(
 
     match (qx, qy) {
         // Row 0 (qy == 0): integer / e_{-1} / b_{-1} / f_{-1}.
-        (0, 0) => vop.fetch_clamped(int_x, int_y),
+        (0, 0) => vop.fetch(int_x, int_y),
         (1, 0) => {
             // e_{-1} = (A_{-1, -1} + b_{-1} + 1 - rc) / 2.
             // Implemented at i = 0 row of Figure 7-32; the spec uses
             // `e_{-1}` to denote the upper-row quarter-pel column.
-            let a = vop.fetch_clamped(int_x, int_y);
-            let b = half_pel_b(vop, int_x, int_y, rc, bpp);
+            let a = vop.fetch(int_x, int_y);
+            let b = half_pel_b_src(vop, int_x, int_y, rc, bpp);
             bilinear(a, b, rc, bpp)
         }
-        (2, 0) => half_pel_b(vop, int_x, int_y, rc, bpp),
+        (2, 0) => half_pel_b_src(vop, int_x, int_y, rc, bpp),
         (3, 0) => {
             // f_{-1} = (b_{-1} + A_{1, -1} + 1 - rc) / 2.
-            let a = vop.fetch_clamped(int_x + 1, int_y);
-            let b = half_pel_b(vop, int_x, int_y, rc, bpp);
+            let a = vop.fetch(int_x + 1, int_y);
+            let b = half_pel_b_src(vop, int_x, int_y, rc, bpp);
             bilinear(b, a, rc, bpp)
         }
         // Row 1 (qy == 1): g / h / i / j.
         (0, 1) => {
             // g = (A_{-1, -1} + c + 1 - rc) / 2.
-            let a = vop.fetch_clamped(int_x, int_y);
-            let c = half_pel_c(vop, int_x, int_y, rc, bpp);
+            let a = vop.fetch(int_x, int_y);
+            let c = half_pel_c_src(vop, int_x, int_y, rc, bpp);
             bilinear(a, c, rc, bpp)
         }
         (1, 1) => {
@@ -403,8 +577,8 @@ pub fn interpolate_quarter_pixel(
             // e_{-3} .. e_{4}); that needs the eight `e` values
             // each computed independently.
             let e_top = {
-                let a = vop.fetch_clamped(int_x, int_y);
-                let b = half_pel_b(vop, int_x, int_y, rc, bpp);
+                let a = vop.fetch(int_x, int_y);
+                let b = half_pel_b_src(vop, int_x, int_y, rc, bpp);
                 bilinear(a, b, rc, bpp)
             };
             let k = compute_k(vop, int_x, int_y, rc, bpp);
@@ -412,37 +586,37 @@ pub fn interpolate_quarter_pixel(
         }
         (2, 1) => {
             // i = (b_{-1} + d + 1 - rc) / 2.
-            let b = half_pel_b(vop, int_x, int_y, rc, bpp);
-            let d = half_pel_d(vop, int_x, int_y, rc, bpp);
+            let b = half_pel_b_src(vop, int_x, int_y, rc, bpp);
+            let d = half_pel_d_src(vop, int_x, int_y, rc, bpp);
             bilinear(b, d, rc, bpp)
         }
         (3, 1) => {
             // j = (l + f_{-1} + 1 - rc) / 2.
             let f_top = {
-                let a = vop.fetch_clamped(int_x + 1, int_y);
-                let b = half_pel_b(vop, int_x, int_y, rc, bpp);
+                let a = vop.fetch(int_x + 1, int_y);
+                let b = half_pel_b_src(vop, int_x, int_y, rc, bpp);
                 bilinear(b, a, rc, bpp)
             };
             let l = compute_l(vop, int_x, int_y, rc, bpp);
             bilinear(l, f_top, rc, bpp)
         }
         // Row 2 (qy == 2): c / k / d / l.
-        (0, 2) => half_pel_c(vop, int_x, int_y, rc, bpp),
+        (0, 2) => half_pel_c_src(vop, int_x, int_y, rc, bpp),
         (1, 2) => compute_k(vop, int_x, int_y, rc, bpp),
-        (2, 2) => half_pel_d(vop, int_x, int_y, rc, bpp),
+        (2, 2) => half_pel_d_src(vop, int_x, int_y, rc, bpp),
         (3, 2) => compute_l(vop, int_x, int_y, rc, bpp),
         // Row 3 (qy == 3): m / n / o / p.
         (0, 3) => {
             // m = (c + A_{-1, 1} + 1 - rc) / 2.
-            let a = vop.fetch_clamped(int_x, int_y + 1);
-            let c = half_pel_c(vop, int_x, int_y, rc, bpp);
+            let a = vop.fetch(int_x, int_y + 1);
+            let c = half_pel_c_src(vop, int_x, int_y, rc, bpp);
             bilinear(c, a, rc, bpp)
         }
         (1, 3) => {
             // n = (k + e_{1} + 1 - rc) / 2.
             let e_bot = {
-                let a = vop.fetch_clamped(int_x, int_y + 1);
-                let b = half_pel_b(vop, int_x, int_y + 1, rc, bpp);
+                let a = vop.fetch(int_x, int_y + 1);
+                let b = half_pel_b_src(vop, int_x, int_y + 1, rc, bpp);
                 bilinear(a, b, rc, bpp)
             };
             let k = compute_k(vop, int_x, int_y, rc, bpp);
@@ -450,15 +624,15 @@ pub fn interpolate_quarter_pixel(
         }
         (2, 3) => {
             // o = (d + b_{1} + 1 - rc) / 2.
-            let b_bot = half_pel_b(vop, int_x, int_y + 1, rc, bpp);
-            let d = half_pel_d(vop, int_x, int_y, rc, bpp);
+            let b_bot = half_pel_b_src(vop, int_x, int_y + 1, rc, bpp);
+            let d = half_pel_d_src(vop, int_x, int_y, rc, bpp);
             bilinear(d, b_bot, rc, bpp)
         }
         (3, 3) => {
             // p = (l + f_{1} + 1 - rc) / 2.
             let f_bot = {
-                let a = vop.fetch_clamped(int_x + 1, int_y + 1);
-                let b = half_pel_b(vop, int_x, int_y + 1, rc, bpp);
+                let a = vop.fetch(int_x + 1, int_y + 1);
+                let b = half_pel_b_src(vop, int_x, int_y + 1, rc, bpp);
                 bilinear(b, a, rc, bpp)
             };
             let l = compute_l(vop, int_x, int_y, rc, bpp);
@@ -473,11 +647,11 @@ pub fn interpolate_quarter_pixel(
 /// `k = (Σ C[j] * (e_{-j} + e_{+j}) + 128 - rc) / 256`, where each
 /// `e_i = (A_{-1, i} + b_i + 1 - rc) / 2` is the left-column quarter
 /// at row `i ∈ {-3..=4}` relative to the integer anchor.
-fn compute_k(vop: &ReferenceVop<'_>, int_x: i32, int_y: i32, rc: u8, bpp: u32) -> u8 {
+fn compute_k<S: QpelSource>(vop: &S, int_x: i32, int_y: i32, rc: u8, bpp: u32) -> u8 {
     let mut col = [0u8; 8];
     for (k, dy) in (-3i32..=4).enumerate() {
-        let a = vop.fetch_clamped(int_x, int_y + dy);
-        let b = half_pel_b(vop, int_x, int_y + dy, rc, bpp);
+        let a = vop.fetch(int_x, int_y + dy);
+        let b = half_pel_b_src(vop, int_x, int_y + dy, rc, bpp);
         col[k] = bilinear(a, b, rc, bpp);
     }
     fir_8tap_clip(&col, rc, bpp)
@@ -488,11 +662,11 @@ fn compute_k(vop: &ReferenceVop<'_>, int_x: i32, int_y: i32, rc: u8, bpp: u32) -
 /// `l = (Σ C[j] * (f_{-j} + f_{+j}) + 128 - rc) / 256`, where each
 /// `f_i = (b_i + A_{1, i} + 1 - rc) / 2` is the right-column quarter
 /// at row `i ∈ {-3..=4}`.
-fn compute_l(vop: &ReferenceVop<'_>, int_x: i32, int_y: i32, rc: u8, bpp: u32) -> u8 {
+fn compute_l<S: QpelSource>(vop: &S, int_x: i32, int_y: i32, rc: u8, bpp: u32) -> u8 {
     let mut col = [0u8; 8];
     for (k, dy) in (-3i32..=4).enumerate() {
-        let b = half_pel_b(vop, int_x, int_y + dy, rc, bpp);
-        let a = vop.fetch_clamped(int_x + 1, int_y + dy);
+        let b = half_pel_b_src(vop, int_x, int_y + dy, rc, bpp);
+        let a = vop.fetch(int_x + 1, int_y + dy);
         col[k] = bilinear(b, a, rc, bpp);
     }
     fir_8tap_clip(&col, rc, bpp)
@@ -582,6 +756,111 @@ pub fn interpolate_block_qpel_into(
                 interpolate_quarter_pixel(vop, col_x, row_y, qfx, qfy, rc, bits_per_pixel);
         }
     }
+}
+
+/// Quarter-sample-interpolate one interlaced **field** block from a
+/// progressive reference plane (§7.6.2 / §7.7.2.1), into a
+/// caller-supplied buffer of length `block_w * block_h`.
+///
+/// The block holds the `block_h` consecutive lines of a single output
+/// field (a 16×8 luma field block for the standard interlaced
+/// macroblock). `ref_field_y0` selects the reference field
+/// (`forward_top_field_reference` / `forward_bottom_field_reference`,
+/// §6.3.7.2: 0 = top reference field, 1 = bottom). `origin_x` /
+/// `origin_y` are the **frame**-coordinate top-left pixel of the
+/// current macroblock. The driver in [`crate::field_motion`] is
+/// responsible for writing the returned lines into the correct output
+/// field (top or bottom) of the prediction macroblock.
+///
+/// `mv_x` is the field motion vector's horizontal component in §7.6.3
+/// quarter-pel frame units; `mv_y` is its vertical component in
+/// quarter-pel **frame** coordinates (always even per §7.7.2.1).
+/// Internally `mv_y` is halved ([`field_mvy_to_field_grid`]) to obtain
+/// the field-grid quarter-pel coordinate, and a [`FieldRefView`]
+/// presents the chosen reference field so every vertical neighbour is
+/// one line of the same field (§7.6.2). The horizontal axis is
+/// unchanged from the progressive case.
+///
+/// `out[j * block_w + i]` is output-field line `j` (the j-th line of
+/// the selected field), column `i`.
+///
+/// # Panics
+///
+/// Panics if `out.len() < block_w * block_h`.
+#[allow(clippy::too_many_arguments)]
+pub fn interpolate_block_qpel_field_into(
+    vop: &ReferenceVop<'_>,
+    mv_x: i32,
+    mv_y: i32,
+    origin_x: i32,
+    origin_y: i32,
+    block_w: usize,
+    block_h: usize,
+    ref_field_y0: i32,
+    vop_rounding_type: u8,
+    bits_per_pixel: u32,
+    out: &mut [u8],
+) {
+    assert!(
+        out.len() >= block_w * block_h,
+        "interpolate_block_qpel_field_into: output buffer too small ({} < {} * {})",
+        out.len(),
+        block_w,
+        block_h,
+    );
+    let field = FieldRefView::new(vop, ref_field_y0);
+    // Field-grid quarter-pel coordinate: halve the always-even
+    // frame-coordinate MVy (§7.7.2.1), then split into the field-line
+    // integer step and the field-grid quarter-pel fraction.
+    let mv_y_field = field_mvy_to_field_grid(mv_y);
+    let (mvx_int, qfx) = split_quarter_pel(mv_x);
+    let (mvy_int_field, qfy) = split_quarter_pel(mv_y_field);
+    let rc = vop_rounding_type & 1;
+    // The macroblock's first line in the reference field's line grid:
+    // the frame-coordinate `origin_y` line is field-grid line
+    // `origin_y / 2`.
+    let origin_field_line = origin_y >> 1;
+    for j in 0..block_h {
+        let row_y = origin_field_line + (j as i32) + mvy_int_field;
+        for i in 0..block_w {
+            let col_x = origin_x + (i as i32) + mvx_int;
+            out[j * block_w + i] =
+                interpolate_quarter_pixel_src(&field, col_x, row_y, qfx, qfy, rc, bits_per_pixel);
+        }
+    }
+}
+
+/// Quarter-sample-interpolate one interlaced field block into a freshly
+/// allocated `Vec`. See [`interpolate_block_qpel_field_into`] for
+/// parameter semantics.
+#[allow(clippy::too_many_arguments)]
+pub fn interpolate_block_qpel_field(
+    vop: &ReferenceVop<'_>,
+    mv_x: i32,
+    mv_y: i32,
+    origin_x: i32,
+    origin_y: i32,
+    block_w: usize,
+    block_h: usize,
+    ref_field_y0: i32,
+    vop_rounding_type: u8,
+    bits_per_pixel: u32,
+) -> Vec<u8> {
+    let mut out = vec![0u8; block_w * block_h];
+    interpolate_block_qpel_field_into(
+        vop,
+        mv_x,
+        mv_y,
+        origin_x,
+        origin_y,
+        block_w,
+        block_h,
+        ref_field_y0,
+        vop_rounding_type,
+        bits_per_pixel,
+        &mut out,
+    );
+    out
 }
 
 #[cfg(test)]
@@ -980,5 +1259,255 @@ mod tests {
             integer <= q1 && q1 <= q2 && q2 <= q3,
             "monotonic property: ({integer}, {q1}, {q2}, {q3})",
         );
+    }
+
+    // ─────────────── field_mvy_to_field_grid ─────────────────────────
+
+    #[test]
+    fn field_mvy_to_field_grid_halves_even_inputs_exactly() {
+        // §7.7.2.1: MVy is always even in quarter-pel frame
+        // coordinates; halving is exact. 8 (full field pel) → 4
+        // (full field-grid pel); 2 (sub-pel) → 1.
+        assert_eq!(field_mvy_to_field_grid(0), 0);
+        assert_eq!(field_mvy_to_field_grid(2), 1);
+        assert_eq!(field_mvy_to_field_grid(4), 2);
+        assert_eq!(field_mvy_to_field_grid(6), 3);
+        assert_eq!(field_mvy_to_field_grid(8), 4);
+        assert_eq!(field_mvy_to_field_grid(-2), -1);
+        assert_eq!(field_mvy_to_field_grid(-8), -4);
+        for n in -16i32..=16 {
+            // Even inputs round-trip: (2n) >> 1 == n.
+            assert_eq!(field_mvy_to_field_grid(2 * n), n);
+        }
+    }
+
+    // ───────────────── FieldRefView ──────────────────────────────────
+
+    /// Reference plane with a per-line value carrying the line parity
+    /// in the high nibble and the line index in the low bits, so a
+    /// fetched value identifies exactly which reference line was read.
+    fn striped_plane(side: usize) -> Vec<u8> {
+        let mut v = vec![0u8; side * side];
+        for y in 0..side {
+            for x in 0..side {
+                // Each line's value equals its frame-line index, so a
+                // fetched value identifies exactly which line was read.
+                v[y * side + x] = y as u8;
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn field_ref_view_top_reads_even_frame_lines() {
+        let side = 16;
+        let plane = striped_plane(side);
+        let vop = ReferenceVop::new(&plane, side, side).unwrap();
+        let top = FieldRefView::new(&vop, 0);
+        // Field-line n → frame line 2n (even). Value == 2n.
+        for n in 0i32..8 {
+            assert_eq!(top.fetch(3, n), (2 * n) as u8, "field-line {n}");
+        }
+    }
+
+    #[test]
+    fn field_ref_view_bottom_reads_odd_frame_lines() {
+        let side = 16;
+        let plane = striped_plane(side);
+        let vop = ReferenceVop::new(&plane, side, side).unwrap();
+        let bot = FieldRefView::new(&vop, 1);
+        // Field-line n → frame line 2n + 1 (odd). Value == 2n + 1.
+        for n in 0i32..8 {
+            assert_eq!(bot.fetch(3, n), (2 * n + 1) as u8, "field-line {n}");
+        }
+    }
+
+    #[test]
+    fn field_ref_view_clamps_in_field_line_space() {
+        let side = 16; // 8 top-field lines, 8 bottom-field lines.
+        let plane = striped_plane(side);
+        let vop = ReferenceVop::new(&plane, side, side).unwrap();
+        let top = FieldRefView::new(&vop, 0);
+        // Negative field-line clamps to field-line 0 (frame line 0).
+        assert_eq!(top.fetch(0, -5), 0);
+        // Past-the-end field-line clamps to the last top-field line
+        // (field-line 7 → frame line 14).
+        assert_eq!(top.fetch(0, 100), 14);
+        let bot = FieldRefView::new(&vop, 1);
+        // Last bottom-field line is field-line 7 → frame line 15.
+        assert_eq!(bot.fetch(0, 100), 15);
+    }
+
+    // ──────────────── interpolate_block_qpel_field ───────────────────
+
+    #[test]
+    fn block_qpel_field_zero_mv_top_copies_even_lines() {
+        // Zero field MV, top reference: each output field line j reads
+        // reference frame line 2*(origin/2 + j) = even lines.
+        let side = 16;
+        let plane = striped_plane(side);
+        let vop = ReferenceVop::new(&plane, side, side).unwrap();
+        let block = interpolate_block_qpel_field(&vop, 0, 0, 0, 0, 16, 8, 0, 0, 8);
+        for j in 0..8 {
+            for i in 0..16 {
+                // Field-line j of the top field → frame line 2j.
+                assert_eq!(block[j * 16 + i], (2 * j) as u8, "j={j} i={i}");
+            }
+        }
+    }
+
+    #[test]
+    fn block_qpel_field_zero_mv_bottom_copies_odd_lines() {
+        let side = 16;
+        let plane = striped_plane(side);
+        let vop = ReferenceVop::new(&plane, side, side).unwrap();
+        // ref_field_y0 = 1 → bottom reference field.
+        let block = interpolate_block_qpel_field(&vop, 0, 0, 0, 0, 16, 8, 1, 0, 8);
+        for j in 0..8 {
+            for i in 0..16 {
+                assert_eq!(block[j * 16 + i], (2 * j + 1) as u8, "j={j} i={i}");
+            }
+        }
+    }
+
+    #[test]
+    fn block_qpel_field_flat_reference_reproduces_constant() {
+        // Any field MV (even MVy) on a flat reference → flat output.
+        let side = 32;
+        let plane = vec![88u8; side * side];
+        let vop = ReferenceVop::new(&plane, side, side).unwrap();
+        for &rc in &[0u8, 1] {
+            for &mvx in &[0i32, 1, 2, 3, -1, -5] {
+                for &mvy in &[0i32, 2, 4, 6, 8, -2, -8] {
+                    let block = interpolate_block_qpel_field(&vop, mvx, mvy, 8, 8, 16, 8, 0, rc, 8);
+                    assert!(block.iter().all(|&v| v == 88), "mv=({mvx},{mvy}) rc={rc}",);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn block_qpel_field_full_field_pel_mvy_shifts_by_one_field_line() {
+        // MVy = 8 quarter-pels = one full field pel: the field grid
+        // shifts by exactly one field line (no vertical interpolation).
+        let side = 16;
+        let plane = striped_plane(side);
+        let vop = ReferenceVop::new(&plane, side, side).unwrap();
+        // Top reference, MVy = 8 → field-grid integer step +1 line.
+        let block = interpolate_block_qpel_field(&vop, 0, 8, 0, 0, 16, 8, 0, 0, 8);
+        for j in 0..7 {
+            for i in 0..16 {
+                // Field-line (j + 1) of the top field → frame 2(j+1).
+                assert_eq!(block[j * 16 + i], (2 * (j + 1)) as u8, "j={j}");
+            }
+        }
+    }
+
+    #[test]
+    fn block_qpel_field_vertical_half_pel_reads_only_same_field_lines() {
+        // MVy = 4 quarter-pels = field-grid half-pel (qfy == 2): the
+        // §7.6.2.2.1 vertical FIR `c` runs over eight *same-field*
+        // lines. Build a plane whose top field is a constant 100 and
+        // whose bottom field is 200. A top-reference field half-pel
+        // fetch must return exactly 100 (the bottom field never enters
+        // the vertical FIR — that is the interlaced same-field rule).
+        let side = 32;
+        let mut plane = vec![0u8; side * side];
+        for y in 0..side {
+            let val = if y % 2 == 0 { 100u8 } else { 200u8 };
+            for x in 0..side {
+                plane[y * side + x] = val;
+            }
+        }
+        let vop = ReferenceVop::new(&plane, side, side).unwrap();
+        // Top reference (ref_field_y0 = 0), MVy = 4 (field half-pel).
+        let block = interpolate_block_qpel_field(&vop, 0, 4, 0, 16, 16, 8, 0, 0, 8);
+        for v in &block {
+            assert_eq!(*v, 100, "bottom-field value 200 must not leak in");
+        }
+        // Bottom reference (ref_field_y0 = 1) → all 200, symmetrically.
+        let block_bot = interpolate_block_qpel_field(&vop, 0, 4, 0, 16, 16, 8, 1, 0, 8);
+        for v in &block_bot {
+            assert_eq!(*v, 200, "top-field value 100 must not leak in");
+        }
+    }
+
+    #[test]
+    fn block_qpel_field_vertical_half_pel_matches_field_c_helper() {
+        // Verify the field half-pel (qfy == 2) value equals the §7.6.2.2
+        // vertical FIR `c` evaluated on the field grid via the same
+        // FieldRefView, at an interior position where all eight taps are
+        // in range (no §7.6.4 clamping). Use a smooth deterministic
+        // top-field ramp.
+        let side = 64;
+        let mut plane = vec![0u8; side * side];
+        for y in 0..side {
+            for x in 0..side {
+                // Top field varies with field-line index; bottom field
+                // is a different function so any cross-field read shows.
+                plane[y * side + x] = if y % 2 == 0 {
+                    ((y / 2) * 3 + 7) as u8
+                } else {
+                    255 - ((y / 2) % 7) as u8
+                };
+            }
+        }
+        let vop = ReferenceVop::new(&plane, side, side).unwrap();
+        let top = FieldRefView::new(&vop, 0);
+        // origin_field_line = 24/2 = 12; output field-line j reads the
+        // half-pel at field-line (12 + j). For j in [0, 7] the FIR taps
+        // span field-lines 9..23, all within [0, 31] → no clamp.
+        let block = interpolate_block_qpel_field(&vop, 0, 4, 0, 24, 16, 8, 0, 0, 8);
+        for j in 0..8 {
+            let expected = half_pel_c_src(&top, 5, 12 + j as i32, 0, 8);
+            for i in 0..16 {
+                assert_eq!(block[j * 16 + i], expected, "j={j} i={i}");
+            }
+        }
+    }
+
+    #[test]
+    fn block_qpel_field_into_panics_on_short_buffer() {
+        let buf = [0u8; 16];
+        let vop = ReferenceVop::new(&buf, 4, 4).unwrap();
+        let mut out = [0u8; 3];
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            interpolate_block_qpel_field_into(&vop, 0, 0, 0, 0, 2, 2, 0, 0, 8, &mut out);
+        }));
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn block_qpel_field_horizontal_matches_progressive_on_single_field() {
+        // The horizontal axis is unchanged from the progressive
+        // cascade. Build a plane where the top field is a horizontal
+        // ramp identical on every top-field line; a top-field qpel
+        // field fetch with MVy = 0 must equal the progressive qpel
+        // result on a one-line plane holding that ramp.
+        let side = 16;
+        let row = [
+            0u8, 16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240,
+        ];
+        let mut plane = vec![0u8; side * side];
+        for y in (0..side).step_by(2) {
+            plane[y * side..y * side + side].copy_from_slice(&row);
+        }
+        // Bottom-field lines left zero (must not affect top fetch).
+        let vop = ReferenceVop::new(&plane, side, side).unwrap();
+        // Single-line progressive reference holding the same ramp.
+        let one_line = ReferenceVop::new(&row, side, 1).unwrap();
+        for qfx in 0u8..=3 {
+            let field = interpolate_block_qpel_field(&vop, qfx as i32, 0, 0, 0, side, 8, 0, 0, 8);
+            for i in 0..side {
+                // Progressive single-line fetch at the same x sub-pel,
+                // qfy = 0 (no vertical interp).
+                let prog = interpolate_quarter_pixel(&one_line, i as i32, 0, qfx, 0, 0, 8);
+                // Every output field line equals the single-line value
+                // (top field lines are all the same ramp).
+                for j in 0..8 {
+                    assert_eq!(field[j * side + i], prog, "qfx={qfx} i={i} j={j}");
+                }
+            }
+        }
     }
 }

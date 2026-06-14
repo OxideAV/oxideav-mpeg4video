@@ -5,12 +5,54 @@ A pure-Rust MPEG-4 Part 2 Video codec (ISO/IEC 14496-2) for the
 
 ## Status
 
-**Round 43 of the clean-room rebuild (2026-06-13).** The prior
+**Round 44 of the clean-room rebuild (2026-06-14).** The prior
 implementation was retired on 2026-05-18 under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md);
 the VLC tables admitted to sourcing their numeric entries from an
 external library. Master history was fully erased per the Hat-3 cold-
 enforcement procedure.
+
+* Round 44 — §7.6.2.2 quarter-sample field motion compensation,
+  closing the round-43 follow-up. The §7.6.2 interlaced rule — "the
+  half and quarter sample values are vertically interpolated between
+  two successive lines of the same field … the field motion vectors
+  are given in frame coordinates; that is the vertical coordinates of
+  the integer samples differ by 2" — is realised by a new
+  `FieldRefView` (in `src/quarter_sample.rs`) that presents one field
+  of the progressive reference plane as a contiguous line grid:
+  field-line `n` maps to frame line `field_y0 + 2n`, with the §7.6.4
+  last-full-pel clamp applied in field-line space so vertical taps
+  never cross fields. The §7.6.2.2.1/.2 8-tap-FIR + bilinear cascade
+  is now generic over a `QpelSource` trait, so the identical math runs
+  on the frame plane (progressive) or a `FieldRefView` (interlaced)
+  with no duplication; the public `half_pel_b/c/d`,
+  `interpolate_quarter_pixel`, `interpolate_block_qpel*` signatures are
+  unchanged. `field_mvy_to_field_grid(mvy)` halves the always-even
+  (§7.7.2.1) frame-coordinate field MVy into a field-grid quarter-pel
+  coordinate (exact: a multiple of 8 qpel = a full field pel, no
+  vertical interpolation; an odd multiple of 2 = a same-field vertical
+  sub-pel). `interpolate_block_qpel_field[_into](…, ref_field_y0, …)`
+  interpolates one 16×8 luma field block. The driver
+  `field_motion_compensate_one_reference_qpel(…, bits_per_pixel)` (in
+  `src/field_motion.rs`) mirrors the half-sample
+  `field_motion_compensate_one_reference` but replaces the two luma
+  `mc` calls with the quarter-pel field-block interpolation (top
+  output field → even destination rows, bottom → odd), while keeping
+  the four §7.7.2.1 chroma `mc` calls in half-sample field mode; per
+  §7.7.2.2 the quarter-sample chroma MV is
+  `div2_round(half_pel_chroma_mv_from_qpel(c))` = `Div2Round` of the
+  luma qpel component divided by 2 (quarter → half, `/` truncating
+  toward 0). 17 tests pin the path: `FieldRefView` line mapping +
+  field-space clamp, field-grid MVy conversion, field-block zero-MV
+  even/odd line copy, full-field-pel single-line shift, same-field
+  vertical-half-pel (no cross-field leak + match against the field `c`
+  helper), horizontal-axis equivalence with the progressive cascade,
+  flat-reference invariance, full-pel equivalence with the half-sample
+  driver, and end-to-end qpel-field-MC + §7.3 residual-add with the
+  display clip. Half-sample field MC (round 43) and quarter-sample
+  field MC (this round) now both land; field-MV CASE 1/2/3 predictor
+  selection over field-aware neighbours remains the
+  motion-vector-prediction module's follow-up. (803 lib tests, +17.)
 
 * Round 43 — §7.7.2.1 field-MV reconstruction + the field
   motion-compensation driver (`src/field_motion.rs`): the parsed
