@@ -395,10 +395,11 @@ pub use motion::{
     averaged_motion_vector, decode_field_motion_vector_pair, decode_motion_vector_delta,
     decode_p_macroblock_motion_vectors, decode_p_macroblock_motion_vectors_interlaced,
     decode_p_macroblock_motion_vectors_with_shape, direct_mode_motion_vector,
-    direct_mode_reduce_qpel_to_half_pel, motion_coding, predict_motion_vector,
-    reconstruct_motion_vector, BinaryShapeBlockOpacity, BinaryShapeFourMv, DirectCoLocatedMv,
-    DirectModeMv, DirectMvError, DirectMvUnits, FieldMvPair, MotionCodingDeltas, MotionParseError,
-    MotionVector, MotionVectorDelta, MvMode, PMbMotionVectors, TypeOfMb, AMV_PIXEL_COUNT,
+    direct_mode_reduce_qpel_to_half_pel, motion_coding, predict_field_motion_vector,
+    predict_motion_vector, reconstruct_motion_vector, BinaryShapeBlockOpacity, BinaryShapeFourMv,
+    DirectCoLocatedMv, DirectModeMv, DirectMvError, DirectMvUnits, FieldMvPair, FieldPredCandidate,
+    MotionCodingDeltas, MotionParseError, MotionVector, MotionVectorDelta, MvMode,
+    PMbMotionVectors, TypeOfMb, AMV_PIXEL_COUNT,
 };
 pub use mv_predictor_grid::{
     gather_mv_predictor_candidates, MbMv, MbMvRecord, MvGrid, MvGridError,

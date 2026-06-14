@@ -5,12 +5,50 @@ A pure-Rust MPEG-4 Part 2 Video codec (ISO/IEC 14496-2) for the
 
 ## Status
 
-**Round 44 of the clean-room rebuild (2026-06-14).** The prior
+**Round 45 of the clean-room rebuild (2026-06-14).** The prior
 implementation was retired on 2026-05-18 under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md);
 the VLC tables admitted to sourcing their numeric entries from an
 external library. Master history was fully erased per the Hat-3 cold-
 enforcement procedure.
+
+* Round 45 — §7.7.2.1 field-MV predictor selection (CASE 1 / CASE 2 /
+  CASE 3), closing the round-43/44 follow-up "field-MV CASE 1/2/3
+  predictor selection over field-aware neighbours". The §7.7.2.1 rule
+  for how an interlaced P-/S(GMC)-VOP forms the shared `(Px, Py)`
+  predictor depends on whether each of the three §7.6.5 spatial
+  neighbour candidates is itself field predicted: a frame-predicted
+  neighbour contributes its frame MV unchanged, while a field-predicted
+  neighbour contributes the per-component `Div2Round(MVf1 + MVf2)`
+  average of its two field motion vectors (Figure 7-47), collapsing all
+  fractional-pel offsets onto the half-/quarter-pel grid. The new
+  `FieldPredCandidate` enum (`Frame` / `Field { top, bottom }` /
+  `Invalid`) classifies each neighbour, and
+  `predict_field_motion_vector([FieldPredCandidate; 3])` maps the three
+  to candidate vectors, applies the existing four §7.6.5 validity rules
+  (a `None`/`Invalid` slot → zero / sole-valid / all-zero), and medians
+  component-wise — `Px = Median(MV1x, MV2x, MV3x)`,
+  `Py = Median(MV1y, MV2y, MV3y)`. CASE 1 (current field-predicted, no
+  field-predicted neighbour) reduces to the progressive median; CASE 2
+  (current frame-predicted with ≥1 field neighbour) feeds the plain
+  `MVx = MVDx + Px` / `MVy = MVDy + Py` reconstruction; CASE 3 (current
+  field-predicted with ≥1 field neighbour) feeds the shared predictor
+  into the round-43 `reconstruct_field_motion_vectors`
+  (`MVx fi = MVDx fi + Px`, `MVy fi = 2*(MVDy fi + Py/2)`). The
+  `Div2Round` operator is duplicated as a `const fn` in `src/motion.rs`
+  so the predictor layer carries no dependency on the field-MC module.
+  6 tests pin the path: the `Div2Round` bit definition, CASE-1
+  equivalence with the progressive median, the field-neighbour
+  `Div2Round`-average mapping (even and odd sums), CASE 2 with a single
+  field neighbour feeding `reconstruct_motion_vector`, CASE 3 end-to-end
+  through `reconstruct_field_motion_vectors`, and the §7.6.5 validity
+  rules over `Invalid` slots. With field-MV reconstruction (round 43),
+  field MC half-sample (round 43) + quarter-sample (round 44), and now
+  field-MV predictor selection all landed, the interlaced P-VOP
+  field-prediction motion path is end-to-end; selecting the actual
+  spatial neighbours from the macroblock grid for the field-aware
+  candidates remains the `mv_predictor_grid` follow-up. (809 lib tests,
+  +6.)
 
 * Round 44 — §7.6.2.2 quarter-sample field motion compensation,
   closing the round-43 follow-up. The §7.6.2 interlaced rule — "the
@@ -1296,6 +1334,10 @@ and reduced-resolution VOP extension bodies are typed-rejected via
 | §6.2.6.3 four field-reference bits (forward / backward pairs)        | `FieldReference::{Top, Bottom}` (round 39) |
 | §6.2.6.3 `interlaced_information()` body (0..=6 bits)                 | `parse_interlaced_information` (round 39) |
 | `mcsel == 1` S(GMC) suppression of §6.2.6.3 second gate               | structural via `McSel` / `s_gmc_vop` (round 39) |
+| §7.7.2.1 field-MV predictor CASE 1 (current field, all-frame neighbours) | `predict_field_motion_vector` → progressive median (round 45) |
+| §7.7.2.1 field-MV predictor CASE 2 (current frame, ≥1 field neighbour)  | field neighbour → `Div2Round(MVf1+MVf2)` candidate (round 45) |
+| §7.7.2.1 field-MV predictor CASE 3 (current field, ≥1 field neighbour)  | `FieldPredCandidate::Field` → shared `(Px,Py)` (round 45) |
+| §7.7.2.1 field-candidate `Div2Round(MVf1+MVf2)` averaging (Fig 7-47)    | `FieldPredCandidate::to_candidate_vector` (round 45) |
 | Encoder                                       | not yet |
 
 740 round-1..39 unit tests + 9 doctests pass.

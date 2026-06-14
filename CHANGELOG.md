@@ -8,6 +8,18 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 45 of the clean-room rebuild: §7.7.2.1 field-MV predictor
+  selection (CASE 1 / CASE 2 / CASE 3), closing the round-43/44
+  follow-up. New `FieldPredCandidate` enum (`Frame` /
+  `Field { top, bottom }` / `Invalid`) classifies each §7.6.5 spatial
+  neighbour, and `predict_field_motion_vector([FieldPredCandidate; 3])`
+  maps a field-predicted neighbour to its per-component
+  `Div2Round(MVf1 + MVf2)` average (Figure 7-47), a frame-predicted
+  neighbour to its frame MV, applies the four §7.6.5 validity rules,
+  and medians component-wise to the shared `(Px, Py)` predictor. CASE 1
+  reduces to the progressive median; CASE 2 feeds `MVx = MVDx + Px` /
+  `MVy = MVDy + Py`; CASE 3 feeds the shared predictor into
+  `reconstruct_field_motion_vectors`. 6 new tests. (809 lib tests.)
 - Round 44 of the clean-room rebuild: §7.6.2.2 quarter-sample field
   motion compensation, closing the round-43 follow-up. A new
   `FieldRefView` (`src/quarter_sample.rs`) presents one field of the

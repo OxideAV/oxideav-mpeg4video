@@ -470,6 +470,124 @@ pub fn predict_motion_vector(candidates: [Option<MotionVector>; 3]) -> MotionVec
 }
 
 // ---------------------------------------------------------------------------
+// §7.7.2.1 — field-MV predictor (interlaced P-/S(GMC)-VOP, CASE 1/2/3).
+//
+// When either the current macroblock or one of its three §7.6.5 spatial
+// neighbour candidates is field predicted, the candidate vector each
+// neighbour contributes to the `Median` depends on how that neighbour is
+// itself coded:
+//
+//   * A frame-predicted neighbour (1-MV, or — for an `inter4v` neighbour —
+//     the 8×8 block vector closest to the current MB's upper-left block,
+//     already selected by the caller before reaching this layer)
+//     contributes its frame motion vector unchanged.
+//   * A field-predicted neighbour contributes the average of its two
+//     field motion vectors, with `Div2Round(MVf1 + MVf2)` applied
+//     component-wise so all fractional-pel offsets collapse onto the
+//     half- or quarter-pel grid (§7.7.2.1 CASE 2 / CASE 3; Figure 7-47).
+//
+// The three resolved candidates are then medianed component-wise exactly
+// as in the progressive predictor — `Px = Median(MV1x, MV2x, MV3x)`,
+// `Py = Median(MV1y, MV2y, MV3y)`. The §7.6.5 validity rules (a `None`
+// slot marks a transparent / out-of-VOP neighbour) are applied first,
+// identically to [`predict_motion_vector`].
+//
+// CASE 1 (current field-predicted, no field-predicted neighbour) is the
+// degenerate form where every neighbour is `Frame`, so this layer reduces
+// to the progressive `Median`; the case distinction in the spec governs
+// only how the resulting `(Px, Py)` is *applied* — a field-predicted
+// current MB reconstructs both fields via
+// [`crate::field_motion::reconstruct_field_motion_vectors`]
+// (`MVx fi = MVDx fi + Px`, `MVy fi = 2*(MVDy fi + Py/2)`), while a
+// frame-predicted current MB (CASE 2) uses the plain
+// `MVx = MVDx + Px` / `MVy = MVDy + Py` of [`reconstruct_motion_vector`].
+// ---------------------------------------------------------------------------
+
+/// `Div2Round(x) = (x >> 1) | (x & 1)` (§7.7.2.1) — the averaging-rounding
+/// operator the field-MV candidate mapping shares with
+/// [`crate::field_motion::div2_round`], duplicated here so the predictor
+/// layer has no dependency on the field-MC module.
+const fn div2_round(x: i32) -> i32 {
+    (x >> 1) | (x & 1)
+}
+
+/// One §7.7.2.1 spatial-neighbour candidate for the field-MV predictor.
+///
+/// The caller classifies each of the three §7.6.5 neighbour slots:
+///
+/// * [`FieldPredCandidate::Frame`] — a frame-predicted (or already-
+///   block-selected `inter4v`) neighbour; its frame motion vector is the
+///   candidate verbatim.
+/// * [`FieldPredCandidate::Field`] — a field-predicted neighbour; its two
+///   field motion vectors (top `MV f1`, bottom `MV f2`, in that order)
+///   are averaged with `Div2Round` per component to form the candidate.
+/// * [`FieldPredCandidate::Invalid`] — a transparent / out-of-VOP /
+///   out-of-video-packet neighbour ("treated as transparent" per §7.6.5),
+///   equivalent to `None` in [`predict_motion_vector`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldPredCandidate {
+    /// Frame-predicted neighbour — frame MV used directly.
+    Frame(MotionVector),
+    /// Field-predicted neighbour — top (`MV f1`) then bottom (`MV f2`)
+    /// field MV, averaged via `Div2Round(MVf1 + MVf2)` per component.
+    Field {
+        /// Top-field motion vector (`MV f1`).
+        top: MotionVector,
+        /// Bottom-field motion vector (`MV f2`).
+        bottom: MotionVector,
+    },
+    /// Transparent / out-of-VOP neighbour (`None` equivalent).
+    Invalid,
+}
+
+impl FieldPredCandidate {
+    /// Map this neighbour to its §7.7.2.1 candidate vector, or `None`
+    /// when the neighbour is invalid (so the §7.6.5 validity rules in
+    /// [`resolve_candidates`] still apply).
+    fn to_candidate_vector(self) -> Option<MotionVector> {
+        match self {
+            FieldPredCandidate::Frame(mv) => Some(mv),
+            // CASE 2 / CASE 3: a field-predicted neighbour contributes
+            // `Div2Round(MVf1 + MVf2)` component-wise (Figure 7-47).
+            FieldPredCandidate::Field { top, bottom } => Some(MotionVector {
+                x: div2_round(top.x + bottom.x),
+                y: div2_round(top.y + bottom.y),
+            }),
+            FieldPredCandidate::Invalid => None,
+        }
+    }
+}
+
+/// Compute the §7.7.2.1 field-MV predictor `(Px, Py)` from the three
+/// classified spatial neighbour candidates (CASE 1 / CASE 2 / CASE 3).
+///
+/// Each [`FieldPredCandidate`] is first mapped to its candidate vector —
+/// a frame neighbour contributes its frame MV, a field neighbour the
+/// `Div2Round`-averaged pair, an invalid neighbour `None` — then the
+/// §7.6.5 validity rules (a single invalid → zero; two invalid → the one
+/// valid; all invalid → zero) are applied and the surviving triple is
+/// medianed component-wise:
+///
+/// ```text
+/// Px = Median(MV1x, MV2x, MV3x)
+/// Py = Median(MV1y, MV2y, MV3y)
+/// ```
+///
+/// The returned `(Px, Py)` is the **shared** predictor both fields of a
+/// field-predicted current macroblock add to their differentials via
+/// [`crate::field_motion::reconstruct_field_motion_vectors`] (CASE 1 /
+/// CASE 3), or that a frame-predicted current macroblock adds once via
+/// [`reconstruct_motion_vector`] (CASE 2).
+pub fn predict_field_motion_vector(candidates: [FieldPredCandidate; 3]) -> MotionVector {
+    let mapped = [
+        candidates[0].to_candidate_vector(),
+        candidates[1].to_candidate_vector(),
+        candidates[2].to_candidate_vector(),
+    ];
+    predict_motion_vector(mapped)
+}
+
+// ---------------------------------------------------------------------------
 // §7.8.7.3 — S(GMC)-VOP averaged-vector substitution.
 //
 // Macroblocks with `mcsel == 1` do not carry their own block motion vector;
@@ -1767,6 +1885,128 @@ mod tests {
         let mv = reconstruct_motion_vector(delta, p.x, p.y, 2).unwrap();
         assert_eq!(mv.x, 3);
         assert_eq!(mv.y, 2);
+    }
+
+    // ----- §7.7.2.1 field-MV predictor (CASE 1 / 2 / 3) ----------------
+
+    fn frame(x: i32, y: i32) -> FieldPredCandidate {
+        FieldPredCandidate::Frame(MotionVector { x, y })
+    }
+
+    fn field(tx: i32, ty: i32, bx: i32, by: i32) -> FieldPredCandidate {
+        FieldPredCandidate::Field {
+            top: MotionVector { x: tx, y: ty },
+            bottom: MotionVector { x: bx, y: by },
+        }
+    }
+
+    #[test]
+    fn field_div2_round_matches_spec_definition() {
+        // Div2Round(x) = (x >> 1) | (x & 1) — the same bit definition the
+        // field-MC module pins; verified here for the predictor copy.
+        assert_eq!(super::div2_round(0), 0);
+        assert_eq!(super::div2_round(3), 1); // (1)|(1) = 1
+        assert_eq!(super::div2_round(4), 2);
+        assert_eq!(super::div2_round(5), 3); // (2)|(1) = 3
+        assert_eq!(super::div2_round(-3), -1); // (-2)|(1) = -1
+        assert_eq!(super::div2_round(-4), -2);
+    }
+
+    #[test]
+    fn case1_all_frame_neighbours_reduce_to_progressive_median() {
+        // CASE 1: current field-predicted, no field-predicted neighbour.
+        // Every candidate is Frame, so the field predictor must equal the
+        // progressive median of the same three vectors. Worked-example
+        // triple (-2,3),(1,5),(-1,7) → (-1,5).
+        let cands = [frame(-2, 3), frame(1, 5), frame(-1, 7)];
+        let p = predict_field_motion_vector(cands);
+        assert_eq!(p.x, -1);
+        assert_eq!(p.y, 5);
+        // Identical to the progressive path on the same vectors.
+        let prog = predict_motion_vector([
+            Some(MotionVector { x: -2, y: 3 }),
+            Some(MotionVector { x: 1, y: 5 }),
+            Some(MotionVector { x: -1, y: 7 }),
+        ]);
+        assert_eq!(p, prog);
+    }
+
+    #[test]
+    fn field_neighbour_maps_to_div2round_average() {
+        // A field neighbour with MVf1=(4,8), MVf2=(2,4) contributes
+        // (Div2Round(6), Div2Round(12)) = (3, 6).
+        let c = field(4, 8, 2, 4);
+        assert_eq!(c.to_candidate_vector(), Some(MotionVector { x: 3, y: 6 }));
+        // Odd sum rounds via the bit formula: Div2Round(4+1=5)=3.
+        let c2 = field(4, 0, 1, 0);
+        assert_eq!(c2.to_candidate_vector().unwrap().x, 3);
+    }
+
+    #[test]
+    fn case2_frame_current_one_field_neighbour() {
+        // CASE 2: current frame-predicted, the middle neighbour is field
+        // predicted. Its candidate is Div2Round((MVx f1+MVx f2)),
+        // Div2Round((MVy f1+MVy f2)). With MVf1=(6,2), MVf2=(2,2) the
+        // field candidate is (4,2); flanked by frame (1,1) and (7,7) the
+        // x-median is Median(1,4,7)=4, y-median Median(1,2,7)=2.
+        let cands = [frame(1, 1), field(6, 2, 2, 2), frame(7, 7)];
+        let p = predict_field_motion_vector(cands);
+        assert_eq!(p.x, 4);
+        assert_eq!(p.y, 2);
+        // The frame-predicted current MB then adds the differential once.
+        let mv =
+            reconstruct_motion_vector(MotionVectorDelta { dx: -1, dy: 0 }, p.x, p.y, 2).unwrap();
+        assert_eq!(mv.x, 3);
+        assert_eq!(mv.y, 2);
+    }
+
+    #[test]
+    fn case3_field_current_mixed_neighbours_feed_field_reconstruct() {
+        use crate::field_motion::{reconstruct_field_motion_vectors, FieldMotionVectors};
+        // CASE 3: current field-predicted, at least one neighbour field
+        // predicted. MV1 frame (2,4); MV2 field MVf1=(8,8),MVf2=(4,4) →
+        // (Div2Round(12),Div2Round(12))=(6,6); MV3 frame (10,2).
+        // Px = Median(2,6,10)=6, Py = Median(4,6,2)=4.
+        let cands = [frame(2, 4), field(8, 8, 4, 4), frame(10, 2)];
+        let p = predict_field_motion_vector(cands);
+        assert_eq!(p.x, 6);
+        assert_eq!(p.y, 4);
+        // Both fields share (Px,Py)=(6,4); reconstruct via §7.7.2.1.
+        // Differentials: top (1, 0), bottom (-1, 1).
+        let pair = FieldMvPair {
+            top: MotionVectorDelta { dx: 1, dy: 0 },
+            bottom: MotionVectorDelta { dx: -1, dy: 1 },
+        };
+        let fmv = reconstruct_field_motion_vectors(pair, p.x, p.y);
+        // MVx f1 = 1 + 6 = 7; MVy f1 = 2*(0 + 4/2) = 4.
+        // MVx f2 = -1 + 6 = 5; MVy f2 = 2*(1 + 2) = 6.
+        assert_eq!(
+            fmv,
+            FieldMotionVectors {
+                top: MotionVector { x: 7, y: 4 },
+                bottom: MotionVector { x: 5, y: 6 },
+            }
+        );
+    }
+
+    #[test]
+    fn field_predictor_honours_invalid_validity_rules() {
+        // One invalid neighbour → it becomes zero (§7.6.5 rule 2). With
+        // frame (4,4), Invalid, frame (4,4): x-median Median(4,0,4)=4.
+        let p =
+            predict_field_motion_vector([frame(4, 4), FieldPredCandidate::Invalid, frame(4, 4)]);
+        assert_eq!(p, MotionVector { x: 4, y: 4 });
+        // Two invalid → both take the one valid candidate (rule 3).
+        let p2 = predict_field_motion_vector([
+            field(8, 8, 4, 4),
+            FieldPredCandidate::Invalid,
+            FieldPredCandidate::Invalid,
+        ]);
+        // Sole valid candidate is the field average (6,6).
+        assert_eq!(p2, MotionVector { x: 6, y: 6 });
+        // All invalid → zero (rule 4).
+        let p3 = predict_field_motion_vector([FieldPredCandidate::Invalid; 3]);
+        assert_eq!(p3, MotionVector { x: 0, y: 0 });
     }
 
     // ----- §7.8.7.3 averaged-vector substitution -----------------------
