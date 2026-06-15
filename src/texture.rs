@@ -178,6 +178,15 @@ pub enum TextureParseError {
         /// expected (right-aligned).
         window: u8,
     },
+    /// A backward (reverse-direction) Type-5 escape did not terminate
+    /// with the opening `00001` delimiter (read tail-first as `10000`),
+    /// per §E.1.4.4.1 / Table B.23 ESCAPE row; the five bits read in its
+    /// place are reported (tail-first, right-aligned) for diagnostics.
+    RvlcEscapeOpenerMissing {
+        /// The five bits read where the `00001` opener was expected
+        /// (tail-first order, right-aligned).
+        window: u8,
+    },
 }
 
 impl core::fmt::Display for TextureParseError {
@@ -206,6 +215,12 @@ impl core::fmt::Display for TextureParseError {
                 write!(
                     f,
                     "Type-5 escape closing delimiter was 0b{window:04b} (expected 0b0000)"
+                )
+            }
+            TextureParseError::RvlcEscapeOpenerMissing { window } => {
+                write!(
+                    f,
+                    "backward Type-5 escape opener was 0b{window:05b} (expected 0b10000)"
                 )
             }
         }
@@ -846,6 +861,209 @@ pub fn decode_ac_events_rvlc(
             return Ok(events);
         }
     }
+}
+
+/// Reverse the low `len` bits of `code`. A forward Table B.23 codeword,
+/// once bit-reversed, is the bit pattern a backward (reverse-direction)
+/// decoder reconstructs when it visits those `len` stream bits tail-first
+/// and shifts each into the LSB of its accumulator. RVLC codes are
+/// designed (§E.1.3) so this bit-reversed pattern uniquely identifies the
+/// same EVENT, which is what makes the reverse-direction decode possible.
+fn reverse_bits(code: u32, len: u8) -> u32 {
+    let mut out = 0u32;
+    for i in 0..len {
+        out |= ((code >> i) & 1) << (len - 1 - i);
+    }
+    out
+}
+
+/// Match the *bit-reversed* reversible Tcoef VLC against the leading bits
+/// of a backward accumulator `window` (whose most-significant valid bit
+/// is the bit emitted first, i.e. the last forward bit of the codeword).
+/// Returns `(code_len, last, run, level)` for the selected table-kind
+/// column on a hit (before the sign bit), `None` on no match.
+///
+/// The decode direction does not change which `(LAST, RUN, LEVEL)` triple
+/// a codeword carries — only the order in which its bits arrive. So this
+/// reuses Table B.23 verbatim, comparing each entry's reversed code.
+fn match_rvlc_tcoef_reverse(
+    window: u32,
+    window_len: u8,
+    table_kind: TcoefTable,
+) -> Option<(u8, bool, u32, i32)> {
+    for &(code, len, i_last, i_run, i_level, n_last, n_run, n_level) in RVLC_TCOEF {
+        if len <= window_len {
+            let shift = window_len - len;
+            if (window >> shift) == reverse_bits(code, len) {
+                let (last, run, level) = match table_kind {
+                    TcoefTable::Intra => (i_last, i_run, i_level),
+                    TcoefTable::Inter => (n_last, n_run, n_level),
+                };
+                return Some((len, last != 0, run as u32, level as i32));
+            }
+        }
+    }
+    None
+}
+
+/// Decode one §7.4.1.2 `DCT coefficient` EVENT in the **backward**
+/// (reverse) direction for the `reversible_vlc == 1` path — the
+/// reverse-decode half of the Annex E.1.4.4 two-way RVLC error recovery.
+///
+/// Reading proceeds from the end of the DCT-coefficient region toward the
+/// front (`br` is a [`BackwardBitReader`]). One forward EVENT is laid out,
+/// from low to high bit address, as either:
+///
+/// * **Common** — `code_bits` (a Table B.23 reversible VLC) then the sign
+///   bit `s`. Backward, `s` is consumed first, then the codeword bits in
+///   reverse; the reversed pattern is matched against
+///   [`match_rvlc_tcoef_reverse`].
+/// * **Type-5 escape** — forward `00001 LAST RUN m LEVEL m 0000 s`.
+///   Backward, the sign bit `s` is consumed first, then the closing
+///   delimiter `0000` (which, read tail-first, is the escape marker for
+///   the reverse direction per §E.1.4.4.1 — `00001` is *not* used
+///   backward), then the fixed-length payload bits in reverse order
+///   (`m LEVEL m RUN LAST`), and finally the opening `00001` (whose
+///   tail-first form is `10000`).
+///
+/// An EVENT begins with a 5-bit lookahead: the four bits below the sign
+/// bit are the closing `0000` delimiter iff this is an escape. Because no
+/// non-escape Table B.23 code, reversed, begins with `0000` (no forward
+/// code *ends* with `0000`), the escape is distinguished unambiguously.
+pub fn decode_ac_event_rvlc_reverse(
+    br: &mut crate::bitreader::BackwardBitReader<'_>,
+    table_kind: TcoefTable,
+) -> Result<AcEvent, TextureParseError> {
+    // Backward, the sign bit `s` is the first bit consumed for every
+    // EVENT (it is the last forward bit, common path and escape alike).
+    let sign_negative = br.read_bit_reverse()? == 1;
+
+    // Peek the next four bits (tail-first) without committing: an escape
+    // EVENT has the closing `0000` delimiter immediately below `s`.
+    // Reconstruct them tail-first into `peek`.
+    let mut delim = 0u8;
+    let mut delim_bits = [0u8; 4];
+    let mut have = 0usize;
+    for slot in delim_bits.iter_mut() {
+        match br.read_bit_reverse() {
+            Ok(b) => {
+                *slot = b;
+                delim = (delim << 1) | b;
+                have += 1;
+            }
+            Err(_) => break,
+        }
+    }
+
+    if have == 4 && delim == 0 {
+        // Escape: the four `0000` bits are consumed; read the payload in
+        // reverse order (`m LEVEL m RUN LAST`), then the `00001` opener.
+        // First marker (forward second marker, after LEVEL).
+        if br.read_bit_reverse()? != 1 {
+            return Err(TextureParseError::EscapeMarkerBitMissing);
+        }
+        // 11-bit LEVEL magnitude. Backward, the bits arrive tail-first,
+        // but read_bits_value reassembles the forward-order value.
+        let magnitude = br.read_bits_value(11)?;
+        // Second marker (forward first marker, before LEVEL).
+        if br.read_bit_reverse()? != 1 {
+            return Err(TextureParseError::EscapeMarkerBitMissing);
+        }
+        let run = br.read_bits_value(6)?;
+        let last = br.read_bit_reverse()? == 1;
+        // Opening `00001` (Table B.23 ESCAPE row); tail-first that is the
+        // sequence 1,0,0,0,0.
+        let opener = [
+            br.read_bit_reverse()?,
+            br.read_bit_reverse()?,
+            br.read_bit_reverse()?,
+            br.read_bit_reverse()?,
+            br.read_bit_reverse()?,
+        ];
+        if opener != [1, 0, 0, 0, 0] {
+            return Err(TextureParseError::RvlcEscapeOpenerMissing {
+                window: ((opener[0] << 4)
+                    | (opener[1] << 3)
+                    | (opener[2] << 2)
+                    | (opener[3] << 1)
+                    | opener[4]),
+            });
+        }
+        if magnitude == 0 {
+            return Err(TextureParseError::ReservedEscapeLevel);
+        }
+        let level = if sign_negative {
+            -(magnitude as i32)
+        } else {
+            magnitude as i32
+        };
+        return Ok(AcEvent { last, run, level });
+    }
+
+    // Common path: the `delim`/`delim_bits` we speculatively read are the
+    // first up-to-4 bits of the reversed codeword. Continue accumulating
+    // until a reversed Table B.23 code matches (max 15 code bits).
+    let mut window: u32 = 0;
+    for &b in delim_bits.iter().take(have) {
+        window = (window << 1) | u32::from(b);
+    }
+    let mut window_len = have as u8;
+    loop {
+        if let Some((_, last, run, level)) =
+            match_rvlc_tcoef_reverse(window, window_len, table_kind)
+        {
+            let signed = if sign_negative { -level } else { level };
+            return Ok(AcEvent {
+                last,
+                run,
+                level: signed,
+            });
+        }
+        if window_len >= 15 {
+            return Err(TextureParseError::InvalidTcoef {
+                window: window as u16,
+            });
+        }
+        let bit = br.read_bit_reverse()?;
+        window = (window << 1) | u32::from(bit);
+        window_len += 1;
+    }
+}
+
+/// Run the reverse-direction EVENT loop over the DCT-coefficient region
+/// of a video packet for the `reversible_vlc == 1` path — the backward
+/// half of Annex E.1.4.4. The region `[start_bit, end_bit)` is decoded
+/// from `end_bit` toward `start_bit`; EVENTs are returned in **forward**
+/// scan order (the backward decode is reversed before returning).
+///
+/// The region may span several blocks; in forward order each block ends
+/// with its `LAST` EVENT, so backward decoding simply continues across
+/// block boundaries until the region is exhausted. The `LAST` flag is
+/// preserved on each EVENT so the caller can re-segment the recovered
+/// stream into blocks.
+///
+/// Under Annex E the backward decode is expected to terminate on the
+/// first illegal RVLC (the bits past the error are corrupt). When that
+/// happens after at least one EVENT was recovered, the recovered tail is
+/// returned (the whole point of the two-way decode); if the very first
+/// (trailing) EVENT is already illegal, the error is propagated.
+pub fn decode_ac_events_rvlc_reverse(
+    data: &[u8],
+    start_bit: usize,
+    end_bit: usize,
+    table_kind: TcoefTable,
+) -> Result<Vec<AcEvent>, TextureParseError> {
+    let mut br = crate::bitreader::BackwardBitReader::new(data, start_bit, end_bit);
+    let mut events = Vec::new();
+    while br.remaining_bits() > 0 {
+        match decode_ac_event_rvlc_reverse(&mut br, table_kind) {
+            Ok(ev) => events.push(ev),
+            Err(_) if !events.is_empty() => break,
+            Err(e) => return Err(e),
+        }
+    }
+    events.reverse();
+    Ok(events)
 }
 
 #[cfg(test)]
@@ -1837,5 +2055,154 @@ mod tests {
         let mut br = BitReader::new(&data);
         let err = decode_ac_events_rvlc(&mut br, TcoefTable::Inter).unwrap_err();
         assert_eq!(err, TextureParseError::Truncated);
+    }
+
+    // ---- §E.1.4.4 backward (reverse-direction) RVLC decode ----
+
+    /// Pack a bit-string into bytes and return `(data, total_bit_count)`.
+    /// Unlike [`bits`] the caller learns the exact number of valid bits so
+    /// a backward reader can be positioned at the true end.
+    fn bits_exact(s: &str) -> (Vec<u8>, usize) {
+        let cleaned: String = s.chars().filter(|c| *c == '0' || *c == '1').collect();
+        let n = cleaned.len();
+        (bits(&cleaned), n)
+    }
+
+    #[test]
+    fn reverse_bits_roundtrips() {
+        assert_eq!(reverse_bits(0b110, 3), 0b011);
+        assert_eq!(reverse_bits(0b1011, 4), 0b1101);
+        assert_eq!(reverse_bits(0b00001, 5), 0b10000);
+    }
+
+    #[test]
+    fn rvlc_reverse_common_single_event() {
+        // Forward INDEX 0 intra (LAST=0, RUN=0, LEVEL=1): `110` + sign 0.
+        let (data, nbits) = bits_exact("110 0");
+        let events = decode_ac_events_rvlc_reverse(&data, 0, nbits, TcoefTable::Intra).unwrap();
+        assert_eq!(
+            events,
+            vec![AcEvent {
+                last: false,
+                run: 0,
+                level: 1
+            }]
+        );
+    }
+
+    #[test]
+    fn rvlc_reverse_matches_forward_event_sequence() {
+        // Forward stream: INDEX 0 (110, intra 0,0,1) sign0,
+        // INDEX 5 (00100, intra 0,2,1) sign1, then a LAST EVENT
+        // INDEX 4 (1011, intra 1,0,1) sign0.
+        let (data, nbits) = bits_exact("110 0  00100 1  1011 0");
+        let mut fb = BitReader::new(&data);
+        let forward = decode_ac_events_rvlc(&mut fb, TcoefTable::Intra).unwrap();
+        let backward = decode_ac_events_rvlc_reverse(&data, 0, nbits, TcoefTable::Intra).unwrap();
+        assert_eq!(forward, backward);
+        assert_eq!(forward.len(), 3);
+        assert!(forward[2].last);
+    }
+
+    #[test]
+    fn rvlc_reverse_inter_column() {
+        // INDEX 1 inter (0,1,1) `111` sign0, INDEX 4 inter LAST (1,0,1)
+        // `1011` sign1.
+        let (data, nbits) = bits_exact("111 0  1011 1");
+        let backward = decode_ac_events_rvlc_reverse(&data, 0, nbits, TcoefTable::Inter).unwrap();
+        assert_eq!(
+            backward,
+            vec![
+                AcEvent {
+                    last: false,
+                    run: 1,
+                    level: 1
+                },
+                AcEvent {
+                    last: true,
+                    run: 0,
+                    level: -1
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn rvlc_reverse_type5_escape() {
+        // Forward Type-5 escape: LAST=1, RUN=63, LEVEL=1, sign 1
+        // (negative). Backward decode must recover it identically.
+        let (data, nbits) = bits_exact("00001 1 111111 1 00000000001 1 0000 1");
+        let mut fb = BitReader::new(&data);
+        let forward = decode_ac_event_rvlc(&mut fb, TcoefTable::Inter).unwrap();
+        let backward = decode_ac_events_rvlc_reverse(&data, 0, nbits, TcoefTable::Inter).unwrap();
+        assert_eq!(backward, vec![forward]);
+        assert_eq!(
+            backward[0],
+            AcEvent {
+                last: true,
+                run: 63,
+                level: -1
+            }
+        );
+    }
+
+    #[test]
+    fn rvlc_reverse_escape_then_common() {
+        // A non-last common EVENT followed by a LAST Type-5 escape; the
+        // backward decode (escape first, common second) reversed back to
+        // forward order must equal the forward decode.
+        let (data, nbits) = bits_exact("110 0  00001 1 000101 1 00000000011 1 0000 0");
+        let mut fb = BitReader::new(&data);
+        let forward = decode_ac_events_rvlc(&mut fb, TcoefTable::Intra).unwrap();
+        let backward = decode_ac_events_rvlc_reverse(&data, 0, nbits, TcoefTable::Intra).unwrap();
+        assert_eq!(forward, backward);
+        assert_eq!(backward.len(), 2);
+        assert_eq!(backward[1].run, 5);
+        assert_eq!(backward[1].level, 3);
+        assert!(backward[1].last);
+    }
+
+    #[test]
+    fn rvlc_reverse_longest_code() {
+        // INDEX 165 (15-bit code 011111101111101, intra 1,44,1) as a
+        // standalone LAST EVENT, sign 0.
+        let (data, nbits) = bits_exact("011111101111101 0");
+        let backward = decode_ac_events_rvlc_reverse(&data, 0, nbits, TcoefTable::Intra).unwrap();
+        assert_eq!(
+            backward,
+            vec![AcEvent {
+                last: true,
+                run: 44,
+                level: 1
+            }]
+        );
+    }
+
+    #[test]
+    fn rvlc_reverse_stops_on_error_keeping_recovered_tail() {
+        // A valid LAST EVENT at the end preceded by garbage. The backward
+        // decode recovers the trailing EVENT, then errors on the garbage —
+        // and keeps what it recovered (Annex E semantics).
+        let (data, nbits) = bits_exact("00000 00000  1011 0");
+        let backward = decode_ac_events_rvlc_reverse(&data, 0, nbits, TcoefTable::Intra).unwrap();
+        assert_eq!(
+            backward,
+            vec![AcEvent {
+                last: true,
+                run: 0,
+                level: 1
+            }]
+        );
+    }
+
+    #[test]
+    fn rvlc_reverse_first_event_error_propagates() {
+        // If the very first (trailing) EVENT is illegal, the error is
+        // surfaced rather than swallowed. All-zeros read backward decodes
+        // `s`, then `0000` (escape marker), then a 0 first marker → an
+        // EscapeMarkerBitMissing on the very first EVENT.
+        let (data, nbits) = bits_exact("00000 0000000");
+        let err = decode_ac_events_rvlc_reverse(&data, 0, nbits, TcoefTable::Intra).unwrap_err();
+        assert_eq!(err, TextureParseError::EscapeMarkerBitMissing);
     }
 }

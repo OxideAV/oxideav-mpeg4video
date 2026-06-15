@@ -8,6 +8,34 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 48 of the clean-room rebuild: the §E.1.4.4 **backward
+  (reverse-direction) reversible-VLC Tcoef decode** — the second half of
+  the Annex E two-way RVLC error-recovery method (round 47 landed the
+  forward half). A new `BackwardBitReader` (`src/bitreader.rs`) reads a
+  half-open absolute bit range `[start_bit, end_bit)` from `end_bit`
+  toward `start_bit` (`read_bit_reverse` emits stream bits tail-first;
+  `read_bits_value(n)` reassembles a fixed-length field in forward bit
+  order). `decode_ac_event_rvlc_reverse` decodes one EVENT in reverse:
+  the sign bit `s` is consumed first, then the four bits below it select
+  the common path (a Table B.23 reversible VLC, matched against its
+  bit-reversed code — RVLC codes are reverse-decodable by construction,
+  §E.1.3) or the Type-5 escape, whose closing `0000` delimiter is the
+  escape marker in the reverse direction (`00001` is *not* used backward,
+  §E.1.4.4.1). The escape payload `m LEVEL(11) m RUN(6) LAST(1)` is read
+  in reverse order, terminating with the `00001` opener (tail-first
+  `10000`). `decode_ac_events_rvlc_reverse(data, start_bit, end_bit,
+  table_kind)` runs the reverse loop over a video-packet DCT-coefficient
+  region across block boundaries and returns the recovered EVENTs in
+  **forward** scan order; per Annex E, a mid-region illegal RVLC stops
+  the decode while preserving the already-recovered trailing EVENTs. A
+  new `TextureParseError::RvlcEscapeOpenerMissing { window }` flags a
+  malformed backward opener. `reverse_bits(code, len)` bit-reverses a
+  forward codeword for the reverse match. 13 new tests: backward-reader
+  tail-first emission / forward-field reassembly / start-bound, the
+  `reverse_bits` roundtrip, forward↔backward equality on common-path and
+  escape sequences (single + multi-EVENT, intra + inter column), the
+  longest 15-bit code, the Annex-E error-recovery tail-preservation, and
+  first-EVENT error propagation. (843 lib tests, +12.)
 - Round 47 of the clean-room rebuild: the §7.4.1.2 reversible-VLC Tcoef
   decode for the `reversible_vlc == 1` path. A new `rvlc_tables.rs`
   transcribes Table B.23 — the 169 reversible EVENTs, each carrying both
