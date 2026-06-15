@@ -439,9 +439,9 @@ pub use scan::{
     InverseScanError, ScanType,
 };
 pub use texture::{
-    decode_ac_event, decode_ac_event_short_video_header, decode_ac_events,
-    decode_ac_events_short_video_header, decode_intra_dc, AcEvent, DcComponent,
-    IntraDcDifferential, TcoefTable, TextureParseError,
+    decode_ac_event, decode_ac_event_rvlc, decode_ac_event_short_video_header, decode_ac_events,
+    decode_ac_events_rvlc, decode_ac_events_short_video_header, decode_intra_dc, AcEvent,
+    DcComponent, IntraDcDifferential, TcoefTable, TextureParseError,
 };
 pub use vector_padding::{
     pad_macroblock_vectors, BlockTransparency, MacroblockPaddingMode, VectorPaddingError,

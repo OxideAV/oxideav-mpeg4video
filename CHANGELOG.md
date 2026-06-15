@@ -8,6 +8,28 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 47 of the clean-room rebuild: the §7.4.1.2 reversible-VLC Tcoef
+  decode for the `reversible_vlc == 1` path. A new `rvlc_tables.rs`
+  transcribes Table B.23 — the 169 reversible EVENTs, each carrying both
+  its intra `(LAST, RUN, LEVEL)` and inter `(LAST, RUN, LEVEL)` triple
+  under one prefix-free code (selected by the existing `TcoefTable`
+  argument). `decode_ac_event_rvlc` decodes one EVENT: the common path
+  is a Table B.23 code plus its trailing sign bit `s`; combinations not
+  in the table use the §7.4.1.3 Type-5 escape (the only escape mode
+  permitted when `reversible_vlc == 1`) — opener `00001`, fixed-length
+  `LAST(1) RUN(6) marker LEVEL(11) marker`, closing delimiter `0000`,
+  sign bit `s`, with the 11-bit unsigned LEVEL magnitude per Table B.25
+  (`0` forbidden) and the 6-bit RUN per Table B.24.
+  `decode_ac_events_rvlc` runs the §6.2.7 `while (!last)` loop. A new
+  `TextureParseError::RvlcEscapeDelimiterMissing { window }` flags a
+  malformed closing delimiter; the existing `EscapeMarkerBitMissing` and
+  `ReservedEscapeLevel` cover the marker bits and the forbidden LEVEL.
+  The escape opener `00001` is prefix-disjoint from every Table B.23
+  code (none begins with `0000`), so the common and escape paths are
+  distinguished by the leading five bits. 13 new tests (prefix-freeness
+  + 169-entry count, intra/inter column divergence, longest 16-bit code,
+  Type-5 positive/negative escapes, forbidden-LEVEL / marker / delimiter
+  / invalid-code rejections, event loop). (831 lib tests, +13.)
 - Round 46 of the clean-room rebuild: §7.7.2.1 / Figure 7-46 / Figure
   7-47 field-aware spatial neighbour selection, closing the round-45
   follow-up. A new `MbMv::Field { top, bottom }` records a

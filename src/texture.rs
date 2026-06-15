@@ -166,8 +166,18 @@ pub enum TextureParseError {
     /// LEVEL, per §7.4.1.3) was expected to be 1 but was read as 0.
     EscapeMarkerBitMissing,
     /// A Type-3 escape carried a reserved 12-bit LEVEL value (`0` or
-    /// `-2048`, both forbidden by Table B.18 b).
+    /// `-2048`, both forbidden by Table B.18 b). Also raised for a
+    /// Type-5 (reversible-VLC) escape whose 11-bit LEVEL decoded to the
+    /// forbidden value `0` (Table B.25).
     ReservedEscapeLevel,
+    /// A Type-5 (reversible-VLC) escape did not terminate with the
+    /// closing delimiter `0000` (§7.4.1.3 / Table B.23 ESCAPE row); the
+    /// four bits read in its place are reported for diagnostics.
+    RvlcEscapeDelimiterMissing {
+        /// The four bits read where the closing `0000` delimiter was
+        /// expected (right-aligned).
+        window: u8,
+    },
 }
 
 impl core::fmt::Display for TextureParseError {
@@ -191,6 +201,12 @@ impl core::fmt::Display for TextureParseError {
             }
             TextureParseError::ReservedEscapeLevel => {
                 write!(f, "Type-3 escape LEVEL was a reserved value (0 or -2048)")
+            }
+            TextureParseError::RvlcEscapeDelimiterMissing { window } => {
+                write!(
+                    f,
+                    "Type-5 escape closing delimiter was 0b{window:04b} (expected 0b0000)"
+                )
             }
         }
     }
@@ -380,6 +396,20 @@ const TCOEF_ESCAPE_LEN: u8 = 7;
 // which is read separately. Generated verbatim from the spec tables;
 // every code is prefix-free and none collides with TCOEF_ESCAPE_CODE.
 include!("tcoef_tables.rs");
+
+// Table B.23 RVLC EVENTs are
+// `(code_bits, code_len, intra_last, intra_run, intra_level, inter_last,
+//  inter_run, inter_level)`; `code_bits` is the reversible VLC *without*
+// its trailing sign bit `s`. The intra / inter triples share one code.
+// Generated verbatim from the spec; every code is prefix-free and none
+// collides with the escape delimiter `00001` / `0000`.
+include!("rvlc_tables.rs");
+
+/// The §7.4.1.3 Type-5 (reversible-VLC) escape opening delimiter `00001`
+/// (5 bits), per Table B.23 ESCAPE row. The closing delimiter is `0000`
+/// followed by the LEVEL sign bit `s`.
+const RVLC_ESCAPE_OPEN: u32 = 0b00001;
+const RVLC_ESCAPE_OPEN_LEN: u8 = 5;
 
 /// Match a prefix-free Tcoef table against the leading bits of `window`.
 /// Returns `(code_len, last, run, level)` on a hit (before the sign bit),
@@ -680,6 +710,136 @@ pub fn decode_ac_events_short_video_header(
     let mut events = Vec::new();
     loop {
         let ev = decode_ac_event_short_video_header(br, table_kind)?;
+        let last = ev.last;
+        events.push(ev);
+        if last {
+            return Ok(events);
+        }
+    }
+}
+
+/// Match the prefix-free reversible Tcoef VLC (Table B.23) against the
+/// leading bits of `window`, returning `(code_len, last, run, level)` for
+/// the selected table-kind column on a hit (before the sign bit), `None`
+/// on no match.
+fn match_rvlc_tcoef(
+    window: u32,
+    window_len: u8,
+    table_kind: TcoefTable,
+) -> Option<(u8, bool, u32, i32)> {
+    for &(code, len, i_last, i_run, i_level, n_last, n_run, n_level) in RVLC_TCOEF {
+        if len <= window_len {
+            let shift = window_len - len;
+            if (window >> shift) == code {
+                let (last, run, level) = match table_kind {
+                    TcoefTable::Intra => (i_last, i_run, i_level),
+                    TcoefTable::Inter => (n_last, n_run, n_level),
+                };
+                return Some((len, last != 0, run as u32, level as i32));
+            }
+        }
+    }
+    None
+}
+
+/// Decode one §7.4.1.2 `DCT coefficient` EVENT for the
+/// `short_video_header == 0`, `reversible_vlc == 1` path (the
+/// reversible-VLC tables of §6.3.3 / §7.4.1.2).
+///
+/// The common case is a single Table B.23 reversible VLC (its intra or
+/// inter column, selected by `table_kind`) plus a trailing sign bit `s`
+/// (`0` positive, `1` negative). The combinations not represented in the
+/// table use the §7.4.1.3 Type-5 escape — the only escape mode permitted
+/// when `reversible_vlc == 1`:
+///
+/// * **Type 5** — opening delimiter `00001`, then a fixed-length
+///   `LAST(1)` `RUN(6)` `marker_bit` `LEVEL(11)` `marker_bit`, then the
+///   closing delimiter `0000` and the sign bit `s` (Table B.23 ESCAPE
+///   row + the diagram beneath it). The 11-bit LEVEL is the unsigned
+///   magnitude per Table B.25 (`0` is forbidden); its sign comes from
+///   the closing `s`. The two marker bits prevent `resync_marker`
+///   emulation and must both be 1.
+///
+/// The escape opener `00001` is prefix-disjoint from every Table B.23
+/// code (no code begins with `0000`), so an ordinary reversible VLC is
+/// distinguished from the escape by inspecting the leading five bits.
+pub fn decode_ac_event_rvlc(
+    br: &mut BitReader<'_>,
+    table_kind: TcoefTable,
+) -> Result<AcEvent, TextureParseError> {
+    // Peek the 5-bit escape opener without consuming, so an ordinary
+    // reversible VLC (none of which begins with `0000`) falls through to
+    // the table decode.
+    let peek = br.remaining_bits().min(RVLC_ESCAPE_OPEN_LEN as usize) as u8;
+    if peek == 0 {
+        return Err(TextureParseError::Truncated);
+    }
+    let is_escape = peek == RVLC_ESCAPE_OPEN_LEN
+        && br.next_bits(RVLC_ESCAPE_OPEN_LEN as usize)? == RVLC_ESCAPE_OPEN;
+
+    if !is_escape {
+        // Common path: a Table B.23 reversible VLC plus its sign bit.
+        let avail = br.remaining_bits().min(16) as u8;
+        if avail == 0 {
+            return Err(TextureParseError::Truncated);
+        }
+        let window = br.next_bits(avail as usize)?;
+        let (code_len, last, run, level) =
+            match_rvlc_tcoef(window, avail, table_kind).ok_or(TextureParseError::InvalidTcoef {
+                window: window as u16,
+            })?;
+        br.skip_bits(code_len as usize)?;
+        let sign_negative = br.read_bool()?;
+        let signed = if sign_negative { -level } else { level };
+        return Ok(AcEvent {
+            last,
+            run,
+            level: signed,
+        });
+    }
+
+    // Type 5: consume the opener, then the fixed-length payload.
+    br.skip_bits(RVLC_ESCAPE_OPEN_LEN as usize)?;
+    let last = br.read_bool()?;
+    let run = br.read_bits(6)?;
+    if !br.read_bool()? {
+        return Err(TextureParseError::EscapeMarkerBitMissing);
+    }
+    let magnitude = br.read_bits(11)?;
+    if !br.read_bool()? {
+        return Err(TextureParseError::EscapeMarkerBitMissing);
+    }
+    // Closing delimiter `0000` then sign bit `s`.
+    let delimiter = br.read_bits(4)?;
+    if delimiter != 0 {
+        return Err(TextureParseError::RvlcEscapeDelimiterMissing {
+            window: delimiter as u8,
+        });
+    }
+    let sign_negative = br.read_bool()?;
+    // LEVEL == 0 is forbidden by Table B.25.
+    if magnitude == 0 {
+        return Err(TextureParseError::ReservedEscapeLevel);
+    }
+    let level = if sign_negative {
+        -(magnitude as i32)
+    } else {
+        magnitude as i32
+    };
+    Ok(AcEvent { last, run, level })
+}
+
+/// Run the §6.2.7 `while (!last) DCT coefficient` loop for the
+/// `short_video_header == 0`, `reversible_vlc == 1` path. See
+/// [`decode_ac_event_rvlc`] for the per-EVENT semantics. An empty stream
+/// that never reaches `LAST == 1` returns [`TextureParseError::Truncated`].
+pub fn decode_ac_events_rvlc(
+    br: &mut BitReader<'_>,
+    table_kind: TcoefTable,
+) -> Result<Vec<AcEvent>, TextureParseError> {
+    let mut events = Vec::new();
+    loop {
+        let ev = decode_ac_event_rvlc(br, table_kind)?;
         let last = ev.last;
         events.push(ev);
         if last {
@@ -1490,5 +1650,192 @@ mod tests {
         assert_eq!(ev.run, 32);
         assert_eq!(ev.level, 3);
         assert_eq!(br.bit_position(), 22);
+    }
+
+    // ---- §7.4.1.2 reversible-VLC (Table B.23) path ----
+
+    #[test]
+    fn rvlc_table_is_prefix_free_and_escape_disjoint() {
+        // Every RVLC code is prefix-free and none collides with the
+        // escape opener `00001` / closing delimiter `0000`.
+        for (i, &(ca, la, ..)) in RVLC_TCOEF.iter().enumerate() {
+            // No code begins with `0000` (reserved for the escape).
+            if la >= 4 {
+                assert_ne!(ca >> (la - 4), 0, "code {i} begins with 0000");
+            } else {
+                assert_ne!(ca, 0, "code {i} begins with 0000");
+            }
+            for (j, &(cb, lb, ..)) in RVLC_TCOEF.iter().enumerate() {
+                if i == j || la > lb {
+                    continue;
+                }
+                assert_ne!(cb >> (lb - la), ca, "code {i} is a prefix of code {j}");
+            }
+        }
+        assert_eq!(RVLC_TCOEF.len(), 169);
+    }
+
+    #[test]
+    fn rvlc_common_intra_first_code() {
+        // Table B.23 INDEX 0: intra (LAST=0, RUN=0, LEVEL=1), code
+        // 110s. Sign bit 0 → +1.
+        let data = bits("110 0");
+        let mut br = BitReader::new(&data);
+        let ev = decode_ac_event_rvlc(&mut br, TcoefTable::Intra).unwrap();
+        assert_eq!(
+            ev,
+            AcEvent {
+                last: false,
+                run: 0,
+                level: 1
+            }
+        );
+        assert_eq!(br.bit_position(), 4);
+    }
+
+    #[test]
+    fn rvlc_common_inter_differs_from_intra() {
+        // Table B.23 INDEX 1: code 111s. intra=(0,0,2), inter=(0,1,1).
+        let intra = bits("111 1"); // sign 1 → negative
+        let mut br = BitReader::new(&intra);
+        let ev = decode_ac_event_rvlc(&mut br, TcoefTable::Intra).unwrap();
+        assert_eq!(
+            ev,
+            AcEvent {
+                last: false,
+                run: 0,
+                level: -2
+            }
+        );
+
+        let inter = bits("111 0");
+        let mut br = BitReader::new(&inter);
+        let ev = decode_ac_event_rvlc(&mut br, TcoefTable::Inter).unwrap();
+        assert_eq!(
+            ev,
+            AcEvent {
+                last: false,
+                run: 1,
+                level: 1
+            }
+        );
+    }
+
+    #[test]
+    fn rvlc_common_last_flag_index4() {
+        // INDEX 4: code 1011s, intra=(1,0,1), inter=(1,0,1).
+        let data = bits("1011 0");
+        let mut br = BitReader::new(&data);
+        let ev = decode_ac_event_rvlc(&mut br, TcoefTable::Intra).unwrap();
+        assert!(ev.last);
+        assert_eq!(ev.run, 0);
+        assert_eq!(ev.level, 1);
+    }
+
+    #[test]
+    fn rvlc_longest_16bit_code() {
+        // INDEX 168 (last row, 15-bit prefix + sign): code
+        // 011111101111101s, intra=(1,44,1), inter=(1,44,1).
+        let data = bits("011111101111101 1");
+        let mut br = BitReader::new(&data);
+        let ev = decode_ac_event_rvlc(&mut br, TcoefTable::Inter).unwrap();
+        assert!(ev.last);
+        assert_eq!(ev.run, 44);
+        assert_eq!(ev.level, -1);
+        assert_eq!(br.bit_position(), 16);
+    }
+
+    #[test]
+    fn rvlc_type5_escape_positive() {
+        // Type 5: open 00001 + LAST(1) + RUN(6) + marker(1) +
+        // LEVEL(11) + marker(1) + closing 0000 + sign s.
+        // LAST=0, RUN=5 (000101), LEVEL=300 (00100101100), sign 0.
+        let data = bits("00001 0 000101 1 00100101100 1 0000 0");
+        let mut br = BitReader::new(&data);
+        let ev = decode_ac_event_rvlc(&mut br, TcoefTable::Intra).unwrap();
+        assert_eq!(
+            ev,
+            AcEvent {
+                last: false,
+                run: 5,
+                level: 300
+            }
+        );
+        // 5 + 1 + 6 + 1 + 11 + 1 + 4 + 1 = 30 bits.
+        assert_eq!(br.bit_position(), 30);
+    }
+
+    #[test]
+    fn rvlc_type5_escape_negative_with_last() {
+        // LAST=1, RUN=63 (111111), LEVEL=1 (00000000001), sign 1.
+        let data = bits("00001 1 111111 1 00000000001 1 0000 1");
+        let mut br = BitReader::new(&data);
+        let ev = decode_ac_event_rvlc(&mut br, TcoefTable::Inter).unwrap();
+        assert_eq!(
+            ev,
+            AcEvent {
+                last: true,
+                run: 63,
+                level: -1
+            }
+        );
+    }
+
+    #[test]
+    fn rvlc_type5_escape_forbidden_zero_level() {
+        // LEVEL == 0 is forbidden (Table B.25).
+        let data = bits("00001 0 000000 1 00000000000 1 0000 0");
+        let mut br = BitReader::new(&data);
+        let err = decode_ac_event_rvlc(&mut br, TcoefTable::Intra).unwrap_err();
+        assert_eq!(err, TextureParseError::ReservedEscapeLevel);
+    }
+
+    #[test]
+    fn rvlc_type5_escape_first_marker_must_be_one() {
+        let data = bits("00001 0 000001 0 00000000001 1 0000 0");
+        let mut br = BitReader::new(&data);
+        let err = decode_ac_event_rvlc(&mut br, TcoefTable::Intra).unwrap_err();
+        assert_eq!(err, TextureParseError::EscapeMarkerBitMissing);
+    }
+
+    #[test]
+    fn rvlc_type5_escape_bad_closing_delimiter() {
+        // Closing delimiter must be 0000.
+        let data = bits("00001 0 000001 1 00000000001 1 0001 0");
+        let mut br = BitReader::new(&data);
+        let err = decode_ac_event_rvlc(&mut br, TcoefTable::Intra).unwrap_err();
+        assert_eq!(
+            err,
+            TextureParseError::RvlcEscapeDelimiterMissing { window: 0b0001 }
+        );
+    }
+
+    #[test]
+    fn rvlc_invalid_code_reports_window() {
+        // `0000` is reserved for the escape; a `0000` not followed by `1`
+        // (i.e. `00000...`) is neither a code nor a valid opener.
+        let data = bits("00000 0000000");
+        let mut br = BitReader::new(&data);
+        let err = decode_ac_event_rvlc(&mut br, TcoefTable::Intra).unwrap_err();
+        assert!(matches!(err, TextureParseError::InvalidTcoef { .. }));
+    }
+
+    #[test]
+    fn rvlc_event_loop_runs_until_last() {
+        // INDEX 0 (110s, intra not-last) then INDEX 4 (1011s, last).
+        let data = bits("110 0 1011 0");
+        let mut br = BitReader::new(&data);
+        let events = decode_ac_events_rvlc(&mut br, TcoefTable::Intra).unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(!events[0].last);
+        assert!(events[1].last);
+    }
+
+    #[test]
+    fn rvlc_event_loop_truncated() {
+        let data: [u8; 0] = [];
+        let mut br = BitReader::new(&data);
+        let err = decode_ac_events_rvlc(&mut br, TcoefTable::Inter).unwrap_err();
+        assert_eq!(err, TextureParseError::Truncated);
     }
 }

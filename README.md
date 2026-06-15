@@ -43,9 +43,13 @@ encoder.
   2 / 3) with field-aware neighbour selection.
 - **Residual + reconstruction**: intra DC prediction, AC prediction,
   the intra/inter Tcoef EVENT VLCs (Tables B.16 / B.17) with the escape
-  forms, zigzag / alternate scan, §7.4 inverse quantisation (methods 1
-  and 2), the 8×8 IDCT, and the §7.3 `d[y][x]` reconstruction with the
-  display clip for I-, P-, and inter macroblocks.
+  forms, the reversible-VLC Tcoef table (Table B.23, intra + inter
+  columns) with its Type-5 escape (`00001` + LAST/RUN/marker/LEVEL/marker
+  + closing `0000` + sign, Tables B.24 / B.25) for the
+  `reversible_vlc == 1` path, zigzag / alternate scan, §7.4 inverse
+  quantisation (methods 1 and 2), the 8×8 IDCT, and the §7.3 `d[y][x]`
+  reconstruction with the display clip for I-, P-, and inter
+  macroblocks.
 - **B-VOP prediction**: forward / backward / interpolated / direct
   modes, bidirectional averaging, and 8×8 luminance prediction-block
   generation.
@@ -57,7 +61,9 @@ encoder.
 - Runtime registration (`register` is a no-op) and a single top-level
   frame-decode entry point.
 - Encoder.
-- RVLC Tcoef tables (B.23..B.25) + Type-5 escape, and the SA-DCT
+- The Annex E.1.4.4 two-way / backward RVLC error-recovery decode (the
+  forward `reversible_vlc == 1` Tcoef decode is implemented; the
+  bit-discard error-concealment strategies are not), and the SA-DCT
   modified inverse scan.
 - Sprite / GMC bodies, scalability enhancement layers, Studio Profile,
   and non-rectangular shapes (rejected with typed errors).
