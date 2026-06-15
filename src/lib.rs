@@ -402,7 +402,8 @@ pub use motion::{
     PMbMotionVectors, TypeOfMb, AMV_PIXEL_COUNT,
 };
 pub use mv_predictor_grid::{
-    gather_mv_predictor_candidates, MbMv, MbMvRecord, MvGrid, MvGridError,
+    gather_field_mv_predictor_candidates, gather_mv_predictor_candidates, MbMv, MbMvRecord, MvGrid,
+    MvGridError,
 };
 pub use neighbour::{
     block_grid_position, BlockGridPosition, BlockNeighbour, ChromaPlane, IntraBlockGrid,

@@ -5,13 +5,50 @@ A pure-Rust MPEG-4 Part 2 Video codec (ISO/IEC 14496-2) for the
 
 ## Status
 
-**Round 45 of the clean-room rebuild (2026-06-14).** The prior
+**Round 46 of the clean-room rebuild (2026-06-15).** The prior
 implementation was retired on 2026-05-18 under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md);
 the VLC tables admitted to sourcing their numeric entries from an
 external library. Master history was fully erased per the Hat-3 cold-
 enforcement procedure.
 
+* Round 46 — §7.7.2.1 / Figure 7-46 / Figure 7-47 field-aware spatial
+  neighbour selection, closing the round-45 follow-up "selecting the
+  actual spatial neighbours from the macroblock grid for the field-aware
+  candidates". Round 45 added `predict_field_motion_vector([FieldPredCandidate;
+  3])` but the caller had to classify the three neighbours by hand; this
+  round wires the round-30 `MvGrid` to produce that triple. A new
+  `MbMv::Field { top, bottom }` records a field-predicted neighbour's two
+  field motion vectors (`MV f1` / `MV f2`); `MvGrid::record_field` /
+  `MbMvRecord::field` set it. `MvGrid::field_predictor_candidates(mb_row,
+  mb_col)` (and the free `gather_field_mv_predictor_candidates`) resolve
+  the three Figure 7-46 / 7-47 macroblock-level positions — `MV1` (left
+  MB), `MV2` (above MB), `MV3` (above-right MB), coinciding with the
+  §7.6.5 frame-mode top-left-block layout — into a `[FieldPredCandidate;
+  3]` ready for `predict_field_motion_vector`. Each neighbour keeps its
+  coding mode: a frame-predicted neighbour (`OneMv`, or — per the
+  §7.7.2.1 "8x8 block motion vector closest to the upper left block of
+  the current MB" rule — the selected sub-block of a `FourMv`) →
+  `FieldPredCandidate::Frame`; a field-predicted neighbour →
+  `FieldPredCandidate::Field` so the predictor applies `Div2Round(MVf1 +
+  MVf2)` itself (CASE 2 / CASE 3); an absent / transparent / out-of-VOP
+  neighbour → `FieldPredCandidate::Invalid` (the §7.6.5 validity rules
+  then apply). The existing frame-mode `MvGrid::predictor_candidates`
+  query now collapses a `Field` neighbour to its `Div2Round(MVf1 + MVf2)`
+  frame candidate, matching §7.7.2.1 CASE 2 / Figure 7-47 (and the
+  §7.6.6 OBMC rule for an adjacent field-predicted MB). With this, the
+  interlaced P-VOP field-prediction path is end-to-end: parse (rounds
+  39–42), MV predictor selection (round 45) + candidate gathering (this
+  round), reconstruction (round 43), and half-/quarter-sample field MC
+  (rounds 43/44). 9 tests pin the path: the `Field` record constructor +
+  getter, out-of-bounds rejection, the top-left-of-VOP all-invalid case,
+  CASE-1 frame-neighbour pass-through reducing to the progressive median,
+  the §7.7.2.1 "closest to upper-left" `FourMv` sub-block selection,
+  field-neighbour pair preservation (with the frame-mode query collapsing
+  the same neighbour for contrast), transparent/absent → invalid, an
+  end-to-end CASE 3 candidate-gather → predictor →
+  `reconstruct_field_motion_vectors` composition, and free-function
+  equivalence. (818 lib tests, +9; 12 doc, +1.)
 * Round 45 — §7.7.2.1 field-MV predictor selection (CASE 1 / CASE 2 /
   CASE 3), closing the round-43/44 follow-up "field-MV CASE 1/2/3
   predictor selection over field-aware neighbours". The §7.7.2.1 rule

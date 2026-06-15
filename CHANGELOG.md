@@ -8,6 +8,29 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 46 of the clean-room rebuild: §7.7.2.1 / Figure 7-46 / Figure
+  7-47 field-aware spatial neighbour selection, closing the round-45
+  follow-up. A new `MbMv::Field { top, bottom }` records a
+  field-predicted neighbour's two field motion vectors;
+  `MvGrid::record_field` / `MbMvRecord::field` set it.
+  `MvGrid::field_predictor_candidates(mb_row, mb_col)` (and the free
+  `gather_field_mv_predictor_candidates`) resolve the three Figure 7-46 /
+  7-47 macroblock-level positions (`MV1` left, `MV2` above, `MV3`
+  above-right — coinciding with the §7.6.5 frame-mode top-left-block
+  layout) into a `[FieldPredCandidate; 3]` ready for round 45's
+  `predict_field_motion_vector`. A frame-predicted neighbour (`OneMv`, or
+  — per the §7.7.2.1 "8x8 block motion vector closest to the upper left
+  block of the current MB" rule — the selected sub-block of a `FourMv`)
+  → `FieldPredCandidate::Frame`; a field-predicted neighbour →
+  `FieldPredCandidate::Field`; an absent / transparent / out-of-VOP
+  neighbour → `FieldPredCandidate::Invalid`. The existing frame-mode
+  `MvGrid::predictor_candidates` query now collapses a `Field` neighbour
+  to its `Div2Round(MVf1 + MVf2)` frame candidate (§7.7.2.1 CASE 2 /
+  Figure 7-47, also the §7.6.6 OBMC adjacent-field-MB rule). With this
+  the interlaced P-VOP field-prediction path is end-to-end (parse rounds
+  39–42, predictor selection round 45 + gathering this round,
+  reconstruction round 43, half-/quarter-sample field MC rounds 43/44).
+  9 new tests. (818 lib tests, +9; 12 doc, +1.)
 - Round 45 of the clean-room rebuild: §7.7.2.1 field-MV predictor
   selection (CASE 1 / CASE 2 / CASE 3), closing the round-43/44
   follow-up. New `FieldPredCandidate` enum (`Frame` /

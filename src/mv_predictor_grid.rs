@@ -90,7 +90,17 @@
 //! `[Option<MotionVector>; 3]` triple, so this module's contract is
 //! "supply `None` where appropriate, supply `Some(MV)` otherwise."
 
-use crate::motion::MotionVector;
+use crate::motion::{FieldPredCandidate, MotionVector};
+
+/// `Div2Round(x) = (x >> 1) | (x & 1)` (§7.7.2.1) — the averaging-rounding
+/// operator that maps a field-predicted neighbour's two field motion
+/// vectors onto a single frame-mode candidate vector for the §7.6.5
+/// median predictor (Figure 7-47). Duplicated here so the grid layer has
+/// no dependency on the field-MC module, matching the same `const fn` in
+/// [`crate::motion`].
+const fn div2_round(x: i32) -> i32 {
+    (x >> 1) | (x & 1)
+}
 
 /// The motion-vector content of one macroblock recorded in
 /// [`MvGrid`].
@@ -108,6 +118,22 @@ pub enum MbMv {
     /// mode). Indexing follows Figure 6-8: `[block 1 (TL, i=0), block 2
     /// (TR, i=1), block 3 (BL, i=2), block 4 (BR, i=3)]`.
     FourMv([MotionVector; 4]),
+    /// The macroblock is field predicted (§7.7.2.1) — it carries a top
+    /// (`MV f1`) and a bottom (`MV f2`) field motion vector. When this
+    /// macroblock is queried as a §7.6.5 frame-mode neighbour
+    /// ([`MvGrid::predictor_candidates`]) the spec maps it to a single
+    /// frame vector via `Div2Round(MVf1 + MVf2)` (§7.7.2.1 CASE 2 /
+    /// Figure 7-47, also the §7.6.6 OBMC rule for an adjacent
+    /// field-predicted MB); when queried by the field-MV predictor
+    /// ([`MvGrid::field_predictor_candidates`]) it surfaces both field
+    /// vectors so [`crate::motion::predict_field_motion_vector`] can
+    /// apply CASE 2 / CASE 3 itself.
+    Field {
+        /// Top-field motion vector (`MV f1`).
+        top: MotionVector,
+        /// Bottom-field motion vector (`MV f2`).
+        bottom: MotionVector,
+    },
 }
 
 /// 1-MV vs 4-MV mode plus the per-luma-block transparency mask of a
@@ -139,6 +165,17 @@ impl MbMvRecord {
     pub fn four_mv(mvs: [MotionVector; 4]) -> Self {
         Self {
             content: MbMv::FourMv(mvs),
+            transparent: [false; 4],
+        }
+    }
+
+    /// Convenience constructor for a field-predicted macroblock
+    /// (§7.7.2.1) with all four blocks opaque. `top` is the top-field
+    /// motion vector (`MV f1`), `bottom` the bottom-field motion vector
+    /// (`MV f2`).
+    pub fn field(top: MotionVector, bottom: MotionVector) -> Self {
+        Self {
+            content: MbMv::Field { top, bottom },
             transparent: [false; 4],
         }
     }
@@ -306,6 +343,20 @@ impl MvGrid {
         self.record(mb_row, mb_col, MbMvRecord::four_mv(mvs))
     }
 
+    /// Convenience wrapper for [`Self::record`] with a fully-opaque
+    /// field-predicted macroblock (§7.7.2.1). `top` is the top-field
+    /// motion vector (`MV f1`), `bottom` the bottom-field motion vector
+    /// (`MV f2`).
+    pub fn record_field(
+        &mut self,
+        mb_row: usize,
+        mb_col: usize,
+        top: MotionVector,
+        bottom: MotionVector,
+    ) -> Result<(), MvGridError> {
+        self.record(mb_row, mb_col, MbMvRecord::field(top, bottom))
+    }
+
     /// Convenience wrapper for [`Self::record`] writing an
     /// [`MbMv::Absent`] entry — the §7.6.5 "treated as transparent"
     /// boundary substitution for macroblocks outside the current
@@ -346,6 +397,58 @@ impl MvGrid {
             MbMv::Absent => None,
             MbMv::OneMv(mv) => Some(mv),
             MbMv::FourMv(mvs) => Some(mvs[block_idx]),
+            // §7.7.2.1 CASE 2 / Figure 7-47: when a field-predicted MB
+            // is consulted as a frame-mode neighbour, its candidate
+            // vector is `Div2Round(MVf1 + MVf2)` per component, mapping
+            // both field offsets onto the half-/quarter-pel grid.
+            MbMv::Field { top, bottom } => Some(MotionVector {
+                x: div2_round(top.x + bottom.x),
+                y: div2_round(top.y + bottom.y),
+            }),
+        }
+    }
+
+    /// Resolve the §7.7.2.1 field-MV candidate at luminance sub-grid
+    /// position `(sub_row, sub_col)`.
+    ///
+    /// Unlike [`Self::sub_block_mv`] this preserves a field-predicted
+    /// neighbour's two field motion vectors instead of collapsing them
+    /// with `Div2Round`: the field-MV predictor
+    /// ([`crate::motion::predict_field_motion_vector`]) needs the raw
+    /// pair so it can apply the CASE 2 / CASE 3 mapping itself. A
+    /// frame-predicted neighbour (`OneMv`, or the per-position sub-block
+    /// of a `FourMv`) maps to [`FieldPredCandidate::Frame`]; an absent /
+    /// transparent / out-of-VOP neighbour maps to
+    /// [`FieldPredCandidate::Invalid`].
+    fn field_candidate_at(&self, sub_row: isize, sub_col: isize) -> FieldPredCandidate {
+        if sub_row < 0 || sub_col < 0 {
+            return FieldPredCandidate::Invalid;
+        }
+        let sub_row = sub_row as usize;
+        let sub_col = sub_col as usize;
+        if sub_row >= 2 * self.mb_rows || sub_col >= 2 * self.mb_cols {
+            return FieldPredCandidate::Invalid;
+        }
+        let mb_row = sub_row / 2;
+        let mb_col = sub_col / 2;
+        let row_bit = sub_row & 1;
+        let col_bit = sub_col & 1;
+        let block_idx = 2 * row_bit + col_bit;
+        let cell = &self.cells[self.cell_index(mb_row, mb_col)];
+        if cell.transparent[block_idx] {
+            return FieldPredCandidate::Invalid;
+        }
+        match cell.content {
+            MbMv::Absent => FieldPredCandidate::Invalid,
+            MbMv::OneMv(mv) => FieldPredCandidate::Frame(mv),
+            // §7.7.2.1 CASE 1 / CASE 3: "If the candidate block i is in
+            // four MV motion (8x8) mode, the 8x8 block motion vector
+            // closest to the upper left block of the current MB is
+            // used." The Figure 7-46 sub-grid position already names
+            // that sub-block, so the frame vector at this slot is the
+            // selected 8x8 vector.
+            MbMv::FourMv(mvs) => FieldPredCandidate::Frame(mvs[block_idx]),
+            MbMv::Field { top, bottom } => FieldPredCandidate::Field { top, bottom },
         }
     }
 
@@ -426,6 +529,75 @@ impl MvGrid {
             self.sub_block_mv(p3.0, p3.1),
         ])
     }
+
+    /// Gather the three §7.7.2.1 / Figure 7-46 / Figure 7-47 candidate
+    /// predictors for a **field-predicted** current macroblock at
+    /// `(mb_row, mb_col)`, classified as [`FieldPredCandidate`]s ready to
+    /// feed into [`crate::motion::predict_field_motion_vector`].
+    ///
+    /// A field-predicted macroblock forms one shared `(Px, Py)` predictor
+    /// for both fields, so — unlike the per-8×8-block frame predictor —
+    /// the field-MV predictor is queried once per macroblock. Figures
+    /// 7-46 / 7-47 place the three candidates at the macroblock-level
+    /// `MV1` (left), `MV2` (above), `MV3` (above-right) positions, which
+    /// coincide with the §7.6.5 frame-mode layout for the top-left block
+    /// (`block_index = 0`): `MV1` is the left MB's right-column sub-block,
+    /// `MV2` the above MB's bottom-left sub-block, `MV3` the above-right
+    /// MB's bottom-left sub-block (the §7.7.2.1 "8x8 block motion vector
+    /// closest to the upper left block of the current MB" rule for a
+    /// `FourMv` neighbour). Each resolved neighbour keeps its coding mode:
+    ///
+    /// * a frame-predicted neighbour (`OneMv`, or the selected 8×8
+    ///   sub-block of a `FourMv`) → [`FieldPredCandidate::Frame`]
+    ///   (CASE 1 / CASE 3 "frame motion vector for the macroblock");
+    /// * a field-predicted neighbour → [`FieldPredCandidate::Field`] so
+    ///   the predictor applies `Div2Round(MVf1 + MVf2)` itself
+    ///   (CASE 2 / CASE 3);
+    /// * an absent / transparent / out-of-VOP neighbour →
+    ///   [`FieldPredCandidate::Invalid`] (the §7.6.5 validity rules then
+    ///   apply inside [`crate::motion::predict_field_motion_vector`]).
+    ///
+    /// Whether the result is consumed as CASE 1 (no field neighbour),
+    /// CASE 2 (frame-predicted current MB with ≥1 field neighbour) or
+    /// CASE 3 (field-predicted current MB with ≥1 field neighbour) is the
+    /// caller's dispatch; this query supplies the same classified triple
+    /// for all three, and the predictor's mapping is identical across
+    /// them.
+    ///
+    /// Returns [`MvGridError`] only when `mb_row` / `mb_col` is out of
+    /// range; never reads outside the grid.
+    pub fn field_predictor_candidates(
+        &self,
+        mb_row: usize,
+        mb_col: usize,
+    ) -> Result<[FieldPredCandidate; 3], MvGridError> {
+        if mb_row >= self.mb_rows {
+            return Err(MvGridError::RowOutOfBounds {
+                mb_row,
+                mb_rows: self.mb_rows,
+            });
+        }
+        if mb_col >= self.mb_cols {
+            return Err(MvGridError::ColOutOfBounds {
+                mb_col,
+                mb_cols: self.mb_cols,
+            });
+        }
+        let r = mb_row as isize;
+        let c = mb_col as isize;
+        // Figure 7-46 / 7-47 macroblock-level positions — identical to
+        // the §7.6.5 frame-mode block-0 (TL) layout: MV1 = left MB's TR
+        // sub-block, MV2 = above MB's BL sub-block, MV3 = above-right
+        // MB's BL sub-block.
+        let p1 = (2 * r, 2 * c - 1);
+        let p2 = (2 * r - 1, 2 * c);
+        let p3 = (2 * r - 1, 2 * c + 2);
+        Ok([
+            self.field_candidate_at(p1.0, p1.1),
+            self.field_candidate_at(p2.0, p2.1),
+            self.field_candidate_at(p3.0, p3.1),
+        ])
+    }
 }
 
 /// Standalone helper: gather the Figure 7-34 candidate predictors for
@@ -461,6 +633,48 @@ pub fn gather_mv_predictor_candidates(
     block_index: usize,
 ) -> Result<[Option<MotionVector>; 3], MvGridError> {
     grid.predictor_candidates(mb_row, mb_col, block_index)
+}
+
+/// Standalone helper: gather the §7.7.2.1 / Figure 7-46 / 7-47
+/// field-MV candidate predictors for the field-predicted current
+/// macroblock at `(mb_row, mb_col)` against the supplied [`MvGrid`].
+/// Equivalent to [`MvGrid::field_predictor_candidates`]; provided for
+/// symmetry with [`gather_mv_predictor_candidates`].
+///
+/// ```
+/// use oxideav_mpeg4video::{
+///     gather_field_mv_predictor_candidates, predict_field_motion_vector,
+///     FieldPredCandidate, MotionVector, MvGrid,
+/// };
+///
+/// // 2 x 2 macroblocks: above-left frame, above field-predicted, left
+/// // 1-MV; decoding the field-predicted MB at (1, 1).
+/// let mut grid = MvGrid::new(2, 2);
+/// grid.record_one_mv(1, 0, MotionVector { x: 4, y: 0 }).unwrap(); // left → MV1
+/// grid
+///     .record_field(
+///         0,
+///         1,
+///         MotionVector { x: 6, y: 4 }, // top field
+///         MotionVector { x: 2, y: 4 }, // bottom field
+///     )
+///     .unwrap(); // above → MV2 (field predicted)
+/// // above-right MB (0, 2) is outside the 2x2 grid → MV3 Invalid.
+/// let cands = gather_field_mv_predictor_candidates(&grid, 1, 1).unwrap();
+/// assert_eq!(cands[0], FieldPredCandidate::Frame(MotionVector { x: 4, y: 0 }));
+/// assert!(matches!(cands[1], FieldPredCandidate::Field { .. }));
+/// assert_eq!(cands[2], FieldPredCandidate::Invalid);
+/// // MV2 maps to (Div2Round(8), Div2Round(8)) = (4, 4); MV3 invalid →
+/// // §7.6.5 rule sets it to zero; median over {(4,0), (4,4), (0,0)}.
+/// let px_py = predict_field_motion_vector(cands);
+/// assert_eq!(px_py, MotionVector { x: 4, y: 0 });
+/// ```
+pub fn gather_field_mv_predictor_candidates(
+    grid: &MvGrid,
+    mb_row: usize,
+    mb_col: usize,
+) -> Result<[FieldPredCandidate; 3], MvGridError> {
+    grid.field_predictor_candidates(mb_row, mb_col)
 }
 
 #[cfg(test)]
@@ -827,6 +1041,185 @@ mod tests {
                     let via_free = gather_mv_predictor_candidates(&grid, r, c, i).unwrap();
                     assert_eq!(via_method, via_free);
                 }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // §7.7.2.1 field-MV candidate gathering (Figure 7-46 / 7-47).
+    // ---------------------------------------------------------------------
+
+    use crate::motion::{
+        predict_field_motion_vector, FieldMvPair, FieldPredCandidate, MotionVectorDelta,
+    };
+
+    #[test]
+    fn field_record_constructor_and_getter() {
+        let mut grid = MvGrid::new(2, 2);
+        grid.record_field(0, 1, mv(6, 4), mv(2, 4)).unwrap();
+        assert_eq!(
+            grid.get(0, 1).unwrap().content,
+            MbMv::Field {
+                top: mv(6, 4),
+                bottom: mv(2, 4)
+            }
+        );
+        assert_eq!(grid.get(0, 1).unwrap().transparent, [false; 4]);
+    }
+
+    #[test]
+    fn field_candidates_out_of_bounds() {
+        let grid = MvGrid::new(2, 2);
+        assert!(matches!(
+            grid.field_predictor_candidates(2, 0),
+            Err(MvGridError::RowOutOfBounds {
+                mb_row: 2,
+                mb_rows: 2
+            })
+        ));
+        assert!(matches!(
+            grid.field_predictor_candidates(0, 2),
+            Err(MvGridError::ColOutOfBounds {
+                mb_col: 2,
+                mb_cols: 2
+            })
+        ));
+    }
+
+    #[test]
+    fn field_candidates_top_left_mb_all_invalid() {
+        // MB (0, 0): MV1 = (0, -1), MV2 = (-1, 0), MV3 = (-1, 2). All
+        // off the VOP → Invalid.
+        let grid = MvGrid::new(3, 3);
+        let cs = grid.field_predictor_candidates(0, 0).unwrap();
+        assert_eq!(cs, [FieldPredCandidate::Invalid; 3]);
+    }
+
+    #[test]
+    fn field_candidates_frame_neighbours_pass_through() {
+        // CASE 1: all three neighbours frame-predicted (1-MV) → Frame
+        // candidates verbatim; the Figure 7-46 MB-level positions match
+        // the frame-mode block-0 layout.
+        let mut grid = MvGrid::new(3, 3);
+        grid.record_one_mv(1, 0, mv(-2, 3)).unwrap(); // left → MV1
+        grid.record_one_mv(0, 1, mv(1, 5)).unwrap(); // above → MV2
+        grid.record_one_mv(0, 2, mv(-1, 7)).unwrap(); // above-right → MV3
+        let cs = grid.field_predictor_candidates(1, 1).unwrap();
+        assert_eq!(cs[0], FieldPredCandidate::Frame(mv(-2, 3)));
+        assert_eq!(cs[1], FieldPredCandidate::Frame(mv(1, 5)));
+        assert_eq!(cs[2], FieldPredCandidate::Frame(mv(-1, 7)));
+        // CASE 1 reduces to the progressive median: predictor (-1, 5).
+        assert_eq!(predict_field_motion_vector(cs), mv(-1, 5));
+    }
+
+    #[test]
+    fn field_candidates_select_upper_left_block_of_fourmv_neighbour() {
+        // §7.7.2.1: "If the candidate block i is in four MV motion (8x8)
+        // mode, the 8x8 block motion vector closest to the upper left
+        // block of the current MB is used." The left MB's TR sub-block
+        // (block 1), the above MB's BL (block 2), the above-right MB's BL
+        // (block 2) are the closest-to-upper-left selections.
+        let mut grid = MvGrid::new(3, 3);
+        grid.record_four_mv(1, 0, [mv(10, 0), mv(11, 1), mv(12, 2), mv(13, 3)])
+            .unwrap(); // left → block 1 (TR) = (11, 1)
+        grid.record_four_mv(0, 1, [mv(20, 0), mv(21, 1), mv(22, 2), mv(23, 3)])
+            .unwrap(); // above → block 2 (BL) = (22, 2)
+        grid.record_four_mv(0, 2, [mv(30, 0), mv(31, 1), mv(32, 2), mv(33, 3)])
+            .unwrap(); // above-right → block 2 (BL) = (32, 2)
+        let cs = grid.field_predictor_candidates(1, 1).unwrap();
+        assert_eq!(cs[0], FieldPredCandidate::Frame(mv(11, 1)));
+        assert_eq!(cs[1], FieldPredCandidate::Frame(mv(22, 2)));
+        assert_eq!(cs[2], FieldPredCandidate::Frame(mv(32, 2)));
+    }
+
+    #[test]
+    fn field_candidates_preserve_field_neighbour_pair() {
+        // CASE 2 / CASE 3: a field-predicted neighbour surfaces both
+        // field MVs so the predictor can Div2Round-average itself, rather
+        // than being collapsed by the grid (contrast the frame-mode
+        // query, which DOES collapse it).
+        let mut grid = MvGrid::new(3, 3);
+        grid.record_field(0, 1, mv(6, 4), mv(2, 4)).unwrap(); // above field-predicted
+        let cs = grid.field_predictor_candidates(1, 1).unwrap();
+        assert_eq!(
+            cs[1],
+            FieldPredCandidate::Field {
+                top: mv(6, 4),
+                bottom: mv(2, 4)
+            }
+        );
+        // The frame-mode query on the same neighbour collapses it to
+        // Div2Round(6+2)=4, Div2Round(4+4)=4.
+        let frame_cs = grid.predictor_candidates(1, 1, 0).unwrap();
+        assert_eq!(frame_cs[1], Some(mv(4, 4)));
+    }
+
+    #[test]
+    fn field_candidates_transparent_and_absent_invalid() {
+        let mut grid = MvGrid::new(3, 3);
+        grid.record_absent(1, 0).unwrap(); // left absent → MV1 Invalid
+        grid.record(
+            0,
+            1,
+            MbMvRecord {
+                // above MB present but its BL sub-block (the MV2 cell) is
+                // transparent.
+                content: MbMv::FourMv([mv(1, 1), mv(2, 2), mv(3, 3), mv(4, 4)]),
+                transparent: [false, false, true, false],
+            },
+        )
+        .unwrap();
+        let cs = grid.field_predictor_candidates(1, 1).unwrap();
+        assert_eq!(cs[0], FieldPredCandidate::Invalid);
+        assert_eq!(cs[1], FieldPredCandidate::Invalid);
+    }
+
+    #[test]
+    fn field_candidates_end_to_end_case3_reconstruction() {
+        use crate::field_motion::{reconstruct_field_motion_vectors, FieldMotionVectors};
+
+        // CASE 3: current MB field-predicted, above neighbour also field-
+        // predicted. left frame (10, 2), above field top=(6,2)
+        // bottom=(2,2) → Div2Round(8)=4 / Div2Round(4)=2 → (4, 2),
+        // above-right invalid → §7.6.5 takes... two valid + one invalid:
+        // the single invalid is set to (0,0); median over {(10,2),(4,2),(0,0)}.
+        let mut grid = MvGrid::new(3, 3);
+        grid.record_one_mv(1, 0, mv(10, 2)).unwrap();
+        grid.record_field(0, 1, mv(6, 2), mv(2, 2)).unwrap();
+        // above-right (0, 2) stays Absent → Invalid.
+        let cs = grid.field_predictor_candidates(1, 1).unwrap();
+        let p = predict_field_motion_vector(cs);
+        // median x = median(10, 4, 0) = 4; median y = median(2, 2, 0) = 2.
+        assert_eq!(p, mv(4, 2));
+        // Feed the shared predictor into the CASE 3 field reconstruction.
+        let pair = FieldMvPair {
+            top: MotionVectorDelta { dx: 1, dy: 0 },
+            bottom: MotionVectorDelta { dx: -1, dy: 0 },
+        };
+        let fmv = reconstruct_field_motion_vectors(pair, p.x, p.y);
+        // MVx f1 = 1 + 4 = 5; MVy f1 = 2 * (0 + (2 / 2)) = 2.
+        assert_eq!(
+            fmv,
+            FieldMotionVectors {
+                top: mv(5, 2),
+                bottom: mv(3, 2),
+            }
+        );
+    }
+
+    #[test]
+    fn field_candidates_free_function_matches_method() {
+        let mut grid = MvGrid::new(3, 3);
+        grid.record_one_mv(1, 0, mv(1, 2)).unwrap();
+        grid.record_field(0, 1, mv(3, 4), mv(5, 6)).unwrap();
+        grid.record_four_mv(0, 2, [mv(7, 7), mv(8, 8), mv(9, 9), mv(0, 0)])
+            .unwrap();
+        for r in 0..3 {
+            for c in 0..3 {
+                assert_eq!(
+                    grid.field_predictor_candidates(r, c).unwrap(),
+                    gather_field_mv_predictor_candidates(&grid, r, c).unwrap()
+                );
             }
         }
     }
