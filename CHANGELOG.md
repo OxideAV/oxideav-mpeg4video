@@ -8,6 +8,25 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 50 of the clean-room rebuild: the §7.4.2 **modified inverse
+  scan** for the `sadct_disable == 0` shape-adaptive-DCT path. In a
+  non-rectangular VOP, an 8×8 block with fewer than 64 opaque pels
+  carries only `opaque_pels` SA-DCT coefficients, packed `coeff_width[v]`
+  per row against the left edge. New `scan::modified_inverse_scan`
+  implements the spec's `coeff_width`-aware loop — it walks the chosen
+  Figure 7-4 scan path, writes a decoded coefficient only where
+  `coeff_width[v] > u`, and zero-fills every SA-DCT-undefined position
+  (§7.4.2 NOTE 1, so subsequent AC prediction is not confused). The
+  auxiliary `coeff_width[v]` array and the `opaque_pels` total are
+  derived from the decoded 8×8 binary shape via
+  `scan::ShapeParams::from_shape`, transcribing Annex A §A.3.2 step
+  I-S1 (per-column vertical shift of opaque pels, then a per-row count).
+  `scan::events_to_pqf_sadct` is the one-call EVENTs → `PQF[v][u]`
+  convenience for the SA-DCT path. 13 new tests cover the shape-param
+  derivation (full / empty / quadrant / non-contiguous vertical-shift /
+  staircase / L-shape), the full-width equivalence to the plain inverse
+  scan, the zero-fill constraint, scan-order coefficient packing, and
+  the `coeff_count == opaque_pels` invariant.
 - Round 49 of the clean-room rebuild: the §E.1.4.4.2.1 **two-way RVLC
   error-recovery strategy selection** — the arbitration that decides,
   after both the forward and the backward `reversible_vlc == 1` Tcoef

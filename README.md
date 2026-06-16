@@ -47,7 +47,11 @@ encoder.
   columns) with its Type-5 escape (`00001` + LAST/RUN/marker/LEVEL/marker
   + closing `0000` + sign, Tables B.24 / B.25) for the
   `reversible_vlc == 1` path in **both** the forward and the §E.1.4.4
-  backward (reverse-direction) decode, zigzag / alternate scan, §7.4 inverse
+  backward (reverse-direction) decode, zigzag / alternate scan, the
+  §7.4.2 `sadct_disable == 0` modified inverse scan (`coeff_width[]`-aware
+  packing with the NOTE 1 zero-fill, plus the Annex A §A.3.2 I-S1
+  `coeff_width[v]` / `opaque_pels` derivation from the decoded binary
+  shape), §7.4 inverse
   quantisation (methods 1 and 2), the 8×8 IDCT, and the §7.3 `d[y][x]`
   reconstruction with the display clip for I-, P-, and inter
   macroblocks.
@@ -75,8 +79,12 @@ encoder.
   implemented as composable pieces, but the video-packet driver that
   detects the forward-decode error, runs both directions, gathers the
   `L/N/L1/L2/N1/N2` inputs, and applies the kept-MB decision to the
-  reconstructed frame is not yet assembled. The SA-DCT modified inverse
-  scan is also not implemented.
+  reconstructed frame is not yet assembled.
+- The inverse SA-DCT / ∆DC-SA-DCT transform bodies themselves (§7.3.5 /
+  Annex A §A.3.2 steps I-S2..I-S4). The §7.4.2 modified inverse scan and
+  the `coeff_width[]` / `opaque_pels` shape-parameter derivation that
+  feed the transform are implemented; the transform that consumes the
+  resulting `PQF[v][u]` layout is not.
 - Sprite / GMC bodies, scalability enhancement layers, Studio Profile,
   and non-rectangular shapes (rejected with typed errors).
 

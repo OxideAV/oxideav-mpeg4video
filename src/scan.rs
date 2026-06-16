@@ -25,15 +25,36 @@
 //! once those land, the caller threads their direction into
 //! `select_scan_type` to pick the right table.
 //!
+//! ## The §7.4.2 modified inverse scan (`sadct_disable == 0`)
+//!
+//! For a non-rectangular VOP with `sadct_disable == 0`, an 8×8 block
+//! whose number of opaque pels is below 64 is reconstructed with the
+//! shape-adaptive DCT (SA-DCT). The number of SA-DCT coefficients in
+//! such a block equals `opaque_pels`, and the coefficients are *not*
+//! distributed over the whole 8×8 grid — each row `v` only holds
+//! `coeff_width[v]` coefficients, packed against the left edge.
+//! §7.4.2 therefore replaces the textbook scan with a `coeff_width`
+//! aware variant that walks the chosen scan path, writes a decoded
+//! coefficient only at positions `u < coeff_width[v]`, and forces
+//! every other position to zero (NOTE 1 — a stray non-zero at an
+//! SA-DCT-undefined position would confuse subsequent AC prediction).
+//!
+//! The auxiliary `coeff_width[v]` array and `opaque_pels` total are
+//! derived from the decoded binary shape `f_shape[y][x]` per Annex A
+//! §A.3.2 step I-S1 — see [`ShapeParams::from_shape`]. The modified
+//! scan itself is [`modified_inverse_scan`]; [`events_to_pqf_sadct`]
+//! is the one-call convenience.
+//!
 //! ## Out of scope (this round)
 //!
-//! * The `sadct_disable == 0` modified inverse scan for
-//!   non-rectangular VOPs (the `coeff_width[]` aware variant in the
-//!   §7.4.2 pseudocode). The rectangular path lands here.
 //! * The §7.4.3 spatial DC/AC predictor that supplies the per-block
 //!   prediction direction. `select_scan_type` is parameterised on a
 //!   pre-resolved direction so it doesn't depend on the missing
 //!   gathering.
+//! * The inverse SA-DCT transform itself (§7.3.5 / Annex A §A.3.2
+//!   steps I-S2..I-S4). This module supplies the `PQF[v][u]` layout
+//!   and the `coeff_width[]` / `opaque_pels` shape parameters that
+//!   that transform consumes; the transform body is later-round work.
 //!
 //! ## Spec references
 //!
@@ -45,10 +66,16 @@
 //!   / `inv_scan_v[scan_type]` arrays, the
 //!   `PQF[inv_scan_v[scan_type][n]][inv_scan_u[scan_type][n]] = QFS[n]`
 //!   loop, the per-block scan-selection rule keyed on the
-//!   `ac_pred_flag` and the §7.4.3.1 prediction direction.
+//!   `ac_pred_flag` and the §7.4.3.1 prediction direction, and the
+//!   `sadct_disable == 0` modified-scan pseudocode plus its NOTE 1
+//!   zero-fill constraint.
+//! * Annex A §A.3.2 step I-S1 — the derivation of `coeff_width[v]`,
+//!   `shift_shape[y][x]`, `pels_height[x]` and `opaque_pels` from the
+//!   decoded shape `f_shape[y][x]`.
 //! * Figure 7-4 — the three 8×8 scan tables: (a) Alternate-Horizontal,
 //!   (b) Alternate-Vertical, (c) Zigzag.
 
+use crate::sample_padding::SamplePresence;
 use crate::texture::AcEvent;
 
 /// One of the three §7.4.2 scan patterns of Figure 7-4.
@@ -227,6 +254,131 @@ pub fn inverse_scan(qfs: &[i32; 64], scan_type: ScanType) -> [[i32; 8]; 8] {
         }
     }
     pqf
+}
+
+/// The Annex A §A.3.2 step I-S1 shape parameters derived from a decoded
+/// 8×8 binary shape block `f_shape[y][x]`, used to drive the §7.4.2
+/// modified inverse scan (and, in a later round, the inverse SA-DCT
+/// transform itself).
+///
+/// `coeff_width[v]` gives the number of SA-DCT coefficients available
+/// in row `v` of `PQF[v][u]`; `opaque_pels` is the total number of
+/// opaque samples in the block (which equals the number of SA-DCT
+/// coefficients, per §7.4.2 NOTE 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShapeParams {
+    /// `coeff_width[v]` — coefficients available in each of the eight
+    /// rows of `PQF[v][u]`. Each element lies in `0..=8`.
+    pub coeff_width: [u8; 8],
+    /// `opaque_pels` — the total opaque-sample count of the block,
+    /// `0..=64`. Equals `coeff_width.iter().sum()`.
+    pub opaque_pels: u8,
+}
+
+impl ShapeParams {
+    /// Derive [`ShapeParams`] from an 8×8 binary shape block
+    /// `f_shape[y][x]` per Annex A §A.3.2 step I-S1.
+    ///
+    /// Mirroring the spec pseudocode: for each column `x`, opaque pels
+    /// (`f_shape[y][x] == 255`) are vertically shifted to the top to
+    /// form `shift_shape[y][x]`; `coeff_width[v]` then counts the
+    /// opaque cells in row `v` of `shift_shape`. Because the per-column
+    /// shift packs `pels_height[x]` opaque cells against the top,
+    /// `coeff_width[v]` equals the number of columns whose
+    /// `pels_height[x] > v` — i.e. the number of columns with strictly
+    /// more than `v` opaque samples.
+    pub fn from_shape(f_shape: &[[SamplePresence; 8]; 8]) -> Self {
+        // I-S1: pels_height[x] = opaque count in column x; opaque_pels
+        // = total. shift_shape[v][x] is opaque iff v < pels_height[x],
+        // so coeff_width[v] = #{ x : pels_height[x] > v }.
+        let mut pels_height = [0u8; 8];
+        let mut opaque_pels = 0u16;
+        for x in 0..8 {
+            let mut count = 0u8;
+            for row in f_shape.iter() {
+                if row[x].is_opaque() {
+                    count += 1;
+                }
+            }
+            pels_height[x] = count;
+            opaque_pels += count as u16;
+        }
+        let mut coeff_width = [0u8; 8];
+        for (v, cw) in coeff_width.iter_mut().enumerate() {
+            *cw = pels_height.iter().filter(|&&h| (h as usize) > v).count() as u8;
+        }
+        ShapeParams {
+            coeff_width,
+            opaque_pels: opaque_pels as u8,
+        }
+    }
+}
+
+/// Apply the §7.4.2 **modified** inverse scan used when
+/// `sadct_disable == 0` and the block has fewer than 64 opaque pels.
+///
+/// The spec loop:
+///
+/// ```text
+/// coeff_count = 0;
+/// for (n = 0; n < 64; n++) {
+///     PQF[inv_scan_v[st][n]][inv_scan_u[st][n]] = 0;
+///     if (coeff_width[inv_scan_v[st][n]] > inv_scan_u[st][n]) {
+///         PQF[inv_scan_v[st][n]][inv_scan_u[st][n]] = QFS[coeff_count];
+///         coeff_count++;
+///     }
+/// }
+/// ```
+///
+/// `QFS[0..opaque_pels]` carries the decoded SA-DCT coefficients in
+/// scan order (the EVENT stream produced exactly `opaque_pels`
+/// coefficients for a conformant block); every `PQF[v][u]` outside the
+/// `u < coeff_width[v]` region is forced to zero so that subsequent AC
+/// prediction is not confused (§7.4.2 NOTE 1).
+pub fn modified_inverse_scan(
+    qfs: &[i32; 64],
+    scan_type: ScanType,
+    coeff_width: &[u8; 8],
+) -> [[i32; 8]; 8] {
+    let grid = scan_grid(scan_type);
+    // Invert the `[v][u] = n` grid into the scan-order `n -> (v, u)`
+    // mapping the spec's `inv_scan_v[st][n]` / `inv_scan_u[st][n]`
+    // arrays provide.
+    let mut pos_of_n = [(0u8, 0u8); 64];
+    for (v, row) in grid.iter().enumerate() {
+        for (u, &cell) in row.iter().enumerate() {
+            pos_of_n[cell as usize] = (v as u8, u as u8);
+        }
+    }
+    let mut pqf = [[0i32; 8]; 8];
+    let mut coeff_count = 0usize;
+    for &(v, u) in pos_of_n.iter() {
+        let (v, u) = (v as usize, u as usize);
+        // PQF is already zero; only fill the in-shape positions.
+        if (coeff_width[v] as usize) > u {
+            pqf[v][u] = qfs[coeff_count];
+            coeff_count += 1;
+        }
+    }
+    pqf
+}
+
+/// One-shot SA-DCT path: expand AC EVENTs (+ optional intra-DC) into a
+/// `QFS[]` stream, then apply the §7.4.2 modified inverse scan using
+/// `coeff_width[]` derived from the block's binary shape.
+///
+/// The EVENTs of a conformant SA-DCT block carry exactly `opaque_pels`
+/// coefficients packed at `QFS[0..opaque_pels]`; the modified scan
+/// distributes them across the in-shape `PQF[v][u]` positions and
+/// zero-fills the rest.
+pub fn events_to_pqf_sadct(
+    events: &[AcEvent],
+    intra_dc: Option<i32>,
+    scan_type: ScanType,
+    coeff_width: &[u8; 8],
+) -> Result<[[i32; 8]; 8], InverseScanError> {
+    let qfs = events_to_qfs(events, intra_dc)?;
+    Ok(modified_inverse_scan(&qfs, scan_type, coeff_width))
 }
 
 /// One-shot: expand AC EVENTs (+ optional intra-DC) into a
@@ -555,6 +707,217 @@ mod tests {
             select_scan_type(true, true, DcPredictionDirection::FromLeft),
             ScanType::AlternateHorizontal
         );
+    }
+
+    /// Build an 8×8 `f_shape` from a row-major boolean grid
+    /// (`true` == opaque) for the SA-DCT tests.
+    fn shape(rows: [[bool; 8]; 8]) -> [[SamplePresence; 8]; 8] {
+        let mut s = [[SamplePresence::Transparent; 8]; 8];
+        for y in 0..8 {
+            for x in 0..8 {
+                if rows[y][x] {
+                    s[y][x] = SamplePresence::Opaque;
+                }
+            }
+        }
+        s
+    }
+
+    #[test]
+    fn shape_params_full_opaque_is_8x8() {
+        // A fully opaque block → every column has height 8, so every
+        // row has 8 coefficients and opaque_pels == 64.
+        let s = shape([[true; 8]; 8]);
+        let p = ShapeParams::from_shape(&s);
+        assert_eq!(p.coeff_width, [8; 8]);
+        assert_eq!(p.opaque_pels, 64);
+        // Invariant from §7.4.2 NOTE 1: opaque_pels == sum(coeff_width).
+        let sum: u16 = p.coeff_width.iter().map(|&c| c as u16).sum();
+        assert_eq!(p.opaque_pels as u16, sum);
+    }
+
+    #[test]
+    fn shape_params_all_transparent_is_zero() {
+        let s = shape([[false; 8]; 8]);
+        let p = ShapeParams::from_shape(&s);
+        assert_eq!(p.coeff_width, [0; 8]);
+        assert_eq!(p.opaque_pels, 0);
+    }
+
+    #[test]
+    fn shape_params_top_left_quadrant() {
+        // Opaque 4×4 top-left quadrant. Each of columns 0..4 has 4
+        // opaque pels (rows 0..4); columns 4..8 have 0. After the
+        // vertical shift, shift_shape rows 0..4 each have 4 opaque
+        // cells (one per opaque column), rows 4..8 have none.
+        let mut rows = [[false; 8]; 8];
+        for r in rows.iter_mut().take(4) {
+            for c in r.iter_mut().take(4) {
+                *c = true;
+            }
+        }
+        let p = ShapeParams::from_shape(&shape(rows));
+        assert_eq!(p.coeff_width, [4, 4, 4, 4, 0, 0, 0, 0]);
+        assert_eq!(p.opaque_pels, 16);
+    }
+
+    #[test]
+    fn shape_params_vertical_shift_packs_to_top() {
+        // Opaque pels are NOT contiguous within a column: column 0 has
+        // opaque at rows 1 and 5 (height 2), all others transparent.
+        // The vertical shift packs them to rows 0,1 of shift_shape, so
+        // coeff_width = [1, 1, 0, 0, 0, 0, 0, 0].
+        let mut rows = [[false; 8]; 8];
+        rows[1][0] = true;
+        rows[5][0] = true;
+        let p = ShapeParams::from_shape(&shape(rows));
+        assert_eq!(p.coeff_width, [1, 1, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(p.opaque_pels, 2);
+    }
+
+    #[test]
+    fn shape_params_staircase_columns() {
+        // Column x has (x+1) opaque pels (rows 0..=x). pels_height =
+        // [1,2,3,4,5,6,7,8]. coeff_width[v] = #cols with height > v:
+        //   v=0 → 8, v=1 → 7, … v=7 → 1.
+        let mut rows = [[false; 8]; 8];
+        for (x, _) in (0..8).enumerate() {
+            for r in rows.iter_mut().take(x + 1) {
+                r[x] = true;
+            }
+        }
+        let p = ShapeParams::from_shape(&shape(rows));
+        assert_eq!(p.coeff_width, [8, 7, 6, 5, 4, 3, 2, 1]);
+        assert_eq!(p.opaque_pels, 36);
+    }
+
+    #[test]
+    fn modified_scan_full_width_matches_plain_scan() {
+        // coeff_width all 8 → no position is excluded, and the
+        // coefficients are written in scan order, which is exactly the
+        // standard inverse scan of QFS in scan order. Build QFS = the
+        // scan-order ramp so plain inverse_scan(ramp) lays 1..=64 out
+        // in scan order; the modified scan must produce the same grid.
+        let mut qfs = [0i32; 64];
+        for (n, slot) in qfs.iter_mut().enumerate() {
+            *slot = (n + 1) as i32;
+        }
+        let plain = inverse_scan(&qfs, ScanType::Zigzag);
+        let modified = modified_inverse_scan(&qfs, ScanType::Zigzag, &[8; 8]);
+        assert_eq!(plain, modified);
+    }
+
+    #[test]
+    fn modified_scan_zero_fills_out_of_shape_positions() {
+        // coeff_width = [2,1,0,...]: row 0 keeps u in {0,1}, row 1
+        // keeps u==0, every other position must be zero — even if a
+        // hostile QFS would otherwise place values there. We feed a
+        // QFS of all-ones; only 3 positions (2 + 1 coefficients) may
+        // be non-zero.
+        let qfs = [1i32; 64];
+        let cw = [2u8, 1, 0, 0, 0, 0, 0, 0];
+        let pqf = modified_inverse_scan(&qfs, ScanType::Zigzag, &cw);
+        let mut nonzero = 0;
+        for (v, row) in pqf.iter().enumerate() {
+            for (u, &cell) in row.iter().enumerate() {
+                let in_shape = (cw[v] as usize) > u;
+                if in_shape {
+                    assert_eq!(cell, 1, "in-shape ({v},{u}) should hold a coeff");
+                    nonzero += 1;
+                } else {
+                    assert_eq!(cell, 0, "out-of-shape ({v},{u}) must be zero");
+                }
+            }
+        }
+        assert_eq!(nonzero, 3, "exactly opaque_pels coefficients survive");
+    }
+
+    #[test]
+    fn modified_scan_packs_coeffs_in_scan_order() {
+        // coeff_width = [3,0,...]: only PQF[0][0..3] are in-shape. The
+        // zigzag scan visits (0,0)→(0,1)→(1,0)→(2,0)→(1,1)→(0,2)→…
+        // Of those, the in-shape positions are (0,0), (0,1), (0,2) at
+        // coeff_count 0, 1, 2 respectively (others skipped). So
+        // QFS[0]→(0,0), QFS[1]→(0,1), QFS[2]→(0,2).
+        let mut qfs = [0i32; 64];
+        qfs[0] = 11;
+        qfs[1] = 22;
+        qfs[2] = 33;
+        let cw = [3u8, 0, 0, 0, 0, 0, 0, 0];
+        let pqf = modified_inverse_scan(&qfs, ScanType::Zigzag, &cw);
+        assert_eq!(pqf[0][0], 11);
+        assert_eq!(pqf[0][1], 22);
+        assert_eq!(pqf[0][2], 33);
+        // Nothing else.
+        for (v, row) in pqf.iter().enumerate() {
+            for (u, &cell) in row.iter().enumerate() {
+                if !(v == 0 && u < 3) {
+                    assert_eq!(cell, 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn modified_scan_coeff_count_equals_opaque_pels() {
+        // The number of non-zero positions the modified scan can fill
+        // equals sum(coeff_width) == opaque_pels. Feed all-ones QFS so
+        // every fillable position becomes non-zero and count them.
+        let rows = {
+            let mut r = [[false; 8]; 8];
+            // L-shape: column 0 full (8), row 0 full (8) → overlap at
+            // (0,0). pels_height col0 = 8, cols1..8 each = 1.
+            for r0 in r.iter_mut() {
+                r0[0] = true;
+            }
+            for c in r[0].iter_mut() {
+                *c = true;
+            }
+            r
+        };
+        let p = ShapeParams::from_shape(&shape(rows));
+        let qfs = [1i32; 64];
+        let pqf = modified_inverse_scan(&qfs, ScanType::Zigzag, &p.coeff_width);
+        let nonzero: usize = pqf.iter().flatten().filter(|&&c| c != 0).count();
+        assert_eq!(nonzero, p.opaque_pels as usize);
+    }
+
+    #[test]
+    fn events_to_pqf_sadct_round_trip() {
+        // coeff_width = [2,1,0,...] (opaque_pels = 3). EVENTs produce
+        // QFS = [5, 0, -2] (DC 5; one EVENT run 1 level -2). The
+        // modified scan lays them at the first three in-shape zigzag
+        // positions: (0,0)=5, (0,1)=0, (1,0)=-2.
+        let cw = [2u8, 1, 0, 0, 0, 0, 0, 0];
+        let events = [AcEvent {
+            last: true,
+            run: 1,
+            level: -2,
+        }];
+        let pqf = events_to_pqf_sadct(&events, Some(5), ScanType::Zigzag, &cw).unwrap();
+        assert_eq!(pqf[0][0], 5);
+        assert_eq!(pqf[0][1], 0);
+        assert_eq!(pqf[1][0], -2);
+        // All other cells zero.
+        for (v, row) in pqf.iter().enumerate() {
+            for (u, &cell) in row.iter().enumerate() {
+                if !matches!((v, u), (0, 0) | (0, 1) | (1, 0)) {
+                    assert_eq!(cell, 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn events_to_pqf_sadct_propagates_overflow() {
+        let cw = [8u8; 8];
+        let events = [AcEvent {
+            last: true,
+            run: 64,
+            level: 1,
+        }];
+        let err = events_to_pqf_sadct(&events, None, ScanType::Zigzag, &cw).unwrap_err();
+        assert!(matches!(err, InverseScanError::Overflow { position: 64 }));
     }
 
     #[test]
