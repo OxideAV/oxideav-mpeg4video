@@ -56,18 +56,27 @@ encoder.
   generation.
 - **Half-sample / quarter-sample** motion compensation, OBMC, and the
   padding stages (sample / vertical / extended / interlaced).
+- **RVLC error recovery**: the §E.1.4.4.2.1 two-way strategy selection —
+  the Strategy 1–4 arbitration (`RvlcArbitration::select`) that picks
+  how many macroblocks to keep from the forward decode at the head and
+  from the backward decode at the tail, from the `L1+L2 >= L` /
+  `N1+N2 >= N` predicates, the `f_mb` / `b_mb` step-inverse counters, and
+  the threshold `T = 90` — plus the §E.1.4.4.2.2 intra-MB concealment
+  pass (`displayed_mbs`).
 
 ## Not yet supported
 
 - Runtime registration (`register` is a no-op) and a single top-level
   frame-decode entry point.
 - Encoder.
-- The Annex E.1.4.4 two-way RVLC error-recovery *strategy selection* (the
-  forward and the backward reverse-direction `reversible_vlc == 1` Tcoef
-  decodes are both implemented; the §E.1.4.4.2.1 Strategy 1–4
-  bit-discard arbitration that picks which forward/backward MBs to keep,
-  the `f_mb` / `b_mb` counters, and the §E.1.4.4.2.2 intra-MB
-  concealment are not), and the SA-DCT modified inverse scan.
+- The end-to-end wiring of the §E.1.4.4 two-way RVLC error recovery: the
+  forward / backward Tcoef decodes (§E.1.4.4.1) and the §E.1.4.4.2.1
+  Strategy 1–4 arbitration + §E.1.4.4.2.2 intra-MB concealment are all
+  implemented as composable pieces, but the video-packet driver that
+  detects the forward-decode error, runs both directions, gathers the
+  `L/N/L1/L2/N1/N2` inputs, and applies the kept-MB decision to the
+  reconstructed frame is not yet assembled. The SA-DCT modified inverse
+  scan is also not implemented.
 - Sprite / GMC bodies, scalability enhancement layers, Studio Profile,
   and non-rectangular shapes (rejected with typed errors).
 

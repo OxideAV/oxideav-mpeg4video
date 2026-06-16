@@ -8,6 +8,30 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 49 of the clean-room rebuild: the §E.1.4.4.2.1 **two-way RVLC
+  error-recovery strategy selection** — the arbitration that decides,
+  after both the forward and the backward `reversible_vlc == 1` Tcoef
+  decodes have run, how many macroblocks to keep from the beginning
+  (forward result) and how many from the end (backward result), with
+  the straddling middle discarded. New `src/rvlc_arbitration.rs`:
+  `RvlcArbitration::select(&RvlcArbitrationInput)` classifies the packet
+  into one of the four §E.1.4.4.2.1 strategies from the two predicates
+  `L1 + L2 >= L` (decodable-bit overlap) and `N1 + N2 >= N`
+  (completely-decoded-MB overlap), then computes `keep_front` /
+  `keep_back` from the strategy's formula — Strategy 1 `f_mb(L1-T)` /
+  `b_mb(L2-T)`, Strategy 2 `N-N2-1` / `N-N1-1`, Strategy 3 `N-b_mb(L2)`
+  / `N-f_mb(L1)`, Strategy 4 the `min` of the two. The `f_mb(S)` /
+  `b_mb(S)` step-inverse counters are evaluated over per-MB cumulative
+  bit-cost tables (`partition_point`), with the §E.1.4.4.2 counter rule
+  (a non-positive `S` yields 0). `RVLC_THRESHOLD` exposes the spec's
+  `T = 90`. The two kept regions are clamped disjoint so the discard
+  region never goes negative. `RvlcArbitration::displayed_mbs` applies
+  the §E.1.4.4.2.2 INTRA-MB concealment pass — every INTRA MB in an
+  errored packet is concealed (not displayed), even one a strategy
+  would otherwise have kept. Nine unit tests cover each strategy's
+  formula, the step-inverse counters, the disjoint-region clamp, the
+  `0 <= N1,N2 <= N-1` bound, and the concealment pass. Re-exported at
+  the crate root.
 - Round 48 of the clean-room rebuild: the §E.1.4.4 **backward
   (reverse-direction) reversible-VLC Tcoef decode** — the second half of
   the Annex E two-way RVLC error-recovery method (round 47 landed the

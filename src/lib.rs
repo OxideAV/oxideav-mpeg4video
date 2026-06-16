@@ -328,6 +328,7 @@ pub mod obmc;
 pub mod predictor;
 pub mod quarter_sample;
 pub mod reconstruct;
+pub mod rvlc_arbitration;
 pub mod sample_padding;
 pub mod scan;
 pub mod texture;
@@ -429,6 +430,7 @@ pub use reconstruct::{
     reconstruct_intra_macroblock, InterPredictionMacroblock, ReconstructedMacroblock, BLOCK_SIDE,
     MACROBLOCK_CHROMA_SIDE, MACROBLOCK_LUMA_SIDE,
 };
+pub use rvlc_arbitration::{RvlcArbitration, RvlcArbitrationInput, RvlcStrategy, RVLC_THRESHOLD};
 pub use sample_padding::{
     horizontal_repetitive_padding_chroma, horizontal_repetitive_padding_luma,
     horizontal_repetitive_padding_row, SamplePresence, ShapeRowState,
