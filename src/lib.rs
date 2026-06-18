@@ -332,6 +332,7 @@ pub mod reconstruct;
 pub mod rvlc_arbitration;
 pub mod sample_padding;
 pub mod scan;
+pub mod sprite;
 pub mod texture;
 pub mod vector_padding;
 pub mod vertical_padding;
@@ -441,6 +442,10 @@ pub use scan::{
     events_to_pqf, events_to_qfs, inverse_scan, select_scan_type, DcPredictionDirection,
     InverseScanError, ScanType,
 };
+pub use sprite::{
+    decode_sprite_trajectory, decode_warping_mv_code, SpriteTrajectory, SpriteTrajectoryError,
+    MAX_GMC_WARPING_POINTS,
+};
 pub use texture::{
     decode_ac_event, decode_ac_event_rvlc, decode_ac_event_short_video_header, decode_ac_events,
     decode_ac_events_rvlc, decode_ac_events_short_video_header, decode_intra_dc, AcEvent,
@@ -521,6 +526,9 @@ pub enum Error {
     /// referred to a macroblock or sub-block index outside the grid.
     /// See [`MvGridError`] for the discrimination.
     MvGrid(MvGridError),
+    /// A §6.2.5 `sprite_trajectory()` / `warping_mv_code()` decode
+    /// failed. See [`SpriteTrajectoryError`] for the discrimination.
+    SpriteTrajectory(SpriteTrajectoryError),
 }
 
 impl core::fmt::Display for Error {
@@ -561,6 +569,9 @@ impl core::fmt::Display for Error {
             }
             Error::MvGrid(err) => {
                 write!(f, "oxideav-mpeg4video: MV-predictor grid error: {err}")
+            }
+            Error::SpriteTrajectory(err) => {
+                write!(f, "oxideav-mpeg4video: sprite_trajectory error: {err}")
             }
         }
     }
@@ -637,6 +648,12 @@ impl From<VectorPaddingError> for Error {
 impl From<MvGridError> for Error {
     fn from(err: MvGridError) -> Self {
         Error::MvGrid(err)
+    }
+}
+
+impl From<SpriteTrajectoryError> for Error {
+    fn from(err: SpriteTrajectoryError) -> Self {
+        Error::SpriteTrajectory(err)
     }
 }
 

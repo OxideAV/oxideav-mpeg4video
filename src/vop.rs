@@ -55,6 +55,7 @@
 //! `scalability=false`.
 
 use crate::bitreader::{BitReader, BitReaderError};
+use crate::sprite::{decode_sprite_trajectory, SpriteTrajectory, SpriteTrajectoryError};
 use crate::vol::{SpriteEnable, VolHeader, VolParseError};
 
 /// Start code for a `Group_of_VideoObjectPlane()` (§6.2.4 / §6.3.4 —
@@ -129,13 +130,20 @@ pub struct VopContext {
     /// header carries `top_field_first` + `alternate_vertical_scan_flag`
     /// after `intra_dc_vlc_thr`.
     pub interlaced: bool,
-    /// Whether the VOL declared `sprite_enable == "GMC"`. Round 2 does
-    /// not support the GMC sprite branch — if true and the VOP is S-
-    /// or P-coded the parser will refuse rather than mis-align.
+    /// Whether the VOL declared `sprite_enable == "GMC"`. When true and
+    /// the VOP is S-coded, the parser walks the §6.2.5 `sprite_trajectory()`
+    /// branch (the GMC global-motion-compensation path).
     pub sprite_gmc: bool,
     /// Whether the VOL declared `sprite_enable == "static"`. Round 2
     /// rejects this branch up front.
     pub sprite_static: bool,
+    /// `no_of_sprite_warping_points` (Table 6-20) from the VOL header,
+    /// `0` when sprite coding is off. Gates the `sprite_trajectory()`
+    /// parse — `> 0` triggers it.
+    pub no_of_sprite_warping_points: u8,
+    /// `sprite_brightness_change` (§6.3.3) from the VOL header. `false`
+    /// when sprite coding is off, and always `false` under GMC.
+    pub sprite_brightness_change: bool,
     /// Whether the VOL declared `scalability == 1`. Round 2 rejects.
     pub scalability: bool,
     /// Whether the VOL declared `newpred_enable == 1`. Round 2 rejects.
@@ -156,6 +164,8 @@ impl Default for VopContext {
             interlaced: false,
             sprite_gmc: false,
             sprite_static: false,
+            no_of_sprite_warping_points: 0,
+            sprite_brightness_change: false,
             scalability: false,
             newpred_enable: false,
             reduced_resolution_vop_enable: false,
@@ -175,6 +185,8 @@ impl VopContext {
             interlaced: vol.interlaced,
             sprite_gmc: matches!(vol.sprite_enable, SpriteEnable::Gmc),
             sprite_static: matches!(vol.sprite_enable, SpriteEnable::Static),
+            no_of_sprite_warping_points: vol.no_of_sprite_warping_points.unwrap_or(0),
+            sprite_brightness_change: vol.sprite_brightness_change.unwrap_or(false),
             scalability: vol.scalability,
             newpred_enable: vol.newpred_enable,
             reduced_resolution_vop_enable: vol.reduced_resolution_vop_enable,
@@ -222,6 +234,11 @@ pub struct VopHeader {
     /// `vop_fcode_backward`. Present only when `vop_coding_type == B`.
     /// Defaults to `0` otherwise.
     pub fcode_bwd: u8,
+    /// Decoded §6.2.5 `sprite_trajectory()` for an S(GMC)-VOP, when the
+    /// VOL declared `sprite_enable == "GMC"` and
+    /// `no_of_sprite_warping_points > 0`. `None` for every non-GMC VOP
+    /// and for the stationary (0-point) GMC case.
+    pub sprite_trajectory: Option<SpriteTrajectory>,
 }
 
 /// Errors produced by the VOP / GOV header parsers. We reuse
@@ -253,6 +270,15 @@ pub enum VopParseError {
     /// or a complexity-estimation header). Carry-back enum text is
     /// enough; the offending bit is named.
     UnsupportedBranch(&'static str),
+    /// A §6.2.5 `sprite_trajectory()` body (S(GMC)-VOP) failed to
+    /// decode. See [`SpriteTrajectoryError`].
+    SpriteTrajectory(SpriteTrajectoryError),
+}
+
+impl From<SpriteTrajectoryError> for VopParseError {
+    fn from(err: SpriteTrajectoryError) -> Self {
+        VopParseError::SpriteTrajectory(err)
+    }
 }
 
 impl core::fmt::Display for VopParseError {
@@ -271,6 +297,9 @@ impl core::fmt::Display for VopParseError {
             }
             VopParseError::UnsupportedBranch(name) => {
                 write!(f, "VOP branch '{name}' not supported by round-2 parser")
+            }
+            VopParseError::SpriteTrajectory(err) => {
+                write!(f, "sprite_trajectory decode failed: {err}")
             }
         }
     }
@@ -301,6 +330,7 @@ impl From<VopParseError> for VolParseError {
             // informative.
             VopParseError::BadQuantPrecision(_)
             | VopParseError::ForbiddenFcode
+            | VopParseError::SpriteTrajectory(_)
             | VopParseError::UnsupportedBranch(_) => VolParseError::UnsupportedFgs,
         }
     }
@@ -454,6 +484,7 @@ fn parse_video_object_plane_body(
             quant: 0,
             fcode_fwd: 0,
             fcode_bwd: 0,
+            sprite_trajectory: None,
         });
     }
 
@@ -482,10 +513,13 @@ fn parse_video_object_plane_body(
         rounding_type = br.read_bits(1)? as u8;
     }
 
-    if matches!(coding_type, VopCodingType::S) && (ctx.sprite_gmc || ctx.sprite_static) {
-        // Sprite trajectory + brightness_change + sprite_transmit_mode
-        // branches are not supported in round 2.
-        return Err(VopParseError::UnsupportedBranch("sprite_S_VOP"));
+    // Static sprite S-VOPs need the §7.8.2/§7.8.3 sprite-object buffer
+    // and piece-update machinery (sprite_transmit_mode loop +
+    // decode_sprite_piece()), which is out of scope; reject up front so
+    // the bit position never drifts. GMC S-VOPs fall through to the
+    // §6.2.5 sprite_trajectory() branch below.
+    if matches!(coding_type, VopCodingType::S) && ctx.sprite_static {
+        return Err(VopParseError::UnsupportedBranch("sprite_static_S_VOP"));
     }
 
     if !ctx.complexity_estimation_disable {
@@ -504,6 +538,36 @@ fn parse_video_object_plane_body(
         let _top_field_first = br.read_bool()?;
         let _alt_vert_scan = br.read_bool()?;
     }
+
+    // §6.2.5 S(GMC)-VOP sprite branch (spec lines 4328..=4333). For
+    // `sprite_enable == "GMC"` the trajectory is followed (when
+    // no_of_sprite_warping_points > 0) by an optional
+    // brightness_change_factor() — mandated absent under GMC since
+    // sprite_brightness_change must be 0 (§6.3.3). Unlike the static
+    // path there is NO `next_start_code(); return()` here: a GMC S-VOP
+    // continues to vop_quant / vop_fcode_forward / motion_shape_texture()
+    // exactly like a P-VOP.
+    let sprite_trajectory = if matches!(coding_type, VopCodingType::S) && ctx.sprite_gmc {
+        let traj = if ctx.no_of_sprite_warping_points > 0 {
+            Some(decode_sprite_trajectory(
+                br,
+                ctx.no_of_sprite_warping_points,
+            )?)
+        } else {
+            None
+        };
+        if ctx.sprite_brightness_change {
+            // brightness_change_factor() is present. The spec forbids
+            // sprite_brightness_change == 1 under GMC, so reaching here
+            // means the VOL was inconsistent; reject rather than guess.
+            return Err(VopParseError::UnsupportedBranch(
+                "GMC brightness_change_factor",
+            ));
+        }
+        traj
+    } else {
+        None
+    };
 
     // vop_quant: `quant_precision` bits, default 5.
     let quant = br.read_bits(ctx.quant_precision as usize)? as u16;
@@ -541,6 +605,7 @@ fn parse_video_object_plane_body(
         quant,
         fcode_fwd,
         fcode_bwd,
+        sprite_trajectory,
     })
 }
 
@@ -651,6 +716,115 @@ mod tests {
         w.write_bits(fcode_bwd, 3);
         w.align();
         w.buf
+    }
+
+    /// Emit a `warping_mv_code(d)`: unary SSS, terminating 0, SSS-bit
+    /// FLC `code`, marker.
+    fn write_warping(w: &mut BitWriter, sss: u32, code: u32) {
+        for _ in 0..sss {
+            w.write_bits(1, 1);
+        }
+        w.write_bits(0, 1);
+        if sss != 0 {
+            w.write_bits(code, sss as usize);
+        }
+        w.write_marker();
+    }
+
+    /// Build an S(GMC)-VOP with a 2-point (affine) sprite trajectory.
+    fn make_s_gmc_vop(resolution: u16, fcode_fwd: u32, quant: u32) -> Vec<u8> {
+        let mut w = BitWriter::new();
+        w.write_bits(VOP_START_CODE, 32);
+        w.write_bits(0b11, 2); // vop_coding_type = S
+        w.write_bits(0, 1); // modulo_time_base = 0
+        w.write_marker();
+        let bits = vop_time_increment_bits(resolution) as usize;
+        w.write_bits(0, bits);
+        w.write_marker();
+        w.write_bits(1, 1); // vop_coded
+        w.write_bits(0, 1); // vop_rounding_type (present: S && GMC)
+        w.write_bits(0, 3); // intra_dc_vlc_thr
+                            // sprite_trajectory(): 2 points.
+        write_warping(&mut w, 1, 1); // du0 = +1
+        write_warping(&mut w, 1, 0); // dv0 = -1
+        write_warping(&mut w, 2, 0b11); // du1 = +3
+        write_warping(&mut w, 2, 0b01); // dv1 = -2
+                                        // No brightness_change (GMC). Continue as a P-VOP.
+        w.write_bits(quant, 5); // vop_quant
+        w.write_bits(fcode_fwd, 3); // vop_fcode_forward (S != I)
+        w.align();
+        w.buf
+    }
+
+    #[test]
+    fn parses_s_gmc_vop_with_sprite_trajectory() {
+        let data = make_s_gmc_vop(30_000, 2, 8);
+        let ctx = VopContext {
+            sprite_gmc: true,
+            no_of_sprite_warping_points: 2,
+            ..VopContext::default()
+        };
+        let header = parse_video_object_plane_header(&data, 30_000, ctx).unwrap();
+        assert_eq!(header.coding_type, VopCodingType::S);
+        assert_eq!(header.quant, 8);
+        assert_eq!(header.fcode_fwd, 2);
+        let traj = header.sprite_trajectory.expect("GMC trajectory present");
+        assert_eq!(traj.count, 2);
+        assert_eq!(traj.points[0], [1, -1]);
+        assert_eq!(traj.points[1], [3, -2]);
+    }
+
+    #[test]
+    fn s_gmc_vop_stationary_has_no_trajectory() {
+        // no_of_sprite_warping_points == 0 → identity warp, no trajectory
+        // bits, falls straight through to vop_quant / vop_fcode_forward.
+        let mut w = BitWriter::new();
+        w.write_bits(VOP_START_CODE, 32);
+        w.write_bits(0b11, 2); // S
+        w.write_bits(0, 1);
+        w.write_marker();
+        let bits = vop_time_increment_bits(30_000) as usize;
+        w.write_bits(0, bits);
+        w.write_marker();
+        w.write_bits(1, 1); // vop_coded
+        w.write_bits(0, 1); // vop_rounding_type
+        w.write_bits(0, 3); // intra_dc_vlc_thr
+        w.write_bits(5, 5); // vop_quant
+        w.write_bits(1, 3); // vop_fcode_forward
+        w.align();
+        let ctx = VopContext {
+            sprite_gmc: true,
+            no_of_sprite_warping_points: 0,
+            ..VopContext::default()
+        };
+        let header = parse_video_object_plane_header(&w.buf, 30_000, ctx).unwrap();
+        assert_eq!(header.coding_type, VopCodingType::S);
+        assert!(header.sprite_trajectory.is_none());
+        assert_eq!(header.quant, 5);
+        assert_eq!(header.fcode_fwd, 1);
+    }
+
+    #[test]
+    fn static_sprite_s_vop_still_rejected() {
+        let mut w = BitWriter::new();
+        w.write_bits(VOP_START_CODE, 32);
+        w.write_bits(0b11, 2); // S
+        w.write_bits(0, 1);
+        w.write_marker();
+        let bits = vop_time_increment_bits(30_000) as usize;
+        w.write_bits(0, bits);
+        w.write_marker();
+        w.write_bits(1, 1); // vop_coded
+        w.align();
+        let ctx = VopContext {
+            sprite_static: true,
+            ..VopContext::default()
+        };
+        let err = parse_video_object_plane_header(&w.buf, 30_000, ctx).unwrap_err();
+        match err {
+            VopParseError::UnsupportedBranch(name) => assert!(name.contains("static")),
+            other => panic!("expected UnsupportedBranch, got {other:?}"),
+        }
     }
 
     #[test]

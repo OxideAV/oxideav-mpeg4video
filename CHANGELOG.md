@@ -8,6 +8,28 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 53 of the clean-room rebuild — **GMC subsystem, part 2
+  (sprite-trajectory syntax)**: a new `sprite` module decoding the
+  §6.2.5 `sprite_trajectory()` body for S(GMC)-VOPs.
+  `decode_warping_mv_code` reads one §6.3.5.4 `warping_mv_code()`
+  codeword — the unary `dmv_length` (`SSS`) VLC, the `SSS`-bit FLC
+  `dmv_code`, and the trailing `marker_bit` — and reconstructs the
+  signed differential per Table B.34 ("Code table for the first
+  trajectory point"): `SSS == k` selects a value in
+  `{ -(2^k-1)..-2^(k-1), 2^(k-1)..2^k-1 }`, top-bit-set codes mapping
+  to the positive half. `decode_sprite_trajectory` walks the
+  `no_of_sprite_warping_points` `du[i]`/`dv[i]` pairs into a `Copy`
+  `SpriteTrajectory` (max 3 points for GMC; perspective is rejected at
+  the VOL). The §6.2.5 VOP-header parser now follows the S(GMC)-VOP
+  sprite branch: after `intra_dc_vlc_thr` + interlaced flags it reads
+  `sprite_trajectory()` (when `no_of_sprite_warping_points > 0`),
+  surfaces it on the new `VopHeader::sprite_trajectory` field, and —
+  unlike the static path — falls through to `vop_quant` /
+  `vop_fcode_forward` exactly like a P-VOP (the GMC branch has no
+  `return()`). The static-sprite S-VOP stays typed-rejected. Tests
+  cover the Table B.34 SSS=0/1/2/5 codeword mappings, the marker-bit
+  and overflow rejections, a 2-point affine trajectory round-trip, the
+  stationary (0-point) GMC fall-through, and the static rejection.
 - Round 53 of the clean-room rebuild — **GMC subsystem, part 1
   (configuration syntax)**: the §6.2.3 `sprite_enable == "GMC"` VOL
   body. `parse_video_object_layer` now decodes
