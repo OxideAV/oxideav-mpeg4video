@@ -171,6 +171,31 @@ fn round_sample(value: f64) -> i32 {
 /// transform output, exactly like [`crate::idct::idct_8x8`] returns
 /// before any reconstruction add.
 pub fn inverse_sadct(pqf: &[[i32; 8]; 8], f_shape: &[[SamplePresence; 8]; 8]) -> [[i32; 8]; 8] {
+    let (f, _shape) = inverse_sadct_float(pqf, f_shape);
+    let mut out = [[0i32; 8]; 8];
+    for (y, row) in f.iter().enumerate() {
+        for (x, &val) in row.iter().enumerate() {
+            out[y][x] = round_sample(val);
+        }
+    }
+    out
+}
+
+/// The floating-point core of the inverse SA-DCT (steps I-S1..I-S5),
+/// returning the *unrounded* decoded texture `f[y][x]` alongside the
+/// I-S1 [`SadctShape`].
+///
+/// This is the building block both [`inverse_sadct`] (which rounds the
+/// result) and [`inverse_delta_dc_sadct`] (which applies the Annex A
+/// §A.4.2 ∆DC pre-/post-processing) sit on. Per Annex A NOTE 2 the entire
+/// transform runs in floating point and the rounding to integers happens
+/// only at the very end, so the ∆DC correction in I-∆S3 / I-∆S4 must be
+/// computed against these unrounded `f[y][x]` values. Transparent
+/// positions (`f_shape[y][x]` transparent) are returned as `0.0`.
+fn inverse_sadct_float(
+    pqf: &[[i32; 8]; 8],
+    f_shape: &[[SamplePresence; 8]; 8],
+) -> ([[f64; 8]; 8], SadctShape) {
     let shape = SadctShape::from_shape(f_shape);
 
     // I-S2: per-row coeff_width[v]-point inverse DCT over F[v][0..cw].
@@ -224,17 +249,114 @@ pub fn inverse_sadct(pqf: &[[i32; 8]; 8], f_shape: &[[SamplePresence; 8]; 8]) ->
 
     // I-S5: re-shift each column of shift_texture from the top-packed
     // position back to the original row positions of f_shape[y][x].
-    let mut f = [[0i32; 8]; 8];
+    let mut f = [[0.0f64; 8]; 8];
     for x in 0..8 {
         let mut pels_count = 0usize;
         for y in 0..8 {
             if f_shape[y][x].is_opaque() {
-                f[y][x] = round_sample(shift_texture[pels_count][x]);
+                f[y][x] = shift_texture[pels_count][x];
                 pels_count += 1;
             }
         }
     }
-    f
+    (f, shape)
+}
+
+/// Apply the inverse **∆DC-SA-DCT** (Annex A §A.4.2 steps I-∆S1..I-∆S4) to
+/// a single 8×8 block.
+///
+/// ∆DC-SA-DCT is an extension of the plain inverse SA-DCT used for
+/// intra-coded 8×8 blocks of a non-rectangular VOP when `opaque_pels < 64`
+/// (the per-block transform-selection rule of §7.3.5 / Table 7-2). On the
+/// encoder side the block mean is subtracted before the forward SA-DCT
+/// (∆S1) and re-injected as a *scaled* `F[0][0] = 8·mean_value` (∆S3),
+/// overwriting the redundant SA-DCT DC. The decoder must undo that:
+///
+/// * **I-∆S1** extracts `mean_value = F[0][0] / 8` and zeroes `F[0][0]`.
+/// * **I-∆S2** runs the inverse SA-DCT (steps I-S1..I-S5) on the modified
+///   coefficients via [`inverse_sadct_float`].
+/// * **I-∆S3** computes the ∆DC correction term that compensates the
+///   systematic error from the overwritten (non-zero) SA-DCT DC:
+///
+///   ```text
+///     check_sum = Σ_{x,y} bin_shape[y][x] · f[y][x]   (opaque samples)
+///     sqrt_sum  = Σ_{x : pels_height[x] != 0} √pels_height[x]
+///     corr_term = check_sum / sqrt_sum
+///   ```
+///
+/// * **I-∆S4** adds the re-scaled mean and the per-column-weighted
+///   correction back to every opaque sample:
+///
+///   ```text
+///     f[y][x] += mean_value − corr_term / √pels_height[x]
+///   ```
+///
+/// `pqf` is the inverse-quantised coefficient block `F[v][u]` in the
+/// `PQF[v][u]` packing produced by the §7.4.2 modified inverse scan;
+/// `f_shape` is the decoded binary shape. The return value is the decoded
+/// texture `f[y][x]` rounded to the nearest integer (half-away-from-zero,
+/// §4.1); transparent positions are returned as `0`.
+///
+/// Per Annex A NOTE 2 the entire transform — mean extraction, inverse
+/// SA-DCT, correction term, and the final additions — runs in floating
+/// point, with rounding to integers only at the very end.
+pub fn inverse_delta_dc_sadct(
+    pqf: &[[i32; 8]; 8],
+    f_shape: &[[SamplePresence; 8]; 8],
+) -> [[i32; 8]; 8] {
+    // I-∆S1: extract the re-scaled mean value and zero F[0][0] before the
+    // inverse SA-DCT runs (the SA-DCT DC carried here is the scaled mean,
+    // not a transform coefficient).
+    let mean_value = pqf[0][0] as f64 / 8.0;
+    let mut modified = *pqf;
+    modified[0][0] = 0;
+
+    // I-∆S2: inverse SA-DCT on the modified coefficients (unrounded).
+    let (mut f, shape) = inverse_sadct_float(&modified, f_shape);
+
+    // I-∆S3: ∆DC correction term.
+    //   check_sum = Σ bin_shape[y][x]·f[y][x] over opaque samples
+    //   sqrt_sum  = Σ_{pels_height[x]!=0} √pels_height[x]
+    let mut check_sum = 0.0f64;
+    let mut sqrt_sum = 0.0f64;
+    for x in 0..8 {
+        let ph = shape.pels_height[x];
+        if ph == 0 {
+            continue;
+        }
+        sqrt_sum += (ph as f64).sqrt();
+        for (y, row) in f.iter().enumerate() {
+            if f_shape[y][x].is_opaque() {
+                check_sum += row[x];
+            }
+        }
+    }
+    // sqrt_sum is non-zero whenever the block has any opaque column, which
+    // is guaranteed for an opaque_pels < 64 block carrying texture; guard
+    // the degenerate all-transparent input so corr_term stays finite.
+    let corr_term = if sqrt_sum != 0.0 {
+        check_sum / sqrt_sum
+    } else {
+        0.0
+    };
+
+    // I-∆S4: add the re-scaled mean and the per-column-weighted correction
+    // back to every opaque sample, then round to integers.
+    let mut out = [[0i32; 8]; 8];
+    for x in 0..8 {
+        let ph = shape.pels_height[x];
+        if ph == 0 {
+            continue;
+        }
+        let weight = mean_value - corr_term / (ph as f64).sqrt();
+        for (y, f_row) in f.iter_mut().enumerate() {
+            if f_shape[y][x].is_opaque() {
+                f_row[x] += weight;
+                out[y][x] = round_sample(f_row[x]);
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -439,5 +561,262 @@ mod tests {
         }
         let out = inverse_sadct(&[[0i32; 8]; 8], &shape(rows));
         assert_eq!(out, [[0i32; 8]; 8]);
+    }
+
+    /// A right-triangle staircase shape used by several ∆DC tests: cell
+    /// `(y,x)` is opaque iff `y <= x` (column `x` has `x+1` opaque pels).
+    fn staircase() -> [[SamplePresence; 8]; 8] {
+        let mut rows = [[false; 8]; 8];
+        for (y, row) in rows.iter_mut().enumerate() {
+            for (x, cell) in row.iter_mut().enumerate() {
+                if y <= x {
+                    *cell = true;
+                }
+            }
+        }
+        shape(rows)
+    }
+
+    /// ∆DC-SA-DCT of a block carrying *only* the scaled mean in `F[0][0]`
+    /// reconstructs a flat `mean_value` over every opaque sample. This is
+    /// the canonical encoder path for a constant-valued opaque region:
+    /// ∆S1 subtracts the mean (leaving zero data), the forward SA-DCT of
+    /// zero data is zero, and ∆S3 writes `F[0][0] = 8·mean_value`. The
+    /// decoder must recover exactly `mean_value` because the ∆DC
+    /// correction term is zero (the SA-DCT output `f` is identically 0).
+    #[test]
+    fn delta_dc_mean_only_is_flat_mean() {
+        let f_shape = staircase();
+        // mean_value = 37  ⇒  F[0][0] = 8·37 = 296.
+        let mut pqf = [[0i32; 8]; 8];
+        pqf[0][0] = 296;
+        let out = inverse_delta_dc_sadct(&pqf, &f_shape);
+        for (y, row) in out.iter().enumerate() {
+            for (x, &val) in row.iter().enumerate() {
+                if y <= x {
+                    assert_eq!(val, 37, "opaque ({y},{x}) must be the mean");
+                } else {
+                    assert_eq!(val, 0, "transparent ({y},{x}) stays zero");
+                }
+            }
+        }
+    }
+
+    /// The ∆DC-SA-DCT output differs from the plain inverse SA-DCT by
+    /// exactly the I-∆S4 per-opaque-sample additive term
+    /// `mean_value − corr_term/√pels_height[x]`, where `mean_value` comes
+    /// from `F[0][0]/8` (I-∆S1) and `corr_term = check_sum/sqrt_sum` over
+    /// the plain SA-DCT output of the *mean-stripped* coefficients (I-∆S3).
+    /// This pins the correction algebra independently of the round-trip.
+    #[test]
+    fn delta_dc_correction_matches_closed_form() {
+        let f_shape = staircase();
+        let shape = SadctShape::from_shape(&f_shape);
+        let mut pqf = [[0i32; 8]; 8];
+        pqf[0][0] = 480; // F[0][0] = 8·60 ⇒ mean_value = 60.
+        pqf[0][1] = 120;
+        pqf[1][0] = -64;
+        pqf[2][1] = 33;
+        let mean_value = pqf[0][0] as f64 / 8.0;
+
+        // Plain inverse SA-DCT of the mean-stripped coefficients (= what
+        // I-∆S2 reconstructs before the correction is added).
+        let mut stripped = pqf;
+        stripped[0][0] = 0;
+        let (f_plain, _) = inverse_sadct_float(&stripped, &f_shape);
+
+        // Closed-form I-∆S3 correction term over f_plain.
+        let mut check_sum = 0.0f64;
+        let mut sqrt_sum = 0.0f64;
+        for x in 0..8 {
+            let ph = shape.pels_height[x];
+            if ph == 0 {
+                continue;
+            }
+            sqrt_sum += (ph as f64).sqrt();
+            for (y, row) in f_plain.iter().enumerate() {
+                if f_shape[y][x].is_opaque() {
+                    check_sum += row[x];
+                }
+            }
+        }
+        let corr_term = check_sum / sqrt_sum;
+
+        let delta = inverse_delta_dc_sadct(&pqf, &f_shape);
+        for x in 0..8 {
+            let ph = shape.pels_height[x];
+            if ph == 0 {
+                continue;
+            }
+            let add = mean_value - corr_term / (ph as f64).sqrt();
+            for (y, row) in f_plain.iter().enumerate() {
+                if f_shape[y][x].is_opaque() {
+                    let want = round_sample(row[x] + add);
+                    assert_eq!(delta[y][x], want, "I-∆S4 add at ({y},{x})");
+                }
+            }
+        }
+    }
+
+    /// The ∆DC correction term annihilates exactly when the plain SA-DCT
+    /// output is identically zero (a mean-only block): then `check_sum = 0`,
+    /// `corr_term = 0`, and ∆DC-SA-DCT reduces to adding the bare
+    /// `mean_value`. Verified separately from the flat-mean test by
+    /// asserting `corr_term`'s degenerate path leaves the AC-free result
+    /// equal to the plain SA-DCT (all zero) plus the mean.
+    #[test]
+    fn delta_dc_mean_only_zero_correction() {
+        let f_shape = staircase();
+        let mut pqf = [[0i32; 8]; 8];
+        pqf[0][0] = 200; // mean_value = 25, no AC ⇒ plain SA-DCT = 0.
+        let delta = inverse_delta_dc_sadct(&pqf, &f_shape);
+        let mut stripped = pqf;
+        stripped[0][0] = 0;
+        let plain = inverse_sadct(&stripped, &f_shape); // all zero.
+        for (y, row) in plain.iter().enumerate() {
+            for (x, &p) in row.iter().enumerate() {
+                if f_shape[y][x].is_opaque() {
+                    assert_eq!(delta[y][x], p + 25, "mean add at ({y},{x})");
+                }
+            }
+        }
+    }
+
+    /// Full end-to-end check: build a known opaque texture, run the
+    /// *forward* ∆DC-SA-DCT (∆S1 mean removal + forward SA-DCT + ∆S3 mean
+    /// re-injection) in the test, feed the coefficients to
+    /// [`inverse_delta_dc_sadct`], and require the original integer texture
+    /// back. The forward SA-DCT here is the analytic transpose of the
+    /// shape-adaptive 1-D kernel used by [`sadct_idct_1d`].
+    #[test]
+    fn delta_dc_forward_inverse_roundtrip() {
+        let f_shape = staircase();
+        // A deterministic opaque texture (only opaque cells matter).
+        let mut tex = [[0.0f64; 8]; 8];
+        for (y, row) in tex.iter_mut().enumerate() {
+            for (x, cell) in row.iter_mut().enumerate() {
+                if y <= x {
+                    *cell = (40 + 7 * x as i32 - 3 * y as i32 + ((x * y) as i32 % 5)) as f64;
+                }
+            }
+        }
+
+        // ∆S1: mean over opaque samples, then subtract it.
+        let mut mean = 0.0f64;
+        let mut count = 0u32;
+        for (y, row) in tex.iter().enumerate() {
+            for (x, &v) in row.iter().enumerate() {
+                if y <= x {
+                    mean += v;
+                    count += 1;
+                }
+            }
+        }
+        mean /= count as f64;
+        let mut zero_mean = [[0.0f64; 8]; 8];
+        for (y, row) in tex.iter().enumerate() {
+            for (x, &v) in row.iter().enumerate() {
+                if y <= x {
+                    zero_mean[y][x] = v - mean;
+                }
+            }
+        }
+
+        // ∆S2: forward SA-DCT (S1..S4) of the zero-mean texture, producing
+        // F[v][u] in the PQF packing. Forward S1 packs columns to the top
+        // (shift_shape), forward S2 is the column n-point DCT, forward S3
+        // packs rows to the left (coeff_width), forward S4 is the row
+        // n-point DCT.
+        let shape = SadctShape::from_shape(&f_shape);
+
+        // S1: vertical top-pack of zero-mean texture into shift_text[y][x].
+        let mut shift_text = [[0.0f64; 8]; 8];
+        for x in 0..8 {
+            let mut c = 0usize;
+            for y in 0..8 {
+                if f_shape[y][x].is_opaque() {
+                    shift_text[c][x] = zero_mean[y][x];
+                    c += 1;
+                }
+            }
+        }
+        // S2: per-column pels_height[x]-point forward DCT.
+        let mut f_inter = [[0.0f64; 8]; 8];
+        for x in 0..8 {
+            let ph = shape.pels_height[x] as usize;
+            if ph == 0 {
+                continue;
+            }
+            let col_in: [f64; 8] = std::array::from_fn(|y| shift_text[y][x]);
+            let col_out = sadct_fdct_1d(&col_in, ph);
+            for (v, &val) in col_out.iter().enumerate().take(ph) {
+                f_inter[v][x] = val;
+            }
+        }
+        // S3: per-row left-pack of f_inter into shift_coeff[v][u].
+        let mut shift_coeff = [[0.0f64; 8]; 8];
+        for (v, row) in shift_coeff.iter_mut().enumerate() {
+            let mut c = 0usize;
+            for (x, &present) in shape.shift_shape[v].iter().enumerate() {
+                if present {
+                    row[c] = f_inter[v][x];
+                    c += 1;
+                }
+            }
+        }
+        // S4: per-row coeff_width[v]-point forward DCT → F[v][u].
+        let mut f_coeff = [[0.0f64; 8]; 8];
+        for v in 0..8 {
+            let cw = shape.coeff_width[v] as usize;
+            if cw == 0 {
+                continue;
+            }
+            f_coeff[v] = sadct_fdct_1d(&shift_coeff[v], cw);
+        }
+        // ∆S3: overwrite F[0][0] with the scaled mean.
+        f_coeff[0][0] = 8.0 * mean;
+
+        // Quantise the coefficients to integers (the decoder consumes the
+        // inverse-quantised integer F[v][u]); round half-away-from-zero.
+        let mut pqf = [[0i32; 8]; 8];
+        for (v, row) in f_coeff.iter().enumerate() {
+            for (u, &val) in row.iter().enumerate() {
+                pqf[v][u] = round_sample(val);
+            }
+        }
+
+        let out = inverse_delta_dc_sadct(&pqf, &f_shape);
+        for (y, row) in tex.iter().enumerate() {
+            for (x, &v) in row.iter().enumerate() {
+                if y <= x {
+                    // Allow ±1 for the integer coefficient quantisation.
+                    let got = out[y][x];
+                    let want = v.round() as i32;
+                    assert!(
+                        (got - want).abs() <= 1,
+                        "({y},{x}) roundtrip: got {got}, want {want}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A shape-adaptive `n`-point *forward* DCT — the transpose of
+    /// [`sadct_idct_1d`], used only by the round-trip test to synthesise
+    /// encoder coefficients. `out[u] = √(2/n)·C(u)·Σ_k cos(u·(k+0.5)·π/n)·in[k]`.
+    fn sadct_fdct_1d(input: &[f64; 8], n: usize) -> [f64; 8] {
+        let scaling = (2.0_f64 / n as f64).sqrt();
+        let mut out = [0.0f64; 8];
+        for (u, slot) in out.iter_mut().enumerate().take(n) {
+            let c0 = if u == 0 { 0.5_f64.sqrt() } else { 1.0 };
+            let mut acc = 0.0f64;
+            for (k, &val) in input.iter().enumerate().take(n) {
+                let basis =
+                    (u as f64 * (k as f64 + 0.5) * (core::f64::consts::PI / n as f64)).cos();
+                acc += basis * val;
+            }
+            *slot = scaling * c0 * acc;
+        }
+        out
     }
 }

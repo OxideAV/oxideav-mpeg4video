@@ -58,9 +58,14 @@ encoder.
   `pels_height[x]` / `shift_shape[y][x]`, the variable-length
   `coeff_width[v]`- / `pels_height[x]`-point 1-D inverse DCT kernels,
   and the I-S3 / I-S5 column / row re-shifts) reconverting the
-  `PQF[v][u]` layout back to texture `f[y][x]`, and the §7.3 `d[y][x]`
-  reconstruction with the display clip for I-, P-, and inter
-  macroblocks.
+  `PQF[v][u]` layout back to texture `f[y][x]`, the Annex A §A.4.2 inverse
+  **∆DC-SA-DCT** post-processing (steps I-∆S1..I-∆S4: extract the re-scaled
+  mean `F[0][0]/8` and zero `F[0][0]`, run the inverse SA-DCT body, derive
+  the ∆DC correction term `corr_term = check_sum / sqrt_sum` over the
+  opaque samples, and add `mean_value − corr_term/√pels_height[x]` back per
+  opaque pel — the path used for intra 8×8-blocks with `opaque_pels < 64`),
+  and the §7.3 `d[y][x]` reconstruction with the display clip for I-, P-,
+  and inter macroblocks.
 - **B-VOP prediction**: forward / backward / interpolated / direct
   modes, bidirectional averaging, and 8×8 luminance prediction-block
   generation.
@@ -86,13 +91,13 @@ encoder.
   detects the forward-decode error, runs both directions, gathers the
   `L/N/L1/L2/N1/N2` inputs, and applies the kept-MB decision to the
   reconstructed frame is not yet assembled.
-- The ∆DC-SA-DCT extension (Annex A §A.4: the DC-separation /
-  ∆DC-correction pre- and post-processing steps used in intra-coded
-  8×8-blocks with `opaque_pels < 64`). The base inverse SA-DCT transform
-  body (§7.3.5 / Annex A §A.3.2 steps I-S1..I-S5) it builds on **is**
-  implemented; only the ∆DC wrapper and the §7.3.5 / Table 7-2
-  per-block transform-selection wiring (8×8-DCT vs SA-DCT vs
-  ∆DC-SA-DCT) into the reconstruction loop remain.
+- The §7.3.5 / Table 7-2 per-block transform-selection wiring (8×8-DCT vs
+  SA-DCT vs ∆DC-SA-DCT) into the reconstruction loop. All three transform
+  bodies are now implemented — the 8×8 IDCT, the inverse SA-DCT (Annex A
+  §A.3.2 steps I-S1..I-S5), and the inverse ∆DC-SA-DCT (Annex A §A.4.2
+  steps I-∆S1..I-∆S4) — but the per-block decision that picks which one to
+  apply (from the shape's `opaque_pels` count and `sadct_disable`) is not
+  yet routed into the residual-reconstruction path.
 - Sprite / GMC bodies, scalability enhancement layers, Studio Profile,
   and non-rectangular shapes (rejected with typed errors).
 

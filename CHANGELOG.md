@@ -8,6 +8,26 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 52 of the clean-room rebuild: the Annex A §A.4.2 **inverse
+  ∆DC-SA-DCT** post-processing (`inverse_sadct::inverse_delta_dc_sadct`).
+  ∆DC-SA-DCT is the transform used for intra-coded 8×8 blocks of a
+  non-rectangular VOP with `opaque_pels < 64`: the encoder separates the
+  block mean before the forward SA-DCT (∆S1) and re-injects it as a scaled
+  `F[0][0] = 8·mean_value` (∆S3). The decoder undoes this in steps
+  I-∆S1..I-∆S4:
+  - **I-∆S1** extracts `mean_value = F[0][0] / 8` and zeroes `F[0][0]`.
+  - **I-∆S2** runs the inverse SA-DCT body (I-S1..I-S5) on the modified
+    coefficients, refactored to a shared floating-point core
+    (`inverse_sadct_float`) so the correction operates on the unrounded
+    `f[y][x]` per Annex A NOTE 2.
+  - **I-∆S3** derives the correction term `corr_term = check_sum / sqrt_sum`,
+    with `check_sum = Σ f[y][x]` over opaque samples and
+    `sqrt_sum = Σ √pels_height[x]` over non-empty columns.
+  - **I-∆S4** adds `mean_value − corr_term/√pels_height[x]` to every opaque
+    sample and rounds to integers.
+  Tests cover the flat-mean reconstruction, the closed-form I-∆S4 additive
+  identity, the zero-correction degenerate case, and a full forward/inverse
+  round-trip through a test-local forward SA-DCT.
 - Round 51 of the clean-room rebuild: the Annex A §A.3.2 **inverse
   shape-adaptive DCT** (SA-DCT) transform body — steps I-S1..I-S5 — in a
   new `inverse_sadct` module. This is the §7.3.5 / Table 7-2 transform
