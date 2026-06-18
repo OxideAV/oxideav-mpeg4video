@@ -8,6 +8,24 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 53 of the clean-room rebuild — **GMC subsystem, part 4
+  (§7.8.6 sample reconstruction)**: a new `gmc` module that warps a
+  reference VOP into a GMC prediction macroblock. `gmc_luma_prediction`
+  fills a 16×16 luma block and `gmc_chroma_prediction` an 8×8 chroma
+  block: for each destination pixel it evaluates the §7.8.5
+  `(F,G)`/`(Fc,Gc)` warp, floors it to an integer reference position
+  (`////s`, truncation toward −∞), derives the `1/s`-pel residuals `ri`
+  / `rj`, fetches the four surrounding reference samples with §7.6.4
+  last-full-pel clamping, and applies the §7.8.6 GMC bilinear blend
+  `Y = ((s−rj)((s−ri)Y00 + ri Y01) + rj((s−ri)Y10 + ri Y11) + s²/2 −
+  rounding_control) / s²`, clipped to `[0, 2^bpp − 1]`. This closes the
+  GMC syntax → geometry → reconstruction path end-to-end: a parsed
+  S(GMC)-VOP trajectory now drives a real prediction block. Tests
+  verify the `////` floor division, a flat reference warping flat, the
+  0-point identity reducing to an integer-pel copy, a 1-pel integer
+  translation sampling the shifted reference column, a half-pel shift
+  producing the exact two-column average, the chroma path, and the
+  `vop_rounding_type` half-case down-bias.
 - Round 53 of the clean-room rebuild — **GMC subsystem, part 3
   (reference-point + warping geometry)**: a new `warp` module
   implementing §7.8.4 sprite reference-point decoding and §7.8.5

@@ -69,6 +69,17 @@ encoder.
 - **B-VOP prediction**: forward / backward / interpolated / direct
   modes, bidirectional averaging, and 8×8 luminance prediction-block
   generation.
+- **GMC (global motion compensation)** end-to-end for rectangular
+  S(GMC)-VOPs: the §6.2.3 `sprite_enable == "GMC"` VOL body
+  (`no_of_sprite_warping_points`, `sprite_warping_accuracy`,
+  `sprite_brightness_change`), the §6.2.5 `sprite_trajectory()` syntax
+  (`warping_mv_code` VLC, Table B.34, → `du[i]`/`dv[i]`), the §7.8.4
+  sprite reference-point + virtual-point geometry, the §7.8.5 warping
+  transform `(F,G)`/`(Fc,Gc)` for 0/1/2/3 warping points (stationary /
+  translation / affine — perspective is disallowed under GMC), and the
+  §7.8.6 sample reconstruction that bilinearly warps a reference VOP
+  into a 16×16 luma / 8×8 chroma GMC prediction block with
+  `vop_rounding_type` control and §7.6.4 edge clamping.
 - **Half-sample / quarter-sample** motion compensation, OBMC, and the
   padding stages (sample / vertical / extended / interlaced).
 - **RVLC error recovery**: the §E.1.4.4.2.1 two-way strategy selection —
@@ -98,8 +109,17 @@ encoder.
   steps I-∆S1..I-∆S4) — but the per-block decision that picks which one to
   apply (from the shape's `opaque_pels` count and `sadct_disable`) is not
   yet routed into the residual-reconstruction path.
-- Sprite / GMC bodies, scalability enhancement layers, Studio Profile,
-  and non-rectangular shapes (rejected with typed errors).
+- Static-sprite bodies (the §7.8.2 sprite-object buffer + §7.8.3
+  piece-update / `sprite_transmit_mode` machinery), scalability
+  enhancement layers, Studio Profile, and non-rectangular shapes
+  (rejected with typed errors). GMC global-motion warping *is* now
+  supported (see "What works today"); the remaining GMC wiring is the
+  per-macroblock `mcsel`-gated routing of the warped prediction into
+  the §7.3 reconstruction loop (the warp generator + §7.8.7.3 averaged
+  MV predictor are implemented as composable pieces).
+- Brightness change in GMC/sprite warping (`brightness_change_factor()`
+  / `sprite_brightness_change == 1`) — typed-rejected, since the spec
+  mandates `sprite_brightness_change == 0` under GMC.
 
 ## Provenance
 
