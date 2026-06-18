@@ -111,6 +111,9 @@ pub enum VolParseError {
     /// transmitted and is a bitstream error. Carries the matrix name
     /// (`"intra"` / `"nonintra"`) for diagnostics.
     EmptyQuantMatrix(&'static str),
+    /// `no_of_sprite_warping_points` carried a value in the reserved
+    /// range (5..=63, Table 6-20). Carries the offending count.
+    ReservedWarpingPoints(u8),
 }
 
 impl core::fmt::Display for VolParseError {
@@ -146,6 +149,12 @@ impl core::fmt::Display for VolParseError {
                 write!(
                     f,
                     "{name}_quant_mat first value was 0 (list must hold 2..=64 entries)"
+                )
+            }
+            VolParseError::ReservedWarpingPoints(n) => {
+                write!(
+                    f,
+                    "no_of_sprite_warping_points={n} is in the reserved 5..=63 range (Table 6-20)"
                 )
             }
         }
@@ -198,6 +207,48 @@ impl SpriteEnable {
             0b10 => SpriteEnable::Gmc,
             0b11 => SpriteEnable::Reserved,
             _ => unreachable!("masked to 2 bits"),
+        }
+    }
+}
+
+/// Decoded `sprite_warping_accuracy` field (Table 6-21, §6.3.3).
+///
+/// The 2-bit code selects the sub-pel quantisation accuracy `s` of the
+/// warping motion vectors used in sprite / GMC reconstruction. The
+/// `s` value is the denominator in the §7.8.4 / §7.8.5 reference-point
+/// and warping formulas (`(i', j') = (s/2)(...)`, `1/s` pel accuracy).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpriteWarpingAccuracy {
+    /// `00` — 1/2-pixel accuracy (`s == 2`).
+    HalfPel,
+    /// `01` — 1/4-pixel accuracy (`s == 4`).
+    QuarterPel,
+    /// `10` — 1/8-pixel accuracy (`s == 8`).
+    EighthPel,
+    /// `11` — 1/16-pixel accuracy (`s == 16`).
+    SixteenthPel,
+}
+
+impl SpriteWarpingAccuracy {
+    fn from_bits(bits: u32) -> Self {
+        match bits & 0b11 {
+            0b00 => SpriteWarpingAccuracy::HalfPel,
+            0b01 => SpriteWarpingAccuracy::QuarterPel,
+            0b10 => SpriteWarpingAccuracy::EighthPel,
+            0b11 => SpriteWarpingAccuracy::SixteenthPel,
+            _ => unreachable!("masked to 2 bits"),
+        }
+    }
+
+    /// The sub-pel denominator `s` for this accuracy: 2, 4, 8, or 16.
+    /// This is the `s` used throughout §7.8.4 (reference-point
+    /// scaling), §7.8.5 (warping) and §7.8.6 (sample reconstruction).
+    pub const fn s(self) -> i64 {
+        match self {
+            SpriteWarpingAccuracy::HalfPel => 2,
+            SpriteWarpingAccuracy::QuarterPel => 4,
+            SpriteWarpingAccuracy::EighthPel => 8,
+            SpriteWarpingAccuracy::SixteenthPel => 16,
         }
     }
 }
@@ -400,6 +451,18 @@ pub struct VolHeader {
     pub obmc_disable: bool,
     /// Decoded `sprite_enable` (Table 6-19).
     pub sprite_enable: SpriteEnable,
+    /// `no_of_sprite_warping_points` (§6.3.3, Table 6-20). Present only
+    /// when `sprite_enable` is `Static` or `Gmc`; `None` otherwise.
+    /// Value `0` → stationary, `1` → translation, `2`/`3` → affine,
+    /// `4` → perspective (perspective is disallowed under `Gmc`).
+    pub no_of_sprite_warping_points: Option<u8>,
+    /// `sprite_warping_accuracy` (§6.3.3, Table 6-21). Present only
+    /// when `sprite_enable` is `Static` or `Gmc`; `None` otherwise.
+    pub sprite_warping_accuracy: Option<SpriteWarpingAccuracy>,
+    /// `sprite_brightness_change` (§6.3.3). Present only when
+    /// `sprite_enable` is `Static` or `Gmc`; `None` otherwise. Always
+    /// `false` under `Gmc` (the spec mandates the bit be `0`).
+    pub sprite_brightness_change: Option<bool>,
     /// `not_8_bit` flag (§6.3.3). When `true`, `quant_precision` and
     /// `bits_per_pixel` are transmitted in-line; otherwise the spec
     /// defaults `quant_precision = 5` and `bits_per_pixel = 8`.
@@ -679,18 +742,50 @@ fn parse_video_object_layer_body(
     } else {
         SpriteEnable::from_two_bits(br.read_bits(2)?)
     };
-    // The full sprite block (sprite_width / _height / coordinates /
-    // warping points / accuracy / brightness change / low-latency)
-    // is not part of round 3. Surface a typed rejection so the bit
-    // position doesn't quietly drift.
-    if matches!(sprite_enable, SpriteEnable::Static | SpriteEnable::Gmc) {
-        return Err(VolParseError::UnsupportedBranch(
-            "sprite_enable static/GMC body",
-        ));
-    }
-    if matches!(sprite_enable, SpriteEnable::Reserved) {
-        return Err(VolParseError::UnsupportedBranch("sprite_enable reserved"));
-    }
+    // §6.2.3 sprite block (spec lines 3997..=4013). The GMC sub-branch
+    // (`sprite_enable == "GMC"`) carries only the warping-point count,
+    // accuracy and brightness-change flag — no sprite_width / _height /
+    // coordinates / low_latency_sprite_enable (those are static-only,
+    // gated `if (sprite_enable != "GMC")`). The static branch additionally
+    // needs the sprite-object buffer + piece-update machinery (§7.8.2 /
+    // §7.8.3), which is out of scope; it stays typed-rejected so the bit
+    // position never drifts.
+    let (no_of_sprite_warping_points, sprite_warping_accuracy, sprite_brightness_change) =
+        match sprite_enable {
+            SpriteEnable::Gmc => {
+                let points = br.read_bits(6)? as u8;
+                // Table 6-20: 5..=63 reserved; value 4 (perspective) is
+                // disallowed under GMC (§6.3.3 no_of_sprite_warping_points).
+                if points == 4 {
+                    return Err(VolParseError::UnsupportedBranch(
+                        "GMC perspective (4 warping points)",
+                    ));
+                }
+                if points > 4 {
+                    return Err(VolParseError::ReservedWarpingPoints(points));
+                }
+                let accuracy = SpriteWarpingAccuracy::from_bits(br.read_bits(2)?);
+                // sprite_brightness_change shall be 0 when
+                // sprite_enable == "GMC" (§6.3.3). Read it to stay aligned;
+                // reject a non-zero value as a malformed stream.
+                let brightness = br.read_bool()?;
+                if brightness {
+                    return Err(VolParseError::UnsupportedBranch(
+                        "GMC sprite_brightness_change == 1",
+                    ));
+                }
+                (Some(points), Some(accuracy), Some(brightness))
+            }
+            SpriteEnable::Static => {
+                return Err(VolParseError::UnsupportedBranch(
+                    "sprite_enable static body",
+                ));
+            }
+            SpriteEnable::Reserved => {
+                return Err(VolParseError::UnsupportedBranch("sprite_enable reserved"));
+            }
+            SpriteEnable::NotUsed => (None, None, None),
+        };
     // sadct_disable is only present when verid != 1 AND shape !=
     // rectangular (spec line 4014). Round 3 gates `shape ==
     // rectangular` upfront, so we never read it.
@@ -790,6 +885,9 @@ fn parse_video_object_layer_body(
         interlaced,
         obmc_disable,
         sprite_enable,
+        no_of_sprite_warping_points,
+        sprite_warping_accuracy,
+        sprite_brightness_change,
         not_8_bit,
         quant_precision,
         bits_per_pixel,
@@ -1444,6 +1542,72 @@ mod tests {
     }
 
     #[test]
+    fn gmc_vol_sprite_body_decodes_warping_fields() {
+        // verid == 2 ⇒ sprite_enable is a 2-bit field; `10` selects GMC.
+        let mut w = BitWriter::new();
+        write_vol_header_up_to_trailing(&mut w, Some(2), 0b00, false);
+        w.write_bits(0, 1); // interlaced
+        w.write_bits(0, 1); // obmc_disable
+        w.write_bits(0b10, 2); // sprite_enable = GMC
+        w.write_bits(2, 6); // no_of_sprite_warping_points = 2 (affine)
+        w.write_bits(0b01, 2); // sprite_warping_accuracy = 1/4 pel
+        w.write_bits(0, 1); // sprite_brightness_change = 0 (mandatory)
+                            // verid != 1 ⇒ sadct_disable only when shape != rect; skipped.
+        w.write_bits(0, 1); // not_8_bit
+        w.write_bits(0, 1); // quant_type
+        w.write_bits(0, 1); // quarter_sample (verid != 1)
+        w.write_bits(1, 1); // complexity_estimation_disable
+        w.write_bits(0, 1); // resync_marker_disable
+        w.write_bits(0, 1); // data_partitioned
+        w.write_bits(0, 1); // newpred_enable (verid != 1)
+        w.write_bits(0, 1); // reduced_resolution_vop_enable
+        w.write_bits(0, 1); // scalability
+        w.align();
+        let header = parse_video_object_layer(&w.buf, 0).unwrap();
+        assert_eq!(header.sprite_enable, SpriteEnable::Gmc);
+        assert_eq!(header.no_of_sprite_warping_points, Some(2));
+        assert_eq!(
+            header.sprite_warping_accuracy,
+            Some(SpriteWarpingAccuracy::QuarterPel)
+        );
+        assert_eq!(header.sprite_warping_accuracy.unwrap().s(), 4);
+        assert_eq!(header.sprite_brightness_change, Some(false));
+    }
+
+    #[test]
+    fn gmc_vol_rejects_perspective_four_points() {
+        let mut w = BitWriter::new();
+        write_vol_header_up_to_trailing(&mut w, Some(2), 0b00, false);
+        w.write_bits(0, 1); // interlaced
+        w.write_bits(0, 1); // obmc_disable
+        w.write_bits(0b10, 2); // sprite_enable = GMC
+        w.write_bits(4, 6); // no_of_sprite_warping_points = 4 (disallowed under GMC)
+        w.write_bits(0b00, 2);
+        w.write_bits(0, 1);
+        w.align();
+        let err = parse_video_object_layer(&w.buf, 0).unwrap_err();
+        match err {
+            VolParseError::UnsupportedBranch(name) => assert!(name.contains("perspective")),
+            other => panic!("expected UnsupportedBranch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gmc_vol_rejects_reserved_warping_points() {
+        let mut w = BitWriter::new();
+        write_vol_header_up_to_trailing(&mut w, Some(2), 0b00, false);
+        w.write_bits(0, 1); // interlaced
+        w.write_bits(0, 1); // obmc_disable
+        w.write_bits(0b10, 2); // sprite_enable = GMC
+        w.write_bits(5, 6); // no_of_sprite_warping_points = 5 (reserved)
+        w.write_bits(0b00, 2);
+        w.write_bits(0, 1);
+        w.align();
+        let err = parse_video_object_layer(&w.buf, 0).unwrap_err();
+        assert_eq!(err, VolParseError::ReservedWarpingPoints(5));
+    }
+
+    #[test]
     fn round3_sprite_static_is_rejected_with_branch_error() {
         let mut w = BitWriter::new();
         write_vol_header_up_to_trailing(&mut w, None, 0b00, false);
@@ -1487,15 +1651,34 @@ mod tests {
     }
 
     #[test]
-    fn round3_verid2_sprite_gmc_is_rejected() {
+    fn round3_verid2_sprite_gmc_stationary_decodes() {
+        // GMC with no_of_sprite_warping_points == 0 (stationary / identity
+        // warp). The sprite body still carries accuracy + brightness.
         let mut w = BitWriter::new();
         write_vol_header_up_to_trailing(&mut w, Some(2), 0b00, false);
-        w.write_bits(0, 1);
-        w.write_bits(0, 1);
+        w.write_bits(0, 1); // interlaced
+        w.write_bits(0, 1); // obmc_disable
         w.write_bits(0b10, 2); // sprite_enable = GMC
+        w.write_bits(0, 6); // no_of_sprite_warping_points = 0 (stationary)
+        w.write_bits(0b11, 2); // sprite_warping_accuracy = 1/16 pel
+        w.write_bits(0, 1); // sprite_brightness_change = 0
+        w.write_bits(0, 1); // not_8_bit
+        w.write_bits(0, 1); // quant_type
+        w.write_bits(0, 1); // quarter_sample
+        w.write_bits(1, 1); // complexity_estimation_disable
+        w.write_bits(0, 1); // resync_marker_disable
+        w.write_bits(0, 1); // data_partitioned
+        w.write_bits(0, 1); // newpred_enable
+        w.write_bits(0, 1); // reduced_resolution_vop_enable
+        w.write_bits(0, 1); // scalability
         w.align();
-        let err = parse_video_object_layer(&w.buf, 0).unwrap_err();
-        assert!(matches!(err, VolParseError::UnsupportedBranch(_)));
+        let header = parse_video_object_layer(&w.buf, 0).unwrap();
+        assert_eq!(header.sprite_enable, SpriteEnable::Gmc);
+        assert_eq!(header.no_of_sprite_warping_points, Some(0));
+        assert_eq!(
+            header.sprite_warping_accuracy,
+            Some(SpriteWarpingAccuracy::SixteenthPel)
+        );
     }
 
     #[test]

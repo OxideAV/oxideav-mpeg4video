@@ -8,8 +8,26 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- Round 52 of the clean-room rebuild: the Annex A §A.4.2 **inverse
-  ∆DC-SA-DCT** post-processing (`inverse_sadct::inverse_delta_dc_sadct`).
+- Round 53 of the clean-room rebuild — **GMC subsystem, part 1
+  (configuration syntax)**: the §6.2.3 `sprite_enable == "GMC"` VOL
+  body. `parse_video_object_layer` now decodes
+  `no_of_sprite_warping_points` (Table 6-20: `0` stationary, `1`
+  translation, `2`/`3` affine — `4` perspective is typed-rejected as
+  disallowed under GMC, `5..=63` rejected as `ReservedWarpingPoints`),
+  `sprite_warping_accuracy` (Table 6-21 → new `SpriteWarpingAccuracy`
+  enum with `s()` returning the `2 / 4 / 8 / 16` sub-pel denominator),
+  and `sprite_brightness_change` (mandated `0` under GMC, a non-zero
+  bit is rejected). The GMC branch correctly skips the static-only
+  `sprite_width` / `sprite_height` / coordinate fields and the
+  `low_latency_sprite_enable` bit (all gated `if (sprite_enable !=
+  "GMC")` in §6.2.3). The `static` branch stays typed-rejected — it
+  needs the §7.8.2 sprite-object buffer + §7.8.3 piece-update
+  machinery, out of scope for the GMC milestone. New `VolHeader`
+  fields `no_of_sprite_warping_points` / `sprite_warping_accuracy` /
+  `sprite_brightness_change` (all `Option`, `None` when sprite coding
+  is off). Tests cover the affine 2-point body, the stationary
+  0-point body, the perspective-rejection and reserved-count paths,
+  and the accuracy → `s` mapping.
   ∆DC-SA-DCT is the transform used for intra-coded 8×8 blocks of a
   non-rectangular VOP with `opaque_pels < 64`: the encoder separates the
   block mean before the forward SA-DCT (∆S1) and re-injects it as a scaled
