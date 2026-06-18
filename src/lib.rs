@@ -339,6 +339,7 @@ pub mod vertical_padding;
 pub mod video_packet;
 pub mod vol;
 pub mod vop;
+pub mod warp;
 
 pub use bitreader::{BitReader, BitReaderError};
 pub use block::{
@@ -476,6 +477,7 @@ pub use vop::{
     parse_group_of_vop_header, parse_video_object_plane_header, GovHeader, TimeCode, VopCodingType,
     VopContext, VopHeader, VopParseError, GROUP_OF_VOP_START_CODE, VOP_START_CODE,
 };
+pub use warp::{div_sdr, WarpGeometry};
 
 /// Crate-level error surface. Decoding entry points map their internal
 /// parse errors into this enum so callers don't need to depend on the

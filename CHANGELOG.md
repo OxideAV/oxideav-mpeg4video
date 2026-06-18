@@ -8,6 +8,29 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 53 of the clean-room rebuild — **GMC subsystem, part 3
+  (reference-point + warping geometry)**: a new `warp` module
+  implementing §7.8.4 sprite reference-point decoding and §7.8.5
+  warping. `WarpGeometry::decode` turns a [`SpriteTrajectory`] + VOP
+  `W`/`H` + `sprite_warping_accuracy` into the sprite reference points
+  `(i0',j0')` / `(i1',j1')` / `(i2',j2')` (`1/s`-pel), the virtual
+  sprite points `(i1'',j1'')` / `(i2'',j2'')` for 2/3-point affine
+  warps, and the derived `r = 16/s`, `W'`/`H'` (smallest powers of two
+  `>= W`/`H`) and their exponents. `luma_fg(i,j)` / `chroma_fg(ic,jc)`
+  evaluate the §7.8.5 `(F,G)` / `(Fc,Gc)` transforms for all GMC point
+  counts (0 stationary, 1 translation incl. the GMC-specific chroma
+  `(i0'>>1)|(i0'&1)` form, 2/3 affine), mapping a destination VOP pixel
+  to a `1/s`-pel reference coordinate. The §3.4 `///` operator (sign-
+  dependent rounding to nearest) is implemented exactly as `div_sdr`
+  (`3 /// 2 == 2`, `-3 /// 2 == -1`) and `// ` as `div_half`; the spec's
+  power-of-two shift rewrites are equivalent and folded into the exact
+  forms. Two OCR ambiguities in the §7.8.5 listing (the garbled
+  `2^(α+ρ−1)` rounding offset and the `−16 i0` terms) are documented in
+  the source. Tests verify: the `///`/`// ` rounding examples, the
+  `r`/`rho` and `W'`/`alpha` derivations, the 0-point identity
+  (`F = s·i`), single-point pure translation, the 2- and 3-point
+  zero-trajectory reduction to the identity affine, and the
+  degenerate-affine pure-translation case.
 - Round 53 of the clean-room rebuild — **GMC subsystem, part 2
   (sprite-trajectory syntax)**: a new `sprite` module decoding the
   §6.2.5 `sprite_trajectory()` body for S(GMC)-VOPs.
