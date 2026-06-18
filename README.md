@@ -52,7 +52,13 @@ encoder.
   packing with the NOTE 1 zero-fill, plus the Annex A §A.3.2 I-S1
   `coeff_width[v]` / `opaque_pels` derivation from the decoded binary
   shape), §7.4 inverse
-  quantisation (methods 1 and 2), the 8×8 IDCT, and the §7.3 `d[y][x]`
+  quantisation (methods 1 and 2), the 8×8 IDCT, the Annex A §A.3.2
+  inverse **shape-adaptive DCT** (SA-DCT) transform body (steps
+  I-S1..I-S5: the full shape-parameter derivation `coeff_width[v]` /
+  `pels_height[x]` / `shift_shape[y][x]`, the variable-length
+  `coeff_width[v]`- / `pels_height[x]`-point 1-D inverse DCT kernels,
+  and the I-S3 / I-S5 column / row re-shifts) reconverting the
+  `PQF[v][u]` layout back to texture `f[y][x]`, and the §7.3 `d[y][x]`
   reconstruction with the display clip for I-, P-, and inter
   macroblocks.
 - **B-VOP prediction**: forward / backward / interpolated / direct
@@ -80,11 +86,13 @@ encoder.
   detects the forward-decode error, runs both directions, gathers the
   `L/N/L1/L2/N1/N2` inputs, and applies the kept-MB decision to the
   reconstructed frame is not yet assembled.
-- The inverse SA-DCT / ∆DC-SA-DCT transform bodies themselves (§7.3.5 /
-  Annex A §A.3.2 steps I-S2..I-S4). The §7.4.2 modified inverse scan and
-  the `coeff_width[]` / `opaque_pels` shape-parameter derivation that
-  feed the transform are implemented; the transform that consumes the
-  resulting `PQF[v][u]` layout is not.
+- The ∆DC-SA-DCT extension (Annex A §A.4: the DC-separation /
+  ∆DC-correction pre- and post-processing steps used in intra-coded
+  8×8-blocks with `opaque_pels < 64`). The base inverse SA-DCT transform
+  body (§7.3.5 / Annex A §A.3.2 steps I-S1..I-S5) it builds on **is**
+  implemented; only the ∆DC wrapper and the §7.3.5 / Table 7-2
+  per-block transform-selection wiring (8×8-DCT vs SA-DCT vs
+  ∆DC-SA-DCT) into the reconstruction loop remain.
 - Sprite / GMC bodies, scalability enhancement layers, Studio Profile,
   and non-rectangular shapes (rejected with typed errors).
 

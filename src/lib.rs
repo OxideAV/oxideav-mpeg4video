@@ -320,6 +320,7 @@ pub mod idct;
 pub mod interlaced_information;
 pub mod interlaced_padding;
 pub mod inverse_quant;
+pub mod inverse_sadct;
 pub mod macroblock;
 pub mod motion;
 pub mod mv_predictor_grid;

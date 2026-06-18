@@ -8,6 +8,32 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 51 of the clean-room rebuild: the Annex A §A.3.2 **inverse
+  shape-adaptive DCT** (SA-DCT) transform body — steps I-S1..I-S5 — in a
+  new `inverse_sadct` module. This is the §7.3.5 / Table 7-2 transform
+  that replaces the textbook 8×8 inverse DCT in non-rectangular VOPs
+  (`sadct_disable == 0`) for blocks with `opaque_pels < 64`. It consumes
+  the `PQF[v][u]` layout produced by the §7.4.2 modified inverse scan and
+  reconverts it to decoded texture `f[y][x]`:
+  - **I-S1** re-derives the full shape-parameter set (`coeff_width[v]`,
+    `pels_height[x]`, `shift_shape[y][x]`) from the decoded binary shape
+    `f_shape[y][x]` — the `coeff_width` / `opaque_pels` halves already
+    drove the scan; the transform also needs `pels_height` and
+    `shift_shape` for the re-shifts.
+  - **I-S2 / I-S4** apply variable-length, shape-adaptive 1-D inverse
+    DCTs (`coeff_width[v]`-point per row, then `pels_height[x]`-point per
+    column) using the orthonormal `√(2/N)` / `C(0)=√0.5` kernel with `N`
+    taken from the shape parameter rather than fixed at 8.
+  - **I-S3 / I-S5** re-shift the intermediate coefficients and final
+    pels from their left-/top-packed positions back to the original
+    column/row positions defined by `shift_shape` / `f_shape`.
+  Floating-point per Annex A NOTE 3, output rounded half-away-from-zero
+  (§4.1). Two transcription typos in the ISO listing (`coff_count` in
+  I-S3, the missing `[pels_count]` row index in I-S5) are documented and
+  corrected. 8 new tests: the full-opaque block reduces exactly to the
+  Annex A §A.1 8×8 IDCT, DC-only flat reconstruction, single-opaque-row
+  and single-opaque-column DC behaviour, staircase shape-param
+  invariants, transparent-position and all-zero-block guarantees.
 - Round 50 of the clean-room rebuild: the §7.4.2 **modified inverse
   scan** for the `sadct_disable == 0` shape-adaptive-DCT path. In a
   non-rectangular VOP, an 8×8 block with fewer than 64 opaque pels
