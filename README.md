@@ -32,8 +32,14 @@ encoder.
   time base, `vop_quant`, `vop_fcode_forward` / `_backward`, rounding
   type, and the interlaced flags.
 - **Macroblock layer**: I/P-VOP macroblock-header bit-walk (mcbpc /
-  cbpy / dquant / ac_pred / not-coded skip), B-VOP header prefix (modb /
-  mb_type / cbpb / dbquant), and the `interlaced_information()` body.
+  cbpy / dquant / ac_pred / not-coded skip), the §6.3.6 **S(GMC)-VOP**
+  macroblock layer (shares the P-VOP MCBPC table + not-coded syntax, plus
+  the `mcsel` flag — GMC vs. local-MC reference selection — for inter /
+  inter+q macroblocks, with the §6.3.6 implied `mcsel == 1` for a
+  not-coded GMC macroblock and the §6.2.6.3 / line-11715 rule that an
+  `mcsel == 1` macroblock invokes no `interlaced_information()` body),
+  B-VOP header prefix (modb / mb_type / cbpb / dbquant), and the
+  `interlaced_information()` body.
 - **Motion vectors**: the `motion_vector()` body and MVD VLC (Table
   B.12), §7.6.3 differential reconstruction with the modulo wrap, the
   §7.6.5 median predictor with the four candidate-validity rules,
@@ -102,21 +108,27 @@ encoder.
   detects the forward-decode error, runs both directions, gathers the
   `L/N/L1/L2/N1/N2` inputs, and applies the kept-MB decision to the
   reconstructed frame is not yet assembled.
-- The §7.3.5 / Table 7-2 per-block transform-selection wiring (8×8-DCT vs
-  SA-DCT vs ∆DC-SA-DCT) into the reconstruction loop. All three transform
-  bodies are now implemented — the 8×8 IDCT, the inverse SA-DCT (Annex A
-  §A.3.2 steps I-S1..I-S5), and the inverse ∆DC-SA-DCT (Annex A §A.4.2
-  steps I-∆S1..I-∆S4) — but the per-block decision that picks which one to
-  apply (from the shape's `opaque_pels` count and `sadct_disable`) is not
-  yet routed into the residual-reconstruction path.
+- The final routing of the §7.3.5 / Table 7-2 per-block transform
+  selection from a *live decoded shape* inside the macroblock
+  reconstruction loop. The decision rule itself is now implemented
+  ([`transform_select`]: `select_transform` transcribes the three Table
+  7-2 rows — 8×8-DCT for rectangular / `sadct_disable == 1` /
+  `opaque_pels == 64`; ∆DC-SA-DCT for non-B intra blocks; SA-DCT for
+  P-VOP inter and all B-VOP blocks — and `inverse_transform_block` /
+  `select_and_inverse_transform` apply the chosen one of the three
+  transform bodies). What remains is calling it from the residual loop
+  with the per-block `opaque_pels` count and `f_shape` derived from the
+  decoded binary shape of the current macroblock.
 - Static-sprite bodies (the §7.8.2 sprite-object buffer + §7.8.3
   piece-update / `sprite_transmit_mode` machinery), scalability
   enhancement layers, Studio Profile, and non-rectangular shapes
   (rejected with typed errors). GMC global-motion warping *is* now
-  supported (see "What works today"); the remaining GMC wiring is the
+  supported (see "What works today"), as is the §6.3.6 S(GMC)-VOP
+  macroblock-layer `mcsel` parse; the remaining GMC wiring is the
   per-macroblock `mcsel`-gated routing of the warped prediction into
-  the §7.3 reconstruction loop (the warp generator + §7.8.7.3 averaged
-  MV predictor are implemented as composable pieces).
+  the §7.3 reconstruction loop (the warp generator, the parsed `mcsel`
+  selector, and the §7.8.7.3 averaged MV predictor are implemented as
+  composable pieces).
 - Brightness change in GMC/sprite warping (`brightness_change_factor()`
   / `sprite_brightness_change == 1`) — typed-rejected, since the spec
   mandates `sprite_brightness_change == 0` under GMC.

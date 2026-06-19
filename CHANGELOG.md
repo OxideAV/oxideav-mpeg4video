@@ -8,6 +8,28 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **§7.3.5 / Table 7-2 inverse-transform selection** (`transform_select`
+  module): the per-8×8-block decision that routes a decoded `PQF[v][u]`
+  coefficient block to one of the three already-implemented inverse
+  transforms. `select_transform` transcribes the three Table 7-2 rows
+  verbatim — 8×8-DCT when `rectangular || sadct_disable || opaque_pels ==
+  64`; ∆DC-SA-DCT for non-B intra blocks (`derived_mb_type ∈ {3,4}`) of
+  a non-rectangular `sadct_disable == 0` `opaque_pels < 64` VOL; SA-DCT
+  for the remaining P-VOP-inter / B-VOP-intra / B-VOP-inter cases (incl.
+  the subtle B-VOP-intra → plain-SA-DCT case the ∆DC `!= "B"` gate
+  excludes). `inverse_transform_block` / `select_and_inverse_transform`
+  apply the chosen transform. 16 tests: per-row coverage, exhaustiveness
+  over the SA-DCT space, and dispatch-matches-body for all three arms.
+- **§6.3.6 S(GMC)-VOP macroblock layer** (`macroblock`): the
+  macroblock-header parser now decodes S(GMC)-VOP macroblocks
+  (`sprite_enable == "GMC"`) instead of rejecting all S-VOPs. They share
+  the P-VOP MCBPC type table and not-coded syntax and additionally carry
+  the §6.3.6 `mcsel` flag (GMC vs. local-MC reference, present for inter /
+  inter+q types) via the new `MacroblockHeader::mcsel` field and the
+  `MacroblockHeader::SKIPPED_GMC` not-coded constant (implied `mcsel == 1`
+  per §6.3.6). Interlaced routing follows §6.2.6.3 / line 11715: an
+  `mcsel == 1` GMC macroblock invokes no `interlaced_information()` body.
+  Static-sprite S-VOPs and B-VOPs remain typed-rejected. 8 new tests.
 - Round 53 of the clean-room rebuild — **GMC subsystem, part 4
   (§7.8.6 sample reconstruction)**: a new `gmc` module that warps a
   reference VOP into a GMC prediction macroblock. `gmc_luma_prediction`
