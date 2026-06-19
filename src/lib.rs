@@ -335,6 +335,7 @@ pub mod sample_padding;
 pub mod scan;
 pub mod sprite;
 pub mod texture;
+pub mod transform_select;
 pub mod vector_padding;
 pub mod vertical_padding;
 pub mod video_packet;
@@ -456,6 +457,10 @@ pub use texture::{
     decode_ac_event, decode_ac_event_rvlc, decode_ac_event_short_video_header, decode_ac_events,
     decode_ac_events_rvlc, decode_ac_events_short_video_header, decode_intra_dc, AcEvent,
     DcComponent, IntraDcDifferential, TcoefTable, TextureParseError,
+};
+pub use transform_select::{
+    inverse_transform_block, select_and_inverse_transform, select_transform, InverseTransform,
+    TransformSelection, SHAPE_RECTANGULAR,
 };
 pub use vector_padding::{
     pad_macroblock_vectors, BlockTransparency, MacroblockPaddingMode, VectorPaddingError,
