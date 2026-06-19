@@ -68,9 +68,9 @@
 
 use crate::bitreader::{BitReader, BitReaderError};
 use crate::interlaced_information::{
-    parse_interlaced_information, InterlacedInfoContext, InterlacedInformation,
+    parse_interlaced_information, InterlacedInfoContext, InterlacedInformation, McSel,
 };
-use crate::vol::VolHeader;
+use crate::vol::{SpriteEnable, VolHeader};
 use crate::vop::VopCodingType;
 
 /// Decoded macroblock type, per the `mb type` column of Table B.1.
@@ -181,6 +181,25 @@ pub struct MacroblockHeader {
     /// may be unfired (a zero-bit body — see
     /// [`InterlacedInformation::bit_count`]).
     pub interlaced_info: Option<InterlacedInformation>,
+    /// The §6.3.6 `mcsel` flag for an S(GMC)-VOP macroblock.
+    ///
+    /// `mcsel` is present in the bitstream only when `vop_coding_type ==
+    /// "S"`, `sprite_enable == "GMC"`, and the macroblock type from
+    /// `mcbpc` is inter / inter+q (`derived_mb_type == 0 || == 1`). It
+    /// selects, for that macroblock, whether the global-motion-compensated
+    /// image (`mcsel == true`) or the previous reconstructed VOP via local
+    /// motion vectors (`mcsel == false`) is the reference for interframe
+    /// prediction. When `mcsel == true` no local motion vectors are
+    /// transmitted for the macroblock.
+    ///
+    /// Per the §6.3.6 default rule, a not-coded macroblock in an
+    /// S(GMC)-VOP (`not_coded == 1`) carries an implied `mcsel == true`
+    /// (GMC prediction). This field is therefore `Some(true)` for a
+    /// not-coded S(GMC) macroblock, `Some(value)` for a coded inter / inter+q
+    /// S(GMC) macroblock, and `None` for every non-S(GMC) macroblock and
+    /// for an intra S(GMC) macroblock (where the `mcsel` syntax gate does
+    /// not fire).
+    pub mcsel: Option<bool>,
 }
 
 impl MacroblockHeader {
@@ -195,6 +214,22 @@ impl MacroblockHeader {
         cbpy: 0,
         dquant_delta: None,
         interlaced_info: None,
+        mcsel: None,
+    };
+
+    /// The not-coded macroblock of an S(GMC)-VOP. Identical to
+    /// [`MacroblockHeader::SKIPPED`] but with the §6.3.6 implied
+    /// `mcsel == true` (the default for a not-coded S(GMC) macroblock,
+    /// which is predicted from the global-motion-compensated image).
+    pub const SKIPPED_GMC: Self = Self {
+        not_coded: true,
+        mb_type: None,
+        cbpc: 0,
+        ac_pred_flag: false,
+        cbpy: 0,
+        dquant_delta: None,
+        interlaced_info: None,
+        mcsel: Some(true),
     };
 }
 
@@ -475,9 +510,13 @@ fn decode_cbpy4(br: &mut BitReader<'_>) -> Result<(u8, u8, u8), MacroblockParseE
 /// to the next valid macroblock, returning the first non-stuffing
 /// header.
 ///
-/// **Scope.** Only I-VOPs and P-VOPs with rectangular shape are
-/// supported. B-VOPs (`modb` / `mb_type` Tables B.3 / B.4 / B.5)
-/// and S-VOPs (sprite branches) are rejected with
+/// **Scope.** I-VOPs, P-VOPs, and S(GMC)-VOPs (`sprite_enable ==
+/// "GMC"`) with rectangular shape are supported. The S(GMC)-VOP path
+/// shares the P-VOP macroblock type table and additionally parses the
+/// §6.3.6 `mcsel` flag (GMC vs. local-MC reference selection) for its
+/// inter / inter+q macroblocks, surfaced in
+/// [`MacroblockHeader::mcsel`]. B-VOPs (`modb` / `mb_type` Tables B.3 /
+/// B.4 / B.5) and `Static`-sprite S-VOPs are still rejected with
 /// [`MacroblockParseError::UnsupportedVopKind`].
 pub fn parse_macroblock_header(
     br: &mut BitReader<'_>,
@@ -491,25 +530,41 @@ pub fn parse_macroblock_header(
         ));
     }
 
+    // §6.3.6: the S(GMC)-VOP macroblock layer shares the P-VOP macroblock
+    // type table (MCBPC_P_TABLE: inter / inter+q / inter4v / intra /
+    // intra+q) and the P-VOP `not_coded` syntax, and additionally carries
+    // the `mcsel` flag (§6.3.6) for inter / inter+q macroblocks. The
+    // `mcsel` route only exists for `sprite_enable == "GMC"`; a `Static`
+    // sprite or any other S-VOP framing is still out of scope.
+    let is_s_gmc =
+        vop_coding_type == VopCodingType::S && matches!(vol.sprite_enable, SpriteEnable::Gmc);
     let (mcbpc_table, vop_has_not_coded) = match vop_coding_type {
         VopCodingType::I => (MCBPC_I_TABLE, false),
         VopCodingType::P => (MCBPC_P_TABLE, true),
+        VopCodingType::S if is_s_gmc => (MCBPC_P_TABLE, true),
         VopCodingType::B | VopCodingType::S => {
             return Err(MacroblockParseError::UnsupportedVopKind(vop_coding_type));
         }
     };
 
     loop {
-        // §6.2.6: not_coded is present only for P-VOPs (and S-VOPs
-        // we already rejected). For I-VOPs the syntax goes directly
-        // to mcbpc.
+        // §6.2.6: not_coded is present only for P-VOPs and S-VOPs (the
+        // `vop_coding_type != "I"` gate). For I-VOPs the syntax goes
+        // directly to mcbpc.
         let not_coded = if vop_has_not_coded {
             br.read_bool()?
         } else {
             false
         };
         if not_coded {
-            return Ok(MacroblockHeader::SKIPPED);
+            // §6.3.6: a not-coded S(GMC)-VOP macroblock carries an implied
+            // `mcsel == 1` (predicted from the global-motion-compensated
+            // image). A not-coded P-VOP macroblock is a plain skip.
+            return Ok(if is_s_gmc {
+                MacroblockHeader::SKIPPED_GMC
+            } else {
+                MacroblockHeader::SKIPPED
+            });
         }
 
         let (_len, mb_type_raw, cbpc) = decode_mcbpc(br, mcbpc_table)?;
@@ -524,6 +579,18 @@ pub fn parse_macroblock_header(
             3 => DerivedMbType::Intra,
             4 => DerivedMbType::IntraQ,
             other => unreachable!("MCBPC table emitted unexpected mb_type {other}"),
+        };
+
+        // §6.3.6 `mcsel`: present iff `vop_coding_type == "S" &&
+        // sprite_enable == "GMC" && (derived_mb_type == 0 ||
+        // derived_mb_type == 1)` — i.e. an inter / inter+q macroblock of an
+        // S(GMC)-VOP. It selects GMC (`1`) vs. local MC (`0`) prediction.
+        // The syntax places it immediately after `mcbpc` and before
+        // `ac_pred_flag`.
+        let mcsel = if is_s_gmc && matches!(mb_type, DerivedMbType::Inter | DerivedMbType::InterQ) {
+            Some(br.read_bool()?)
+        } else {
+            None
         };
 
         // ac_pred_flag — Table B.1: present iff derived_mb_type ≥ 3
@@ -564,15 +631,42 @@ pub fn parse_macroblock_header(
         let interlaced_info = if vol.interlaced {
             let any_block_coded = cbpy != 0 || cbpc != 0;
             let ctx = match vop_coding_type {
-                VopCodingType::I => InterlacedInfoContext::i_vop(mb_type)
-                    .map_err(|_| MacroblockParseError::InvalidInterlacedContext)?,
-                VopCodingType::P => InterlacedInfoContext::p_vop(mb_type, any_block_coded),
-                // B / S were rejected before the parse loop began.
+                VopCodingType::I => Some(
+                    InterlacedInfoContext::i_vop(mb_type)
+                        .map_err(|_| MacroblockParseError::InvalidInterlacedContext)?,
+                ),
+                VopCodingType::P => Some(InterlacedInfoContext::p_vop(mb_type, any_block_coded)),
+                // §6.2.6.3 / line 11715: an S(GMC)-VOP macroblock invokes
+                // `interlaced_information()` only when `mcsel == 0` (local
+                // MC); an `mcsel == 1` GMC macroblock uses frame prediction
+                // and carries no interlaced body. For an inter / inter+q
+                // macroblock the §6.2.6.3 S-disjunct (`derived_mb_type < 2 &&
+                // !mcsel`) governs `field_prediction`; the dedicated
+                // `s_gmc_vop` constructor encodes that. An intra S(GMC)
+                // macroblock (`mcsel == None`, `derived_mb_type >= 2`) leaves
+                // the field_prediction gate unfired but still takes the
+                // `dct_type` gate, which the PVop context computes identically
+                // (`is_intra() || any_block_coded`).
+                VopCodingType::S if is_s_gmc => match mb_type {
+                    DerivedMbType::Inter | DerivedMbType::InterQ => {
+                        let mc = if mcsel == Some(true) {
+                            McSel::On
+                        } else {
+                            McSel::Off
+                        };
+                        InterlacedInfoContext::s_gmc_vop(mb_type, mc, any_block_coded)
+                            .map_err(|_| MacroblockParseError::InvalidInterlacedContext)?
+                    }
+                    _ => Some(InterlacedInfoContext::p_vop(mb_type, any_block_coded)),
+                },
                 VopCodingType::B | VopCodingType::S => {
                     return Err(MacroblockParseError::UnsupportedVopKind(vop_coding_type));
                 }
             };
-            Some(parse_interlaced_information(br, &ctx)?)
+            match ctx {
+                Some(ctx) => Some(parse_interlaced_information(br, &ctx)?),
+                None => None,
+            }
         } else {
             None
         };
@@ -585,6 +679,7 @@ pub fn parse_macroblock_header(
             cbpy,
             dquant_delta,
             interlaced_info,
+            mcsel,
         });
     }
 }
@@ -864,7 +959,9 @@ mod tests {
     }
 
     #[test]
-    fn s_vop_is_rejected() {
+    fn s_vop_static_sprite_is_rejected() {
+        // A plain (non-GMC) S-VOP — make_vol()'s sprite_enable is NotUsed —
+        // is still out of scope and rejected.
         let mut w = BitWriter::new();
         w.write_bits(0xFF, 8);
         let data = w.buf;
@@ -874,6 +971,128 @@ mod tests {
             err,
             MacroblockParseError::UnsupportedVopKind(VopCodingType::S)
         ));
+    }
+
+    /// A VOL header declaring `sprite_enable == "GMC"` so an S-VOP takes
+    /// the §6.3.6 GMC macroblock path.
+    fn make_gmc_vol() -> VolHeader {
+        VolHeader {
+            sprite_enable: SpriteEnable::Gmc,
+            no_of_sprite_warping_points: Some(2),
+            sprite_warping_accuracy: Some(crate::vol::SpriteWarpingAccuracy::HalfPel),
+            sprite_brightness_change: Some(false),
+            ..make_vol()
+        }
+    }
+
+    #[test]
+    fn s_gmc_static_sprite_still_rejected() {
+        // sprite_enable == Static on an S-VOP is not the GMC path; reject.
+        let vol = VolHeader {
+            sprite_enable: SpriteEnable::Static,
+            ..make_vol()
+        };
+        let mut w = BitWriter::new();
+        w.write_bits(0xFF, 8);
+        let data = w.buf;
+        let mut br = BitReader::new(&data);
+        let err = parse_macroblock_header(&mut br, VopCodingType::S, &vol).unwrap_err();
+        assert!(matches!(
+            err,
+            MacroblockParseError::UnsupportedVopKind(VopCodingType::S)
+        ));
+    }
+
+    #[test]
+    fn s_gmc_not_coded_implies_mcsel_on() {
+        // §6.3.6: a not-coded S(GMC) macroblock carries implied mcsel == 1.
+        let mut w = BitWriter::new();
+        w.write_bits(1, 1); // not_coded
+        w.align();
+        let data = w.buf;
+        let mut br = BitReader::new(&data);
+        let mb = parse_macroblock_header(&mut br, VopCodingType::S, &make_gmc_vol()).unwrap();
+        assert!(mb.not_coded);
+        assert_eq!(mb.mcsel, Some(true));
+        assert_eq!(mb, MacroblockHeader::SKIPPED_GMC);
+    }
+
+    #[test]
+    fn s_gmc_inter_mb_mcsel_on() {
+        // Coded inter S(GMC) MB with mcsel = 1 (GMC reference). Syntax:
+        // not_coded=0, mcbpc=1 (mb_type 0, cbpc 00), mcsel=1,
+        // cbpy_inter=0000 → code 11.
+        let mut w = BitWriter::new();
+        w.write_bits(0, 1); // not_coded
+        w.write_bits(0b1, 1); // mcbpc → mb_type 0 (inter), cbpc 00
+        w.write_bits(1, 1); // mcsel = 1 (GMC)
+        w.write_bits(0b11, 2); // cbpy_inter=0000
+        w.align();
+        let data = w.buf;
+        let mut br = BitReader::new(&data);
+        let mb = parse_macroblock_header(&mut br, VopCodingType::S, &make_gmc_vol()).unwrap();
+        assert_eq!(mb.mb_type, Some(DerivedMbType::Inter));
+        assert_eq!(mb.mcsel, Some(true));
+        assert_eq!(mb.cbpy, 0b0000);
+    }
+
+    #[test]
+    fn s_gmc_inter_q_mb_mcsel_off_with_dquant() {
+        // Coded inter+q S(GMC) MB with mcsel = 0 (local MC). Syntax:
+        // not_coded=0, mcbpc=011 (mb_type 1, cbpc 00), mcsel=0,
+        // cbpy_inter=1111 → code 0011, dquant=10 → +1.
+        let mut w = BitWriter::new();
+        w.write_bits(0, 1); // not_coded
+        w.write_bits(0b011, 3); // mcbpc → mb_type 1 (inter+q), cbpc 00
+        w.write_bits(0, 1); // mcsel = 0 (local MC)
+        w.write_bits(0b0011, 4); // cbpy_inter=1111
+        w.write_bits(0b10, 2); // dquant = +1
+        w.align();
+        let data = w.buf;
+        let mut br = BitReader::new(&data);
+        let mb = parse_macroblock_header(&mut br, VopCodingType::S, &make_gmc_vol()).unwrap();
+        assert_eq!(mb.mb_type, Some(DerivedMbType::InterQ));
+        assert_eq!(mb.mcsel, Some(false));
+        assert_eq!(mb.cbpy, 0b1111);
+        assert_eq!(mb.dquant_delta, Some(1));
+    }
+
+    #[test]
+    fn s_gmc_intra_mb_has_no_mcsel() {
+        // An intra S(GMC) MB: the mcsel syntax gate (derived_mb_type ∈
+        // {0,1}) does not fire, so no mcsel bit is consumed. Syntax:
+        // not_coded=0, mcbpc=00011 (mb_type 3, cbpc 00), ac_pred=1,
+        // cbpy_intra=1010 → code 0101.
+        let mut w = BitWriter::new();
+        w.write_bits(0, 1); // not_coded
+        w.write_bits(0b00011, 5); // mcbpc → mb_type 3 (intra)
+        w.write_bits(1, 1); // ac_pred_flag (NO mcsel before it)
+        w.write_bits(0b0101, 4); // cbpy_intra=1010
+        w.align();
+        let data = w.buf;
+        let mut br = BitReader::new(&data);
+        let mb = parse_macroblock_header(&mut br, VopCodingType::S, &make_gmc_vol()).unwrap();
+        assert_eq!(mb.mb_type, Some(DerivedMbType::Intra));
+        assert_eq!(mb.mcsel, None);
+        assert!(mb.ac_pred_flag);
+        assert_eq!(mb.cbpy, 0b1010);
+    }
+
+    #[test]
+    fn s_gmc_inter4v_mb_has_mcsel() {
+        // inter4v (mb_type 2) is NOT in the §6.3.6 mcsel gate
+        // (derived_mb_type ∈ {0,1}); no mcsel bit. mcbpc=010 → mb_type 2.
+        let mut w = BitWriter::new();
+        w.write_bits(0, 1); // not_coded
+        w.write_bits(0b010, 3); // mcbpc → mb_type 2 (inter4v)
+        w.write_bits(0b0011, 4); // cbpy_inter=1111 (no mcsel, no ac_pred)
+        w.align();
+        let data = w.buf;
+        let mut br = BitReader::new(&data);
+        let mb = parse_macroblock_header(&mut br, VopCodingType::S, &make_gmc_vol()).unwrap();
+        assert_eq!(mb.mb_type, Some(DerivedMbType::Inter4V));
+        assert_eq!(mb.mcsel, None);
+        assert_eq!(mb.cbpy, 0b1111);
     }
 
     #[test]
@@ -1156,6 +1375,56 @@ mod tests {
         );
         assert_eq!(fp.backward, None);
         assert_eq!(info.bit_count(), 4);
+    }
+
+    #[test]
+    fn s_gmc_interlaced_mcsel_on_suppresses_body() {
+        // §6.2.6.3 / line 11715: an mcsel == 1 S(GMC) macroblock uses
+        // frame prediction; interlaced_information() is NOT invoked, so no
+        // interlaced bits are consumed even when interlaced == 1.
+        let mut vol = make_gmc_vol();
+        vol.interlaced = true;
+        let mut w = BitWriter::new();
+        w.write_bits(0, 1); // not_coded
+        w.write_bits(0b1, 1); // mcbpc → mb_type 0 (inter), cbpc 00
+        w.write_bits(1, 1); // mcsel = 1 (GMC)
+        w.write_bits(0b0011, 4); // cbpy_inter=1111 → cbp != 0
+        w.write_bits(0b1, 1); // sentinel (must NOT be consumed as interlaced)
+        w.align();
+        let data = w.buf;
+        let mut br = BitReader::new(&data);
+        let mb = parse_macroblock_header(&mut br, VopCodingType::S, &vol).unwrap();
+        assert_eq!(mb.mcsel, Some(true));
+        // mcsel == 1 ⇒ no interlaced body.
+        assert_eq!(mb.interlaced_info, None);
+    }
+
+    #[test]
+    fn s_gmc_interlaced_mcsel_off_reads_body() {
+        // An mcsel == 0 (local-MC) inter S(GMC) macroblock with cbp != 0
+        // invokes interlaced_information(): the §6.2.6.3 dct_type + the
+        // S-disjunct field_prediction gate (derived_mb_type < 2 && !mcsel)
+        // both fire.
+        let mut vol = make_gmc_vol();
+        vol.interlaced = true;
+        let mut w = BitWriter::new();
+        w.write_bits(0, 1); // not_coded
+        w.write_bits(0b1, 1); // mcbpc → mb_type 0 (inter), cbpc 00
+        w.write_bits(0, 1); // mcsel = 0 (local MC)
+        w.write_bits(0b0011, 4); // cbpy_inter=1111 → cbp != 0
+        w.write_bits(0, 1); // dct_type = 0 → Frame
+        w.write_bits(0, 1); // field_prediction = 0
+        w.align();
+        let data = w.buf;
+        let mut br = BitReader::new(&data);
+        let mb = parse_macroblock_header(&mut br, VopCodingType::S, &vol).unwrap();
+        assert_eq!(mb.mcsel, Some(false));
+        let info = mb
+            .interlaced_info
+            .expect("mcsel == 0 reads interlaced body");
+        assert_eq!(info.dct_type, Some(DctType::Frame));
+        assert_eq!(info.field_prediction, None);
+        assert!(info.field_prediction_guard_fired);
     }
 
     /// P-VOP inter4v MB (`derived_mb_type == 2`) with `cbp == 0`:
