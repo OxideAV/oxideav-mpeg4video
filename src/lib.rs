@@ -310,6 +310,7 @@ use oxideav_core::RuntimeContext;
 pub mod bitreader;
 pub mod block;
 pub mod bvop;
+pub mod bvop_field_predictor;
 pub mod bvop_prediction;
 pub mod chroma_mv;
 pub mod chroma_shape;
@@ -355,6 +356,9 @@ pub use block::{
 pub use bvop::{
     decode_b_vop_mb_motion_vectors, default_b_mb_type, parse_b_vop_mb_header, parse_dbquant,
     BMbTypeTable, BVopMbHeader, BVopMbParseError, BVopMbType, BVopMotionVectors, BVopMvBody,
+};
+pub use bvop_field_predictor::{
+    FieldMvDirection, FieldPmvBank, PMV_BOT_BWD, PMV_BOT_FWD, PMV_TOP_BWD, PMV_TOP_FWD,
 };
 pub use bvop_prediction::{
     average_bidirectional, average_bidirectional_into, generate_b_vop_luma_prediction,
