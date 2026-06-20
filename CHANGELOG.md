@@ -25,6 +25,18 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   blocks 1/2/3) are visible to the next block's median. `reset_packet`
   invalidates the current row's earlier MBs at a §7.6.5 video-packet /
   GOB boundary. Surfaces `PvopMbMotion` / `PvopMvError`. 7 tests.
+- **§7.6.2 P-VOP luma prediction-block generator** (`pvop_mv` module):
+  `predict_luma_macroblock(motion, reference, mb_x, mb_y,
+  vop_rounding_type)` bridges a driver-decoded `PvopMbMotion` to a
+  concrete 16×16 half-sample-interpolated luma prediction block — a
+  zero-MV co-located copy for a skipped MB, a single 16×16
+  `interpolate_block` for inter / inter+q, four tiled 8×8 blocks (one
+  per Figure 6-8 sub-block) for inter4v, and `None` for intra (no §7.6.2
+  prediction). New end-to-end test drives a synthetic 2×2-macroblock
+  progressive P-VOP motion-vector bitstream through `MvDriver` and
+  predicts the whole 32×32 frame from a gradient reference, asserting
+  the raster-order predictor threading and the half-sample diagonal
+  bilinear against a closed form. +5 tests (12 total in the module).
 - **§6.2.3 static-sprite VOL body + §7.8.2/§7.8.6 reconstruction**
   (`vol`, `static_sprite` modules): the `sprite_enable == static` VOL
   branch now parses (the `sprite_{width,height,left,top}` geometry

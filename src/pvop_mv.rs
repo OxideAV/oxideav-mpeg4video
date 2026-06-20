@@ -335,6 +335,90 @@ impl MvDriver {
     }
 }
 
+/// Generate the §7.6.2 16×16 luminance prediction block for one decoded
+/// progressive P-VOP macroblock, half-sample interpolated from a
+/// reference plane.
+///
+/// This is the bridge from the [`MvDriver`]'s decoded motion vector(s)
+/// to a concrete predicted block — the §7.6.2.1 half-sample path. It
+/// dispatches on the [`PvopMbMotion`] the driver returned:
+///
+/// * [`PvopMbMotion::Skipped`] → a zero-MV 16×16 block (the §7.6.2
+///   skipped-MB copy of the co-located reference samples, MV `(0, 0)`).
+/// * [`PvopMbMotion::OneMv`] → one 16×16 [`interpolate_block`] with the
+///   single MV.
+/// * [`PvopMbMotion::FourMv`] → four 8×8 [`interpolate_block`]s, one per
+///   Figure 6-8 luminance sub-block, tiled into the 16×16 output. Block
+///   `i`'s 8×8 origin is `(mb_x + 8*(i & 1), mb_y + 8*(i >> 1))`.
+/// * [`PvopMbMotion::Intra`] → `None`: an intra macroblock carries no
+///   motion-compensated prediction (its samples come from the §7.4
+///   intra texture path, not §7.6.2).
+///
+/// `mb_x` / `mb_y` are the macroblock's top-left luma pixel coordinates
+/// in the current VOP (`16 * mb_col`, `16 * mb_row`). The MVs are taken
+/// in §7.6.3 half-sample units (the progressive `quarter_sample == 0`
+/// path). Returns a row-major `[u8; 256]` 16×16 block (length 256),
+/// laid out `block[16*j + i]`.
+pub fn predict_luma_macroblock(
+    motion: PvopMbMotion,
+    reference: &crate::half_sample::ReferenceVop<'_>,
+    mb_x: i32,
+    mb_y: i32,
+    vop_rounding_type: u8,
+) -> Option<Vec<u8>> {
+    use crate::half_sample::interpolate_block_into;
+
+    match motion {
+        PvopMbMotion::Intra => None,
+        PvopMbMotion::Skipped => Some(crate::half_sample::interpolate_block(
+            reference,
+            0,
+            0,
+            mb_x,
+            mb_y,
+            16,
+            16,
+            vop_rounding_type,
+        )),
+        PvopMbMotion::OneMv(mv) => Some(crate::half_sample::interpolate_block(
+            reference,
+            mv.x,
+            mv.y,
+            mb_x,
+            mb_y,
+            16,
+            16,
+            vop_rounding_type,
+        )),
+        PvopMbMotion::FourMv(mvs) => {
+            let mut out = vec![0u8; 256];
+            let mut tile = vec![0u8; 64];
+            for (i, mv) in mvs.iter().enumerate() {
+                let bx = mb_x + 8 * (i as i32 & 1);
+                let by = mb_y + 8 * (i as i32 >> 1);
+                interpolate_block_into(
+                    reference,
+                    mv.x,
+                    mv.y,
+                    bx,
+                    by,
+                    8,
+                    8,
+                    vop_rounding_type,
+                    &mut tile,
+                );
+                let dst_col = 8 * (i & 1);
+                let dst_row = 8 * (i >> 1);
+                for r in 0..8 {
+                    let dst = (dst_row + r) * 16 + dst_col;
+                    out[dst..dst + 8].copy_from_slice(&tile[r * 8..r * 8 + 8]);
+                }
+            }
+            Some(out)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -500,5 +584,221 @@ mod tests {
             .decode_macroblock(&mut br, 1, 0, false, Some(DerivedMbType::Inter))
             .unwrap();
         assert_eq!(m1, PvopMbMotion::OneMv(MotionVector { x: 1, y: 1 }));
+    }
+
+    // ------------------------------------------------------------------
+    // §7.6.2 prediction-block generation (driver → predicted block).
+    // ------------------------------------------------------------------
+
+    use crate::half_sample::ReferenceVop;
+
+    /// A `w × h` reference plane whose sample value is `x + y` (mod 256)
+    /// — a deterministic gradient with no half-pel ambiguity at integer
+    /// MVs.
+    fn gradient_plane(w: usize, h: usize) -> Vec<u8> {
+        let mut v = vec![0u8; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                v[y * w + x] = ((x + y) & 0xff) as u8;
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn skipped_mb_predicts_colocated_reference() {
+        let w = 32;
+        let h = 32;
+        let plane = gradient_plane(w, h);
+        let reference = ReferenceVop::new(&plane, w, h).unwrap();
+        // MB at (16, 0): a skipped MB copies the co-located samples
+        // (MV 0,0). Sample (i, j) of the block = reference(16+i, 0+j) =
+        // (16 + i + j) mod 256.
+        let block = predict_luma_macroblock(PvopMbMotion::Skipped, &reference, 16, 0, 0).unwrap();
+        for j in 0..16 {
+            for i in 0..16 {
+                assert_eq!(block[16 * j + i], ((16 + i + j) & 0xff) as u8);
+            }
+        }
+    }
+
+    #[test]
+    fn intra_mb_has_no_motion_prediction() {
+        let plane = gradient_plane(16, 16);
+        let reference = ReferenceVop::new(&plane, 16, 16).unwrap();
+        assert!(predict_luma_macroblock(PvopMbMotion::Intra, &reference, 0, 0, 0).is_none());
+    }
+
+    #[test]
+    fn one_mv_integer_shift_predicts_shifted_reference() {
+        // Half-pel units: MV (4, 2) = integer shift (+2, +1), no
+        // half-pel fraction. The predicted block samples the reference
+        // shifted by (+2, +1).
+        let w = 32;
+        let h = 32;
+        let plane = gradient_plane(w, h);
+        let reference = ReferenceVop::new(&plane, w, h).unwrap();
+        let mv = MotionVector { x: 4, y: 2 };
+        let block = predict_luma_macroblock(PvopMbMotion::OneMv(mv), &reference, 0, 0, 0).unwrap();
+        // block(i, j) = reference(0 + i + 2, 0 + j + 1) = (i + 2 + j + 1).
+        for j in 0..16 {
+            for i in 0..16 {
+                assert_eq!(block[16 * j + i], ((i + 2 + j + 1) & 0xff) as u8);
+            }
+        }
+    }
+
+    #[test]
+    fn four_mv_tiles_four_eight_by_eight_predictions() {
+        let w = 48;
+        let h = 48;
+        let plane = gradient_plane(w, h);
+        let reference = ReferenceVop::new(&plane, w, h).unwrap();
+        // Four distinct integer MVs (half-pel units, all even → no
+        // fraction): TL (+1,0), TR (0,+1), BL (+2,0), BR (0,+2) →
+        // integer shifts (+0.5 floor) … keep them even for exactness:
+        let mvs = [
+            MotionVector { x: 2, y: 0 }, // block 0 (TL): shift (+1, 0)
+            MotionVector { x: 0, y: 2 }, // block 1 (TR): shift (0, +1)
+            MotionVector { x: 4, y: 0 }, // block 2 (BL): shift (+2, 0)
+            MotionVector { x: 0, y: 4 }, // block 3 (BR): shift (0, +2)
+        ];
+        let block =
+            predict_luma_macroblock(PvopMbMotion::FourMv(mvs), &reference, 0, 0, 0).unwrap();
+        // Block 0 (TL): origin (0,0), shift (+1,0).
+        for j in 0..8 {
+            for i in 0..8 {
+                assert_eq!(block[16 * j + i], ((i + 1 + j) & 0xff) as u8);
+            }
+        }
+        // Block 1 (TR): origin (8,0), shift (0,+1).
+        for j in 0..8 {
+            for i in 0..8 {
+                assert_eq!(block[16 * j + (8 + i)], ((8 + i + j + 1) & 0xff) as u8);
+            }
+        }
+        // Block 2 (BL): origin (0,8), shift (+2,0).
+        for j in 0..8 {
+            for i in 0..8 {
+                assert_eq!(block[16 * (8 + j) + i], ((i + 2 + 8 + j) & 0xff) as u8);
+            }
+        }
+        // Block 3 (BR): origin (8,8), shift (0,+2).
+        for j in 0..8 {
+            for i in 0..8 {
+                assert_eq!(
+                    block[16 * (8 + j) + (8 + i)],
+                    ((8 + i + 8 + j + 2) & 0xff) as u8
+                );
+            }
+        }
+    }
+
+    /// End-to-end: drive a synthetic 2×2-macroblock progressive P-VOP
+    /// motion-vector bitstream and predict every macroblock from a
+    /// reference frame, asserting the predictor threading and the
+    /// half-sample composition produce the expected frame.
+    #[test]
+    fn end_to_end_pvop_mv_decode_and_predict() {
+        // 2×2 MBs = 32×32 luma. Build a bitstream of four inter MBs in
+        // raster order, each a single MV with a known delta.
+        //
+        // Table B.12 codes (half-pel units):
+        //   `1`   → 0
+        //   `010` → +1
+        //   `011` → -1
+        //
+        // MB(0,0): delta (+1, +1). predictor (0,0) → MV (1, 1).
+        // MB(0,1): delta (0, 0).   predictor: MV1=left=(1,1),
+        //          MV2/MV3 invalid → median (1,1) → MV (1, 1).
+        // MB(1,0): delta (0, 0).   predictor: MV2=above=(1,1),
+        //          MV1/MV3 invalid → median (1,1) → MV (1, 1).
+        // MB(1,1): delta (-1, -1). predictor: MV1=left(1,0)=(1,1),
+        //          MV2=above(0,1)=(1,1), MV3=above-right(0,2) invalid →
+        //          rule-2 (one invalid → 0): median(1,1,0)=1 each →
+        //          predictor (1,1); +(-1,-1) → MV (0, 0).
+        //
+        // Bit layout per MB: two mv_data codes back to back.
+        //   MB(0,0): 010 010                      → x +1, y +1
+        //   MB(0,1): 1 1                           → x 0,  y 0
+        //   MB(1,0): 1 1                           → x 0,  y 0
+        //   MB(1,1): 011 011                       → x -1, y -1
+        //
+        // We decode each MB from its own reader (the driver does not
+        // require a single contiguous reader; the real macroblock layer
+        // interleaves CBP / texture bits between MVs).
+        let mut driver = MvDriver::new(2, 2, 1);
+
+        let mb00 = [0x48u8]; // 010 010 00
+        let mut br = BitReader::new(&mb00);
+        let m00 = driver
+            .decode_macroblock(&mut br, 0, 0, false, Some(DerivedMbType::Inter))
+            .unwrap();
+        assert_eq!(m00, PvopMbMotion::OneMv(MotionVector { x: 1, y: 1 }));
+
+        let zeros = zero_delta_bits(1); // 1 1 padded
+        let mut br = BitReader::new(&zeros);
+        let m01 = driver
+            .decode_macroblock(&mut br, 0, 1, false, Some(DerivedMbType::Inter))
+            .unwrap();
+        assert_eq!(m01, PvopMbMotion::OneMv(MotionVector { x: 1, y: 1 }));
+
+        let mut br = BitReader::new(&zeros);
+        let m10 = driver
+            .decode_macroblock(&mut br, 1, 0, false, Some(DerivedMbType::Inter))
+            .unwrap();
+        assert_eq!(m10, PvopMbMotion::OneMv(MotionVector { x: 1, y: 1 }));
+
+        // bits `011 011 00`: mv_data `011` (-1) for x, `011` (-1) for
+        // y, two pad bits → byte 0x6C.
+        let mb11 = [0x6Cu8];
+        let mut br = BitReader::new(&mb11);
+        let m11 = driver
+            .decode_macroblock(&mut br, 1, 1, false, Some(DerivedMbType::Inter))
+            .unwrap();
+        assert_eq!(m11, PvopMbMotion::OneMv(MotionVector { x: 0, y: 0 }));
+
+        // Predict the whole 32×32 frame from a gradient reference.
+        let w = 48;
+        let h = 48;
+        let plane = gradient_plane(w, h);
+        let reference = ReferenceVop::new(&plane, w, h).unwrap();
+        let motions: [(usize, usize, PvopMbMotion); 4] =
+            [(0, 0, m00), (0, 1, m01), (1, 0, m10), (1, 1, m11)];
+        for (mb_row, mb_col, motion) in motions {
+            let mb_x = 16 * mb_col as i32;
+            let mb_y = 16 * mb_row as i32;
+            let block = predict_luma_macroblock(motion, &reference, mb_x, mb_y, 0).unwrap();
+            let mv = motion.one_mv().unwrap();
+            // Half-pel MV (1,1) = integer shift (0,0) + half-pel (1,1):
+            // bilinear of four neighbours. MV (0,0) = exact copy.
+            // For MV (1,1) on a (x+y) gradient the bilinear average of
+            // (x+y), (x+1+y), (x+y+1), (x+1+y+1) with +1-rc rounding is
+            // (4(x+y)+4 + 2 - 0)/4 = (x+y) + 1 (rc = 0). Verify a few
+            // samples against that closed form.
+            let (sx, sy) = (mv.x >> 1, mv.y >> 1); // integer part
+            let (hx, hy) = (mv.x & 1, mv.y & 1); // half-pel part
+            for j in [0usize, 7, 15] {
+                for i in [0usize, 7, 15] {
+                    let base_x = mb_x + i as i32 + sx;
+                    let base_y = mb_y + j as i32 + sy;
+                    let expected = if hx == 0 && hy == 0 {
+                        ((base_x + base_y) & 0xff) as u8
+                    } else {
+                        // full diagonal bilinear, rc = 0
+                        let a = (base_x + base_y) & 0xff;
+                        let b = (base_x + 1 + base_y) & 0xff;
+                        let c = (base_x + base_y + 1) & 0xff;
+                        let d = (base_x + 1 + base_y + 1) & 0xff;
+                        ((a + b + c + d + 2) / 4) as u8
+                    };
+                    assert_eq!(
+                        block[16 * j + i],
+                        expected,
+                        "MB({mb_row},{mb_col}) sample ({i},{j}) mv={mv:?}"
+                    );
+                }
+            }
+        }
     }
 }

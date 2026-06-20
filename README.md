@@ -99,7 +99,17 @@ encoder.
 ## Not yet supported
 
 - Runtime registration (`register` is a no-op) and a single top-level
-  frame-decode entry point.
+  frame-decode entry point. The §7.6 **progressive P-VOP
+  motion-vector + luma-prediction subsystem is now wired end-to-end**:
+  [`MvDriver`] walks the macroblocks of a P-VOP in raster order —
+  dispatching skipped / intra / inter / inter4v per Table B.1, gathering
+  the Figure 7-34 candidates from the running [`MvGrid`], applying the
+  §7.6.5 median, decoding the §6.2.6.2 MVD body, and reconstructing the
+  §7.6.3 vector — and [`predict_luma_macroblock`] turns the result into
+  a §7.6.2 half-sample-interpolated 16×16 luma prediction block
+  (1-MV / inter4v / skipped). What remains for a *full* frame decoder is
+  threading the residual-texture decode + the §7.3 add into the same
+  loop and emitting a complete reconstructed plane.
 - Encoder.
 - The end-to-end wiring of the §E.1.4.4 two-way RVLC error recovery: the
   forward / backward Tcoef decodes (§E.1.4.4.1) and the §E.1.4.4.2.1
