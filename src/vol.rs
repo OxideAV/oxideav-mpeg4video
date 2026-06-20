@@ -253,6 +253,30 @@ impl SpriteWarpingAccuracy {
     }
 }
 
+/// §6.2.3 static-sprite geometry: the sprite memory array dimensions and
+/// its top-left position in the VOP coordinate space.
+///
+/// `sprite_width`/`sprite_height` (13-bit unsigned) give the dimensions
+/// of the luminance sprite-object buffer (§7.8.2). `sprite_left_coordinate`
+/// / `sprite_top_coordinate` (13-bit signed) place the top-left luminance
+/// sample of that buffer at `(i', j') = (sprite_left_coordinate,
+/// sprite_top_coordinate)` in the §7.8.2 sprite addressing scheme. A VOP
+/// pixel that warps to absolute sprite coordinate `(sx, sy)` reads the
+/// sprite-memory sample at array index `(sx - sprite_left_coordinate,
+/// sy - sprite_top_coordinate)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpriteGeometry {
+    /// `sprite_width` — luminance sprite buffer width (samples).
+    pub width: u16,
+    /// `sprite_height` — luminance sprite buffer height (samples).
+    pub height: u16,
+    /// `sprite_left_coordinate` — signed top-left luma x in the §7.8.2
+    /// sprite addressing space.
+    pub left: i16,
+    /// `sprite_top_coordinate` — signed top-left luma y.
+    pub top: i16,
+}
+
 /// Decoded `colour_description` block of a §6.2.2 `video_signal_type()`.
 ///
 /// All three fields are 8-bit `uimsbf` integers whose enumerations are
@@ -463,6 +487,19 @@ pub struct VolHeader {
     /// `sprite_enable` is `Static` or `Gmc`; `None` otherwise. Always
     /// `false` under `Gmc` (the spec mandates the bit be `0`).
     pub sprite_brightness_change: Option<bool>,
+    /// §6.2.3 static-sprite geometry — the `sprite_width`,
+    /// `sprite_height`, `sprite_left_coordinate`, `sprite_top_coordinate`
+    /// quadruple. Present only when `sprite_enable == Static` (the
+    /// `if (sprite_enable != "GMC")` gate); `None` under `Gmc` /
+    /// `NotUsed`. Widths/heights are `13`-bit unsigned; the coordinates
+    /// are `13`-bit signed (§6.3.3).
+    pub sprite_geometry: Option<SpriteGeometry>,
+    /// `low_latency_sprite_enable` (§6.2.3). Present only when
+    /// `sprite_enable == Static` (gated `if (sprite_enable != "GMC")`);
+    /// `None` otherwise. `true` selects the §7.8.3 low-latency
+    /// reconstruction (piece/update transmit loop), `false` the basic
+    /// §7.8.2 sprite.
+    pub low_latency_sprite_enable: Option<bool>,
     /// `not_8_bit` flag (§6.3.3). When `true`, `quant_precision` and
     /// `bits_per_pixel` are transmitted in-line; otherwise the spec
     /// defaults `quant_precision = 5` and `bits_per_pixel = 8`.
@@ -619,6 +656,14 @@ fn parse_quant_matrix(
     Ok(mat)
 }
 
+/// Read a 13-bit signed (`simsbf`, two's-complement) integer, as used by
+/// `sprite_left_coordinate` / `sprite_top_coordinate` (§6.2.3).
+fn read_simsbf_13(br: &mut BitReader<'_>) -> Result<i16, VolParseError> {
+    let raw = br.read_bits(13)? as i16;
+    // Sign-extend the 13-bit value into i16.
+    Ok((raw << 3) >> 3)
+}
+
 fn parse_vol_control(br: &mut BitReader<'_>) -> Result<VolControlParameters, VolParseError> {
     let chroma_format = br.read_bits(2)? as u8;
     let low_delay = br.read_bool()?;
@@ -747,45 +792,80 @@ fn parse_video_object_layer_body(
     // accuracy and brightness-change flag — no sprite_width / _height /
     // coordinates / low_latency_sprite_enable (those are static-only,
     // gated `if (sprite_enable != "GMC")`). The static branch additionally
-    // needs the sprite-object buffer + piece-update machinery (§7.8.2 /
-    // §7.8.3), which is out of scope; it stays typed-rejected so the bit
-    // position never drifts.
-    let (no_of_sprite_warping_points, sprite_warping_accuracy, sprite_brightness_change) =
-        match sprite_enable {
-            SpriteEnable::Gmc => {
-                let points = br.read_bits(6)? as u8;
-                // Table 6-20: 5..=63 reserved; value 4 (perspective) is
-                // disallowed under GMC (§6.3.3 no_of_sprite_warping_points).
-                if points == 4 {
-                    return Err(VolParseError::UnsupportedBranch(
-                        "GMC perspective (4 warping points)",
-                    ));
-                }
-                if points > 4 {
-                    return Err(VolParseError::ReservedWarpingPoints(points));
-                }
-                let accuracy = SpriteWarpingAccuracy::from_bits(br.read_bits(2)?);
-                // sprite_brightness_change shall be 0 when
-                // sprite_enable == "GMC" (§6.3.3). Read it to stay aligned;
-                // reject a non-zero value as a malformed stream.
-                let brightness = br.read_bool()?;
-                if brightness {
-                    return Err(VolParseError::UnsupportedBranch(
-                        "GMC sprite_brightness_change == 1",
-                    ));
-                }
-                (Some(points), Some(accuracy), Some(brightness))
-            }
-            SpriteEnable::Static => {
+    // reads the four `sprite_{width,height,left,top}` fields (each
+    // followed by a `marker_bit`) plus the trailing
+    // `low_latency_sprite_enable` flag.
+    let (
+        no_of_sprite_warping_points,
+        sprite_warping_accuracy,
+        sprite_brightness_change,
+        sprite_geometry,
+        low_latency_sprite_enable,
+    ) = match sprite_enable {
+        SpriteEnable::Gmc => {
+            let points = br.read_bits(6)? as u8;
+            // Table 6-20: 5..=63 reserved; value 4 (perspective) is
+            // disallowed under GMC (§6.3.3 no_of_sprite_warping_points).
+            if points == 4 {
                 return Err(VolParseError::UnsupportedBranch(
-                    "sprite_enable static body",
+                    "GMC perspective (4 warping points)",
                 ));
             }
-            SpriteEnable::Reserved => {
-                return Err(VolParseError::UnsupportedBranch("sprite_enable reserved"));
+            if points > 4 {
+                return Err(VolParseError::ReservedWarpingPoints(points));
             }
-            SpriteEnable::NotUsed => (None, None, None),
-        };
+            let accuracy = SpriteWarpingAccuracy::from_bits(br.read_bits(2)?);
+            // sprite_brightness_change shall be 0 when
+            // sprite_enable == "GMC" (§6.3.3). Read it to stay aligned;
+            // reject a non-zero value as a malformed stream.
+            let brightness = br.read_bool()?;
+            if brightness {
+                return Err(VolParseError::UnsupportedBranch(
+                    "GMC sprite_brightness_change == 1",
+                ));
+            }
+            (Some(points), Some(accuracy), Some(brightness), None, None)
+        }
+        SpriteEnable::Static => {
+            // §6.2.3 `if (sprite_enable != "GMC")` block: the four sprite
+            // geometry fields, each followed by a marker_bit. Width/height
+            // are 13-bit unsigned; left/top are 13-bit signed (simsbf).
+            let width = br.read_bits(13)? as u16;
+            read_marker_bit(br)?;
+            let height = br.read_bits(13)? as u16;
+            read_marker_bit(br)?;
+            let left = read_simsbf_13(br)?;
+            read_marker_bit(br)?;
+            let top = read_simsbf_13(br)?;
+            read_marker_bit(br)?;
+            let points = br.read_bits(6)? as u8;
+            // Table 6-20: static sprites permit 0..=4 (perspective is
+            // allowed here, unlike GMC); 5..=63 reserved.
+            if points > 4 {
+                return Err(VolParseError::ReservedWarpingPoints(points));
+            }
+            let accuracy = SpriteWarpingAccuracy::from_bits(br.read_bits(2)?);
+            let brightness = br.read_bool()?;
+            let low_latency = br.read_bool()?;
+            let geometry = SpriteGeometry {
+                width,
+                height,
+                left,
+                top,
+            };
+            (
+                Some(points),
+                Some(accuracy),
+                Some(brightness),
+                Some(geometry),
+                Some(low_latency),
+            )
+        }
+        SpriteEnable::Reserved => {
+            return Err(VolParseError::UnsupportedBranch("sprite_enable reserved"));
+        }
+        SpriteEnable::NotUsed => (None, None, None, None, None),
+    };
     // sadct_disable is only present when verid != 1 AND shape !=
     // rectangular (spec line 4014). Round 3 gates `shape ==
     // rectangular` upfront, so we never read it.
@@ -888,6 +968,8 @@ fn parse_video_object_layer_body(
         no_of_sprite_warping_points,
         sprite_warping_accuracy,
         sprite_brightness_change,
+        sprite_geometry,
+        low_latency_sprite_enable,
         not_8_bit,
         quant_precision,
         bits_per_pixel,
@@ -1575,6 +1657,54 @@ mod tests {
     }
 
     #[test]
+    fn static_vol_sprite_body_decodes_geometry_and_low_latency() {
+        // §6.2.3 `sprite_enable == static` carries the geometry quadruple
+        // (each followed by a marker_bit), then warping points / accuracy /
+        // brightness, then low_latency_sprite_enable.
+        let mut w = BitWriter::new();
+        write_vol_header_up_to_trailing(&mut w, Some(2), 0b00, false);
+        w.write_bits(0, 1); // interlaced
+        w.write_bits(0, 1); // obmc_disable
+        w.write_bits(0b01, 2); // sprite_enable = static
+        w.write_bits(352, 13); // sprite_width
+        w.write_bits(1, 1); // marker_bit
+        w.write_bits(288, 13); // sprite_height
+        w.write_bits(1, 1); // marker_bit
+        w.write_bits((-16i16 as u16 & 0x1fff) as u32, 13); // sprite_left_coordinate = -16
+        w.write_bits(1, 1); // marker_bit
+        w.write_bits(0, 13); // sprite_top_coordinate = 0
+        w.write_bits(1, 1); // marker_bit
+        w.write_bits(3, 6); // no_of_sprite_warping_points = 3
+        w.write_bits(0b00, 2); // sprite_warping_accuracy = 1/2 pel
+        w.write_bits(1, 1); // sprite_brightness_change = 1
+        w.write_bits(0, 1); // low_latency_sprite_enable = 0
+        w.write_bits(0, 1); // not_8_bit
+        w.write_bits(0, 1); // quant_type
+        w.write_bits(0, 1); // quarter_sample (verid != 1)
+        w.write_bits(1, 1); // complexity_estimation_disable
+        w.write_bits(0, 1); // resync_marker_disable
+        w.write_bits(0, 1); // data_partitioned
+        w.write_bits(0, 1); // newpred_enable (verid != 1)
+        w.write_bits(0, 1); // reduced_resolution_vop_enable
+        w.write_bits(0, 1); // scalability
+        w.align();
+        let header = parse_video_object_layer(&w.buf, 0).unwrap();
+        assert_eq!(header.sprite_enable, SpriteEnable::Static);
+        assert_eq!(header.no_of_sprite_warping_points, Some(3));
+        assert_eq!(
+            header.sprite_warping_accuracy,
+            Some(SpriteWarpingAccuracy::HalfPel)
+        );
+        assert_eq!(header.sprite_brightness_change, Some(true));
+        assert_eq!(header.low_latency_sprite_enable, Some(false));
+        let geo = header.sprite_geometry.expect("static geometry present");
+        assert_eq!(geo.width, 352);
+        assert_eq!(geo.height, 288);
+        assert_eq!(geo.left, -16);
+        assert_eq!(geo.top, 0);
+    }
+
+    #[test]
     fn gmc_vol_rejects_perspective_four_points() {
         let mut w = BitWriter::new();
         write_vol_header_up_to_trailing(&mut w, Some(2), 0b00, false);
@@ -1608,20 +1738,42 @@ mod tests {
     }
 
     #[test]
-    fn round3_sprite_static_is_rejected_with_branch_error() {
+    fn round3_sprite_static_verid1_decodes_geometry() {
+        // verid == 1 ⇒ sprite_enable is a 1-bit field; `1` selects Static
+        // (Table 6-19). The §6.2.3 geometry quadruple + warping fields
+        // follow. (Pre-r347 this branch was typed-rejected; r347 parses it.)
         let mut w = BitWriter::new();
         write_vol_header_up_to_trailing(&mut w, None, 0b00, false);
         w.write_bits(0, 1); // interlaced
         w.write_bits(0, 1); // obmc_disable
         w.write_bits(1, 1); // sprite_enable = Static (1-bit form)
+        w.write_bits(64, 13); // sprite_width
+        w.write_bits(1, 1); // marker_bit
+        w.write_bits(48, 13); // sprite_height
+        w.write_bits(1, 1); // marker_bit
+        w.write_bits(0, 13); // sprite_left_coordinate = 0
+        w.write_bits(1, 1); // marker_bit
+        w.write_bits(0, 13); // sprite_top_coordinate = 0
+        w.write_bits(1, 1); // marker_bit
+        w.write_bits(0, 6); // no_of_sprite_warping_points = 0 (stationary)
+        w.write_bits(0b00, 2); // sprite_warping_accuracy = 1/2 pel
+        w.write_bits(0, 1); // sprite_brightness_change = 0
+        w.write_bits(1, 1); // low_latency_sprite_enable = 1
+        w.write_bits(0, 1); // not_8_bit
+        w.write_bits(0, 1); // quant_type
+                            // verid == 1 ⇒ no quarter_sample / newpred fields.
+        w.write_bits(1, 1); // complexity_estimation_disable
+        w.write_bits(0, 1); // resync_marker_disable
+        w.write_bits(0, 1); // data_partitioned
+        w.write_bits(0, 1); // scalability
         w.align();
-        let err = parse_video_object_layer(&w.buf, 0).unwrap_err();
-        match err {
-            VolParseError::UnsupportedBranch(name) => {
-                assert!(name.contains("sprite_enable"));
-            }
-            other => panic!("expected UnsupportedBranch, got {other:?}"),
-        }
+        let header = parse_video_object_layer(&w.buf, 0).unwrap();
+        assert_eq!(header.sprite_enable, SpriteEnable::Static);
+        assert_eq!(header.no_of_sprite_warping_points, Some(0));
+        assert_eq!(header.low_latency_sprite_enable, Some(true));
+        let geo = header.sprite_geometry.expect("static geometry present");
+        assert_eq!((geo.width, geo.height), (64, 48));
+        assert_eq!((geo.left, geo.top), (0, 0));
     }
 
     #[test]
