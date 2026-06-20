@@ -419,6 +419,64 @@ pub fn predict_luma_macroblock(
     }
 }
 
+/// Derive the §6.1.3.4 / §7.6.5 chrominance motion vector for one
+/// decoded progressive P-VOP macroblock from its luminance motion
+/// vector(s).
+///
+/// For 4:2:0 the chroma MV is the §7.6.5 `sum / 2K` reduction of the `K`
+/// contributing luminance sub-block vectors
+/// ([`chroma_mv_from_luma_blocks`], half-sample units):
+///
+/// * [`PvopMbMotion::Skipped`] → `(0, 0)` (a skipped MB's chroma is the
+///   co-located reference, MV zero).
+/// * [`PvopMbMotion::OneMv`] → `K = 1`: the chroma MV is the single luma
+///   MV reduced by `sum / 2`.
+/// * [`PvopMbMotion::FourMv`] → `K = 4`: the four luma MVs summed and
+///   reduced by `sum / 8`.
+/// * [`PvopMbMotion::Intra`] → `None`.
+///
+/// The MVs are taken in half-sample units (progressive `quarter_sample
+/// == 0`). Returns the chroma MV in half-sample units ready for the
+/// §7.6.2.1 chroma interpolation, or `None` for an intra macroblock.
+pub fn chroma_mv_for_macroblock(motion: PvopMbMotion) -> Option<MotionVector> {
+    match motion {
+        PvopMbMotion::Intra => None,
+        PvopMbMotion::Skipped => Some(MotionVector { x: 0, y: 0 }),
+        PvopMbMotion::OneMv(mv) => crate::chroma_mv::chroma_mv_from_luma_blocks(&[mv]).ok(),
+        PvopMbMotion::FourMv(mvs) => crate::chroma_mv::chroma_mv_from_luma_blocks(&mvs).ok(),
+    }
+}
+
+/// Generate the §7.6.2 8×8 chrominance prediction block (one of Cb /
+/// Cr) for one decoded progressive 4:2:0 P-VOP macroblock, half-sample
+/// interpolated from a chroma reference plane.
+///
+/// The chroma MV is derived from the decoded [`PvopMbMotion`] via
+/// [`chroma_mv_for_macroblock`] (§7.6.5 `sum / 2K`), then one 8×8
+/// [`interpolate_block`] samples the chroma reference. `cmb_x` / `cmb_y`
+/// are the macroblock's top-left **chroma** pixel coordinates (`8 *
+/// mb_col`, `8 * mb_row` for 4:2:0). Returns a row-major `[u8; 64]`
+/// block, or `None` for an intra macroblock (no §7.6.2 prediction).
+pub fn predict_chroma_macroblock(
+    motion: PvopMbMotion,
+    reference: &crate::half_sample::ReferenceVop<'_>,
+    cmb_x: i32,
+    cmb_y: i32,
+    vop_rounding_type: u8,
+) -> Option<Vec<u8>> {
+    let mv = chroma_mv_for_macroblock(motion)?;
+    Some(crate::half_sample::interpolate_block(
+        reference,
+        mv.x,
+        mv.y,
+        cmb_x,
+        cmb_y,
+        8,
+        8,
+        vop_rounding_type,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -800,5 +858,65 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ------------------------------------------------------------------
+    // §6.1.3.4 / §7.6.5 chroma-MV derivation + chroma prediction block.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn chroma_mv_one_mv_is_half_of_luma() {
+        // §7.6.5 K=1: chroma MV = sum / 2 (half-sample units).
+        let m = PvopMbMotion::OneMv(MotionVector { x: 4, y: -2 });
+        assert_eq!(
+            chroma_mv_for_macroblock(m),
+            Some(MotionVector { x: 2, y: -1 })
+        );
+    }
+
+    #[test]
+    fn chroma_mv_four_mv_sums_then_reduces() {
+        // §7.6.5 K=4: sum (16, 16) / 8 = (2, 2).
+        let m = PvopMbMotion::FourMv([MotionVector { x: 4, y: 4 }; 4]);
+        assert_eq!(
+            chroma_mv_for_macroblock(m),
+            Some(MotionVector { x: 2, y: 2 })
+        );
+    }
+
+    #[test]
+    fn chroma_mv_skipped_is_zero_intra_is_none() {
+        assert_eq!(
+            chroma_mv_for_macroblock(PvopMbMotion::Skipped),
+            Some(MotionVector { x: 0, y: 0 })
+        );
+        assert_eq!(chroma_mv_for_macroblock(PvopMbMotion::Intra), None);
+    }
+
+    #[test]
+    fn chroma_prediction_block_integer_shift() {
+        // K=1, luma MV (4, 0) → chroma MV (2, 0) half-pel = integer
+        // shift (+1, 0). 8x8 chroma block from a gradient chroma plane.
+        let w = 24;
+        let h = 24;
+        let plane = gradient_plane(w, h);
+        let reference = ReferenceVop::new(&plane, w, h).unwrap();
+        let m = PvopMbMotion::OneMv(MotionVector { x: 4, y: 0 });
+        // MB col 1 → chroma origin (8, 0).
+        let block = predict_chroma_macroblock(m, &reference, 8, 0, 0).unwrap();
+        for j in 0..8 {
+            for i in 0..8 {
+                // chroma MV (2,0) = shift (+1,0): block(i,j) =
+                // reference(8 + i + 1, 0 + j).
+                assert_eq!(block[8 * j + i], ((8 + i + 1 + j) & 0xff) as u8);
+            }
+        }
+    }
+
+    #[test]
+    fn chroma_prediction_intra_is_none() {
+        let plane = gradient_plane(8, 8);
+        let reference = ReferenceVop::new(&plane, 8, 8).unwrap();
+        assert!(predict_chroma_macroblock(PvopMbMotion::Intra, &reference, 0, 0, 0).is_none());
     }
 }

@@ -107,7 +107,9 @@ encoder.
   §7.6.5 median, decoding the §6.2.6.2 MVD body, and reconstructing the
   §7.6.3 vector — and [`predict_luma_macroblock`] turns the result into
   a §7.6.2 half-sample-interpolated 16×16 luma prediction block
-  (1-MV / inter4v / skipped). What remains for a *full* frame decoder is
+  (1-MV / inter4v / skipped), and [`predict_chroma_macroblock`] derives
+  the §6.1.3.4 / §7.6.5 4:2:0 chroma MV (`sum / 2K`) and produces the
+  8×8 Cb / Cr prediction. What remains for a *full* frame decoder is
   threading the residual-texture decode + the §7.3 add into the same
   loop and emitting a complete reconstructed plane.
 - Encoder.

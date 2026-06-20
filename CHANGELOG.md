@@ -37,6 +37,14 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   predicts the whole 32×32 frame from a gradient reference, asserting
   the raster-order predictor threading and the half-sample diagonal
   bilinear against a closed form. +5 tests (12 total in the module).
+- **§6.1.3.4 / §7.6.5 P-VOP chroma-MV derivation + chroma prediction**
+  (`pvop_mv` module): `chroma_mv_for_macroblock(motion)` derives the
+  4:2:0 chrominance motion vector from a driver-decoded `PvopMbMotion`
+  via the §7.6.5 `sum / 2K` reduction (`chroma_mv_from_luma_blocks`,
+  K=1 for inter / inter+q, K=4 for inter4v, `(0,0)` for skipped, `None`
+  for intra), and `predict_chroma_macroblock` half-sample-interpolates
+  the 8×8 Cb / Cr prediction block from a chroma reference plane. +5
+  tests (970 lib total).
 - **§6.2.3 static-sprite VOL body + §7.8.2/§7.8.6 reconstruction**
   (`vol`, `static_sprite` modules): the `sprite_enable == static` VOL
   branch now parses (the `sprite_{width,height,left,top}` geometry
