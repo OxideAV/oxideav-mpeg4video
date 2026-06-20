@@ -8,6 +8,37 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **§6.2.3 static-sprite VOL body + §7.8.2/§7.8.6 reconstruction**
+  (`vol`, `static_sprite` modules): the `sprite_enable == static` VOL
+  branch now parses (the `sprite_{width,height,left,top}` geometry
+  quadruple + `low_latency_sprite_enable`), surfaced as
+  `VolHeader::sprite_geometry: Option<SpriteGeometry>` and
+  `VolHeader::low_latency_sprite_enable`. The new `static_sprite` module
+  warps a basic static sprite (`low_latency == 0`) onto the visible VOP:
+  `SpriteMemory` implements §7.8.2 absolute-coordinate addressing
+  (`(left, top)` origin + §7.6.4 edge clamp), `static_sprite_luma` /
+  `_chroma` / `_luma_macroblock` apply the §7.8.6 *static* blend
+  (bilinear, `//`-rounded, **no** `s²/2 − rounding_control` GMC bias)
+  plus the §7.8.6 `brightness_change_factor` post-adjustment. Reuses the
+  existing §7.8.4/§7.8.5 `WarpGeometry`. 9 tests.
+- **§6.3.6 / §7.8.7.1 mcsel-gated S(GMC)-VOP prediction routing**
+  (`s_gmc_recon` module): `s_gmc_prediction_macroblock(mcsel, …)` wires
+  the §6.3.6 `mcsel` flag into the §7.3 recon loop — `mcsel == 1` warps
+  the reference VOP into a 4:2:0 `InterPredictionMacroblock` via the new
+  `gmc_prediction_macroblock` (frame prediction even when interlaced,
+  per §7.8.7.1), `mcsel == 0` passes the caller's translational
+  prediction through unchanged. `GmcReferencePlanes` bundles the three
+  reference planes. 3 tests (passthrough, GMC override, per-MB parity
+  with direct `gmc_luma_prediction`/`gmc_chroma_prediction`).
+- **§7.6.8 four-PMV interlaced-B-VOP field motion-vector predictor**
+  (`bvop_field_predictor` module): the Table 7-14 / Table 7-15 PMV bank
+  (top/bottom forward, top/bottom backward) with per-mode read/update —
+  frame forward/backward/bidirectional (progressive `MV = PMV + MVD`,
+  both field PMVs set equal), field forward/backward/bidirectional
+  (`y = 2·(PMV.y/2 + MVD.y)`, vertical even), direct (no-op). Reproduces
+  the §7.6.8 field-backward quirk (bottom-field x reads PMV[1]) and the
+  per-MB-row `reset_row()` that direct/skipped MBs don't trigger. 10
+  tests.
 - **§7.3.5 / Table 7-2 inverse-transform selection** (`transform_select`
   module): the per-8×8-block decision that routes a decoded `PQF[v][u]`
   coefficient block to one of the three already-implemented inverse

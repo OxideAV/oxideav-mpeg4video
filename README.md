@@ -119,16 +119,21 @@ encoder.
   transform bodies). What remains is calling it from the residual loop
   with the per-block `opaque_pels` count and `f_shape` derived from the
   decoded binary shape of the current macroblock.
-- Static-sprite bodies (the §7.8.2 sprite-object buffer + §7.8.3
-  piece-update / `sprite_transmit_mode` machinery), scalability
-  enhancement layers, Studio Profile, and non-rectangular shapes
-  (rejected with typed errors). GMC global-motion warping *is* now
-  supported (see "What works today"), as is the §6.3.6 S(GMC)-VOP
-  macroblock-layer `mcsel` parse; the remaining GMC wiring is the
-  per-macroblock `mcsel`-gated routing of the warped prediction into
-  the §7.3 reconstruction loop (the warp generator, the parsed `mcsel`
-  selector, and the §7.8.7.3 averaged MV predictor are implemented as
-  composable pieces).
+- The §7.8.3 low-latency static-sprite piece-update machinery (the
+  `sprite_transmit_mode` piece/update transmit loop). The **basic**
+  static sprite (`low_latency_sprite_enable == 0`) is now supported: the
+  §6.2.3 static VOL body parses (`sprite_geometry`, `low_latency`), and
+  `static_sprite` warps the §7.8.2 sprite memory onto the visible VOP
+  via the §7.8.6 static blend (incl. the `brightness_change_factor`
+  post-adjustment). What remains for static sprites end-to-end is the
+  decode of the initial sprite-object I-VOP into sprite memory and the
+  §7.8.3 low-latency piece/update path.
+- Scalability enhancement layers, Studio Profile, and non-rectangular
+  shapes (rejected with typed errors). GMC global-motion warping *is*
+  supported; the §6.3.6 `mcsel` flag is now routed into the §7.3 recon
+  loop (`s_gmc_recon::s_gmc_prediction_macroblock` selects warped vs.
+  translational per-MB), and the §7.8.7.3 averaged MV predictor and the
+  §7.6.8 four-PMV interlaced-B-VOP field predictor are implemented.
 - Brightness change in GMC/sprite warping (`brightness_change_factor()`
   / `sprite_brightness_change == 1`) — typed-rejected, since the spec
   mandates `sprite_brightness_change == 0` under GMC.
