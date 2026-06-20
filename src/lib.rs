@@ -329,6 +329,7 @@ pub mod mv_predictor_grid;
 pub mod neighbour;
 pub mod obmc;
 pub mod predictor;
+pub mod pvop_mv;
 pub mod quarter_sample;
 pub mod reconstruct;
 pub mod rvlc_arbitration;
@@ -433,6 +434,7 @@ pub use predictor::{
     predict_intra_dc, saturate_block, saturate_qf, select_dc_direction, NeighbourBlock,
     NeighbourPosition,
 };
+pub use pvop_mv::{MvDriver, PvopMbMotion, PvopMvError};
 pub use quarter_sample::{
     field_mvy_to_field_grid, fir_8tap_clip, half_pel_b, half_pel_c, half_pel_d,
     interpolate_block_qpel, interpolate_block_qpel_field, interpolate_block_qpel_field_into,

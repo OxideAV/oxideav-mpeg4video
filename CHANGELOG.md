@@ -8,6 +8,23 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **§7.6 progressive P-VOP motion-vector decode driver** (new `pvop_mv`
+  module): `MvDriver` wires the four previously-isolated §7.6 primitives
+  — the §6.2.6.2 `motion_vector()` body
+  (`decode_motion_vector_delta`), the Figure 7-34 candidate gather
+  (`MvGrid::predictor_candidates`), the §7.6.5 median predictor
+  (`predict_motion_vector`), and the §7.6.3 / Table 7-9 reconstruct +
+  modulo wrap (`reconstruct_motion_vector`) — into an end-to-end,
+  raster-order macroblock loop. `decode_macroblock(br, row, col,
+  not_coded, mb_type)` dispatches on Table B.1 `derived_mb_type`: a
+  `not_coded` MB records a valid zero-MV neighbour (§7.6.2), intra MBs
+  record `MbMv::Absent` (an invalid §7.6.5 candidate), inter / inter+q
+  decode one MV with the block-0 (top-left) predictor, and inter4v
+  decodes four MVs, **incrementally** re-recording the cell after each
+  block so the in-MB Figure 7-34 candidates (blocks 2/3/4 →
+  blocks 1/2/3) are visible to the next block's median. `reset_packet`
+  invalidates the current row's earlier MBs at a §7.6.5 video-packet /
+  GOB boundary. Surfaces `PvopMbMotion` / `PvopMvError`. 7 tests.
 - **§6.2.3 static-sprite VOL body + §7.8.2/§7.8.6 reconstruction**
   (`vol`, `static_sprite` modules): the `sprite_enable == static` VOL
   branch now parses (the `sprite_{width,height,left,top}` geometry
