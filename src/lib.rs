@@ -334,6 +334,7 @@ pub mod rvlc_arbitration;
 pub mod sample_padding;
 pub mod scan;
 pub mod sprite;
+pub mod static_sprite;
 pub mod texture;
 pub mod transform_select;
 pub mod vector_padding;
@@ -452,6 +453,10 @@ pub use scan::{
 pub use sprite::{
     decode_sprite_trajectory, decode_warping_mv_code, SpriteTrajectory, SpriteTrajectoryError,
     MAX_GMC_WARPING_POINTS,
+};
+pub use static_sprite::{
+    static_sprite_chroma, static_sprite_luma, static_sprite_luma_macroblock, SpriteMemory,
+    StaticSpriteParams,
 };
 pub use texture::{
     decode_ac_event, decode_ac_event_rvlc, decode_ac_event_short_video_header, decode_ac_events,
