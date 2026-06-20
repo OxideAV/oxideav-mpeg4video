@@ -331,6 +331,7 @@ pub mod predictor;
 pub mod quarter_sample;
 pub mod reconstruct;
 pub mod rvlc_arbitration;
+pub mod s_gmc_recon;
 pub mod sample_padding;
 pub mod scan;
 pub mod sprite;
@@ -441,6 +442,7 @@ pub use reconstruct::{
     MACROBLOCK_CHROMA_SIDE, MACROBLOCK_LUMA_SIDE,
 };
 pub use rvlc_arbitration::{RvlcArbitration, RvlcArbitrationInput, RvlcStrategy, RVLC_THRESHOLD};
+pub use s_gmc_recon::{gmc_prediction_macroblock, s_gmc_prediction_macroblock, GmcReferencePlanes};
 pub use sample_padding::{
     horizontal_repetitive_padding_chroma, horizontal_repetitive_padding_luma,
     horizontal_repetitive_padding_row, SamplePresence, ShapeRowState,
