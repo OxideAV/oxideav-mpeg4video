@@ -109,9 +109,18 @@ encoder.
   a §7.6.2 half-sample-interpolated 16×16 luma prediction block
   (1-MV / inter4v / skipped), and [`predict_chroma_macroblock`] derives
   the §6.1.3.4 / §7.6.5 4:2:0 chroma MV (`sum / 2K`) and produces the
-  8×8 Cb / Cr prediction. What remains for a *full* frame decoder is
-  threading the residual-texture decode + the §7.3 add into the same
-  loop and emitting a complete reconstructed plane.
+  8×8 Cb / Cr prediction. The §7.6.2 → §7.3 bridge is now closed at the
+  macroblock level: [`predict_inter_macroblock`] packs the prediction
+  into an `InterPredictionMacroblock`, and
+  [`reconstruct_pvop_macroblock`] runs the full
+  §7.6.2-predict + §7.3 `d = p + f` add + display clip end-to-end,
+  returning a `ReconstructedMacroblock` ready to blit (verified by a
+  frame-level test that drives a four-macroblock motion bitstream
+  through [`MvDriver`] and reassembles a 32×32 luma / 16×16 chroma
+  frame). What remains for a *full* frame decoder is threading the
+  per-macroblock §7.4 residual-texture decode into the same loop (the
+  residual is currently supplied by the caller) and selecting the
+  reference plane per the VOP reference-frame chain.
 - Encoder.
 - The end-to-end wiring of the §E.1.4.4 two-way RVLC error recovery: the
   forward / backward Tcoef decodes (§E.1.4.4.1) and the §E.1.4.4.2.1

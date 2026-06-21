@@ -542,6 +542,66 @@ pub fn predict_inter_macroblock(
     Some(out)
 }
 
+/// Fully reconstruct one progressive P-VOP **inter** macroblock
+/// end-to-end: §7.6.2 motion-compensated prediction
+/// ([`predict_inter_macroblock`]) plus the §7.3 step-2 add of the §7.4
+/// residual and the step-3 `[0, 2^bpp - 1]` display clip
+/// ([`reconstruct_inter_macroblock`](crate::reconstruct::reconstruct_inter_macroblock)).
+///
+/// This is the single call that closes the progressive-P-VOP
+/// motion-compensation path: given a [`MvDriver`]-decoded
+/// [`PvopMbMotion`], the previous reconstructed VOP's three planes, and
+/// the macroblock's already-decoded §7.4 residual, it produces the
+/// `d[y][x]` [`ReconstructedMacroblock`] ready to blit into the current
+/// VOP's frame buffer.
+///
+/// * `motion` — the driver's per-MB outcome (`OneMv` / `FourMv` /
+///   `Skipped`). A `Skipped` MB has a zero residual *and* a zero MV, so
+///   the caller passes a zero `residual`; the result is the co-located
+///   reference samples.
+/// * `residual` — the §7.4 inverse-quantised + inverse-transformed
+///   signed residual `f[y][x]` for this macroblock.
+/// * `mb_x` / `mb_y` — top-left **luma** pixel coordinates (`16 *
+///   mb_col`, `16 * mb_row`).
+/// * `bits_per_pixel` — §6.3.3 `bits_per_pixel` (8 unless `not_8_bit`).
+///
+/// Returns [`None`] for an intra macroblock — an intra MB is
+/// reconstructed by the §7.4 intra texture path + the §7.3 step-1
+/// `d = f` (see [`reconstruct_intra_macroblock`](crate::reconstruct::reconstruct_intra_macroblock)),
+/// not this motion-compensated path.
+//
+// Each argument is a distinct §7.6.2 / §7.3 input (the decoded motion,
+// the three reference planes, the residual, the MB origin pair, plus the
+// VOP-level rounding-control bit and bit-depth). Bundling them into a
+// struct would add a shim layer without simplifying the call site.
+#[allow(clippy::too_many_arguments)]
+pub fn reconstruct_pvop_macroblock(
+    motion: PvopMbMotion,
+    luma_ref: &crate::half_sample::ReferenceVop<'_>,
+    cb_ref: &crate::half_sample::ReferenceVop<'_>,
+    cr_ref: &crate::half_sample::ReferenceVop<'_>,
+    residual: &crate::block::InterMacroblock,
+    mb_x: i32,
+    mb_y: i32,
+    vop_rounding_type: u8,
+    bits_per_pixel: u32,
+) -> Option<crate::reconstruct::ReconstructedMacroblock> {
+    let prediction = predict_inter_macroblock(
+        motion,
+        luma_ref,
+        cb_ref,
+        cr_ref,
+        mb_x,
+        mb_y,
+        vop_rounding_type,
+    )?;
+    Some(crate::reconstruct::reconstruct_inter_macroblock(
+        &prediction,
+        residual,
+        bits_per_pixel,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1095,5 +1155,225 @@ mod tests {
                 assert_eq!(recon.cr[y][x], (p + 5).min(255));
             }
         }
+    }
+
+    // ------------------------------------------------------------------
+    // §7.6.2 + §7.3 end-to-end P-VOP macroblock reconstruction.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn reconstruct_pvop_macroblock_intra_is_none() {
+        use crate::block::InterMacroblock;
+        use crate::reconstruct::{MACROBLOCK_CHROMA_SIDE, MACROBLOCK_LUMA_SIDE};
+        let luma = gradient_plane(16, 16);
+        let chroma = gradient_plane(8, 8);
+        let luma_ref = ReferenceVop::new(&luma, 16, 16).unwrap();
+        let cb_ref = ReferenceVop::new(&chroma, 8, 8).unwrap();
+        let cr_ref = ReferenceVop::new(&chroma, 8, 8).unwrap();
+        let residual = InterMacroblock {
+            luma: [[0i32; MACROBLOCK_LUMA_SIDE]; MACROBLOCK_LUMA_SIDE],
+            cb: [[0i32; MACROBLOCK_CHROMA_SIDE]; MACROBLOCK_CHROMA_SIDE],
+            cr: [[0i32; MACROBLOCK_CHROMA_SIDE]; MACROBLOCK_CHROMA_SIDE],
+        };
+        assert!(reconstruct_pvop_macroblock(
+            PvopMbMotion::Intra,
+            &luma_ref,
+            &cb_ref,
+            &cr_ref,
+            &residual,
+            0,
+            0,
+            0,
+            8,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn reconstruct_pvop_macroblock_one_mv_plus_residual() {
+        // §7.3 d = p + f, clipped. Luma MV (4, 4) = shift (+2, +2);
+        // chroma MV (2, 2) = shift (+1, +1). A per-sample varying residual
+        // verifies the add is positional, not a constant.
+        use crate::block::InterMacroblock;
+        use crate::reconstruct::{MACROBLOCK_CHROMA_SIDE, MACROBLOCK_LUMA_SIDE};
+
+        let lw = 48;
+        let lh = 48;
+        let cw = 24;
+        let ch = 24;
+        let luma = gradient_plane(lw, lh);
+        let cb = gradient_plane(cw, ch);
+        let cr = gradient_plane(cw, ch);
+        let luma_ref = ReferenceVop::new(&luma, lw, lh).unwrap();
+        let cb_ref = ReferenceVop::new(&cb, cw, ch).unwrap();
+        let cr_ref = ReferenceVop::new(&cr, cw, ch).unwrap();
+
+        let mut residual = InterMacroblock {
+            luma: [[0i32; MACROBLOCK_LUMA_SIDE]; MACROBLOCK_LUMA_SIDE],
+            cb: [[0i32; MACROBLOCK_CHROMA_SIDE]; MACROBLOCK_CHROMA_SIDE],
+            cr: [[0i32; MACROBLOCK_CHROMA_SIDE]; MACROBLOCK_CHROMA_SIDE],
+        };
+        // A checkerboard ±3 residual (kept small so no clip triggers).
+        for y in 0..MACROBLOCK_LUMA_SIDE {
+            for x in 0..MACROBLOCK_LUMA_SIDE {
+                residual.luma[y][x] = if (x + y) % 2 == 0 { 3 } else { -3 };
+            }
+        }
+        for y in 0..MACROBLOCK_CHROMA_SIDE {
+            for x in 0..MACROBLOCK_CHROMA_SIDE {
+                residual.cb[y][x] = if (x + y) % 2 == 0 { 2 } else { -2 };
+                residual.cr[y][x] = if (x + y) % 2 == 0 { 1 } else { -1 };
+            }
+        }
+
+        let motion = PvopMbMotion::OneMv(MotionVector { x: 4, y: 4 });
+        let recon = reconstruct_pvop_macroblock(
+            motion, &luma_ref, &cb_ref, &cr_ref, &residual, 16, 16, 0, 8,
+        )
+        .unwrap();
+
+        for y in 0..16 {
+            for x in 0..16 {
+                // p = ref(16 + x + 2, 16 + y + 2); f = ±3.
+                let p = ((16 + x + 2 + 16 + y + 2) & 0xff) as i32;
+                let f = if (x + y) % 2 == 0 { 3 } else { -3 };
+                assert_eq!(recon.luma[y][x], (p + f).clamp(0, 255), "luma ({x},{y})");
+            }
+        }
+        for y in 0..8 {
+            for x in 0..8 {
+                let p = ((8 + x + 1 + 8 + y + 1) & 0xff) as i32;
+                let fcb = if (x + y) % 2 == 0 { 2 } else { -2 };
+                let fcr = if (x + y) % 2 == 0 { 1 } else { -1 };
+                assert_eq!(recon.cb[y][x], (p + fcb).clamp(0, 255), "cb ({x},{y})");
+                assert_eq!(recon.cr[y][x], (p + fcr).clamp(0, 255), "cr ({x},{y})");
+            }
+        }
+    }
+
+    #[test]
+    fn frame_level_pvop_decode_predict_reconstruct() {
+        // Full §7.6 + §7.3 P-VOP path over a 2×2-macroblock frame:
+        // drive the motion bitstream through MvDriver, then reconstruct
+        // every macroblock against a reference frame and blit into a
+        // 32×32 luma + 16×16 chroma frame buffer. Asserts the assembled
+        // luma plane matches the per-MB prediction (zero residual → the
+        // reconstruction is exactly the §7.6.2 prediction).
+        use crate::block::InterMacroblock;
+        use crate::reconstruct::{MACROBLOCK_CHROMA_SIDE, MACROBLOCK_LUMA_SIDE};
+
+        // Reference planes (with padding margin so half-pel fetches at
+        // the right/bottom edge clamp cleanly): 48×48 luma, 24×24 chroma.
+        let lw = 48;
+        let lh = 48;
+        let cw = 24;
+        let ch = 24;
+        let luma = gradient_plane(lw, lh);
+        let cb = gradient_plane(cw, ch);
+        let cr = gradient_plane(cw, ch);
+        let luma_ref = ReferenceVop::new(&luma, lw, lh).unwrap();
+        let cb_ref = ReferenceVop::new(&cb, cw, ch).unwrap();
+        let cr_ref = ReferenceVop::new(&cr, cw, ch).unwrap();
+
+        // Decode four inter MBs (same bitstream as
+        // end_to_end_pvop_mv_decode_and_predict): all reconstruct to
+        // MV (1,1) except MB(1,1) = (0,0).
+        let mut driver = MvDriver::new(2, 2, 1);
+        let mb00 = [0x48u8]; // 010 010 → (+1,+1)
+        let mut br = BitReader::new(&mb00);
+        let m00 = driver
+            .decode_macroblock(&mut br, 0, 0, false, Some(DerivedMbType::Inter))
+            .unwrap();
+        let zeros = zero_delta_bits(1);
+        let mut br = BitReader::new(&zeros);
+        let m01 = driver
+            .decode_macroblock(&mut br, 0, 1, false, Some(DerivedMbType::Inter))
+            .unwrap();
+        let mut br = BitReader::new(&zeros);
+        let m10 = driver
+            .decode_macroblock(&mut br, 1, 0, false, Some(DerivedMbType::Inter))
+            .unwrap();
+        let mb11 = [0x6Cu8]; // 011 011 → (-1,-1)
+        let mut br = BitReader::new(&mb11);
+        let m11 = driver
+            .decode_macroblock(&mut br, 1, 1, false, Some(DerivedMbType::Inter))
+            .unwrap();
+
+        // Frame buffers: 32×32 luma, 16×16 Cb/Cr.
+        let mut frame_y = vec![0i32; 32 * 32];
+        let mut frame_cb = vec![0i32; 16 * 16];
+        let mut frame_cr = vec![0i32; 16 * 16];
+
+        let zero_residual = InterMacroblock {
+            luma: [[0i32; MACROBLOCK_LUMA_SIDE]; MACROBLOCK_LUMA_SIDE],
+            cb: [[0i32; MACROBLOCK_CHROMA_SIDE]; MACROBLOCK_CHROMA_SIDE],
+            cr: [[0i32; MACROBLOCK_CHROMA_SIDE]; MACROBLOCK_CHROMA_SIDE],
+        };
+        let motions: [(usize, usize, PvopMbMotion); 4] =
+            [(0, 0, m00), (0, 1, m01), (1, 0, m10), (1, 1, m11)];
+        for (mb_row, mb_col, motion) in motions {
+            let mb_x = 16 * mb_col as i32;
+            let mb_y = 16 * mb_row as i32;
+            let recon = reconstruct_pvop_macroblock(
+                motion,
+                &luma_ref,
+                &cb_ref,
+                &cr_ref,
+                &zero_residual,
+                mb_x,
+                mb_y,
+                0,
+                8,
+            )
+            .unwrap();
+            // Blit luma.
+            for y in 0..16 {
+                for x in 0..16 {
+                    frame_y[(mb_y as usize + y) * 32 + (mb_x as usize + x)] = recon.luma[y][x];
+                }
+            }
+            // Blit chroma at half resolution.
+            let cmb_x = (mb_x / 2) as usize;
+            let cmb_y = (mb_y / 2) as usize;
+            for y in 0..8 {
+                for x in 0..8 {
+                    frame_cb[(cmb_y + y) * 16 + (cmb_x + x)] = recon.cb[y][x];
+                    frame_cr[(cmb_y + y) * 16 + (cmb_x + x)] = recon.cr[y][x];
+                }
+            }
+        }
+
+        // Cross-check: the assembled luma equals the per-MB §7.6.2
+        // prediction (zero residual). Recompute the prediction for one
+        // sample of each MB and compare to the frame buffer.
+        for (mb_row, mb_col, motion) in motions {
+            let mb_x = 16 * mb_col as i32;
+            let mb_y = 16 * mb_row as i32;
+            let pred = predict_luma_macroblock(motion, &luma_ref, mb_x, mb_y, 0).unwrap();
+            for y in [0usize, 7, 15] {
+                for x in [0usize, 7, 15] {
+                    let fb = frame_y[(mb_y as usize + y) * 32 + (mb_x as usize + x)];
+                    assert_eq!(
+                        fb,
+                        pred[16 * y + x] as i32,
+                        "luma frame ({},{}) MB({mb_row},{mb_col})",
+                        mb_x as usize + x,
+                        mb_y as usize + y
+                    );
+                }
+            }
+        }
+
+        // The skip-free top-left MB used MV (1,1) → half-pel diagonal;
+        // confirm the frame value is the bilinear of the four reference
+        // neighbours (rc = 0) for one interior sample.
+        let p00 = frame_y[8 * 32 + 8]; // MB(0,0), sample (8,8)
+                                       // sample(8,8) origin in ref: base (8,8), half (1,1) → bilinear of
+                                       // (16),(17),(17),(18) … using (x+y) gradient: base_x=8,base_y=8.
+        let a = (8 + 8) & 0xff;
+        let b = (8 + 1 + 8) & 0xff;
+        let c = (8 + 8 + 1) & 0xff;
+        let d = (8 + 1 + 8 + 1) & 0xff;
+        assert_eq!(p00, (a + b + c + d + 2) / 4);
     }
 }

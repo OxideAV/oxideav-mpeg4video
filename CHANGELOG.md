@@ -55,6 +55,22 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   generators and the §7.3 `d = p + f` reconstruction layer. Derives the
   4:2:0 chroma origin `(mb_x / 2, mb_y / 2)` per §6.1.3.4 and returns
   `None` for intra. +3 tests (973 lib total).
+- **§7.6.2 + §7.3 end-to-end P-VOP inter-macroblock reconstruction**
+  (`pvop_mv` module): `reconstruct_pvop_macroblock(motion, luma_ref,
+  cb_ref, cr_ref, residual, mb_x, mb_y, vop_rounding_type,
+  bits_per_pixel)` is the single call that closes the
+  progressive-P-VOP motion-compensation path — it runs
+  `predict_inter_macroblock` (§7.6.2.1) and feeds the result plus the
+  decoded §7.4 residual into the §7.3 step-2 add + step-3
+  `[0, 2^bpp - 1]` display clip, returning the `d[y][x]`
+  `ReconstructedMacroblock` ready to blit into the frame buffer (`None`
+  for intra, which takes the §7.4 intra texture + §7.3 step-1 path). A
+  new frame-level test drives the four-macroblock motion bitstream
+  through `MvDriver`, reconstructs every MB against a reference frame,
+  blits luma + 4:2:0 chroma into a 32×32 / 16×16 frame buffer, and
+  cross-checks the assembled luma against the per-MB §7.6.2 prediction
+  and a closed-form half-pel diagonal bilinear. +3 tests (976 lib
+  total).
 - **§6.2.3 static-sprite VOL body + §7.8.2/§7.8.6 reconstruction**
   (`vol`, `static_sprite` modules): the `sprite_enable == static` VOL
   branch now parses (the `sprite_{width,height,left,top}` geometry
