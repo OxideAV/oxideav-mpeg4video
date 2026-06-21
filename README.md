@@ -72,9 +72,13 @@ encoder.
   opaque pel — the path used for intra 8×8-blocks with `opaque_pels < 64`),
   and the §7.3 `d[y][x]` reconstruction with the display clip for I-, P-,
   and inter macroblocks.
-- **B-VOP prediction**: forward / backward / interpolated / direct
-  modes, bidirectional averaging, and 8×8 luminance prediction-block
-  generation.
+- **B-VOP prediction + reconstruction**: forward / backward /
+  interpolated / direct modes, bidirectional averaging, 16×16 luma +
+  8×8 Cb / Cr prediction-block generation, and the §7.6.9 → §7.3 bridge
+  ([`predict_b_vop_macroblock`] packs the prediction into an
+  `InterPredictionMacroblock`; [`reconstruct_b_vop_macroblock`] runs the
+  full predict + §7.3 `d = p + f` add + display clip end-to-end across
+  both anchor VOPs).
 - **GMC (global motion compensation)** end-to-end for rectangular
   S(GMC)-VOPs: the §6.2.3 `sprite_enable == "GMC"` VOL body
   (`no_of_sprite_warping_points`, `sprite_warping_accuracy`,

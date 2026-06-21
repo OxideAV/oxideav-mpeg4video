@@ -642,6 +642,156 @@ pub fn generate_b_vop_chroma_prediction(
     out
 }
 
+/// Build the §7.6.9 motion-compensated prediction macroblock `p[y][x]`
+/// (16×16 luma + 8×8 Cb + 8×8 Cr, 4:2:0) for one B-VOP macroblock,
+/// ready as the §7.3 step-2 input to
+/// [`reconstruct_inter_macroblock`](crate::reconstruct::reconstruct_inter_macroblock).
+///
+/// This packs the §7.6.9 forward / backward / bidirectional / direct
+/// prediction (luma via [`generate_b_vop_luma_prediction`], chroma via
+/// [`generate_b_vop_chroma_prediction`]) into the row-major
+/// [`InterPredictionMacroblock`](crate::reconstruct::InterPredictionMacroblock)
+/// shape that the §7.3 `d = p + f` reconstruction layer adds the §7.4
+/// residual to — the B-VOP analogue of the P-VOP
+/// [`predict_inter_macroblock`](crate::pvop_mv::predict_inter_macroblock)
+/// bridge.
+///
+/// * `forward_ref` / `backward_ref` — the §7.6.9.5.1-padded previous /
+///   next anchor VOPs' luma planes.
+/// * `forward_cb_ref` / `backward_cb_ref` / `forward_cr_ref` /
+///   `backward_cr_ref` — the matching chroma planes.
+/// * `mvs` — the four per-sub-block [`BVopMvPair`]s (only `mvs[0]` is
+///   consulted for the non-direct modes; direct mode uses all four).
+/// * `forward_chroma_mv` / `backward_chroma_mv` — the §7.6.5-reduced
+///   chroma MVs (half-sample units), derived by the caller from the
+///   luma MVs via [`crate::chroma_mv::chroma_mv_from_luma_blocks`].
+/// * `mb_origin_x` / `mb_origin_y` — top-left **luma** pixel position in
+///   the current B-VOP (chroma origin is `(mb_origin_x / 2,
+///   mb_origin_y / 2)` per §6.1.3.4).
+/// * `mode` — half-pel vs. quarter-pel luma interpolation.
+/// * `prediction_mode` — one of the four §7.6.9 modes.
+#[allow(clippy::too_many_arguments)]
+pub fn predict_b_vop_macroblock(
+    forward_ref: &ReferenceVop<'_>,
+    backward_ref: &ReferenceVop<'_>,
+    forward_cb_ref: &ReferenceVop<'_>,
+    backward_cb_ref: &ReferenceVop<'_>,
+    forward_cr_ref: &ReferenceVop<'_>,
+    backward_cr_ref: &ReferenceVop<'_>,
+    mvs: &[BVopMvPair; MB_SUB_BLOCKS],
+    forward_chroma_mv: MotionVector,
+    backward_chroma_mv: MotionVector,
+    mb_origin_x: i32,
+    mb_origin_y: i32,
+    vop_rounding_type: u8,
+    mode: BVopSampleMode,
+    prediction_mode: BVopPredictionMode,
+) -> crate::reconstruct::InterPredictionMacroblock {
+    use crate::reconstruct::{
+        InterPredictionMacroblock, MACROBLOCK_CHROMA_SIDE, MACROBLOCK_LUMA_SIDE,
+    };
+
+    let luma_flat = generate_b_vop_luma_prediction(
+        forward_ref,
+        backward_ref,
+        mvs,
+        mb_origin_x,
+        mb_origin_y,
+        vop_rounding_type,
+        mode,
+        prediction_mode,
+    );
+
+    let cmb_x = mb_origin_x / 2;
+    let cmb_y = mb_origin_y / 2;
+    let cb_flat = generate_b_vop_chroma_prediction(
+        forward_cb_ref,
+        backward_cb_ref,
+        forward_chroma_mv,
+        backward_chroma_mv,
+        cmb_x,
+        cmb_y,
+        vop_rounding_type,
+        prediction_mode,
+    );
+    let cr_flat = generate_b_vop_chroma_prediction(
+        forward_cr_ref,
+        backward_cr_ref,
+        forward_chroma_mv,
+        backward_chroma_mv,
+        cmb_x,
+        cmb_y,
+        vop_rounding_type,
+        prediction_mode,
+    );
+
+    let mut out = InterPredictionMacroblock::zero();
+    for y in 0..MACROBLOCK_LUMA_SIDE {
+        for x in 0..MACROBLOCK_LUMA_SIDE {
+            out.luma[y][x] = luma_flat[y * MACROBLOCK_LUMA_SIDE + x] as i32;
+        }
+    }
+    for y in 0..MACROBLOCK_CHROMA_SIDE {
+        for x in 0..MACROBLOCK_CHROMA_SIDE {
+            out.cb[y][x] = cb_flat[y * MACROBLOCK_CHROMA_SIDE + x] as i32;
+            out.cr[y][x] = cr_flat[y * MACROBLOCK_CHROMA_SIDE + x] as i32;
+        }
+    }
+    out
+}
+
+/// Fully reconstruct one B-VOP macroblock end-to-end: §7.6.9
+/// motion-compensated prediction ([`predict_b_vop_macroblock`]) plus the
+/// §7.3 step-2 add of the §7.4 residual and the step-3
+/// `[0, 2^bpp - 1]` display clip
+/// ([`reconstruct_inter_macroblock`](crate::reconstruct::reconstruct_inter_macroblock)).
+///
+/// The B-VOP analogue of the P-VOP
+/// [`reconstruct_pvop_macroblock`](crate::pvop_mv::reconstruct_pvop_macroblock):
+/// it produces the `d[y][x]`
+/// [`ReconstructedMacroblock`](crate::reconstruct::ReconstructedMacroblock)
+/// ready to blit, given the decoded §7.6.9 modes / MVs, the two anchor
+/// VOPs, the already-decoded §7.4 residual, and `bits_per_pixel`
+/// (§6.3.3). See [`predict_b_vop_macroblock`] for the argument
+/// semantics.
+#[allow(clippy::too_many_arguments)]
+pub fn reconstruct_b_vop_macroblock(
+    forward_ref: &ReferenceVop<'_>,
+    backward_ref: &ReferenceVop<'_>,
+    forward_cb_ref: &ReferenceVop<'_>,
+    backward_cb_ref: &ReferenceVop<'_>,
+    forward_cr_ref: &ReferenceVop<'_>,
+    backward_cr_ref: &ReferenceVop<'_>,
+    mvs: &[BVopMvPair; MB_SUB_BLOCKS],
+    forward_chroma_mv: MotionVector,
+    backward_chroma_mv: MotionVector,
+    residual: &crate::block::InterMacroblock,
+    mb_origin_x: i32,
+    mb_origin_y: i32,
+    vop_rounding_type: u8,
+    mode: BVopSampleMode,
+    prediction_mode: BVopPredictionMode,
+    bits_per_pixel: u32,
+) -> crate::reconstruct::ReconstructedMacroblock {
+    let prediction = predict_b_vop_macroblock(
+        forward_ref,
+        backward_ref,
+        forward_cb_ref,
+        backward_cb_ref,
+        forward_cr_ref,
+        backward_cr_ref,
+        mvs,
+        forward_chroma_mv,
+        backward_chroma_mv,
+        mb_origin_x,
+        mb_origin_y,
+        vop_rounding_type,
+        mode,
+        prediction_mode,
+    );
+    crate::reconstruct::reconstruct_inter_macroblock(&prediction, residual, bits_per_pixel)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1555,6 +1705,189 @@ mod tests {
             );
             for sample in out.iter() {
                 assert_eq!(*sample, 150, "rc = {rc}");
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // §7.6.9 + §7.3 end-to-end B-VOP macroblock reconstruction.
+    // -----------------------------------------------------------------
+
+    /// A `w × h` reference plane whose sample value is `(x + y) mod 256`.
+    fn gradient_ref(w: usize, h: usize) -> Vec<u8> {
+        let mut v = vec![0u8; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                v[y * w + x] = ((x + y) & 0xff) as u8;
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn predict_b_vop_macroblock_forward_zero_mv_packs_reference() {
+        // Forward-only, zero MVs, gradient references → the packed
+        // prediction is the co-located forward reference.
+        use crate::reconstruct::{MACROBLOCK_CHROMA_SIDE, MACROBLOCK_LUMA_SIDE};
+        let fwd = gradient_ref(64, 64);
+        let bwd = flat_ref(200); // never sampled
+        let fwd_c = gradient_ref(32, 32);
+        let bwd_c = vec![200u8; 32 * 32];
+        let fwd_ref = ReferenceVop::new(&fwd, 64, 64).unwrap();
+        let bwd_ref = ReferenceVop::new(&bwd, 64, 64).unwrap();
+        let fwd_cb = ReferenceVop::new(&fwd_c, 32, 32).unwrap();
+        let bwd_cb = ReferenceVop::new(&bwd_c, 32, 32).unwrap();
+        let fwd_cr = ReferenceVop::new(&fwd_c, 32, 32).unwrap();
+        let bwd_cr = ReferenceVop::new(&bwd_c, 32, 32).unwrap();
+        let zero = MotionVector { x: 0, y: 0 };
+        let mvs = [BVopMvPair {
+            forward: zero,
+            backward: zero,
+        }; MB_SUB_BLOCKS];
+
+        // MB at luma (16, 16) → chroma (8, 8).
+        let pred = predict_b_vop_macroblock(
+            &fwd_ref,
+            &bwd_ref,
+            &fwd_cb,
+            &bwd_cb,
+            &fwd_cr,
+            &bwd_cr,
+            &mvs,
+            zero,
+            zero,
+            16,
+            16,
+            0,
+            BVopSampleMode::HalfPel,
+            BVopPredictionMode::ForwardOnly,
+        );
+        for y in 0..MACROBLOCK_LUMA_SIDE {
+            for x in 0..MACROBLOCK_LUMA_SIDE {
+                assert_eq!(pred.luma[y][x], ((16 + x + 16 + y) & 0xff) as i32);
+            }
+        }
+        for y in 0..MACROBLOCK_CHROMA_SIDE {
+            for x in 0..MACROBLOCK_CHROMA_SIDE {
+                let e = ((8 + x + 8 + y) & 0xff) as i32;
+                assert_eq!(pred.cb[y][x], e);
+                assert_eq!(pred.cr[y][x], e);
+            }
+        }
+    }
+
+    #[test]
+    fn reconstruct_b_vop_macroblock_bidirectional_plus_residual() {
+        // Bidirectional averages two flat references then §7.3 adds a
+        // residual and clips. fwd=40, bwd=80 → p = (40+80+1)>>1 = 60
+        // everywhere; residual +5 → d = 65.
+        use crate::block::InterMacroblock;
+        use crate::reconstruct::{MACROBLOCK_CHROMA_SIDE, MACROBLOCK_LUMA_SIDE};
+        let fwd = flat_ref(40);
+        let bwd = flat_ref(80);
+        let fwd_c = vec![40u8; 32 * 32];
+        let bwd_c = vec![80u8; 32 * 32];
+        let fwd_ref = ReferenceVop::new(&fwd, 64, 64).unwrap();
+        let bwd_ref = ReferenceVop::new(&bwd, 64, 64).unwrap();
+        let fwd_cb = ReferenceVop::new(&fwd_c, 32, 32).unwrap();
+        let bwd_cb = ReferenceVop::new(&bwd_c, 32, 32).unwrap();
+        let fwd_cr = ReferenceVop::new(&fwd_c, 32, 32).unwrap();
+        let bwd_cr = ReferenceVop::new(&bwd_c, 32, 32).unwrap();
+        let zero = MotionVector { x: 0, y: 0 };
+        let mvs = [BVopMvPair {
+            forward: zero,
+            backward: zero,
+        }; MB_SUB_BLOCKS];
+
+        let residual = InterMacroblock {
+            luma: [[5i32; MACROBLOCK_LUMA_SIDE]; MACROBLOCK_LUMA_SIDE],
+            cb: [[5i32; MACROBLOCK_CHROMA_SIDE]; MACROBLOCK_CHROMA_SIDE],
+            cr: [[5i32; MACROBLOCK_CHROMA_SIDE]; MACROBLOCK_CHROMA_SIDE],
+        };
+
+        let recon = reconstruct_b_vop_macroblock(
+            &fwd_ref,
+            &bwd_ref,
+            &fwd_cb,
+            &bwd_cb,
+            &fwd_cr,
+            &bwd_cr,
+            &mvs,
+            zero,
+            zero,
+            &residual,
+            16,
+            16,
+            0,
+            BVopSampleMode::HalfPel,
+            BVopPredictionMode::Bidirectional,
+            8,
+        );
+        for y in 0..MACROBLOCK_LUMA_SIDE {
+            for x in 0..MACROBLOCK_LUMA_SIDE {
+                assert_eq!(recon.luma[y][x], 65);
+            }
+        }
+        for y in 0..MACROBLOCK_CHROMA_SIDE {
+            for x in 0..MACROBLOCK_CHROMA_SIDE {
+                assert_eq!(recon.cb[y][x], 65);
+                assert_eq!(recon.cr[y][x], 65);
+            }
+        }
+    }
+
+    #[test]
+    fn reconstruct_b_vop_macroblock_clips_to_display_range() {
+        // §7.3 step-3 clip: a high prediction + positive residual must
+        // saturate at 2^bpp - 1 = 255. fwd=bwd=250 → p=250; +20 → 270 →
+        // clip 255.
+        use crate::block::InterMacroblock;
+        use crate::reconstruct::{MACROBLOCK_CHROMA_SIDE, MACROBLOCK_LUMA_SIDE};
+        let plane = flat_ref(250);
+        let plane_c = vec![250u8; 32 * 32];
+        let fwd_ref = ReferenceVop::new(&plane, 64, 64).unwrap();
+        let bwd_ref = ReferenceVop::new(&plane, 64, 64).unwrap();
+        let fwd_cb = ReferenceVop::new(&plane_c, 32, 32).unwrap();
+        let bwd_cb = ReferenceVop::new(&plane_c, 32, 32).unwrap();
+        let fwd_cr = ReferenceVop::new(&plane_c, 32, 32).unwrap();
+        let bwd_cr = ReferenceVop::new(&plane_c, 32, 32).unwrap();
+        let zero = MotionVector { x: 0, y: 0 };
+        let mvs = [BVopMvPair {
+            forward: zero,
+            backward: zero,
+        }; MB_SUB_BLOCKS];
+        let residual = InterMacroblock {
+            luma: [[20i32; MACROBLOCK_LUMA_SIDE]; MACROBLOCK_LUMA_SIDE],
+            cb: [[20i32; MACROBLOCK_CHROMA_SIDE]; MACROBLOCK_CHROMA_SIDE],
+            cr: [[20i32; MACROBLOCK_CHROMA_SIDE]; MACROBLOCK_CHROMA_SIDE],
+        };
+        let recon = reconstruct_b_vop_macroblock(
+            &fwd_ref,
+            &bwd_ref,
+            &fwd_cb,
+            &bwd_cb,
+            &fwd_cr,
+            &bwd_cr,
+            &mvs,
+            zero,
+            zero,
+            &residual,
+            0,
+            0,
+            0,
+            BVopSampleMode::HalfPel,
+            BVopPredictionMode::Bidirectional,
+            8,
+        );
+        for y in 0..MACROBLOCK_LUMA_SIDE {
+            for x in 0..MACROBLOCK_LUMA_SIDE {
+                assert_eq!(recon.luma[y][x], 255);
+            }
+        }
+        for y in 0..MACROBLOCK_CHROMA_SIDE {
+            for x in 0..MACROBLOCK_CHROMA_SIDE {
+                assert_eq!(recon.cb[y][x], 255);
+                assert_eq!(recon.cr[y][x], 255);
             }
         }
     }

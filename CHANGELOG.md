@@ -71,6 +71,19 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   cross-checks the assembled luma against the per-MB §7.6.2 prediction
   and a closed-form half-pel diagonal bilinear. +3 tests (976 lib
   total).
+- **§7.6.9 + §7.3 end-to-end B-VOP macroblock reconstruction**
+  (`bvop_prediction` module): `predict_b_vop_macroblock` packs the
+  §7.6.9 forward / backward / bidirectional / direct prediction
+  (luma via `generate_b_vop_luma_prediction`, 4:2:0 chroma via
+  `generate_b_vop_chroma_prediction` against the §7.6.5-reduced chroma
+  MVs) into the row-major `InterPredictionMacroblock`, and
+  `reconstruct_b_vop_macroblock` feeds it plus the decoded §7.4 residual
+  through the §7.3 step-2 add + step-3 `[0, 2^bpp - 1]` display clip,
+  returning the `d[y][x]` `ReconstructedMacroblock` — the B-VOP analogue
+  of the P-VOP `reconstruct_pvop_macroblock` bridge. Both anchor VOPs
+  (forward + backward) and all three planes per anchor are threaded
+  through; the chroma origin is derived `(mb_origin_x / 2,
+  mb_origin_y / 2)` per §6.1.3.4. +3 tests (979 lib total).
 - **§6.2.3 static-sprite VOL body + §7.8.2/§7.8.6 reconstruction**
   (`vol`, `static_sprite` modules): the `sprite_enable == static` VOL
   branch now parses (the `sprite_{width,height,left,top}` geometry

@@ -363,8 +363,9 @@ pub use bvop_field_predictor::{
 };
 pub use bvop_prediction::{
     average_bidirectional, average_bidirectional_into, generate_b_vop_luma_prediction,
-    generate_b_vop_luma_prediction_into, BVopMvPair, BVopPredictionMode, BVopSampleMode,
-    MB_LUMA_PIXELS, MB_LUMA_SIDE, MB_SUB_BLOCKS, SUB_BLOCK_OFFSETS, SUB_BLOCK_SIDE,
+    generate_b_vop_luma_prediction_into, predict_b_vop_macroblock, reconstruct_b_vop_macroblock,
+    BVopMvPair, BVopPredictionMode, BVopSampleMode, MB_LUMA_PIXELS, MB_LUMA_SIDE, MB_SUB_BLOCKS,
+    SUB_BLOCK_OFFSETS, SUB_BLOCK_SIDE,
 };
 pub use chroma_mv::{
     chroma_mv_from_luma_blocks, ChromaMvError, TABLE_7_10, TABLE_7_11, TABLE_7_12, TABLE_7_13,
