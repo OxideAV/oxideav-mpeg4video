@@ -45,6 +45,16 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   for intra), and `predict_chroma_macroblock` half-sample-interpolates
   the 8×8 Cb / Cr prediction block from a chroma reference plane. +5
   tests (970 lib total).
+- **§7.6.2 → §7.3 P-VOP prediction-macroblock bridge** (`pvop_mv`
+  module): `predict_inter_macroblock(motion, luma_ref, cb_ref, cr_ref,
+  mb_x, mb_y, vop_rounding_type)` packs the §7.6.2.1 half-sample
+  prediction of a driver-decoded `PvopMbMotion` into the row-major
+  `InterPredictionMacroblock` (`[[i32; 16]; 16]` luma + `[[i32; 8]; 8]`
+  Cb/Cr) that `reconstruct::reconstruct_inter_macroblock` adds the §7.4
+  residual to — closing the gap between the flat-`Vec<u8>` §7.6.2 block
+  generators and the §7.3 `d = p + f` reconstruction layer. Derives the
+  4:2:0 chroma origin `(mb_x / 2, mb_y / 2)` per §6.1.3.4 and returns
+  `None` for intra. +3 tests (973 lib total).
 - **§6.2.3 static-sprite VOL body + §7.8.2/§7.8.6 reconstruction**
   (`vol`, `static_sprite` modules): the `sprite_enable == static` VOL
   branch now parses (the `sprite_{width,height,left,top}` geometry

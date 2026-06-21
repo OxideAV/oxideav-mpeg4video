@@ -477,6 +477,71 @@ pub fn predict_chroma_macroblock(
     ))
 }
 
+/// Build the §7.6.2 motion-compensated prediction macroblock
+/// `p[y][x]` (16×16 luma + 8×8 Cb + 8×8 Cr, 4:2:0) for one decoded
+/// progressive P-VOP macroblock, ready as the §7.3 step-2 input to
+/// [`crate::reconstruct::reconstruct_inter_macroblock`].
+///
+/// This is the bridge between the [`MvDriver`]'s decoded
+/// [`PvopMbMotion`] and the §7.3 reconstruction layer: where
+/// [`predict_luma_macroblock`] / [`predict_chroma_macroblock`] emit
+/// flat `Vec<u8>` blocks (useful for direct blit), this function packs
+/// the same §7.6.2.1 half-sample interpolation results into the
+/// row-major [`InterPredictionMacroblock`] `[[i32; …]; …]` shape that
+/// [`reconstruct_inter_macroblock`](crate::reconstruct::reconstruct_inter_macroblock)
+/// adds the §7.4 residual to.
+///
+/// * `luma_ref` is the previous reconstructed VOP's luma plane; `cb_ref`
+///   / `cr_ref` are its two 4:2:0 chroma planes.
+/// * `mb_x` / `mb_y` are the macroblock's top-left **luma** pixel
+///   coordinates in the current VOP (`16 * mb_col`, `16 * mb_row`); the
+///   chroma origin is `(mb_x / 2, mb_y / 2)` per §6.1.3.4 4:2:0
+///   sub-sampling.
+/// * MVs are in half-sample units (the progressive `quarter_sample == 0`
+///   path); the chroma MV is the §7.6.5 `sum / 2K` reduction
+///   ([`chroma_mv_for_macroblock`]).
+///
+/// Returns [`None`] for an intra macroblock (it carries no §7.6.2
+/// prediction — its samples come from the §7.4 intra texture path).
+pub fn predict_inter_macroblock(
+    motion: PvopMbMotion,
+    luma_ref: &crate::half_sample::ReferenceVop<'_>,
+    cb_ref: &crate::half_sample::ReferenceVop<'_>,
+    cr_ref: &crate::half_sample::ReferenceVop<'_>,
+    mb_x: i32,
+    mb_y: i32,
+    vop_rounding_type: u8,
+) -> Option<crate::reconstruct::InterPredictionMacroblock> {
+    use crate::reconstruct::{
+        InterPredictionMacroblock, MACROBLOCK_CHROMA_SIDE, MACROBLOCK_LUMA_SIDE,
+    };
+
+    if matches!(motion, PvopMbMotion::Intra) {
+        return None;
+    }
+
+    let luma_flat = predict_luma_macroblock(motion, luma_ref, mb_x, mb_y, vop_rounding_type)?;
+
+    let cmb_x = mb_x / 2;
+    let cmb_y = mb_y / 2;
+    let cb_flat = predict_chroma_macroblock(motion, cb_ref, cmb_x, cmb_y, vop_rounding_type)?;
+    let cr_flat = predict_chroma_macroblock(motion, cr_ref, cmb_x, cmb_y, vop_rounding_type)?;
+
+    let mut out = InterPredictionMacroblock::zero();
+    for y in 0..MACROBLOCK_LUMA_SIDE {
+        for x in 0..MACROBLOCK_LUMA_SIDE {
+            out.luma[y][x] = luma_flat[y * MACROBLOCK_LUMA_SIDE + x] as i32;
+        }
+    }
+    for y in 0..MACROBLOCK_CHROMA_SIDE {
+        for x in 0..MACROBLOCK_CHROMA_SIDE {
+            out.cb[y][x] = cb_flat[y * MACROBLOCK_CHROMA_SIDE + x] as i32;
+            out.cr[y][x] = cr_flat[y * MACROBLOCK_CHROMA_SIDE + x] as i32;
+        }
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -918,5 +983,117 @@ mod tests {
         let plane = gradient_plane(8, 8);
         let reference = ReferenceVop::new(&plane, 8, 8).unwrap();
         assert!(predict_chroma_macroblock(PvopMbMotion::Intra, &reference, 0, 0, 0).is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // §7.6.2 → §7.3 bridge: InterPredictionMacroblock packing.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn inter_prediction_macroblock_intra_is_none() {
+        let luma = gradient_plane(16, 16);
+        let chroma = gradient_plane(8, 8);
+        let luma_ref = ReferenceVop::new(&luma, 16, 16).unwrap();
+        let cb_ref = ReferenceVop::new(&chroma, 8, 8).unwrap();
+        let cr_ref = ReferenceVop::new(&chroma, 8, 8).unwrap();
+        assert!(predict_inter_macroblock(
+            PvopMbMotion::Intra,
+            &luma_ref,
+            &cb_ref,
+            &cr_ref,
+            0,
+            0,
+            0
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn inter_prediction_macroblock_packs_one_mv() {
+        // 1-MV integer shift: luma MV (4, 2) = shift (+2, +1); chroma MV
+        // = sum/2 = (2, 1) = shift (+1, 0)+half(0,1)? (2,1)→ x even
+        // (shift +1), y odd (half 1). Use even chroma to stay exact:
+        // luma MV (4, 4) → chroma (2, 2) = integer shift (+1, +1).
+        let lw = 48;
+        let lh = 48;
+        let cw = 24;
+        let ch = 24;
+        let luma = gradient_plane(lw, lh);
+        let cb = gradient_plane(cw, ch);
+        let cr = gradient_plane(cw, ch);
+        let luma_ref = ReferenceVop::new(&luma, lw, lh).unwrap();
+        let cb_ref = ReferenceVop::new(&cb, cw, ch).unwrap();
+        let cr_ref = ReferenceVop::new(&cr, cw, ch).unwrap();
+
+        let motion = PvopMbMotion::OneMv(MotionVector { x: 4, y: 4 });
+        // Macroblock at luma (16, 16) → chroma (8, 8).
+        let pred =
+            predict_inter_macroblock(motion, &luma_ref, &cb_ref, &cr_ref, 16, 16, 0).unwrap();
+
+        // Luma: shift (+2, +2). p[y][x] = ref(16 + x + 2, 16 + y + 2).
+        for y in 0..16 {
+            for x in 0..16 {
+                let expect = ((16 + x + 2 + 16 + y + 2) & 0xff) as i32;
+                assert_eq!(pred.luma[y][x], expect, "luma ({x},{y})");
+            }
+        }
+        // Chroma: MV (2,2) = shift (+1,+1). p[y][x] = ref(8 + x + 1,
+        // 8 + y + 1).
+        for y in 0..8 {
+            for x in 0..8 {
+                let expect = ((8 + x + 1 + 8 + y + 1) & 0xff) as i32;
+                assert_eq!(pred.cb[y][x], expect, "cb ({x},{y})");
+                assert_eq!(pred.cr[y][x], expect, "cr ({x},{y})");
+            }
+        }
+    }
+
+    #[test]
+    fn inter_prediction_macroblock_feeds_reconstruction() {
+        // The packed prediction adds cleanly to a §7.4 residual via the
+        // §7.3 reconstruction path: a zero MV + zero residual returns the
+        // co-located reference, and a constant residual offsets it.
+        use crate::block::InterMacroblock;
+        use crate::reconstruct::{
+            reconstruct_inter_macroblock, MACROBLOCK_CHROMA_SIDE, MACROBLOCK_LUMA_SIDE,
+        };
+
+        let lw = 32;
+        let lh = 32;
+        let cw = 16;
+        let ch = 16;
+        let luma = gradient_plane(lw, lh);
+        let cb = gradient_plane(cw, ch);
+        let cr = gradient_plane(cw, ch);
+        let luma_ref = ReferenceVop::new(&luma, lw, lh).unwrap();
+        let cb_ref = ReferenceVop::new(&cb, cw, ch).unwrap();
+        let cr_ref = ReferenceVop::new(&cr, cw, ch).unwrap();
+
+        // Skipped MB at (0,0): zero MV → prediction = co-located ref.
+        let pred =
+            predict_inter_macroblock(PvopMbMotion::Skipped, &luma_ref, &cb_ref, &cr_ref, 0, 0, 0)
+                .unwrap();
+
+        // Residual = +5 everywhere.
+        let residual = InterMacroblock {
+            luma: [[5i32; MACROBLOCK_LUMA_SIDE]; MACROBLOCK_LUMA_SIDE],
+            cb: [[5i32; MACROBLOCK_CHROMA_SIDE]; MACROBLOCK_CHROMA_SIDE],
+            cr: [[5i32; MACROBLOCK_CHROMA_SIDE]; MACROBLOCK_CHROMA_SIDE],
+        };
+        let recon = reconstruct_inter_macroblock(&pred, &residual, 8);
+
+        for y in 0..16 {
+            for x in 0..16 {
+                let p = ((x + y) & 0xff) as i32;
+                assert_eq!(recon.luma[y][x], (p + 5).min(255), "luma ({x},{y})");
+            }
+        }
+        for y in 0..8 {
+            for x in 0..8 {
+                let p = ((x + y) & 0xff) as i32;
+                assert_eq!(recon.cb[y][x], (p + 5).min(255));
+                assert_eq!(recon.cr[y][x], (p + 5).min(255));
+            }
+        }
     }
 }

@@ -435,8 +435,8 @@ pub use predictor::{
     NeighbourPosition,
 };
 pub use pvop_mv::{
-    chroma_mv_for_macroblock, predict_chroma_macroblock, predict_luma_macroblock, MvDriver,
-    PvopMbMotion, PvopMvError,
+    chroma_mv_for_macroblock, predict_chroma_macroblock, predict_inter_macroblock,
+    predict_luma_macroblock, MvDriver, PvopMbMotion, PvopMvError,
 };
 pub use quarter_sample::{
     field_mvy_to_field_grid, fir_8tap_clip, half_pel_b, half_pel_c, half_pel_d,
