@@ -179,6 +179,80 @@ pub struct BVopMbDecode {
     pub backward_chroma_mv: MotionVector,
 }
 
+/// The six §7.6.9.5.1-padded anchor reference planes (forward + backward
+/// luma / Cb / Cr) a B-VOP macroblock reconstruction reads from.
+///
+/// Grouped into one struct so the [`BVopMbDecode::reconstruct`] bridge
+/// avoids a 16-argument signature. `forward_*` are the previous anchor
+/// VOP's planes, `backward_*` the temporally next anchor's.
+#[derive(Debug, Clone, Copy)]
+pub struct BVopAnchorPlanes<'a> {
+    /// Forward (previous anchor) luma plane.
+    pub forward_luma: &'a crate::half_sample::ReferenceVop<'a>,
+    /// Backward (next anchor) luma plane.
+    pub backward_luma: &'a crate::half_sample::ReferenceVop<'a>,
+    /// Forward Cb plane.
+    pub forward_cb: &'a crate::half_sample::ReferenceVop<'a>,
+    /// Backward Cb plane.
+    pub backward_cb: &'a crate::half_sample::ReferenceVop<'a>,
+    /// Forward Cr plane.
+    pub forward_cr: &'a crate::half_sample::ReferenceVop<'a>,
+    /// Backward Cr plane.
+    pub backward_cr: &'a crate::half_sample::ReferenceVop<'a>,
+}
+
+impl BVopMbDecode {
+    /// Fully reconstruct this macroblock end-to-end: §7.6.9
+    /// motion-compensated prediction (forward / backward / bidirectional
+    /// / direct, dispatched on [`Self::prediction_mode`]) plus the §7.3
+    /// step-2 add of the §7.4 residual and the step-3 display clip.
+    ///
+    /// This is the §7.6.9 → §7.3 bridge: it routes the decoded motion
+    /// state ([`Self::mvs`], [`Self::forward_chroma_mv`],
+    /// [`Self::backward_chroma_mv`], [`Self::prediction_mode`]) into
+    /// [`reconstruct_b_vop_macroblock`](crate::bvop_prediction::reconstruct_b_vop_macroblock).
+    ///
+    /// * `anchors` — the six §7.6.9.5.1-padded reference planes.
+    /// * `residual` — the already-decoded §7.4 inter residual macroblock
+    ///   for this MB (`cbpb == None` / all-zero blocks → a zero residual,
+    ///   yielding a pure motion-compensated copy / average).
+    /// * `mb_origin_x` / `mb_origin_y` — top-left **luma** pixel position
+    ///   in the current B-VOP (`16 * mb_col`, `16 * mb_row`).
+    /// * `vop_rounding_type` — §7.6.7 half-pel rounding control.
+    /// * `mode` — half-pel vs quarter-pel luma interpolation.
+    /// * `bits_per_pixel` — §6.3.3 sample depth for the §7.3 step-3 clip.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reconstruct(
+        &self,
+        anchors: &BVopAnchorPlanes<'_>,
+        residual: &crate::block::InterMacroblock,
+        mb_origin_x: i32,
+        mb_origin_y: i32,
+        vop_rounding_type: u8,
+        mode: crate::bvop_prediction::BVopSampleMode,
+        bits_per_pixel: u32,
+    ) -> crate::reconstruct::ReconstructedMacroblock {
+        crate::bvop_prediction::reconstruct_b_vop_macroblock(
+            anchors.forward_luma,
+            anchors.backward_luma,
+            anchors.forward_cb,
+            anchors.backward_cb,
+            anchors.forward_cr,
+            anchors.backward_cr,
+            &self.mvs,
+            self.forward_chroma_mv,
+            self.backward_chroma_mv,
+            residual,
+            mb_origin_x,
+            mb_origin_y,
+            vop_rounding_type,
+            mode,
+            self.prediction_mode,
+            bits_per_pixel,
+        )
+    }
+}
+
 /// The §7.6.9.5.1 / §7.6.9.6 co-located anchor state for one B-VOP
 /// macroblock, supplied by the caller to
 /// [`BVopMvDriver::decode_vop_motion`].
@@ -1055,5 +1129,69 @@ mod tests {
         assert_eq!(mbs[0].mb_type, BVopMbType::Direct);
         assert_eq!(mbs[0].mvs[0].forward, MotionVector { x: 4, y: 0 });
         assert_eq!(mbs[1].mvs[0].forward, MotionVector { x: 0, y: 0 });
+    }
+
+    #[test]
+    fn reconstruct_forward_zero_mv_zero_residual_copies_forward_anchor() {
+        // A forward-only B-MB with a zero MV + zero residual is a pure
+        // §7.6.9.2 copy of the co-located forward-anchor samples. Build a
+        // 16×16 luma / 8×8 chroma uniform reference and verify the
+        // §7.6.9→§7.3 bridge reproduces it exactly.
+        use crate::block::InterMacroblock;
+        use crate::bvop_prediction::BVopSampleMode;
+        use crate::half_sample::ReferenceVop;
+
+        let luma_plane = vec![137u8; 16 * 16];
+        let chroma_plane = vec![88u8; 8 * 8];
+        let fwd_luma = ReferenceVop::new(&luma_plane, 16, 16).unwrap();
+        let fwd_cb = ReferenceVop::new(&chroma_plane, 8, 8).unwrap();
+        let fwd_cr = ReferenceVop::new(&chroma_plane, 8, 8).unwrap();
+        // Backward planes are unused for forward-only mode; reuse the
+        // same buffers so the references are valid.
+        let anchors = BVopAnchorPlanes {
+            forward_luma: &fwd_luma,
+            backward_luma: &fwd_luma,
+            forward_cb: &fwd_cb,
+            backward_cb: &fwd_cb,
+            forward_cr: &fwd_cr,
+            backward_cr: &fwd_cr,
+        };
+
+        let zero = MotionVector { x: 0, y: 0 };
+        let decode = BVopMbDecode {
+            mb_type: BVopMbType::Forward,
+            prediction_mode: BVopPredictionMode::ForwardOnly,
+            cbpb: None,
+            dbquant_delta: None,
+            mvs: [BVopMvPair {
+                forward: zero,
+                backward: zero,
+            }; MB_SUB_BLOCKS],
+            forward_chroma_mv: zero,
+            backward_chroma_mv: zero,
+        };
+
+        let residual = InterMacroblock {
+            luma: [[0i32; 16]; 16],
+            cb: [[0i32; 8]; 8],
+            cr: [[0i32; 8]; 8],
+        };
+
+        let recon = decode.reconstruct(&anchors, &residual, 0, 0, 0, BVopSampleMode::HalfPel, 8);
+        for row in recon.luma {
+            for px in row {
+                assert_eq!(px, 137);
+            }
+        }
+        for row in recon.cb {
+            for px in row {
+                assert_eq!(px, 88);
+            }
+        }
+        for row in recon.cr {
+            for px in row {
+                assert_eq!(px, 88);
+            }
+        }
     }
 }

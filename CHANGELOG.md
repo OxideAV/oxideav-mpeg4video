@@ -41,6 +41,16 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   `CoLocatedAnchor { skipped, mv }`, with a `Default` of
   non-skipped + transparent) for each `(mb_row, mb_col)`. 3 tests cover
   within-row threading, per-row reset, and per-MB anchor dispatch.
+- **§7.6.9 → §7.3 B-VOP macroblock reconstruction bridge** (`bvop_mv`
+  module): `BVopMbDecode::reconstruct(anchors, residual, mb_origin_x,
+  mb_origin_y, vop_rounding_type, mode, bits_per_pixel)` routes a
+  driver-decoded macroblock's motion state into
+  `reconstruct_b_vop_macroblock`, producing the §7.3 `d[y][x]`
+  `ReconstructedMacroblock` (motion-compensated prediction + residual
+  add + display clip). The six §7.6.9.5.1-padded anchor planes are
+  grouped into the new `BVopAnchorPlanes` struct. 1 test verifies a
+  forward-only zero-MV / zero-residual MB copies the forward anchor
+  exactly.
 - **§7.6 progressive P-VOP motion-vector decode driver** (new `pvop_mv`
   module): `MvDriver` wires the four previously-isolated §7.6 primitives
   — the §6.2.6.2 `motion_vector()` body
