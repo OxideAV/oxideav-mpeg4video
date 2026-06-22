@@ -353,6 +353,28 @@ pub fn pattern_code(cbpy: u8, cbpc: u8) -> [bool; 6] {
     ]
 }
 
+/// Derive the six `coded[i]` flags from a B-VOP macroblock's 6-bit
+/// `cbpb`, per §6.3.7 / §6.2.6.
+///
+/// Unlike a P-VOP (where the coded pattern is split across `cbpy`
+/// luminance + `cbpc` chrominance fields), a B-VOP carries a single
+/// `cbpb` field whose bits run **leftmost = top-left block**: for a
+/// 4:2:0 rectangular macroblock the 6 bits map MSB→block 0 …
+/// LSB→block 5 (block 4 = Cb, block 5 = Cr), matching the §6.2.6
+/// `NOTE` `block_count == 6`. `cbpb == None` (the `modb` indicated no
+/// `cbpb`) means no block is coded.
+pub fn cbpb_pattern_code(cbpb: Option<u8>) -> [bool; 6] {
+    let bits = cbpb.unwrap_or(0);
+    [
+        bits & 0b10_0000 != 0, // block 0 — luma top-left
+        bits & 0b01_0000 != 0, // block 1 — luma top-right
+        bits & 0b00_1000 != 0, // block 2 — luma bottom-left
+        bits & 0b00_0100 != 0, // block 3 — luma bottom-right
+        bits & 0b00_0010 != 0, // block 4 — Cb
+        bits & 0b00_0001 != 0, // block 5 — Cr
+    ]
+}
+
 /// The §6.1.3 / Figure 6-8 component of block `i` in a 4:2:0 macroblock.
 #[inline]
 fn block_component(i: usize) -> DcComponent {
@@ -744,6 +766,61 @@ pub fn decode_inter_macroblock(
     // luma blocks.
     let mut luma = [[0i32; 16]; 16];
     // Block 0 → top-left, 1 → top-right, 2 → bottom-left, 3 → bottom-right.
+    const LUMA_OFFSETS: [(usize, usize); 4] = [(0, 0), (0, 8), (8, 0), (8, 8)];
+    for (b, &(row_off, col_off)) in LUMA_OFFSETS.iter().enumerate() {
+        for y in 0..8 {
+            for x in 0..8 {
+                luma[row_off + y][col_off + x] = blocks[b][y][x];
+            }
+        }
+    }
+
+    Ok(InterMacroblock {
+        luma,
+        cb: blocks[4],
+        cr: blocks[5],
+    })
+}
+
+/// Decode and reconstruct a **B-VOP** inter macroblock's signed-residual
+/// 16×16 luma + 8×8 Cb / 8×8 Cr planes from the texture bitstream that
+/// follows the §6.2.6 motion-vector bodies.
+///
+/// `br` must be positioned at the first coded `block(i)` (i.e.
+/// immediately after the last motion-vector body the macroblock's
+/// `mb_type` codes). `cbpb` is the macroblock header's coded-block
+/// pattern (`None` when `modb` indicated no `cbpb`, i.e. every block is
+/// uncoded → a wholly-zero residual). `ctx` carries the resolved
+/// per-macroblock parameters (`quantiser_scale` after any `dbquant`,
+/// `bits_per_pixel`, `quant_type`); `ac_pred_flag` is ignored on the
+/// inter path. `quant_matrix` is the raster-order non-intra `W[1]`
+/// matrix used when `ctx.quant_type == true` (method 1); it is ignored
+/// for method 2.
+///
+/// The B-VOP residual is always an *inter* residual — B-VOPs carry no
+/// intra macroblocks (§7.6.9), so every coded block runs the §6.2.7
+/// inter texture syntax (no DC, inter Tcoef tables). The six blocks are
+/// decoded in Figure 6-8 order (0,1 / 2,3 luminance; 4 Cb; 5 Cr), gated
+/// by [`cbpb_pattern_code`], and assembled into the [`InterMacroblock`]
+/// with the same plane layout as [`decode_inter_macroblock`].
+pub fn decode_b_vop_inter_macroblock(
+    br: &mut BitReader<'_>,
+    cbpb: Option<u8>,
+    ctx: MacroblockTextureContext,
+    quant_matrix: &[[u8; 8]; 8],
+) -> Result<InterMacroblock, BlockAssemblyError> {
+    let coded = cbpb_pattern_code(cbpb);
+
+    // Decode the six blocks in Figure 6-8 order.
+    let mut blocks: [[[i32; 8]; 8]; 6] = [[[0i32; 8]; 8]; 6];
+    for (i, block) in blocks.iter_mut().enumerate() {
+        *block = decode_inter_block(br, i, coded[i], ctx, quant_matrix)?;
+    }
+
+    // Assemble the 16×16 luminance residual plane from the four 8×8
+    // luma blocks (Figure 6-8: 0 → top-left, 1 → top-right, 2 →
+    // bottom-left, 3 → bottom-right).
+    let mut luma = [[0i32; 16]; 16];
     const LUMA_OFFSETS: [(usize, usize); 4] = [(0, 0), (0, 8), (8, 0), (8, 8)];
     for (b, &(row_off, col_off)) in LUMA_OFFSETS.iter().enumerate() {
         for y in 0..8 {
@@ -1337,6 +1414,102 @@ mod tests {
         let err = decode_inter_macroblock(&mut br, &header, ctx, &DEFAULT_NONINTRA_QUANT_MATRIX)
             .unwrap_err();
         assert_eq!(err, BlockAssemblyError::NotInter);
+    }
+
+    #[test]
+    fn cbpb_pattern_code_bit_mapping() {
+        // Leftmost (MSB) bit = block 0; 0b10_0000 → only block 0 coded.
+        assert_eq!(
+            cbpb_pattern_code(Some(0b10_0000)),
+            [true, false, false, false, false, false]
+        );
+        // 0b00_0011 → blocks 4 (Cb) + 5 (Cr) coded.
+        assert_eq!(
+            cbpb_pattern_code(Some(0b00_0011)),
+            [false, false, false, false, true, true]
+        );
+        // All six coded.
+        assert_eq!(cbpb_pattern_code(Some(0b11_1111)), [true; 6]);
+        // None / zero → nothing coded.
+        assert_eq!(cbpb_pattern_code(None), [false; 6]);
+        assert_eq!(cbpb_pattern_code(Some(0)), [false; 6]);
+    }
+
+    /// `cbpb == None` means every block is uncoded — the B-VOP residual
+    /// is wholly zero and no texture bits are consumed.
+    #[test]
+    fn b_vop_inter_macroblock_no_cbpb_is_zero() {
+        let ctx = MacroblockTextureContext {
+            quantiser_scale: 8,
+            bits_per_pixel: 8,
+            quant_type: false,
+            ac_pred_flag: false,
+        };
+        let data = [0u8; 4];
+        let mut br = BitReader::new(&data);
+        let before = br.bit_position();
+        let mb = decode_b_vop_inter_macroblock(&mut br, None, ctx, &DEFAULT_NONINTRA_QUANT_MATRIX)
+            .unwrap();
+        assert_eq!(
+            br.bit_position(),
+            before,
+            "no texture bits should be consumed"
+        );
+        for row in mb.luma.iter() {
+            assert!(row.iter().all(|&px| px == 0));
+        }
+        assert!(mb.cb.iter().all(|r| r.iter().all(|&px| px == 0)));
+        assert!(mb.cr.iter().all(|r| r.iter().all(|&px| px == 0)));
+    }
+
+    /// A B-VOP residual with `cbpb = 0b10_0000` codes only block 0 (luma
+    /// top-left). The decoded residual carries the coefficient there;
+    /// every other block stays zero. Mirrors the P-VOP single-luma test
+    /// but routes the coded-block pattern through `cbpb` rather than
+    /// `cbpy`/`cbpc`.
+    #[test]
+    fn b_vop_inter_macroblock_one_coded_luma_block() {
+        let ctx = MacroblockTextureContext {
+            quantiser_scale: 5,
+            bits_per_pixel: 8,
+            quant_type: false,
+            ac_pred_flag: false,
+        };
+        let mut w = BitWriter::default();
+        // Block 0 — one positive (LAST=1, RUN=0, LEVEL=1) inter EVENT.
+        w.write_bits(0b0111, 4);
+        w.write_bit(0);
+        let data = w.finish();
+        let mut br = BitReader::new(&data);
+        let mb = decode_b_vop_inter_macroblock(
+            &mut br,
+            Some(0b10_0000),
+            ctx,
+            &DEFAULT_NONINTRA_QUANT_MATRIX,
+        )
+        .unwrap();
+
+        for y in 0..8 {
+            for x in 0..8 {
+                let px = mb.luma[y][x];
+                assert!(
+                    (px - 2).abs() <= 1,
+                    "block 0 pixel ({y},{x}) = {px}, expected near 2"
+                );
+            }
+        }
+        for y in 0..8 {
+            for x in 8..16 {
+                assert_eq!(mb.luma[y][x], 0, "block 1 must be zero");
+            }
+        }
+        for y in 8..16 {
+            for x in 0..16 {
+                assert_eq!(mb.luma[y][x], 0, "blocks 2/3 must be zero");
+            }
+        }
+        assert!(mb.cb.iter().all(|r| r.iter().all(|&px| px == 0)));
+        assert!(mb.cr.iter().all(|r| r.iter().all(|&px| px == 0)));
     }
 
     /// A `not_coded == true` macroblock is short-circuited via

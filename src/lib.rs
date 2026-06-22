@@ -350,10 +350,11 @@ pub mod warp;
 
 pub use bitreader::{BitReader, BitReaderError};
 pub use block::{
-    de_zigzag, decode_inter_block, decode_inter_macroblock, decode_intra_block,
-    decode_intra_macroblock, intra_quant_matrix, nonintra_quant_matrix, pattern_code,
-    BlockAssemblyError, BlockPredictors, InterMacroblock, IntraMacroblock,
-    MacroblockTextureContext, DEFAULT_INTRA_QUANT_MATRIX, DEFAULT_NONINTRA_QUANT_MATRIX,
+    cbpb_pattern_code, de_zigzag, decode_b_vop_inter_macroblock, decode_inter_block,
+    decode_inter_macroblock, decode_intra_block, decode_intra_macroblock, intra_quant_matrix,
+    nonintra_quant_matrix, pattern_code, BlockAssemblyError, BlockPredictors, InterMacroblock,
+    IntraMacroblock, MacroblockTextureContext, DEFAULT_INTRA_QUANT_MATRIX,
+    DEFAULT_NONINTRA_QUANT_MATRIX,
 };
 pub use bvop::{
     decode_b_vop_mb_motion_vectors, default_b_mb_type, parse_b_vop_mb_header, parse_dbquant,
