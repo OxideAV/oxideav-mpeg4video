@@ -169,6 +169,18 @@ pub struct BVopMbHeader {
     /// default type ("forward mc + q" for the scalable enhancement
     /// branch, "direct" otherwise — see [`default_b_mb_type`]).
     pub mb_type: BVopMbType,
+    /// Whether an explicit `mb_type` codeword was present in the
+    /// bitstream. The §6.2.6 `modb` discriminator distinguishes
+    /// `"1"` (no `mb_type` — `mb_type` here is the *default* type) from
+    /// `"01"` / `"00"` (an explicit `mb_type` followed). Both `"1"` and
+    /// `"01"` store the numeric raw value `1` in some encodings, so the
+    /// `modb` field alone cannot separate them — this flag is the
+    /// reliable discriminator (`false` ⟺ `modb == "1"`). The
+    /// §7.6.9.6 skipped-macroblock override keys on it: a skipped
+    /// co-located MB with `mb_type_present == false` (`modb == "1"`)
+    /// reconstructs as direct mode with a zero delta, otherwise as
+    /// forward mode with the zero MV.
+    pub mb_type_present: bool,
     /// `cbpb` — coded block pattern across the macroblock's
     /// non-transparent blocks. `Some(value)` only when `modb == 0b00`
     /// (Table B.3 with `cbpb` column set). For 4:2:0 rectangular VOL
@@ -478,6 +490,7 @@ pub fn parse_b_vop_mb_header(
     Ok(BVopMbHeader {
         modb,
         mb_type,
+        mb_type_present,
         cbpb,
         mvdf_present: mb_type.has_forward_mv(),
         mvdb_present: mb_type.has_backward_mv(),

@@ -8,6 +8,28 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **§7.6.8 frame-level B-VOP motion-vector decode driver** (new
+  `bvop_mv` module): `BVopMvDriver` walks the macroblocks of one
+  progressive, non-scalable B-VOP in raster order, decoding each
+  one's §6.2.6 header (`parse_b_vop_mb_header`) + motion bodies
+  (`decode_b_vop_mb_motion_vectors`), resolving the §7.6.9 prediction
+  mode (direct / forward / backward / bidirectional), and
+  reconstructing the forward / backward MVs against the §7.6.8 running
+  per-direction predictor bank — reset to zero at each row start
+  (`start_row`), updated only after a macroblock that decoded a vector
+  in that direction (forward-only → forward predictor; backward-only →
+  backward; bidirectional → both). Direct-mode MBs neither read nor
+  update the bank: their delta is decoded with predictor zero +
+  f_code 1 (§7.6.8) and scaled from the co-located anchor MV by
+  §7.6.9.5.2 TRB/TRD. The §6.2.6 `modb "1"` vs `"01"` discriminator is
+  resolved via the new `BVopMbHeader::mb_type_present` flag: a
+  `modb == "1"` direct MB codes **no** motion body (implicit zero
+  delta). §7.6.9.6 skipped-co-located overrides apply before any
+  `mb_type` decode (`modb == "1"` → direct/zero-delta; else
+  forward/zero-MV). Emits `BVopMbDecode` (prediction mode + four
+  `(MVF, MVB)` sub-block pairs + §7.6.5-reduced chroma MVs) ready for
+  the §7.6.9→§7.3 `predict_b_vop_macroblock` bridge. Surfaces
+  `BVopMvDriver` / `BVopMbDecode` / `BVopMvDriverError`. 6 tests.
 - **§7.6 progressive P-VOP motion-vector decode driver** (new `pvop_mv`
   module): `MvDriver` wires the four previously-isolated §7.6 primitives
   — the §6.2.6.2 `motion_vector()` body
