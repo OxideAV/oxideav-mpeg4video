@@ -30,6 +30,17 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   `(MVF, MVB)` sub-block pairs + §7.6.5-reduced chroma MVs) ready for
   the §7.6.9→§7.3 `predict_b_vop_macroblock` bridge. Surfaces
   `BVopMvDriver` / `BVopMbDecode` / `BVopMvDriverError`. 6 tests.
+- **Frame-level B-VOP motion walk** (`bvop_mv` module):
+  `BVopMvDriver::decode_vop_motion(br, vol, vop_coding_type,
+  co_located)` decodes the motion state of an entire progressive B-VOP
+  in raster order, returning one `BVopMbDecode` per macroblock. It
+  applies the §7.6.8 row-start predictor reset internally (calling
+  `start_row` at each row boundary) and threads the running per-direction
+  predictor bank across the macroblocks of each row. The `co_located`
+  closure supplies the §7.6.9.5.1 / §7.6.9.6 anchor state (new
+  `CoLocatedAnchor { skipped, mv }`, with a `Default` of
+  non-skipped + transparent) for each `(mb_row, mb_col)`. 3 tests cover
+  within-row threading, per-row reset, and per-MB anchor dispatch.
 - **§7.6 progressive P-VOP motion-vector decode driver** (new `pvop_mv`
   module): `MvDriver` wires the four previously-isolated §7.6 primitives
   — the §6.2.6.2 `motion_vector()` body

@@ -362,7 +362,7 @@ pub use bvop::{
 pub use bvop_field_predictor::{
     FieldMvDirection, FieldPmvBank, PMV_BOT_BWD, PMV_BOT_FWD, PMV_TOP_BWD, PMV_TOP_FWD,
 };
-pub use bvop_mv::{BVopMbDecode, BVopMvDriver, BVopMvDriverError};
+pub use bvop_mv::{BVopMbDecode, BVopMvDriver, BVopMvDriverError, CoLocatedAnchor};
 pub use bvop_prediction::{
     average_bidirectional, average_bidirectional_into, generate_b_vop_luma_prediction,
     generate_b_vop_luma_prediction_into, predict_b_vop_macroblock, reconstruct_b_vop_macroblock,

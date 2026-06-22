@@ -179,6 +179,36 @@ pub struct BVopMbDecode {
     pub backward_chroma_mv: MotionVector,
 }
 
+/// The §7.6.9.5.1 / §7.6.9.6 co-located anchor state for one B-VOP
+/// macroblock, supplied by the caller to
+/// [`BVopMvDriver::decode_vop_motion`].
+///
+/// `skipped` is the §7.6.9.6 flag (the co-located macroblock in the
+/// most recently decoded anchor was `not_coded`); `mv` is the
+/// §7.6.9.5.1 co-located block vector (after §7.6.1.6 vector padding)
+/// consulted by direct mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoLocatedAnchor {
+    /// §7.6.9.6: whether the co-located anchor macroblock was skipped.
+    pub skipped: bool,
+    /// §7.6.9.5.1: the co-located anchor block vector (or the
+    /// transparent / unavailable fallback).
+    pub mv: DirectCoLocatedMv,
+}
+
+impl Default for CoLocatedAnchor {
+    /// A non-skipped, transparent/absent co-located macroblock — the
+    /// safe default when the caller has no anchor MV grid (direct mode
+    /// then derives `MVF` / `MVB` from a zero `MV` per §7.6.9.5.1's
+    /// final sentence).
+    fn default() -> Self {
+        Self {
+            skipped: false,
+            mv: DirectCoLocatedMv::TransparentOrAbsent,
+        }
+    }
+}
+
 /// §7.6.8 running motion-vector predictor pair for one direction.
 ///
 /// Reset to `(0, 0)` at the start of every macroblock row; updated only
@@ -332,6 +362,60 @@ impl BVopMvDriver {
             BVopMbType::Backward => self.decode_backward(br, &header),
             BVopMbType::Interpolated => self.decode_bidirectional(br, &header),
         }
+    }
+
+    /// Decode the motion state of an entire progressive B-VOP in raster
+    /// order, returning one [`BVopMbDecode`] per macroblock (row-major,
+    /// `mb_rows * mb_cols` entries).
+    ///
+    /// This is the frame-level §7.6.8 walk: it calls
+    /// [`BVopMvDriver::start_row`] at the start of each macroblock row
+    /// (honouring the "predictors reset to zero only at the beginning of
+    /// each macroblock row" rule) and threads the running predictor bank
+    /// across the macroblocks of each row via repeated
+    /// [`BVopMvDriver::decode_macroblock`] calls.
+    ///
+    /// `co_located` supplies, for each `(mb_row, mb_col)`, the §7.6.9.5.1
+    /// / §7.6.9.6 co-located anchor state — whether the co-located
+    /// macroblock in the most recently decoded anchor was *skipped* and
+    /// its (vector-padded) block MV for direct mode. The closure is
+    /// called exactly once per macroblock in raster order.
+    ///
+    /// The bit reader is left positioned immediately after the final
+    /// macroblock's last motion-vector body. This walker does **not**
+    /// consume the §6.2.6 texture (residual) bodies — those are decoded
+    /// separately by the caller's texture path; this driver owns only
+    /// the §7.6.8 motion-vector decode and predictor threading. A VOP
+    /// that interleaves texture between macroblocks must instead drive
+    /// macroblocks one at a time via [`BVopMvDriver::decode_macroblock`].
+    pub fn decode_vop_motion<F>(
+        &mut self,
+        br: &mut BitReader<'_>,
+        vol: &VolHeader,
+        vop_coding_type: VopCodingType,
+        mut co_located: F,
+    ) -> Result<Vec<BVopMbDecode>, BVopMvDriverError>
+    where
+        F: FnMut(usize, usize) -> CoLocatedAnchor,
+    {
+        let mut out = Vec::with_capacity(self.mb_rows * self.mb_cols);
+        for mb_row in 0..self.mb_rows {
+            self.start_row();
+            for mb_col in 0..self.mb_cols {
+                let anchor = co_located(mb_row, mb_col);
+                let decode = self.decode_macroblock(
+                    br,
+                    vol,
+                    vop_coding_type,
+                    mb_row,
+                    mb_col,
+                    anchor.skipped,
+                    anchor.mv,
+                )?;
+                out.push(decode);
+            }
+        }
+        Ok(out)
     }
 
     /// §7.6.9.6: a skipped co-located anchor macroblock forces the
@@ -874,5 +958,102 @@ mod tests {
         driver.start_row();
         assert_eq!(driver.predictor.forward, MotionVector { x: 0, y: 0 });
         assert_eq!(driver.predictor.backward, MotionVector { x: 0, y: 0 });
+    }
+
+    /// Table B.12 codeword for `mv_data == 2` (`0010`, 4 bits). With
+    /// `vop_fcode == 1` the reconstructed differential equals `mv_data`,
+    /// so a forward body of two of these is a `(2, 2)` delta.
+    fn write_mv_data_two(w: &mut BitWriter) {
+        w.write_bits(0b0010, 4);
+    }
+
+    #[test]
+    fn decode_vop_motion_threads_forward_predictor_within_row() {
+        // 1×2 VOP, two forward MBs, each coding mvdf == (2, 2) with
+        // fcode 1. §7.6.8: MB0 reconstructs (0,0)+(2,2) = (2,2) and sets
+        // the forward predictor to (2,2); MB1 reconstructs (2,2)+(2,2) =
+        // (4,4). This proves the running predictor threads across the
+        // row rather than resetting per macroblock.
+        let vol = make_vol();
+        let mut w = BitWriter::new();
+        for _ in 0..2 {
+            w.write_bits(0b01, 2); // modb "01"
+            w.write_bits(0b0001, 4); // mb_type forward
+            write_mv_data_two(&mut w); // mvdf.x == 2
+            write_mv_data_two(&mut w); // mvdf.y == 2
+        }
+        w.align();
+        let data = w.buf;
+        let mut br = BitReader::new(&data);
+        let mut driver = BVopMvDriver::new(1, 2, 1, 1, 1, 2);
+        let mbs = driver
+            .decode_vop_motion(&mut br, &vol, VopCodingType::B, |_, _| {
+                CoLocatedAnchor::default()
+            })
+            .unwrap();
+        assert_eq!(mbs.len(), 2);
+        assert_eq!(mbs[0].mvs[0].forward, MotionVector { x: 2, y: 2 });
+        assert_eq!(mbs[1].mvs[0].forward, MotionVector { x: 4, y: 4 });
+    }
+
+    #[test]
+    fn decode_vop_motion_resets_predictor_between_rows() {
+        // 2×1 VOP, two forward MBs in separate rows, each mvdf == (2,2).
+        // §7.6.8 resets the predictor at each row start, so BOTH MBs
+        // reconstruct (0,0)+(2,2) = (2,2) — the row-1 MB does not see
+        // the row-0 predictor.
+        let vol = make_vol();
+        let mut w = BitWriter::new();
+        for _ in 0..2 {
+            w.write_bits(0b01, 2);
+            w.write_bits(0b0001, 4);
+            write_mv_data_two(&mut w);
+            write_mv_data_two(&mut w);
+        }
+        w.align();
+        let data = w.buf;
+        let mut br = BitReader::new(&data);
+        let mut driver = BVopMvDriver::new(2, 1, 1, 1, 1, 2);
+        let mbs = driver
+            .decode_vop_motion(&mut br, &vol, VopCodingType::B, |_, _| {
+                CoLocatedAnchor::default()
+            })
+            .unwrap();
+        assert_eq!(mbs.len(), 2);
+        assert_eq!(mbs[0].mvs[0].forward, MotionVector { x: 2, y: 2 });
+        assert_eq!(mbs[1].mvs[0].forward, MotionVector { x: 2, y: 2 });
+    }
+
+    #[test]
+    fn decode_vop_motion_per_mb_co_located_anchor_consulted() {
+        // 1×2 VOP: MB0 is a direct MB (modb "1", no body) with a skipped
+        // co-located anchor → direct/zero-delta from MV (8,0): TRB=1,
+        // TRD=2 → MVF.x = (1*8)/2 = 4. MB1 is modb "1" with a
+        // NON-skipped transparent anchor → also direct, MV zero → all
+        // zero. Proves the closure's per-MB anchor reaches the driver.
+        let vol = make_vol();
+        let mut w = BitWriter::new();
+        w.write_bits(0b1, 1); // MB0 modb "1"
+        w.write_bits(0b1, 1); // MB1 modb "1"
+        w.align();
+        let data = w.buf;
+        let mut br = BitReader::new(&data);
+        let mut driver = BVopMvDriver::new(1, 2, 1, 1, 1, 2);
+        let mbs = driver
+            .decode_vop_motion(&mut br, &vol, VopCodingType::B, |_, col| {
+                if col == 0 {
+                    CoLocatedAnchor {
+                        skipped: true,
+                        mv: DirectCoLocatedMv::Mv(MotionVector { x: 8, y: 0 }),
+                    }
+                } else {
+                    CoLocatedAnchor::default()
+                }
+            })
+            .unwrap();
+        assert_eq!(mbs.len(), 2);
+        assert_eq!(mbs[0].mb_type, BVopMbType::Direct);
+        assert_eq!(mbs[0].mvs[0].forward, MotionVector { x: 4, y: 0 });
+        assert_eq!(mbs[1].mvs[0].forward, MotionVector { x: 0, y: 0 });
     }
 }
