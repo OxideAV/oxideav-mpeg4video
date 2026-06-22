@@ -79,6 +79,21 @@ encoder.
   `InterPredictionMacroblock`; [`reconstruct_b_vop_macroblock`] runs the
   full predict + §7.3 `d = p + f` add + display clip end-to-end across
   both anchor VOPs).
+- **Frame-level B-VOP motion-vector decode driver** ([`BVopMvDriver`],
+  `bvop_mv` module): the B-VOP analogue of the P-VOP [`MvDriver`].
+  `decode_macroblock` decodes one macroblock's §6.2.6 header + motion
+  bodies, resolves the §7.6.9 prediction mode, and reconstructs the
+  forward / backward MVs against the §7.6.8 running per-direction
+  predictor bank (reset per row via `start_row`, updated only by the
+  matching direction; direct mode uses predictor zero + f_code 1 and
+  §7.6.9.5.2 TRB/TRD scaling). `decode_vop_motion` walks a full
+  progressive B-VOP in raster order with the row-reset threading built
+  in, returning one [`BVopMbDecode`] per macroblock; the per-MB
+  §7.6.9.5.1 / §7.6.9.6 co-located anchor state is supplied via a
+  [`CoLocatedAnchor`] closure. [`BVopMbDecode::reconstruct`] then bridges
+  the decoded motion straight into [`reconstruct_b_vop_macroblock`]. The
+  §6.2.6 `modb "1"` vs `"01"` discriminator is resolved via
+  [`BVopMbHeader::mb_type_present`].
 - **GMC (global motion compensation)** end-to-end for rectangular
   S(GMC)-VOPs: the §6.2.3 `sprite_enable == "GMC"` VOL body
   (`no_of_sprite_warping_points`, `sprite_warping_accuracy`,
@@ -124,7 +139,14 @@ encoder.
   frame). What remains for a *full* frame decoder is threading the
   per-macroblock §7.4 residual-texture decode into the same loop (the
   residual is currently supplied by the caller) and selecting the
-  reference plane per the VOP reference-frame chain.
+  reference plane per the VOP reference-frame chain. The **B-VOP motion
+  subsystem is now wired at the same level**: [`BVopMvDriver`] walks a
+  progressive B-VOP in raster order with the §7.6.8 row-reset predictor
+  threading, and [`BVopMbDecode::reconstruct`] closes the §7.6.9 → §7.3
+  bridge per macroblock — the same residual-texture-threading and
+  reference-plane-selection work remains for a full B-VOP frame decode.
+  The interlaced field-prediction B-VOP path is not yet handled by the
+  frame driver (it returns a typed `FieldPredictionUnsupported`).
 - Encoder.
 - The end-to-end wiring of the §E.1.4.4 two-way RVLC error recovery: the
   forward / backward Tcoef decodes (§E.1.4.4.1) and the §E.1.4.4.2.1
