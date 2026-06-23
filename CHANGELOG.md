@@ -22,9 +22,11 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   `BVopMbDecode::reconstruct`. Texture parameters are carried in the
   new `BVopTextureParams { base_quantiser_scale, max_quantiser_scale,
   bits_per_pixel, quant_type }`. New error variant
-  `BVopMvDriverError::Texture`. 3 tests cover residual threading,
-  running-quantiser dbquant accumulation, and the no-`cbpb`
-  zero-residual case.
+  `BVopMvDriverError::Texture`. 4 tests cover residual threading,
+  running-quantiser dbquant accumulation, the no-`cbpb` zero-residual
+  case, and an end-to-end frame decode that drives `decode_vop` and
+  reconstructs each macroblock (anchor + residual) via
+  `BVopMbDecode::reconstruct`.
 - **§6.2.6 / §7.4 B-VOP residual macroblock decoder**
   (`decode_b_vop_inter_macroblock` + `cbpb_pattern_code` in `block`):
   decodes a B-VOP macroblock's §7.4 inter residual (16×16 luma + 8×8

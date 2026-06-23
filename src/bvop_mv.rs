@@ -1467,4 +1467,96 @@ mod tests {
             .iter()
             .all(|r| r.iter().all(|&p| p == 0)));
     }
+
+    /// End-to-end frame decode: `decode_vop` decodes a single forward
+    /// B-VOP macroblock (zero MV, one coded luma block) and the
+    /// per-macroblock [`BVopMbDecode::reconstruct`] bridge adds that
+    /// residual onto a uniform forward anchor. The reconstructed luma
+    /// top-left 8×8 = anchor (100) + residual (~2); every other sample =
+    /// the bare anchor copy. This exercises the full §7.6.8 motion →
+    /// §7.4 residual → §7.6.9/§7.3 reconstruction chain wired through the
+    /// frame loop.
+    #[test]
+    fn decode_vop_reconstruct_forward_anchor_plus_residual() {
+        use crate::bvop_prediction::BVopSampleMode;
+        use crate::half_sample::ReferenceVop;
+
+        let vol = make_vol();
+        let mut w = BitWriter::new();
+        w.write_bits(0b00, 2); // modb "00" — mb_type + cbpb
+        w.write_bits(0b0001, 4); // forward
+        w.write_bits(0b10_0000, 6); // cbpb — block 0 coded
+        w.write_bits(0b0, 1); // dbquant code 0 → delta 0
+        w.write_zero_mv_data_pair(); // mvdf == (0, 0)
+        w.write_bits(0b0111, 4); // block-0 inter EVENT
+        w.write_bits(0b0, 1); // sign +
+        w.align();
+        let data = w.buf;
+        let mut br = BitReader::new(&data);
+        let mut driver = BVopMvDriver::new(1, 1, 1, 1, 1, 2);
+        let mbs = driver
+            .decode_vop(&mut br, &vol, VopCodingType::B, texture_params(), |_, _| {
+                CoLocatedAnchor::default()
+            })
+            .unwrap();
+
+        // Uniform forward anchor; backward planes reuse the same buffers
+        // (forward-only mode never samples them).
+        let luma_plane = vec![100u8; 16 * 16];
+        let chroma_plane = vec![100u8; 8 * 8];
+        let fwd_luma = ReferenceVop::new(&luma_plane, 16, 16).unwrap();
+        let fwd_cb = ReferenceVop::new(&chroma_plane, 8, 8).unwrap();
+        let fwd_cr = ReferenceVop::new(&chroma_plane, 8, 8).unwrap();
+        let anchors = BVopAnchorPlanes {
+            forward_luma: &fwd_luma,
+            backward_luma: &fwd_luma,
+            forward_cb: &fwd_cb,
+            backward_cb: &fwd_cb,
+            forward_cr: &fwd_cr,
+            backward_cr: &fwd_cr,
+        };
+
+        let recon = mbs[0].motion.reconstruct(
+            &anchors,
+            &mbs[0].residual,
+            0,
+            0,
+            0,
+            BVopSampleMode::HalfPel,
+            8,
+        );
+
+        // Block 0 (luma[0..8][0..8]) = anchor 100 + residual ~2.
+        for y in 0..8 {
+            for x in 0..8 {
+                let px = recon.luma[y][x] as i32;
+                assert!(
+                    (px - 102).abs() <= 1,
+                    "block 0 reconstructed ({y},{x}) = {px}, expected near 102"
+                );
+            }
+        }
+        // The other three luma blocks have zero residual → bare copy 100.
+        for y in 0..8 {
+            for x in 8..16 {
+                assert_eq!(recon.luma[y][x], 100);
+            }
+        }
+        for y in 8..16 {
+            for x in 0..16 {
+                assert_eq!(recon.luma[y][x], 100);
+            }
+        }
+        // Chroma residual is zero → bare anchor copy.
+        for row in recon.cb {
+            for px in row {
+                assert_eq!(px, 100);
+            }
+        }
+        for row in recon.cr {
+            for px in row {
+                assert_eq!(px, 100);
+            }
+        }
+    }
 }
