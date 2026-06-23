@@ -93,7 +93,14 @@ encoder.
   [`CoLocatedAnchor`] closure. [`BVopMbDecode::reconstruct`] then bridges
   the decoded motion straight into [`reconstruct_b_vop_macroblock`]. The
   §6.2.6 `modb "1"` vs `"01"` discriminator is resolved via
-  [`BVopMbHeader::mb_type_present`].
+  [`BVopMbHeader::mb_type_present`]. [`BVopMvDriver::decode_vop`] now
+  threads the §6.2.6 / §7.4 residual (texture) decode that follows each
+  macroblock's motion bodies into the same raster loop: it applies each
+  macroblock's `dbquant` (Table 6-33, §6.3.6) to a running quantiser
+  scale and consumes the inter residual gated by the macroblock's
+  `cbpb` (via [`decode_b_vop_inter_macroblock`] / [`cbpb_pattern_code`]),
+  returning one [`BVopMbTexturedDecode`] (motion + residual + quantiser
+  scale) per macroblock — ready to feed [`BVopMbDecode::reconstruct`].
 - **GMC (global motion compensation)** end-to-end for rectangular
   S(GMC)-VOPs: the §6.2.3 `sprite_enable == "GMC"` VOL body
   (`no_of_sprite_warping_points`, `sprite_warping_accuracy`,
@@ -140,11 +147,14 @@ encoder.
   per-macroblock §7.4 residual-texture decode into the same loop (the
   residual is currently supplied by the caller) and selecting the
   reference plane per the VOP reference-frame chain. The **B-VOP motion
-  subsystem is now wired at the same level**: [`BVopMvDriver`] walks a
-  progressive B-VOP in raster order with the §7.6.8 row-reset predictor
-  threading, and [`BVopMbDecode::reconstruct`] closes the §7.6.9 → §7.3
-  bridge per macroblock — the same residual-texture-threading and
-  reference-plane-selection work remains for a full B-VOP frame decode.
+  subsystem is now wired one step further**: [`BVopMvDriver::decode_vop`]
+  walks a progressive B-VOP in raster order with the §7.6.8 row-reset
+  predictor threading **and** threads the §6.2.6 / §7.4 residual decode
+  + `dbquant` running-quantiser accumulation into the same loop,
+  returning one [`BVopMbTexturedDecode`] (motion + residual) per
+  macroblock; [`BVopMbDecode::reconstruct`] closes the §7.6.9 → §7.3
+  bridge per macroblock. The remaining work for a full B-VOP frame
+  decode is reference-plane selection per the VOP reference-frame chain.
   The interlaced field-prediction B-VOP path is not yet handled by the
   frame driver (it returns a typed `FieldPredictionUnsupported`).
 - Encoder.

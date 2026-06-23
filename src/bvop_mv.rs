@@ -64,6 +64,7 @@
 //! No external MPEG-4 implementation consulted.
 
 use crate::bitreader::BitReader;
+use crate::block::{decode_b_vop_inter_macroblock, InterMacroblock, MacroblockTextureContext};
 use crate::bvop::{
     decode_b_vop_mb_motion_vectors, parse_b_vop_mb_header, BMbTypeTable, BVopMbHeader,
     BVopMbParseError, BVopMbType, BVopMvBody,
@@ -102,6 +103,9 @@ pub enum BVopMvDriverError {
     /// threaded through [`crate::bvop_field_predictor`] in a later
     /// round, not this progressive frame walk.
     FieldPredictionUnsupported,
+    /// The §6.2.6 / §7.4 texture (residual) decode for this macroblock
+    /// failed (e.g. a malformed Tcoef EVENT).
+    Texture(crate::block::BlockAssemblyError),
 }
 
 impl core::fmt::Display for BVopMvDriverError {
@@ -122,7 +126,16 @@ impl core::fmt::Display for BVopMvDriverError {
                 f,
                 "b-vop field-prediction is not handled by the progressive frame driver"
             ),
+            BVopMvDriverError::Texture(e) => {
+                write!(f, "b-vop residual texture decode failed: {e}")
+            }
         }
+    }
+}
+
+impl From<crate::block::BlockAssemblyError> for BVopMvDriverError {
+    fn from(e: crate::block::BlockAssemblyError) -> Self {
+        BVopMvDriverError::Texture(e)
     }
 }
 
@@ -300,6 +313,48 @@ impl Default for DirectionPredictor {
             backward: MotionVector { x: 0, y: 0 },
         }
     }
+}
+
+/// Per-VOP texture parameters the residual-threaded B-VOP frame loop
+/// ([`BVopMvDriver::decode_vop`]) needs in addition to the motion state.
+///
+/// `base_quantiser_scale` is the B-VOP's `vop_quant` (§6.3.5); the
+/// driver applies each macroblock's `dbquant` delta to a running copy of
+/// it (§6.3.6, Table 6-33) and clips to `[1, max_quantiser_scale]`
+/// (`max_quantiser_scale == 2^quant_precision - 1`, default 31).
+/// `bits_per_pixel` and `quant_type` come from the §6.3.3 / §6.3.2 VOL
+/// header and map straight onto [`MacroblockTextureContext`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BVopTextureParams {
+    /// §6.3.5 `vop_quant` — the B-VOP base quantiser scale.
+    pub base_quantiser_scale: u32,
+    /// `2^quant_precision - 1` — the §6.3.3 upper clip for the running
+    /// quantiser after each `dbquant` (31 for the default 5-bit
+    /// precision).
+    pub max_quantiser_scale: u32,
+    /// §6.3.3 sample depth used by the §7.4.5 IDCT saturation.
+    pub bits_per_pixel: u32,
+    /// §6.3.2 `quant_type` — `true` selects §7.4.4.1 method 1 (with a
+    /// quantisation matrix), `false` selects §7.4.4.2 method 2.
+    pub quant_type: bool,
+}
+
+/// One fully-decoded progressive B-VOP macroblock: the §7.6.8 motion
+/// state plus its §7.4 inter residual, with the running quantiser scale
+/// that decoded the residual.
+///
+/// Produced by [`BVopMvDriver::decode_vop`]; ready to feed
+/// [`BVopMbDecode::reconstruct`] (the residual is in `residual`).
+#[derive(Debug, Clone)]
+pub struct BVopMbTexturedDecode {
+    /// The §7.6.8 motion state (type, prediction mode, MVs, chroma MVs).
+    pub motion: BVopMbDecode,
+    /// The §7.4 inter residual for this macroblock (wholly zero when the
+    /// macroblock coded no `cbpb`).
+    pub residual: InterMacroblock,
+    /// The §6.3.6 running quantiser scale used to dequantise this
+    /// macroblock's residual (after applying its `dbquant`).
+    pub quantiser_scale: u32,
 }
 
 /// The §7.6.8 progressive, non-scalable B-VOP motion-vector decode
@@ -487,6 +542,90 @@ impl BVopMvDriver {
                     anchor.mv,
                 )?;
                 out.push(decode);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Decode an entire progressive B-VOP **end-to-end** in raster order:
+    /// the §7.6.8 motion walk threaded with the §6.2.6 / §7.4 residual
+    /// (texture) decode that follows each macroblock's motion bodies.
+    ///
+    /// This is the residual-threaded frame loop on top of
+    /// [`BVopMvDriver::decode_vop_motion`]: for each `(mb_row, mb_col)`
+    /// it decodes the motion state (leaving `br` at the start of the
+    /// macroblock's texture), applies the macroblock's `dbquant` delta to
+    /// the running quantiser scale (§6.3.6, clipped to
+    /// `[1, max_quantiser_scale]`), then consumes the §7.4 inter residual
+    /// gated by the macroblock's `cbpb`. `br` is left positioned
+    /// immediately after the final macroblock's last texture block.
+    ///
+    /// The returned [`BVopMbTexturedDecode`]s (row-major,
+    /// `mb_rows * mb_cols` entries) each carry the motion state, the
+    /// decoded residual, and the running quantiser scale; feed each into
+    /// [`BVopMbDecode::reconstruct`] with the anchor planes to produce the
+    /// displayed macroblock.
+    ///
+    /// `co_located` supplies the §7.6.9.5.1 / §7.6.9.6 anchor state per
+    /// macroblock exactly as for [`BVopMvDriver::decode_vop_motion`].
+    /// This frame loop assumes the texture immediately follows the motion
+    /// bodies of the *same* macroblock (the §6.2.6 macroblock-layer
+    /// order); a VOP carrying video packets with `resync_marker`-split
+    /// texture must drive macroblocks one at a time.
+    pub fn decode_vop<F>(
+        &mut self,
+        br: &mut BitReader<'_>,
+        vol: &VolHeader,
+        vop_coding_type: VopCodingType,
+        texture: BVopTextureParams,
+        mut co_located: F,
+    ) -> Result<Vec<BVopMbTexturedDecode>, BVopMvDriverError>
+    where
+        F: FnMut(usize, usize) -> CoLocatedAnchor,
+    {
+        let quant_matrix = crate::block::nonintra_quant_matrix(vol);
+        let mut out = Vec::with_capacity(self.mb_rows * self.mb_cols);
+        // §6.3.6: the running quantiser scale carries across macroblocks
+        // within the VOP, modified only by each macroblock's dbquant.
+        let mut quantiser_scale = texture.base_quantiser_scale;
+        for mb_row in 0..self.mb_rows {
+            self.start_row();
+            for mb_col in 0..self.mb_cols {
+                let anchor = co_located(mb_row, mb_col);
+                let motion = self.decode_macroblock(
+                    br,
+                    vol,
+                    vop_coding_type,
+                    mb_row,
+                    mb_col,
+                    anchor.skipped,
+                    anchor.mv,
+                )?;
+
+                // §6.3.6: apply this macroblock's dbquant (Table 6-33
+                // value already resolved into `dbquant_delta`) to the
+                // running quantiser scale, clipped to
+                // `[1, max_quantiser_scale]`. dbquant is present only when
+                // cbpb != 0 and the type is non-direct, so the residual
+                // it gates always uses the updated scale.
+                if let Some(delta) = motion.dbquant_delta {
+                    let updated = quantiser_scale as i64 + delta as i64;
+                    quantiser_scale = updated.clamp(1, texture.max_quantiser_scale as i64) as u32;
+                }
+
+                let ctx = MacroblockTextureContext {
+                    quantiser_scale,
+                    bits_per_pixel: texture.bits_per_pixel,
+                    quant_type: texture.quant_type,
+                    ac_pred_flag: false,
+                };
+                let residual = decode_b_vop_inter_macroblock(br, motion.cbpb, ctx, &quant_matrix)?;
+
+                out.push(BVopMbTexturedDecode {
+                    motion,
+                    residual,
+                    quantiser_scale,
+                });
             }
         }
         Ok(out)
@@ -853,6 +992,12 @@ mod tests {
         fn write_zero_mv_data(&mut self) {
             self.write_bits(0b1, 1);
         }
+        /// Write a full `(0, 0)` motion-vector body (two zero `mv_data`
+        /// codewords — the horizontal then vertical component).
+        fn write_zero_mv_data_pair(&mut self) {
+            self.write_zero_mv_data();
+            self.write_zero_mv_data();
+        }
         fn align(&mut self) {
             while self.bit_pos % 8 != 0 {
                 self.write_bits(0, 1);
@@ -1193,5 +1338,133 @@ mod tests {
                 assert_eq!(px, 88);
             }
         }
+    }
+
+    fn texture_params() -> BVopTextureParams {
+        BVopTextureParams {
+            base_quantiser_scale: 8,
+            max_quantiser_scale: 31,
+            bits_per_pixel: 8,
+            quant_type: false,
+        }
+    }
+
+    /// `decode_vop` threads the §7.4 residual after the motion bodies:
+    /// a single forward MB whose `modb == "00"` codes a non-zero `cbpb`
+    /// (block 0 coded) carries a residual on the wire that the driver
+    /// decodes into the macroblock's luma top-left 8×8, leaving the
+    /// other blocks zero. The reader ends exactly at the texture's end.
+    #[test]
+    fn decode_vop_threads_residual_after_motion() {
+        let vol = make_vol();
+        let mut w = BitWriter::new();
+        w.write_bits(0b00, 2); // modb "00" — mb_type + cbpb present
+        w.write_bits(0b0001, 4); // mb_type forward
+        w.write_bits(0b10_0000, 6); // cbpb — only block 0 coded
+                                    // mb_type carries dbquant only when non-direct; forward does, but
+                                    // dbquant is gated on cbpb != 0, so it IS present here. Write the
+                                    // Table 6-33 "no change" code (`0`).
+        w.write_bits(0b0, 1); // dbquant code 0 → delta 0
+        w.write_zero_mv_data_pair(); // mvdf == (0, 0)
+                                     // Texture: block 0 one positive inter EVENT (LAST=1,RUN=0,LVL=1).
+        w.write_bits(0b0111, 4);
+        w.write_bits(0b0, 1); // sign +
+        w.align();
+        let data = w.buf;
+        let mut br = BitReader::new(&data);
+        let mut driver = BVopMvDriver::new(1, 1, 1, 1, 1, 2);
+        let mbs = driver
+            .decode_vop(&mut br, &vol, VopCodingType::B, texture_params(), |_, _| {
+                CoLocatedAnchor::default()
+            })
+            .unwrap();
+        assert_eq!(mbs.len(), 1);
+        let mb = &mbs[0];
+        assert_eq!(mb.motion.mb_type, BVopMbType::Forward);
+        assert_eq!(mb.quantiser_scale, 8); // base + delta 0
+                                           // Block 0 carries the residual near 2; everything else is zero.
+        for y in 0..8 {
+            for x in 0..8 {
+                assert!(
+                    (mb.residual.luma[y][x] - 2).abs() <= 1,
+                    "block 0 residual ({y},{x}) = {}",
+                    mb.residual.luma[y][x]
+                );
+            }
+        }
+        for y in 0..8 {
+            for x in 8..16 {
+                assert_eq!(mb.residual.luma[y][x], 0);
+            }
+        }
+        for y in 8..16 {
+            for x in 0..16 {
+                assert_eq!(mb.residual.luma[y][x], 0);
+            }
+        }
+        assert!(mb.residual.cb.iter().all(|r| r.iter().all(|&p| p == 0)));
+        assert!(mb.residual.cr.iter().all(|r| r.iter().all(|&p| p == 0)));
+    }
+
+    /// `decode_vop` applies each macroblock's `dbquant` (Table 6-33,
+    /// §6.3.6) to the running quantiser scale, clipped to
+    /// `[1, max_quantiser_scale]`, and threads it across macroblocks
+    /// within the VOP.
+    #[test]
+    fn decode_vop_threads_running_quantiser() {
+        let vol = make_vol();
+        let mut w = BitWriter::new();
+        // MB0 — forward, cbpb block 0 coded, dbquant code "11" → +2.
+        w.write_bits(0b00, 2);
+        w.write_bits(0b0001, 4);
+        w.write_bits(0b10_0000, 6);
+        w.write_bits(0b11, 2); // dbquant +2
+        w.write_zero_mv_data_pair();
+        w.write_bits(0b0111, 4); // block-0 event
+        w.write_bits(0b0, 1);
+        // MB1 — forward, cbpb block 0 coded, dbquant code "10" → -2.
+        w.write_bits(0b00, 2);
+        w.write_bits(0b0001, 4);
+        w.write_bits(0b10_0000, 6);
+        w.write_bits(0b10, 2); // dbquant -2
+        w.write_zero_mv_data_pair();
+        w.write_bits(0b0111, 4);
+        w.write_bits(0b0, 1);
+        w.align();
+        let data = w.buf;
+        let mut br = BitReader::new(&data);
+        let mut driver = BVopMvDriver::new(1, 2, 1, 1, 1, 2);
+        let mbs = driver
+            .decode_vop(&mut br, &vol, VopCodingType::B, texture_params(), |_, _| {
+                CoLocatedAnchor::default()
+            })
+            .unwrap();
+        // base 8, +2 → 10, then -2 → 8.
+        assert_eq!(mbs[0].quantiser_scale, 10);
+        assert_eq!(mbs[1].quantiser_scale, 8);
+    }
+
+    /// A `modb == "1"` macroblock codes no cbpb (no residual); `decode_vop`
+    /// yields a wholly-zero residual and consumes no texture bits.
+    #[test]
+    fn decode_vop_no_cbpb_zero_residual() {
+        let vol = make_vol();
+        let mut w = BitWriter::new();
+        w.write_bits(0b1, 1); // modb "1" → default direct, no cbpb
+        w.align();
+        let data = w.buf;
+        let mut br = BitReader::new(&data);
+        let mut driver = BVopMvDriver::new(1, 1, 1, 1, 1, 2);
+        let mbs = driver
+            .decode_vop(&mut br, &vol, VopCodingType::B, texture_params(), |_, _| {
+                CoLocatedAnchor::default()
+            })
+            .unwrap();
+        assert_eq!(mbs[0].motion.cbpb, None);
+        assert!(mbs[0]
+            .residual
+            .luma
+            .iter()
+            .all(|r| r.iter().all(|&p| p == 0)));
     }
 }

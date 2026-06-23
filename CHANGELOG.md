@@ -8,6 +8,33 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **§6.2.6 / §7.4 residual-threaded B-VOP frame loop**
+  (`BVopMvDriver::decode_vop`): the frame-level §7.6.8 motion walk
+  (`decode_vop_motion`) now threads the §6.2.6 / §7.4 texture
+  (residual) decode that follows each macroblock's motion bodies into
+  a single end-to-end raster-order loop. Per macroblock it decodes the
+  motion state, applies the macroblock's `dbquant` delta (Table 6-33,
+  §6.3.6) to a running quantiser scale clipped to
+  `[1, max_quantiser_scale]`, then consumes the inter residual gated by
+  the macroblock's `cbpb`. Returns one `BVopMbTexturedDecode` per
+  macroblock (motion state + decoded `InterMacroblock` residual +
+  running quantiser scale), each ready to feed
+  `BVopMbDecode::reconstruct`. Texture parameters are carried in the
+  new `BVopTextureParams { base_quantiser_scale, max_quantiser_scale,
+  bits_per_pixel, quant_type }`. New error variant
+  `BVopMvDriverError::Texture`. 3 tests cover residual threading,
+  running-quantiser dbquant accumulation, and the no-`cbpb`
+  zero-residual case.
+- **§6.2.6 / §7.4 B-VOP residual macroblock decoder**
+  (`decode_b_vop_inter_macroblock` + `cbpb_pattern_code` in `block`):
+  decodes a B-VOP macroblock's §7.4 inter residual (16×16 luma + 8×8
+  Cb / 8×8 Cr) from the texture bitstream. Unlike a P-VOP (whose coded
+  pattern splits across `cbpy` + `cbpc`), a B-VOP carries a single
+  6-bit `cbpb` whose bits run leftmost = top-left block (§6.2.6);
+  `cbpb_pattern_code` maps it to the six Figure 6-8 block flags.
+  B-VOPs carry no intra macroblocks, so every coded block runs the
+  §6.2.7 inter texture syntax (no DC, inter Tcoef tables). `cbpb ==
+  None` collapses to a wholly-zero residual consuming no bits. 3 tests.
 - **§7.6.8 frame-level B-VOP motion-vector decode driver** (new
   `bvop_mv` module): `BVopMvDriver` walks the macroblocks of one
   progressive, non-scalable B-VOP in raster order, decoding each
