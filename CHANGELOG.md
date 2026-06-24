@@ -8,6 +8,31 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **§7.7.2.2 interlaced-direct B-VOP frame-driver wiring**
+  (`BVopMvDriver::decode_interlaced_direct_macroblock`): the frame driver
+  now decodes an interlaced-direct B-VOP macroblock end-to-end instead of
+  rejecting direct mode with `FieldPredictionUnsupported`. The method
+  parses the §6.2.6 header (a `modb == "1"` default direct, or an explicit
+  Direct `mb_type`), reads the single `MVD[0]` body (decoded with
+  `f_code == 1` regardless of the VOP header f_codes, §7.7.2.2; implicitly
+  zero for `modb == "1"`), and threads the caller-supplied co-located
+  *future* P-VOP macroblock's two forward field MVs + their reference
+  fields (`ColocatedFutureFieldMvs`) and the B-VOP's `top_field_first`
+  flag through the round-267 `interlaced_direct_mvs` derivation, using the
+  driver's frame-period `TRB` / `TRD`. Returns a
+  `BVopInterlacedDirectMbDecode` carrying the four derived field MVs, the
+  future macroblock's forward reference fields, and `cbpb` / `dbquant`.
+  `BVopInterlacedDirectMbDecode::reconstruct` closes the §7.7.2.2 → §7.3
+  bridge — it runs `interlaced_direct_prediction` (forward + backward
+  field MC + `(fwd + bak + 1) >> 1` average) against the six reference
+  planes and adds the §7.4 residual with the §7.3 display clip. The
+  four-PMV bank is untouched (direct mode neither reads nor updates it).
+  A non-direct macroblock is rejected with `FieldPredictionUnsupported`.
+  This completes the interlaced-direct path inside the frame driver — the
+  last remaining interlaced-direct step noted in round 267. 5 tests:
+  `modb == "1"` zero-delta derivation, explicit `MVD[0]` application, the
+  non-direct rejection, out-of-bounds rejection, and a zero-MV
+  forward/backward-average pixel reconstruction.
 - **§7.7.2.2 interlaced-direct B-VOP field motion-vector derivation**
   (new `bvop_field_direct` module): `interlaced_direct_mvs` derives the
   four field motion vectors `mvf[0..2]` (forward top/bottom) / `mvb[0..2]`

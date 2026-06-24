@@ -182,11 +182,19 @@ encoder.
   `2*frame_distance + δ` conversion with the Table 7-16 `δ` parity
   selection), plus [`interlaced_direct_prediction`] which runs the
   §7.7.2.2 forward + backward (mvb[1]-for-both-fields) field MC and
-  averages them. What remains for interlaced direct *inside the frame
-  driver* is plumbing the co-located future P-VOP macroblock's field MVs
-  + the frame-period `TRB`/`TRD` from the reference-frame chain into
-  `decode_field_macroblock` (the derivation + reconstruction primitives
-  are complete and tested).
+  averages them. **Interlaced direct mode is now wired into the frame
+  driver**: [`BVopMvDriver::decode_interlaced_direct_macroblock`] parses
+  the §6.2.6 header (a `modb == "1"` default direct, or an explicit Direct
+  `mb_type`), reads the single `MVD[0]` body (`f_code == 1`, §7.7.2.2;
+  implicitly zero for `modb == "1"`), and threads the caller-supplied
+  co-located *future* P-VOP macroblock's two forward field MVs + reference
+  fields ([`ColocatedFutureFieldMvs`]) and `top_field_first` through
+  [`interlaced_direct_mvs`] with the driver's frame-period `TRB` / `TRD`,
+  returning a [`BVopInterlacedDirectMbDecode`] whose `reconstruct` runs
+  the §7.7.2.2 → §7.3 forward/backward field-MC + average + residual add
+  + display clip. The caller establishes interlaced-direct applicability
+  (future macroblock field-predicted) and supplies the future field MVs
+  from the reference-frame chain.
 - Encoder.
 - The end-to-end wiring of the §E.1.4.4 two-way RVLC error recovery: the
   forward / backward Tcoef decodes (§E.1.4.4.1) and the §E.1.4.4.2.1

@@ -69,6 +69,9 @@ use crate::bvop::{
     decode_b_vop_mb_motion_vectors, parse_b_vop_mb_header, BMbTypeTable, BVopMbHeader,
     BVopMbParseError, BVopMbType, BVopMotionVectors, BVopMvBody,
 };
+use crate::bvop_field_direct::{
+    interlaced_direct_mvs, interlaced_direct_prediction, ColocatedFutureField, InterlacedDirectMvs,
+};
 use crate::bvop_field_motion::{
     field_backward_prediction, field_bidirectional_prediction, field_forward_prediction,
     BVopFieldReferences, FieldMvDeltas, FieldReferenceFlags, FieldSampleMode,
@@ -464,6 +467,91 @@ impl BVopFieldMbDecode {
     }
 }
 
+/// The §7.7.2.2 co-located **future** P-VOP macroblock's two forward
+/// field motion vectors (`MV[0]` top, `MV[1]` bottom) and their per-field
+/// reference selections, supplied to
+/// [`BVopMvDriver::decode_interlaced_direct_macroblock`].
+///
+/// These come from the reference-frame chain: the macroblock at the same
+/// coordinates in the temporally next (future) anchor must itself be
+/// field-predicted (`field_prediction == 1`) for interlaced direct mode
+/// to apply (§7.7.2.2; otherwise progressive direct mode is used). The
+/// driver derives the four direct field MVs from these plus the single
+/// transmitted `MVD[0]` and the frame-period `TRB` / `TRD` it already
+/// owns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColocatedFutureFieldMvs {
+    /// `MV[0]` — the future macroblock's top-field forward MV + reference
+    /// field.
+    pub top: ColocatedFutureField,
+    /// `MV[1]` — the future macroblock's bottom-field forward MV +
+    /// reference field.
+    pub bottom: ColocatedFutureField,
+}
+
+/// One fully-decoded interlaced **direct** B-VOP macroblock (§7.7.2.2
+/// last pseudo-code block). Produced by
+/// [`BVopMvDriver::decode_interlaced_direct_macroblock`]; reconstructed to
+/// pixels via [`BVopInterlacedDirectMbDecode::reconstruct`].
+///
+/// Unlike the three non-direct field modes, interlaced direct mode does
+/// not touch the §7.7.2.2 four-PMV bank — its four field MVs are derived
+/// purely from the co-located future field MVs, the single `MVD[0]`, and
+/// the field-period temporal references (§7.7.2.2). The derived MVs and
+/// the future macroblock's forward reference fields are captured here so
+/// reconstruction is self-contained.
+#[derive(Debug, Clone, Copy)]
+pub struct BVopInterlacedDirectMbDecode {
+    /// The four derived field MVs (`mvf[0..2]` forward, `mvb[0..2]`
+    /// backward).
+    pub mvs: InterlacedDirectMvs,
+    /// The future macroblock's `colocated_future_mb_top_field_reference`
+    /// (the forward MC's top reference field).
+    pub forward_top_ref: FieldReference,
+    /// The future macroblock's
+    /// `colocated_future_mb_bottom_field_reference` (the forward MC's
+    /// bottom reference field).
+    pub forward_bottom_ref: FieldReference,
+    /// `cbpb` (coded-block pattern) — `None` when no residual is coded.
+    pub cbpb: Option<u8>,
+    /// `dbquant` delta applied to the running quantiser (§6.3.6).
+    pub dbquant_delta: Option<i8>,
+}
+
+impl BVopInterlacedDirectMbDecode {
+    /// Reconstruct this interlaced-direct macroblock end-to-end: §7.7.2.2
+    /// forward + backward field MC, the `(fwd + bak + 1) >> 1` average,
+    /// the §7.3 step-2 residual add, and the step-3 display clip.
+    ///
+    /// * `references` — the six forward/backward reference planes.
+    /// * `residual` — the already-decoded §7.4 inter residual.
+    /// * `mb_origin_x` / `mb_origin_y` — top-left luma pixel position.
+    /// * `bits_per_pixel` — §6.3.3 sample depth for the §7.3 clip.
+    ///
+    /// Direct-mode B-VOP MC always uses half-sample luma interpolation
+    /// with rounding control `0` (§7.7.2.2 pseudo code's final `mc`
+    /// argument).
+    pub fn reconstruct(
+        &self,
+        references: &BVopFieldReferences<'_>,
+        residual: &InterMacroblock,
+        mb_origin_x: i32,
+        mb_origin_y: i32,
+        bits_per_pixel: u32,
+    ) -> crate::reconstruct::ReconstructedMacroblock {
+        let prediction = interlaced_direct_prediction(
+            self.mvs,
+            self.forward_top_ref,
+            self.forward_bottom_ref,
+            references,
+            mb_origin_x,
+            mb_origin_y,
+            0,
+        );
+        crate::reconstruct::reconstruct_inter_macroblock(&prediction, residual, bits_per_pixel)
+    }
+}
+
 /// The §7.6.8 progressive, non-scalable B-VOP motion-vector decode
 /// driver.
 ///
@@ -713,6 +801,94 @@ impl BVopMvDriver {
             }
             BVopMbType::Direct => Err(BVopMvDriverError::FieldPredictionUnsupported),
         }
+    }
+
+    /// Decode one interlaced **direct** B-VOP macroblock (§7.7.2.2 last
+    /// pseudo-code block) at raster position `(mb_row, mb_col)`.
+    ///
+    /// Interlaced direct mode applies when the co-located macroblock of
+    /// the *future* reference VOP is itself field-predicted
+    /// (`field_prediction == 1`, §7.7.2.2). The caller establishes that
+    /// from the reference-frame chain and supplies the future macroblock's
+    /// two forward field MVs (`future_field_mvs`) plus the B-VOP's
+    /// `top_field_first` flag. The four derived field MVs are then
+    /// computed from those, the single transmitted `MVD[0]`, and the
+    /// driver's frame-period `TRB` / `TRD` (the same `trb` / `trd` the
+    /// progressive §7.6.9.5.2 direct path uses).
+    ///
+    /// `br` is positioned at the start of the macroblock's §6.2.6 `modb`
+    /// field. The macroblock must decode to the Direct type (a `modb`
+    /// `"1"` default or an explicit Direct `mb_type`); a non-direct
+    /// macroblock returns [`BVopMvDriverError::FieldPredictionUnsupported`]
+    /// (drive it through [`BVopMvDriver::decode_field_macroblock`] or
+    /// [`BVopMvDriver::decode_macroblock`] instead). On `Ok`, `br` sits
+    /// immediately after the single `MVD[0]` body (before the texture);
+    /// a `modb == "1"` direct macroblock codes no `MVD[0]` (the delta is
+    /// implicitly zero) and the reader stops after `modb`.
+    ///
+    /// `MVD[0]` is decoded assuming `f_code == 1` regardless of the VOP
+    /// header f_codes (§7.7.2.2). The four-PMV bank is **not** touched —
+    /// direct mode neither reads nor updates it.
+    // Args map directly to the §6.2.6 / §7.7.2.2 interlaced-direct decode
+    // inputs; grouping them into a struct would obscure the call site.
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_interlaced_direct_macroblock(
+        &mut self,
+        br: &mut BitReader<'_>,
+        vol: &VolHeader,
+        vop_coding_type: VopCodingType,
+        mb_row: usize,
+        mb_col: usize,
+        future_field_mvs: ColocatedFutureFieldMvs,
+        top_field_first: bool,
+    ) -> Result<BVopInterlacedDirectMbDecode, BVopMvDriverError> {
+        if mb_row >= self.mb_rows || mb_col >= self.mb_cols {
+            return Err(BVopMvDriverError::OutOfBounds { mb_row, mb_col });
+        }
+
+        let header = parse_b_vop_mb_header(br, vol, vop_coding_type, BMbTypeTable::B4)?;
+
+        if header.mb_type != BVopMbType::Direct {
+            return Err(BVopMvDriverError::FieldPredictionUnsupported);
+        }
+
+        // §6.2.6: a `modb == "1"` direct macroblock codes no `MVD[0]`
+        // body (the whole subtree after `modb` is absent) → the delta is
+        // implicitly zero. An explicit Direct `mb_type` (`modb == "01"`)
+        // carries the single direct body, decoded with f_code 1.
+        let delta = if header.mb_type_present {
+            let bodies = decode_b_vop_mb_motion_vectors(
+                br,
+                BVopMbType::Direct,
+                false,
+                self.vop_fcode_forward,
+                self.vop_fcode_backward,
+            )?;
+            bodies.direct.unwrap_or(MotionVectorDelta { dx: 0, dy: 0 })
+        } else {
+            MotionVectorDelta { dx: 0, dy: 0 }
+        };
+        let delta_mv = MotionVector {
+            x: delta.dx,
+            y: delta.dy,
+        };
+
+        let mvs = interlaced_direct_mvs(
+            future_field_mvs.top,
+            future_field_mvs.bottom,
+            delta_mv,
+            self.trb,
+            self.trd,
+            top_field_first,
+        );
+
+        Ok(BVopInterlacedDirectMbDecode {
+            mvs,
+            forward_top_ref: future_field_mvs.top.reference_field,
+            forward_bottom_ref: future_field_mvs.bottom.reference_field,
+            cbpb: header.cbpb,
+            dbquant_delta: header.dbquant_delta,
+        })
     }
 
     /// Decode the motion state of an entire progressive B-VOP in raster
@@ -1979,6 +2155,224 @@ mod tests {
                 driver.field_predictor.get(slot),
                 MotionVector { x: 0, y: 0 }
             );
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // §7.7.2.2 interlaced-direct B-VOP path (frame-driver wiring)
+    // -----------------------------------------------------------------
+
+    fn future_field(x: i32, y: i32, r: FieldReference) -> ColocatedFutureField {
+        ColocatedFutureField {
+            mv: MotionVector { x, y },
+            reference_field: r,
+        }
+    }
+
+    #[test]
+    fn interlaced_direct_modb_one_zero_delta_derives_mvs() {
+        // modb == "1" → default direct, no MVD[0] body (implicit zero).
+        // Future field MVs MV[0]=(6,-6) Top, MV[1]=(6,-6) Bottom →
+        // δ = (Top,Bottom) row = (0,0); TRB=2*1=2, TRD=2*2=4.
+        // mvf = 2*6/4 = 3, 2*-6/4 = -3 → (3,-3); mvb (zero delta) =
+        // (2-4)*6/4 = -3, (2-4)*-6/4 = 3 → (-3,3).
+        let vol = make_interlaced_vol();
+        let mut w = BitWriter::new();
+        w.write_bits(0b1, 1); // modb "1"
+        w.align();
+        let data = w.buf;
+        let mut br = BitReader::new(&data);
+        let mut driver = BVopMvDriver::new(1, 1, 1, 1, 1, 2);
+        let future = ColocatedFutureFieldMvs {
+            top: future_field(6, -6, FieldReference::Top),
+            bottom: future_field(6, -6, FieldReference::Bottom),
+        };
+        let decode = driver
+            .decode_interlaced_direct_macroblock(
+                &mut br,
+                &vol,
+                VopCodingType::B,
+                0,
+                0,
+                future,
+                false,
+            )
+            .unwrap();
+        assert_eq!(decode.mvs.forward_top, MotionVector { x: 3, y: -3 });
+        assert_eq!(decode.mvs.backward_top, MotionVector { x: -3, y: 3 });
+        assert_eq!(decode.mvs.forward_bottom, MotionVector { x: 3, y: -3 });
+        assert_eq!(decode.mvs.backward_bottom, MotionVector { x: -3, y: 3 });
+        assert_eq!(decode.forward_top_ref, FieldReference::Top);
+        assert_eq!(decode.forward_bottom_ref, FieldReference::Bottom);
+        assert_eq!(decode.cbpb, None);
+    }
+
+    #[test]
+    fn interlaced_direct_explicit_mvd_applied() {
+        // modb == "01" (mb_type present), mb_type "1" (direct, Table B.4),
+        // then a single direct MVD[0] body = (1, 0) (mv_data 2 then 0
+        // under f_code 1 ⇒ but write (1,0) via mv_data 1).
+        // mv_data codeword for 1 is "010" (Table B.12); with f_code 1 the
+        // reconstructed component is the mv_data value (1).
+        let vol = make_interlaced_vol();
+        let mut w = BitWriter::new();
+        w.write_bits(0b01, 2); // modb "01"
+        w.write_bits(0b1, 1); // mb_type "1" → direct
+                              // MVD[0] = (1, 0): mv_data 1 then mv_data 0.
+        w.write_bits(0b010, 3); // mv_data == 1
+        w.write_zero_mv_data(); // mv_data == 0
+        w.align();
+        let data = w.buf;
+        let mut br = BitReader::new(&data);
+        let mut driver = BVopMvDriver::new(1, 1, 1, 1, 1, 2);
+        // Future MV[0]=(8,4) Top, MV[1]=(8,4) Bottom → δ=(0,0); TRB=2, TRD=4.
+        // mvf.x = 2*8/4 + 1 = 5; mvf.y = 2*4/4 + 0 = 2.
+        // mvb.x (delta.x != 0) = mvf.x - MV.x = 5 - 8 = -3.
+        // mvb.y (delta.y == 0) = (2-4)*4/4 = -2.
+        let future = ColocatedFutureFieldMvs {
+            top: future_field(8, 4, FieldReference::Top),
+            bottom: future_field(8, 4, FieldReference::Bottom),
+        };
+        let decode = driver
+            .decode_interlaced_direct_macroblock(
+                &mut br,
+                &vol,
+                VopCodingType::B,
+                0,
+                0,
+                future,
+                false,
+            )
+            .unwrap();
+        assert_eq!(decode.mvs.forward_top, MotionVector { x: 5, y: 2 });
+        assert_eq!(decode.mvs.backward_top, MotionVector { x: -3, y: -2 });
+    }
+
+    #[test]
+    fn interlaced_direct_rejects_non_direct() {
+        // A forward macroblock routed to the interlaced-direct method is
+        // rejected (it belongs on decode_field_macroblock / decode_macroblock).
+        let vol = make_interlaced_vol();
+        let mut w = BitWriter::new();
+        w.write_bits(0b01, 2); // modb "01"
+        w.write_bits(0b0001, 4); // mb_type forward
+        w.write_bits(0b0, 1); // field_prediction = 0 (frame)
+        w.write_zero_mv_data_pair();
+        w.align();
+        let data = w.buf;
+        let mut br = BitReader::new(&data);
+        let mut driver = BVopMvDriver::new(1, 1, 1, 1, 1, 2);
+        let future = ColocatedFutureFieldMvs {
+            top: future_field(0, 0, FieldReference::Top),
+            bottom: future_field(0, 0, FieldReference::Bottom),
+        };
+        let err = driver
+            .decode_interlaced_direct_macroblock(
+                &mut br,
+                &vol,
+                VopCodingType::B,
+                0,
+                0,
+                future,
+                false,
+            )
+            .unwrap_err();
+        assert_eq!(err, BVopMvDriverError::FieldPredictionUnsupported);
+    }
+
+    #[test]
+    fn interlaced_direct_out_of_bounds_rejected() {
+        let vol = make_interlaced_vol();
+        let mut w = BitWriter::new();
+        w.write_bits(0b1, 1);
+        w.align();
+        let data = w.buf;
+        let mut br = BitReader::new(&data);
+        let mut driver = BVopMvDriver::new(1, 1, 1, 1, 1, 2);
+        let future = ColocatedFutureFieldMvs {
+            top: future_field(0, 0, FieldReference::Top),
+            bottom: future_field(0, 0, FieldReference::Bottom),
+        };
+        let err = driver
+            .decode_interlaced_direct_macroblock(
+                &mut br,
+                &vol,
+                VopCodingType::B,
+                3,
+                3,
+                future,
+                false,
+            )
+            .unwrap_err();
+        assert_eq!(
+            err,
+            BVopMvDriverError::OutOfBounds {
+                mb_row: 3,
+                mb_col: 3
+            }
+        );
+    }
+
+    #[test]
+    fn interlaced_direct_reconstructs_pixels_zero_mv() {
+        // All-zero derived MVs (zero future MV + zero delta) ⇒ each output
+        // field copies its reference; forward 90 / backward 150 average to
+        // (90 + 150 + 1) >> 1 = 120, plus a zero residual.
+        let vol = make_interlaced_vol();
+        let mut w = BitWriter::new();
+        w.write_bits(0b1, 1); // modb "1" → direct, zero delta
+        w.align();
+        let data = w.buf;
+        let mut br = BitReader::new(&data);
+        let mut driver = BVopMvDriver::new(1, 1, 1, 1, 1, 2);
+        let future = ColocatedFutureFieldMvs {
+            top: future_field(0, 0, FieldReference::Top),
+            bottom: future_field(0, 0, FieldReference::Bottom),
+        };
+        let decode = driver
+            .decode_interlaced_direct_macroblock(
+                &mut br,
+                &vol,
+                VopCodingType::B,
+                0,
+                0,
+                future,
+                false,
+            )
+            .unwrap();
+        assert_eq!(decode.mvs.forward_top, MotionVector { x: 0, y: 0 });
+
+        let fwd = flat_plane(48, 48, 90);
+        let bak = flat_plane(48, 48, 150);
+        let fwd_c = flat_plane(24, 24, 90);
+        let bak_c = flat_plane(24, 24, 150);
+        let fl = ReferenceVop::new(&fwd, 48, 48).unwrap();
+        let bl = ReferenceVop::new(&bak, 48, 48).unwrap();
+        let fc = ReferenceVop::new(&fwd_c, 24, 24).unwrap();
+        let bc = ReferenceVop::new(&bak_c, 24, 24).unwrap();
+        let refs = BVopFieldReferences {
+            forward_luma: &fl,
+            forward_cb: &fc,
+            forward_cr: &fc,
+            backward_luma: &bl,
+            backward_cb: &bc,
+            backward_cr: &bc,
+        };
+        let residual = InterMacroblock {
+            luma: [[0i32; 16]; 16],
+            cb: [[0i32; 8]; 8],
+            cr: [[0i32; 8]; 8],
+        };
+        let recon = decode.reconstruct(&refs, &residual, 16, 16, 8);
+        for row in recon.luma {
+            for px in row {
+                assert_eq!(px, 120);
+            }
+        }
+        for row in recon.cb {
+            for px in row {
+                assert_eq!(px, 120);
+            }
         }
     }
 
