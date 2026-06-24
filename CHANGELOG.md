@@ -8,6 +8,25 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **§7.7.2.2 interlaced B-VOP field motion-compensated reconstruction**
+  (new `bvop_field_motion` module): the three non-direct field-prediction
+  modes (field forward `mb_type == "0001"`, field backward `"001"`, field
+  bidirectional `"01"`, all with `field_prediction == 1`) now reconstruct
+  to pixels. `field_forward_prediction` / `field_backward_prediction` /
+  `field_bidirectional_prediction` reconstruct the top/bottom field MVs
+  through the round-53 `FieldPmvBank` (§7.7.2.2 `PMV[k].y = 2*(PMV[k].y/2
+  + MVD[i].y)` with the field-backward bottom-x quirk reading PMV[1]) and
+  drive the §7.7.2.1 `field_motion_compensate_one_reference` per active
+  direction, then average the bidirectional case with the §7.7.2.2 rule
+  `(pred_fwd + pred_bak + 1) >> 1` across luma + 4:2:0 chroma. Both
+  half-sample and quarter-sample luma interpolation are wired via the new
+  `FieldSampleMode` selector (the qpel path reuses
+  `field_motion_compensate_one_reference_qpel`). `BVopFieldReferences`
+  bundles the six forward/backward reference planes; `FieldReferenceFlags`
+  carries the four §6.3.6.3 `*_field_reference` bits; `FieldMvDeltas`
+  carries one direction's top/bottom differentials. Interlaced **direct**
+  mode stays out of scope (needs the §7.7.2.2 field-period `TRB[i]` /
+  `TRD[i]` + the Table 7-16 `δ` parity selection). 4 tests.
 - **§6.2.6 / §7.4 residual-threaded B-VOP frame loop**
   (`BVopMvDriver::decode_vop`): the frame-level §7.6.8 motion walk
   (`decode_vop_motion`) now threads the §6.2.6 / §7.4 texture

@@ -310,6 +310,7 @@ use oxideav_core::RuntimeContext;
 pub mod bitreader;
 pub mod block;
 pub mod bvop;
+pub mod bvop_field_motion;
 pub mod bvop_field_predictor;
 pub mod bvop_mv;
 pub mod bvop_prediction;
@@ -359,6 +360,10 @@ pub use block::{
 pub use bvop::{
     decode_b_vop_mb_motion_vectors, default_b_mb_type, parse_b_vop_mb_header, parse_dbquant,
     BMbTypeTable, BVopMbHeader, BVopMbParseError, BVopMbType, BVopMotionVectors, BVopMvBody,
+};
+pub use bvop_field_motion::{
+    field_backward_prediction, field_bidirectional_prediction, field_forward_prediction,
+    BVopFieldReferences, FieldMvDeltas, FieldReferenceFlags, FieldSampleMode,
 };
 pub use bvop_field_predictor::{
     FieldMvDirection, FieldPmvBank, PMV_BOT_BWD, PMV_BOT_FWD, PMV_TOP_BWD, PMV_TOP_FWD,
