@@ -8,6 +8,18 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Unified interlaced B-VOP reconstruction**
+  (`BVopInterlacedTexturedDecode::reconstruct`): closes the §7.6.9 /
+  §7.7.2.2 → §7.3 reconstruction loop for an interlaced B-VOP macroblock.
+  It dispatches on the path variant — the progressive path consumes the
+  `BVopAnchorPlanes` + `BVopSampleMode`; the field-prediction and
+  interlaced-direct paths consume the `BVopFieldReferences` +
+  `FieldSampleMode` — routing to the matching per-variant `reconstruct`
+  and adding the macroblock's residual with the §7.3 display clip, so the
+  caller never has to `match` the variant. Paired with
+  `decode_interlaced_vop` this is a complete decode→reconstruct path for a
+  per-macroblock-supplied reference chain. 1 test: a field-forward 1×2 VOP
+  reconstructed through the unified entry (copies the forward reference).
 - **End-to-end interlaced B-VOP frame walker**
   (`BVopMvDriver::decode_interlaced_vop`): the interlaced analogue of the
   progressive `decode_vop`. It walks an interlaced B-VOP in raster order,

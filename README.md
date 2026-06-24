@@ -210,10 +210,13 @@ encoder.
   through the unified dispatch, resets both the progressive and §7.7.2.2
   four-PMV predictors per row, applies each `dbquant`, and threads the
   §7.4 residual decode into the same loop, returning one
-  [`BVopInterlacedTexturedDecode`] per macroblock. What remains for a
-  full interlaced B-VOP *frame* decode is the caller supplying each
-  macroblock's co-located future/anchor state from the reference-frame
-  chain and blitting the per-MB reconstruction.
+  [`BVopInterlacedTexturedDecode`] per macroblock, whose
+  [`BVopInterlacedTexturedDecode::reconstruct`] dispatches on the path
+  variant (progressive `BVopAnchorPlanes` / field & interlaced-direct
+  `BVopFieldReferences`) to close the §7.6.9 / §7.7.2.2 → §7.3 loop to
+  pixels. What remains for a full interlaced B-VOP *frame* decode is the
+  caller supplying each macroblock's co-located future/anchor state from
+  the reference-frame chain and blitting the per-MB reconstruction.
 - Encoder.
 - The end-to-end wiring of the §E.1.4.4 two-way RVLC error recovery: the
   forward / backward Tcoef decodes (§E.1.4.4.1) and the §E.1.4.4.2.1

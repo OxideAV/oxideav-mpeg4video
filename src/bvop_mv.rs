@@ -662,6 +662,65 @@ pub struct BVopInterlacedTexturedDecode {
     pub quantiser_scale: u32,
 }
 
+impl BVopInterlacedTexturedDecode {
+    /// Reconstruct this macroblock to pixels, dispatching on its path
+    /// variant: the progressive path consumes the `progressive_anchors`
+    /// ([`BVopAnchorPlanes`]) + `progressive_mode` ([`BVopSampleMode`]);
+    /// the field-prediction and interlaced-direct paths consume the
+    /// `field_references` ([`BVopFieldReferences`]) + `field_mode`
+    /// ([`FieldSampleMode`]).
+    ///
+    /// This closes the §7.6.9 / §7.7.2.2 → §7.3 reconstruction loop for an
+    /// interlaced B-VOP: it routes to the matching per-variant
+    /// `reconstruct` and adds this macroblock's residual with the §7.3
+    /// display clip, so the caller never has to `match` the variant.
+    ///
+    /// * `mb_origin_x` / `mb_origin_y` — top-left luma pixel position.
+    /// * `vop_rounding_type` — §7.6.7 half-pel rounding control (progressive
+    ///   path; the field / interlaced-direct B-VOP MC always rounds with 0).
+    /// * `bits_per_pixel` — §6.3.3 sample depth for the §7.3 clip.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reconstruct(
+        &self,
+        progressive_anchors: &BVopAnchorPlanes<'_>,
+        progressive_mode: crate::bvop_prediction::BVopSampleMode,
+        field_references: &BVopFieldReferences<'_>,
+        field_mode: FieldSampleMode,
+        mb_origin_x: i32,
+        mb_origin_y: i32,
+        vop_rounding_type: u8,
+        bits_per_pixel: u32,
+    ) -> crate::reconstruct::ReconstructedMacroblock {
+        match &self.motion {
+            BVopInterlacedMb::Progressive(d) => d.reconstruct(
+                progressive_anchors,
+                &self.residual,
+                mb_origin_x,
+                mb_origin_y,
+                vop_rounding_type,
+                progressive_mode,
+                bits_per_pixel,
+            ),
+            BVopInterlacedMb::Field(d) => d.reconstruct(
+                field_references,
+                &self.residual,
+                mb_origin_x,
+                mb_origin_y,
+                vop_rounding_type,
+                field_mode,
+                bits_per_pixel,
+            ),
+            BVopInterlacedMb::InterlacedDirect(d) => d.reconstruct(
+                field_references,
+                &self.residual,
+                mb_origin_x,
+                mb_origin_y,
+                bits_per_pixel,
+            ),
+        }
+    }
+}
+
 /// The §7.6.8 progressive, non-scalable B-VOP motion-vector decode
 /// driver.
 ///
@@ -2939,6 +2998,84 @@ mod tests {
             }
         }
         assert_eq!(mbs[1].quantiser_scale, 8);
+    }
+
+    #[test]
+    fn interlaced_textured_reconstruct_dispatches_by_variant() {
+        use crate::bvop_prediction::BVopSampleMode;
+
+        // 1×2 interlaced B-VOP, both MBs field-forward zero-MV no-residual.
+        // The unified reconstruct must route each to the field path and
+        // copy the forward reference (220).
+        let vol = make_interlaced_vol();
+        let mut w = BitWriter::new();
+        for _ in 0..2 {
+            w.write_bits(0b01, 2); // modb "01"
+            w.write_bits(0b0001, 4); // forward
+            w.write_bits(0b1, 1); // field_prediction = 1
+            w.write_bits(0b0, 1); // forward_top → Top
+            w.write_bits(0b0, 1); // forward_bottom → Top
+            w.write_zero_mv_data_pair();
+            w.write_zero_mv_data_pair();
+        }
+        w.align();
+        let data = w.buf;
+        let mut br = BitReader::new(&data);
+        let mut driver = BVopMvDriver::new(1, 2, 1, 1, 1, 2);
+        let mbs = driver
+            .decode_interlaced_vop(&mut br, &vol, VopCodingType::B, texture_params(), |_, _| {
+                plain_anchor()
+            })
+            .unwrap();
+        assert_eq!(mbs.len(), 2);
+
+        // Field references: forward 220, backward unused (50).
+        let fwd = flat_plane(48, 48, 220);
+        let bak = flat_plane(48, 48, 50);
+        let fwd_c = flat_plane(24, 24, 220);
+        let bak_c = flat_plane(24, 24, 50);
+        let fl = ReferenceVop::new(&fwd, 48, 48).unwrap();
+        let bl = ReferenceVop::new(&bak, 48, 48).unwrap();
+        let fc = ReferenceVop::new(&fwd_c, 24, 24).unwrap();
+        let bc = ReferenceVop::new(&bak_c, 24, 24).unwrap();
+        let field_refs = BVopFieldReferences {
+            forward_luma: &fl,
+            forward_cb: &fc,
+            forward_cr: &fc,
+            backward_luma: &bl,
+            backward_cb: &bc,
+            backward_cr: &bc,
+        };
+        // Progressive anchors are unused for the field path; reuse a small
+        // valid plane so the struct is well-formed.
+        let pl = flat_plane(16, 16, 0);
+        let pc = flat_plane(8, 8, 0);
+        let pluma = ReferenceVop::new(&pl, 16, 16).unwrap();
+        let pchroma = ReferenceVop::new(&pc, 8, 8).unwrap();
+        let prog_anchors = BVopAnchorPlanes {
+            forward_luma: &pluma,
+            backward_luma: &pluma,
+            forward_cb: &pchroma,
+            backward_cb: &pchroma,
+            forward_cr: &pchroma,
+            backward_cr: &pchroma,
+        };
+
+        let recon = mbs[0].reconstruct(
+            &prog_anchors,
+            BVopSampleMode::HalfPel,
+            &field_refs,
+            FieldSampleMode::HalfSample,
+            16,
+            16,
+            0,
+            8,
+        );
+        for row in recon.luma {
+            for px in row {
+                assert_eq!(px, 220, "field-forward must copy forward ref");
+            }
+        }
     }
 
     #[test]
