@@ -8,6 +8,27 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **§7.7.2.2 interlaced field-prediction B-VOP frame-driver wiring**
+  (`BVopMvDriver::decode_field_macroblock`): the frame driver now decodes
+  a field-predicted B-VOP macroblock end-to-end instead of returning
+  `FieldPredictionUnsupported` for the non-direct field modes. The driver
+  carries a §7.7.2.2 four-PMV bank (`FieldPmvBank`) threaded alongside the
+  progressive predictor and reset together at each row start
+  (`start_row`). `decode_field_macroblock` parses the §6.2.6 header,
+  confirms the macroblock is field-predicted (a populated forward /
+  backward reference pair), decodes the §6.2.6 field motion bodies, and
+  threads them through the bank (forward → slots 0,1; backward → 2,3;
+  bidirectional → all four), returning a `BVopFieldMbDecode` (new
+  `BVopFieldMode` enum + the four `*_field_reference` flags + `cbpb` /
+  `dbquant` + a pre-update bank snapshot). `BVopFieldMbDecode::reconstruct`
+  closes the §7.7.2.2 → §7.3 bridge — it re-runs the field MC against the
+  six supplied reference planes and adds the §7.4 residual with the §7.3
+  display clip. Interlaced **direct** mode and frame-predicted MBs are
+  still routed away with `FieldPredictionUnsupported` (direct needs the
+  field-period TRB/TRD + Table 7-16 δ). 5 tests: field-forward decode +
+  pixel reconstruction (forward-anchor copy), field-bidirectional
+  forward/backward average, field-PMV row reset, and the
+  frame-predicted-MB rejection.
 - **§7.7.2.2 interlaced B-VOP field motion-compensated reconstruction**
   (new `bvop_field_motion` module): the three non-direct field-prediction
   modes (field forward `mb_type == "0001"`, field backward `"001"`, field

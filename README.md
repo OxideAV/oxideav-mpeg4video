@@ -78,7 +78,15 @@ encoder.
   ([`predict_b_vop_macroblock`] packs the prediction into an
   `InterPredictionMacroblock`; [`reconstruct_b_vop_macroblock`] runs the
   full predict + §7.3 `d = p + f` add + display clip end-to-end across
-  both anchor VOPs).
+  both anchor VOPs). The §7.7.2.2 **interlaced field-prediction** B-VOP
+  modes (field forward / backward / bidirectional) reconstruct to pixels
+  via the `bvop_field_motion` module: the §7.7.2.2 four-PMV bank produces
+  the top/bottom field MVs, [`field_forward_prediction`] /
+  [`field_backward_prediction`] / [`field_bidirectional_prediction`] drive
+  the §7.7.2.1 `field_motion_compensate_one_reference` per active
+  direction (half- or quarter-sample luma), and the bidirectional case
+  averages forward + backward with the §7.7.2.2 `(fwd + bak + 1) >> 1`
+  rounding.
 - **Frame-level B-VOP motion-vector decode driver** ([`BVopMvDriver`],
   `bvop_mv` module): the B-VOP analogue of the P-VOP [`MvDriver`].
   `decode_macroblock` decodes one macroblock's §6.2.6 header + motion
@@ -155,8 +163,20 @@ encoder.
   macroblock; [`BVopMbDecode::reconstruct`] closes the §7.6.9 → §7.3
   bridge per macroblock. The remaining work for a full B-VOP frame
   decode is reference-plane selection per the VOP reference-frame chain.
-  The interlaced field-prediction B-VOP path is not yet handled by the
-  frame driver (it returns a typed `FieldPredictionUnsupported`).
+  The **interlaced field-prediction B-VOP path is now wired into the
+  frame driver** for the three non-direct field modes:
+  [`BVopMvDriver::decode_field_macroblock`] decodes a field-predicted
+  macroblock (forward `mb_type == "0001"` / backward `"001"` /
+  bidirectional `"01"`), threads the §6.2.6 field motion bodies through
+  the §7.7.2.2 four-PMV bank ([`FieldPmvBank`], reset per row alongside
+  the progressive predictor), and emits a [`BVopFieldMbDecode`];
+  [`BVopFieldMbDecode::reconstruct`] runs the §7.7.2.2 field MC (forward /
+  backward / bidirectional-average) against the six reference planes plus
+  the §7.3 residual add + display clip, so an interlaced B-VOP
+  field-predicted macroblock decodes to real pixels. Interlaced **direct**
+  mode still returns a typed `FieldPredictionUnsupported` (it needs the
+  §7.7.2.2 field-period `TRB[i]` / `TRD[i]` temporal references and the
+  Table 7-16 `δ` parity selection).
 - Encoder.
 - The end-to-end wiring of the §E.1.4.4 two-way RVLC error recovery: the
   forward / backward Tcoef decodes (§E.1.4.4.1) and the §E.1.4.4.2.1

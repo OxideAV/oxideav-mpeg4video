@@ -67,10 +67,16 @@ use crate::bitreader::BitReader;
 use crate::block::{decode_b_vop_inter_macroblock, InterMacroblock, MacroblockTextureContext};
 use crate::bvop::{
     decode_b_vop_mb_motion_vectors, parse_b_vop_mb_header, BMbTypeTable, BVopMbHeader,
-    BVopMbParseError, BVopMbType, BVopMvBody,
+    BVopMbParseError, BVopMbType, BVopMotionVectors, BVopMvBody,
 };
+use crate::bvop_field_motion::{
+    field_backward_prediction, field_bidirectional_prediction, field_forward_prediction,
+    BVopFieldReferences, FieldMvDeltas, FieldReferenceFlags, FieldSampleMode,
+};
+use crate::bvop_field_predictor::FieldPmvBank;
 use crate::bvop_prediction::{BVopMvPair, BVopPredictionMode, MB_SUB_BLOCKS};
 use crate::chroma_mv::{chroma_mv_from_luma_blocks, ChromaMvError};
+use crate::interlaced_information::FieldReference;
 use crate::motion::{
     direct_mode_motion_vector, reconstruct_motion_vector, DirectCoLocatedMv, DirectModeMv,
     DirectMvError, DirectMvUnits, MotionVector, MotionVectorDelta,
@@ -357,6 +363,107 @@ pub struct BVopMbTexturedDecode {
     pub quantiser_scale: u32,
 }
 
+/// The §7.7.2.2 prediction mode of an interlaced field-predicted B-VOP
+/// macroblock, carrying its already-bank-updated motion state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BVopFieldMode {
+    /// Field forward (`mb_type == "0001"`): forward top/bottom field
+    /// deltas, compensated from the forward (past) anchor.
+    Forward(FieldMvDeltas),
+    /// Field backward (`mb_type == "001"`): backward top/bottom field
+    /// deltas, compensated from the backward (future) anchor.
+    Backward(FieldMvDeltas),
+    /// Field bidirectional (`mb_type == "01"`): the four differentials in
+    /// bitstream order `MVD[0..4]` (top-fwd, bot-fwd, top-bwd, bot-bwd),
+    /// forward + backward compensated and averaged.
+    Bidirectional([MotionVector; 4]),
+}
+
+/// One fully-decoded interlaced **field-predicted** B-VOP macroblock
+/// (§7.7.2.2 forward / backward / bidirectional). Produced by
+/// [`BVopMvDriver::decode_field_macroblock`]; reconstructed to pixels via
+/// [`BVopFieldMbDecode::reconstruct`].
+///
+/// The motion bodies have already been added to the driver's running
+/// four-PMV bank, so `mode` carries the decoded **differentials**; the
+/// reconstruction re-runs the bank-equivalent field MC against the
+/// supplied reference planes. (The bank state at decode time is captured
+/// so reconstruction is independent of subsequent macroblocks.)
+#[derive(Debug, Clone)]
+pub struct BVopFieldMbDecode {
+    /// The §7.7.2.2 field prediction mode + decoded differentials.
+    pub mode: BVopFieldMode,
+    /// The four §6.3.6.3 `*_field_reference` flags.
+    pub references: FieldReferenceFlags,
+    /// `cbpb` (coded-block pattern) — `None` when no residual is coded.
+    pub cbpb: Option<u8>,
+    /// `dbquant` delta applied to the running quantiser (§6.3.6).
+    pub dbquant_delta: Option<i8>,
+    /// The four-PMV bank snapshot **before** this macroblock's update,
+    /// so [`BVopFieldMbDecode::reconstruct`] reproduces the exact field
+    /// MVs the driver decoded.
+    pub bank_before: FieldPmvBank,
+}
+
+impl BVopFieldMbDecode {
+    /// Reconstruct this field-predicted macroblock end-to-end: §7.7.2.2
+    /// field motion-compensated prediction + §7.3 step-2 residual add +
+    /// step-3 display clip.
+    ///
+    /// * `references` — the six forward/backward reference planes.
+    /// * `residual` — the already-decoded §7.4 inter residual.
+    /// * `mb_origin_x` / `mb_origin_y` — top-left luma pixel position.
+    /// * `vop_rounding_type` — §7.6.7 half-pel rounding control.
+    /// * `sample_mode` — half- vs quarter-sample luma interpolation.
+    /// * `bits_per_pixel` — §6.3.3 sample depth for the §7.3 clip.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reconstruct(
+        &self,
+        references: &BVopFieldReferences<'_>,
+        residual: &InterMacroblock,
+        mb_origin_x: i32,
+        mb_origin_y: i32,
+        vop_rounding_type: u8,
+        sample_mode: FieldSampleMode,
+        bits_per_pixel: u32,
+    ) -> crate::reconstruct::ReconstructedMacroblock {
+        let mut bank = self.bank_before;
+        let prediction = match self.mode {
+            BVopFieldMode::Forward(deltas) => field_forward_prediction(
+                &mut bank,
+                deltas,
+                references,
+                self.references,
+                mb_origin_x,
+                mb_origin_y,
+                vop_rounding_type,
+                sample_mode,
+            ),
+            BVopFieldMode::Backward(deltas) => field_backward_prediction(
+                &mut bank,
+                deltas,
+                references,
+                self.references,
+                mb_origin_x,
+                mb_origin_y,
+                vop_rounding_type,
+                sample_mode,
+            ),
+            BVopFieldMode::Bidirectional(mvd) => field_bidirectional_prediction(
+                &mut bank,
+                mvd,
+                references,
+                self.references,
+                mb_origin_x,
+                mb_origin_y,
+                vop_rounding_type,
+                sample_mode,
+            ),
+        };
+        crate::reconstruct::reconstruct_inter_macroblock(&prediction, residual, bits_per_pixel)
+    }
+}
+
 /// The §7.6.8 progressive, non-scalable B-VOP motion-vector decode
 /// driver.
 ///
@@ -377,6 +484,10 @@ pub struct BVopMvDriver {
     /// §7.6.7 temporal distance next anchor → previous anchor.
     trd: i32,
     predictor: DirectionPredictor,
+    /// §7.7.2.2 four-PMV bank for the interlaced field-prediction path,
+    /// threaded alongside the progressive `predictor` and reset together
+    /// at each row start.
+    field_predictor: FieldPmvBank,
 }
 
 impl BVopMvDriver {
@@ -405,6 +516,7 @@ impl BVopMvDriver {
             trb,
             trd,
             predictor: DirectionPredictor::default(),
+            field_predictor: FieldPmvBank::new(),
         }
     }
 
@@ -424,6 +536,7 @@ impl BVopMvDriver {
     /// the same as a new row for predictor purposes).
     pub fn start_row(&mut self) {
         self.predictor = DirectionPredictor::default();
+        self.field_predictor.reset_row();
     }
 
     /// Decode one progressive B-VOP macroblock at raster position
@@ -490,6 +603,115 @@ impl BVopMvDriver {
             BVopMbType::Forward => self.decode_forward(br, &header),
             BVopMbType::Backward => self.decode_backward(br, &header),
             BVopMbType::Interpolated => self.decode_bidirectional(br, &header),
+        }
+    }
+
+    /// Decode one interlaced **field-predicted** B-VOP macroblock
+    /// (§7.7.2.2 forward / backward / bidirectional) at raster position
+    /// `(mb_row, mb_col)`.
+    ///
+    /// This is the field-prediction analogue of
+    /// [`BVopMvDriver::decode_macroblock`]: where that method rejects a
+    /// field-predicted macroblock with
+    /// [`BVopMvDriverError::FieldPredictionUnsupported`], this method
+    /// decodes the §6.2.6 field motion bodies, threads them through the
+    /// §7.7.2.2 four-PMV bank (reset per row by
+    /// [`BVopMvDriver::start_row`]), and returns a [`BVopFieldMbDecode`]
+    /// ready for [`BVopFieldMbDecode::reconstruct`].
+    ///
+    /// Interlaced **direct** mode is still rejected with
+    /// `FieldPredictionUnsupported` — it needs the §7.7.2.2 field-period
+    /// `TRB[i]` / `TRD[i]` temporal references and the Table 7-16 `δ`
+    /// parity selection, a distinct sub-subsystem. A macroblock that is
+    /// *not* field-predicted (frame prediction, even in an interlaced
+    /// VOL) returns `FieldPredictionUnsupported` too — drive it through
+    /// [`BVopMvDriver::decode_macroblock`] instead.
+    ///
+    /// `br` is positioned at the start of the macroblock's §6.2.6 `modb`
+    /// field. On `Ok` it sits immediately after the last motion-vector
+    /// body (before the texture).
+    pub fn decode_field_macroblock(
+        &mut self,
+        br: &mut BitReader<'_>,
+        vol: &VolHeader,
+        vop_coding_type: VopCodingType,
+        mb_row: usize,
+        mb_col: usize,
+    ) -> Result<BVopFieldMbDecode, BVopMvDriverError> {
+        if mb_row >= self.mb_rows || mb_col >= self.mb_cols {
+            return Err(BVopMvDriverError::OutOfBounds { mb_row, mb_col });
+        }
+
+        let header = parse_b_vop_mb_header(br, vol, vop_coding_type, BMbTypeTable::B4)?;
+
+        // The macroblock must actually be field-predicted (a populated
+        // forward / backward field-reference pair). A frame-predicted MB
+        // belongs on `decode_macroblock`.
+        let field = header
+            .interlaced_info
+            .as_ref()
+            .and_then(|info| info.field_prediction)
+            .filter(|fp| fp.forward.is_some() || fp.backward.is_some());
+        let Some(field) = field else {
+            return Err(BVopMvDriverError::FieldPredictionUnsupported);
+        };
+
+        // Interlaced direct mode is out of scope (§7.7.2.2 last block).
+        if header.mb_type == BVopMbType::Direct {
+            return Err(BVopMvDriverError::FieldPredictionUnsupported);
+        }
+
+        let references = field_reference_flags(&field);
+        let bank_before = self.field_predictor;
+
+        let bodies = decode_b_vop_mb_motion_vectors(
+            br,
+            header.mb_type,
+            true,
+            self.vop_fcode_forward,
+            self.vop_fcode_backward,
+        )?;
+
+        let mode = self.apply_field_bodies(header.mb_type, &bodies)?;
+
+        Ok(BVopFieldMbDecode {
+            mode,
+            references,
+            cbpb: header.cbpb,
+            dbquant_delta: header.dbquant_delta,
+            bank_before,
+        })
+    }
+
+    /// Thread the decoded §6.2.6 field motion bodies through the
+    /// §7.7.2.2 four-PMV bank, updating it in place and returning the
+    /// decoded differentials packaged by mode.
+    fn apply_field_bodies(
+        &mut self,
+        mb_type: BVopMbType,
+        bodies: &BVopMotionVectors,
+    ) -> Result<BVopFieldMode, BVopMvDriverError> {
+        match mb_type {
+            BVopMbType::Forward => {
+                let deltas = field_deltas(bodies.forward)?;
+                self.field_predictor
+                    .field_forward(deltas.top, deltas.bottom);
+                Ok(BVopFieldMode::Forward(deltas))
+            }
+            BVopMbType::Backward => {
+                let deltas = field_deltas(bodies.backward)?;
+                self.field_predictor
+                    .field_backward(deltas.top, deltas.bottom);
+                Ok(BVopFieldMode::Backward(deltas))
+            }
+            BVopMbType::Interpolated => {
+                let fwd = field_deltas(bodies.forward)?;
+                let bwd = field_deltas(bodies.backward)?;
+                let mvd = [fwd.top, fwd.bottom, bwd.top, bwd.bottom];
+                self.field_predictor.field_bidirectional(mvd);
+                Ok(BVopFieldMode::Bidirectional(mvd))
+            }
+            BVopMbType::Direct => Err(BVopMvDriverError::FieldPredictionUnsupported),
         }
     }
 
@@ -892,6 +1114,49 @@ fn direct_chroma_mvs(
         chroma_mv_from_luma_blocks(&fwd)?,
         chroma_mv_from_luma_blocks(&bwd)?,
     ))
+}
+
+/// Map a decoded §6.2.6.3 `FieldPrediction` to the four
+/// `*_field_reference` flags. An absent forward / backward pair (the
+/// direction this macroblock does not predict) defaults to
+/// [`FieldReference::Top`] — the corresponding direction is never
+/// compensated, so the value is unused.
+fn field_reference_flags(
+    fp: &crate::interlaced_information::FieldPrediction,
+) -> FieldReferenceFlags {
+    let (forward_top, forward_bottom) = fp
+        .forward
+        .unwrap_or((FieldReference::Top, FieldReference::Top));
+    let (backward_top, backward_bottom) = fp
+        .backward
+        .unwrap_or((FieldReference::Top, FieldReference::Top));
+    FieldReferenceFlags {
+        forward_top,
+        forward_bottom,
+        backward_top,
+        backward_bottom,
+    }
+}
+
+/// Extract the top/bottom field differentials from a §6.2.6 motion-vector
+/// body, requiring a field pair (the field-prediction driver path).
+fn field_deltas(body: Option<BVopMvBody>) -> Result<FieldMvDeltas, BVopMvDriverError> {
+    match body {
+        Some(BVopMvBody::Field(pair)) => Ok(FieldMvDeltas {
+            top: MotionVector {
+                x: pair.top.dx,
+                y: pair.top.dy,
+            },
+            bottom: MotionVector {
+                x: pair.bottom.dx,
+                y: pair.bottom.dy,
+            },
+        }),
+        // A frame body where a field pair was expected, or an absent
+        // direction the mb_type promised — neither is reachable for a
+        // correctly-decoded field-predicted macroblock, but stay robust.
+        Some(BVopMvBody::Frame(_)) | None => Err(BVopMvDriverError::FieldPredictionUnsupported),
+    }
 }
 
 /// Extract the frame differential from a §6.2.6 motion-vector body,
@@ -1558,5 +1823,183 @@ mod tests {
                 assert_eq!(px, 100);
             }
         }
+    }
+
+    // -----------------------------------------------------------------
+    // §7.7.2.2 interlaced field-prediction B-VOP path
+    // -----------------------------------------------------------------
+
+    fn make_interlaced_vol() -> VolHeader {
+        VolHeader {
+            interlaced: true,
+            ..make_vol()
+        }
+    }
+
+    use crate::bvop_field_motion::BVopFieldReferences;
+    use crate::half_sample::ReferenceVop;
+
+    /// A flat `width × height` reference plane of constant value.
+    fn flat_plane(width: usize, height: usize, value: u8) -> Vec<u8> {
+        vec![value; width * height]
+    }
+
+    #[test]
+    fn decode_field_forward_macroblock_reconstructs_pixels() {
+        // Interlaced VOL, field-forward MB. modb "01" → mb_type "0001"
+        // → interlaced_information (no dct_type since cbp == 0;
+        // field_prediction = 1 + forward pair refs) → two field bodies
+        // (forward-top, forward-bottom), each (0, 0).
+        let vol = make_interlaced_vol();
+        let mut w = BitWriter::new();
+        w.write_bits(0b01, 2); // modb "01"
+        w.write_bits(0b0001, 4); // mb_type forward
+        w.write_bits(0b1, 1); // field_prediction = 1
+        w.write_bits(0b0, 1); // forward_top_field_reference → Top
+        w.write_bits(0b0, 1); // forward_bottom_field_reference → Top
+        w.write_zero_mv_data_pair(); // MVD[0] (top): (0, 0)
+        w.write_zero_mv_data_pair(); // MVD[1] (bottom): (0, 0)
+        w.align();
+        let data = w.buf;
+        let mut br = BitReader::new(&data);
+
+        let mut driver = BVopMvDriver::new(1, 1, 1, 1, 1, 2);
+        driver.start_row();
+        let decode = driver
+            .decode_field_macroblock(&mut br, &vol, VopCodingType::B, 0, 0)
+            .unwrap();
+        assert!(matches!(decode.mode, BVopFieldMode::Forward(_)));
+        assert_eq!(decode.cbpb, None);
+
+        // Reconstruct against a flat forward reference (200); zero MV +
+        // zero residual ⇒ exact copy 200 across the macroblock.
+        let fwd = flat_plane(48, 48, 200);
+        let bak = flat_plane(48, 48, 50);
+        let fwd_c = flat_plane(24, 24, 200);
+        let bak_c = flat_plane(24, 24, 50);
+        let fl = ReferenceVop::new(&fwd, 48, 48).unwrap();
+        let bl = ReferenceVop::new(&bak, 48, 48).unwrap();
+        let fc = ReferenceVop::new(&fwd_c, 24, 24).unwrap();
+        let bc = ReferenceVop::new(&bak_c, 24, 24).unwrap();
+        let refs = BVopFieldReferences {
+            forward_luma: &fl,
+            forward_cb: &fc,
+            forward_cr: &fc,
+            backward_luma: &bl,
+            backward_cb: &bc,
+            backward_cr: &bc,
+        };
+        let residual = InterMacroblock {
+            luma: [[0i32; 16]; 16],
+            cb: [[0i32; 8]; 8],
+            cr: [[0i32; 8]; 8],
+        };
+        let recon = decode.reconstruct(&refs, &residual, 16, 16, 0, FieldSampleMode::HalfSample, 8);
+        for row in recon.luma {
+            for px in row {
+                assert_eq!(px, 200, "forward-only must copy the forward ref");
+            }
+        }
+    }
+
+    #[test]
+    fn decode_field_bidirectional_averages_references() {
+        // Field-bidirectional MB: modb "01" → mb_type "01" → field
+        // prediction with forward + backward pairs → four field bodies.
+        let vol = make_interlaced_vol();
+        let mut w = BitWriter::new();
+        w.write_bits(0b01, 2); // modb "01"
+        w.write_bits(0b01, 2); // mb_type interpolated
+        w.write_bits(0b1, 1); // field_prediction = 1
+        w.write_bits(0b0, 1); // forward_top → Top
+        w.write_bits(0b0, 1); // forward_bottom → Top
+        w.write_bits(0b0, 1); // backward_top → Top
+        w.write_bits(0b0, 1); // backward_bottom → Top
+        w.write_zero_mv_data_pair(); // MVD[0] forward-top
+        w.write_zero_mv_data_pair(); // MVD[1] forward-bottom
+        w.write_zero_mv_data_pair(); // MVD[2] backward-top
+        w.write_zero_mv_data_pair(); // MVD[3] backward-bottom
+        w.align();
+        let data = w.buf;
+        let mut br = BitReader::new(&data);
+
+        let mut driver = BVopMvDriver::new(1, 1, 1, 1, 1, 2);
+        driver.start_row();
+        let decode = driver
+            .decode_field_macroblock(&mut br, &vol, VopCodingType::B, 0, 0)
+            .unwrap();
+        assert!(matches!(decode.mode, BVopFieldMode::Bidirectional(_)));
+
+        // Forward ref 100, backward 200 ⇒ average 150.
+        let fwd = flat_plane(48, 48, 100);
+        let bak = flat_plane(48, 48, 200);
+        let fwd_c = flat_plane(24, 24, 100);
+        let bak_c = flat_plane(24, 24, 200);
+        let fl = ReferenceVop::new(&fwd, 48, 48).unwrap();
+        let bl = ReferenceVop::new(&bak, 48, 48).unwrap();
+        let fc = ReferenceVop::new(&fwd_c, 24, 24).unwrap();
+        let bc = ReferenceVop::new(&bak_c, 24, 24).unwrap();
+        let refs = BVopFieldReferences {
+            forward_luma: &fl,
+            forward_cb: &fc,
+            forward_cr: &fc,
+            backward_luma: &bl,
+            backward_cb: &bc,
+            backward_cr: &bc,
+        };
+        let residual = InterMacroblock {
+            luma: [[0i32; 16]; 16],
+            cb: [[0i32; 8]; 8],
+            cr: [[0i32; 8]; 8],
+        };
+        let recon = decode.reconstruct(&refs, &residual, 16, 16, 0, FieldSampleMode::HalfSample, 8);
+        for row in recon.luma {
+            for px in row {
+                assert_eq!(px, 150);
+            }
+        }
+    }
+
+    #[test]
+    fn field_predictor_resets_at_row_start() {
+        // The field PMV bank is reset alongside the progressive predictor.
+        let mut driver = BVopMvDriver::new(2, 2, 1, 1, 1, 2);
+        driver
+            .field_predictor
+            .field_forward(MotionVector { x: 7, y: 4 }, MotionVector { x: 3, y: 2 });
+        assert_ne!(
+            driver
+                .field_predictor
+                .get(crate::bvop_field_predictor::PMV_TOP_FWD),
+            MotionVector { x: 0, y: 0 }
+        );
+        driver.start_row();
+        for slot in 0..4 {
+            assert_eq!(
+                driver.field_predictor.get(slot),
+                MotionVector { x: 0, y: 0 }
+            );
+        }
+    }
+
+    #[test]
+    fn decode_field_rejects_frame_predicted_macroblock() {
+        // A frame-predicted MB (field_prediction == 0) in an interlaced
+        // VOL must route to decode_macroblock, not decode_field_macroblock.
+        let vol = make_interlaced_vol();
+        let mut w = BitWriter::new();
+        w.write_bits(0b01, 2); // modb "01"
+        w.write_bits(0b0001, 4); // mb_type forward
+        w.write_bits(0b0, 1); // field_prediction = 0
+        w.write_zero_mv_data_pair(); // frame mvdf (0, 0)
+        w.align();
+        let data = w.buf;
+        let mut br = BitReader::new(&data);
+        let mut driver = BVopMvDriver::new(1, 1, 1, 1, 1, 2);
+        driver.start_row();
+        let err = driver
+            .decode_field_macroblock(&mut br, &vol, VopCodingType::B, 0, 0)
+            .unwrap_err();
+        assert_eq!(err, BVopMvDriverError::FieldPredictionUnsupported);
     }
 }
