@@ -8,6 +8,27 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **§7.7.2.2 interlaced-direct B-VOP field motion-vector derivation**
+  (new `bvop_field_direct` module): `interlaced_direct_mvs` derives the
+  four field motion vectors `mvf[0..2]` (forward top/bottom) / `mvb[0..2]`
+  (backward top/bottom) of an interlaced-direct B-VOP macroblock from the
+  co-located future P-VOP macroblock's two forward field MVs `MV[i]`, the
+  single transmitted differential `MVD[0]`, and the §7.7.2.2 field-period
+  temporal references — `TRD[i] = 2*trd_frame + δ[i]`,
+  `TRB[i] = 2*trb_frame + δ[i]`, with `δ[i]` the full Table 7-16 parity
+  selection (`delta`, indexed by the future macroblock's per-field
+  reference selections × `top_field_first`). The `mvf`/`mvb` formulas
+  reproduce the spec's zero-delta scaled-backward form vs. the
+  `mvf - MV` non-zero-delta form per component, with `/` truncating toward
+  zero (§3.4). `interlaced_direct_prediction` assembles the prediction
+  macroblock: the §7.7.2.2 forward field MC (`mvf[0]`/`mvf[1]`, co-located
+  future refs) + backward field MC (`mvb[1]` for **both** output fields,
+  refs fixed Top/Bottom per the spec's `0,1` literal), averaged
+  `(fwd + bak + 1) >> 1`. 7 tests: all 8 Table 7-16 rows, the field-period
+  conversion, the zero- and non-zero-delta backward forms, per-field δ
+  shift, toward-zero truncation, and a zero-MV forward/backward-average
+  reconstruction. (Frame-driver plumbing of the future-MB field MVs +
+  frame-period TRB/TRD is the remaining interlaced-direct step.)
 - **§7.7.2.2 interlaced field-prediction B-VOP frame-driver wiring**
   (`BVopMvDriver::decode_field_macroblock`): the frame driver now decodes
   a field-predicted B-VOP macroblock end-to-end instead of returning

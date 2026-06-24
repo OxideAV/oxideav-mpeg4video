@@ -173,10 +173,20 @@ encoder.
   [`BVopFieldMbDecode::reconstruct`] runs the §7.7.2.2 field MC (forward /
   backward / bidirectional-average) against the six reference planes plus
   the §7.3 residual add + display clip, so an interlaced B-VOP
-  field-predicted macroblock decodes to real pixels. Interlaced **direct**
-  mode still returns a typed `FieldPredictionUnsupported` (it needs the
-  §7.7.2.2 field-period `TRB[i]` / `TRD[i]` temporal references and the
-  Table 7-16 `δ` parity selection).
+  field-predicted macroblock decodes to real pixels. The §7.7.2.2
+  **interlaced direct** mode is now implemented as a standalone
+  derivation ([`interlaced_direct_mvs`] in the `bvop_field_direct`
+  module): the four derived field MVs `mvf[0..2]` / `mvb[0..2]` from the
+  co-located future macroblock's two forward field MVs, the single
+  transmitted `MVD[0]`, and the field-period `TRB[i]` / `TRD[i]` (the
+  `2*frame_distance + δ` conversion with the Table 7-16 `δ` parity
+  selection), plus [`interlaced_direct_prediction`] which runs the
+  §7.7.2.2 forward + backward (mvb[1]-for-both-fields) field MC and
+  averages them. What remains for interlaced direct *inside the frame
+  driver* is plumbing the co-located future P-VOP macroblock's field MVs
+  + the frame-period `TRB`/`TRD` from the reference-frame chain into
+  `decode_field_macroblock` (the derivation + reconstruction primitives
+  are complete and tested).
 - Encoder.
 - The end-to-end wiring of the §E.1.4.4 two-way RVLC error recovery: the
   forward / backward Tcoef decodes (§E.1.4.4.1) and the §E.1.4.4.2.1
