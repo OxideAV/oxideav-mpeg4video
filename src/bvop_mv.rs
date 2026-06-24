@@ -582,6 +582,51 @@ impl BVopInterlacedDirectMbDecode {
     }
 }
 
+/// The co-located anchor state a unified interlaced B-VOP macroblock
+/// decode ([`BVopMvDriver::decode_interlaced_macroblock`]) needs, covering
+/// all three §7.6.9 / §7.7.2.2 paths.
+///
+/// The macroblock's prediction mode is only known after the §6.2.6 header
+/// is parsed, so the dispatcher must hold the inputs for every path it
+/// might take: the §7.6.9.5.1 / §7.6.9.6 progressive co-located anchor
+/// (used by a *progressive* direct MB), and — when the co-located *future*
+/// macroblock was field-predicted — its forward field MVs + the B-VOP's
+/// `top_field_first` (used by an *interlaced* direct MB). When
+/// `future_field_mvs` is `None`, a Direct macroblock resolves to
+/// progressive direct mode (§7.7.2.2: the future MB is skipped / GMC /
+/// intra / frame-predicted).
+#[derive(Debug, Clone, Copy)]
+pub struct BVopInterlacedAnchor {
+    /// The §7.6.9.5.1 / §7.6.9.6 progressive co-located anchor (skipped
+    /// flag + co-located block MV) for the progressive paths.
+    pub progressive: CoLocatedAnchor,
+    /// The co-located *future* macroblock's forward field MVs + reference
+    /// fields, present only when that macroblock was field-predicted
+    /// (enabling interlaced direct mode). `None` forces progressive direct.
+    pub future_field_mvs: Option<ColocatedFutureFieldMvs>,
+    /// The B-VOP's `top_field_first` flag (§6.3.5), used by the interlaced
+    /// direct δ selection.
+    pub top_field_first: bool,
+}
+
+/// One decoded interlaced B-VOP macroblock, tagged by which §7.6.9 /
+/// §7.7.2.2 path [`BVopMvDriver::decode_interlaced_macroblock`] dispatched.
+///
+/// Each variant carries the same per-MB decode the dedicated entry point
+/// produces, so the caller reconstructs via the matching `reconstruct`.
+#[derive(Debug, Clone)]
+pub enum BVopInterlacedMb {
+    /// A progressive (frame-predicted, or progressive-direct) macroblock —
+    /// reconstruct with [`BVopMbDecode::reconstruct`] + anchor planes.
+    Progressive(BVopMbDecode),
+    /// An interlaced field-predicted macroblock (forward / backward /
+    /// bidirectional) — reconstruct with [`BVopFieldMbDecode::reconstruct`].
+    Field(BVopFieldMbDecode),
+    /// An interlaced-direct macroblock — reconstruct with
+    /// [`BVopInterlacedDirectMbDecode::reconstruct`].
+    InterlacedDirect(BVopInterlacedDirectMbDecode),
+}
+
 /// The §7.6.8 progressive, non-scalable B-VOP motion-vector decode
 /// driver.
 ///
@@ -779,7 +824,26 @@ impl BVopMvDriver {
             return Err(BVopMvDriverError::FieldPredictionUnsupported);
         }
 
-        let references = field_reference_flags(&field);
+        self.field_from_header(br, &header, &field)
+    }
+
+    /// Decode the §6.2.6 field motion bodies of an already-parsed,
+    /// confirmed-field-predicted, non-direct macroblock header, threading
+    /// them through the §7.7.2.2 four-PMV bank.
+    fn field_from_header(
+        &mut self,
+        br: &mut BitReader<'_>,
+        header: &BVopMbHeader,
+        field: &crate::interlaced_information::FieldPrediction,
+    ) -> Result<BVopFieldMbDecode, BVopMvDriverError> {
+        // Interlaced direct mode is handled separately (§7.7.2.2 last
+        // block); this helper is only reached for the non-direct field
+        // modes.
+        if header.mb_type == BVopMbType::Direct {
+            return Err(BVopMvDriverError::FieldPredictionUnsupported);
+        }
+
+        let references = field_reference_flags(field);
         let bank_before = self.field_predictor;
 
         let bodies = decode_b_vop_mb_motion_vectors(
@@ -877,7 +941,19 @@ impl BVopMvDriver {
         }
 
         let header = parse_b_vop_mb_header(br, vol, vop_coding_type, BMbTypeTable::B4)?;
+        self.interlaced_direct_from_header(br, &header, future_field_mvs, top_field_first)
+    }
 
+    /// Decode the single `MVD[0]` body of an already-parsed Direct
+    /// macroblock header and derive the four §7.7.2.2 interlaced-direct
+    /// field MVs.
+    fn interlaced_direct_from_header(
+        &mut self,
+        br: &mut BitReader<'_>,
+        header: &BVopMbHeader,
+        future_field_mvs: ColocatedFutureFieldMvs,
+        top_field_first: bool,
+    ) -> Result<BVopInterlacedDirectMbDecode, BVopMvDriverError> {
         if header.mb_type != BVopMbType::Direct {
             return Err(BVopMvDriverError::FieldPredictionUnsupported);
         }
@@ -919,6 +995,94 @@ impl BVopMvDriver {
             cbpb: header.cbpb,
             dbquant_delta: header.dbquant_delta,
         })
+    }
+
+    /// Decode one interlaced B-VOP macroblock with **automatic path
+    /// dispatch**: parse the §6.2.6 header once, then route to the
+    /// progressive (§7.6.9), interlaced field-prediction (§7.7.2.2
+    /// forward / backward / bidirectional), or interlaced-direct
+    /// (§7.7.2.2) decode based on the decoded `mb_type` +
+    /// `field_prediction`.
+    ///
+    /// This is the unified entry the dedicated
+    /// [`BVopMvDriver::decode_macroblock`] /
+    /// [`BVopMvDriver::decode_field_macroblock`] /
+    /// [`BVopMvDriver::decode_interlaced_direct_macroblock`] methods feed:
+    /// a frame loop over an interlaced B-VOP can call this once per
+    /// macroblock without peeking the header to pre-select the path.
+    ///
+    /// Dispatch rules:
+    /// * `field_prediction == 1` (populated forward / backward field
+    ///   references) + non-direct → field-predicted
+    ///   ([`BVopInterlacedMb::Field`]).
+    /// * Direct `mb_type` with `anchor.future_field_mvs == Some(_)` (the
+    ///   co-located future macroblock was field-predicted) → interlaced
+    ///   direct ([`BVopInterlacedMb::InterlacedDirect`]).
+    /// * Otherwise → progressive ([`BVopInterlacedMb::Progressive`]),
+    ///   including a progressive-direct MB (Direct type with no future
+    ///   field MVs) and the §7.6.9.6 co-located-skipped overrides.
+    ///
+    /// `br` is positioned at the start of the macroblock's `modb` field;
+    /// on `Ok` it sits after the last motion body (before the texture).
+    pub fn decode_interlaced_macroblock(
+        &mut self,
+        br: &mut BitReader<'_>,
+        vol: &VolHeader,
+        vop_coding_type: VopCodingType,
+        mb_row: usize,
+        mb_col: usize,
+        anchor: BVopInterlacedAnchor,
+    ) -> Result<BVopInterlacedMb, BVopMvDriverError> {
+        if mb_row >= self.mb_rows || mb_col >= self.mb_cols {
+            return Err(BVopMvDriverError::OutOfBounds { mb_row, mb_col });
+        }
+
+        let header = parse_b_vop_mb_header(br, vol, vop_coding_type, BMbTypeTable::B4)?;
+
+        // §7.6.9.6 co-located-skipped override takes precedence over every
+        // path — a skipped co-located anchor forces progressive direct /
+        // forward regardless of the decoded type (§7.6.9.6).
+        if anchor.progressive.skipped {
+            return self
+                .decode_co_located_skipped(br, &header, anchor.progressive.mv)
+                .map(BVopInterlacedMb::Progressive);
+        }
+
+        // Field-predicted, non-direct → field path.
+        let field = header
+            .interlaced_info
+            .as_ref()
+            .and_then(|info| info.field_prediction)
+            .filter(|fp| fp.forward.is_some() || fp.backward.is_some());
+        if let Some(field) = field {
+            if header.mb_type != BVopMbType::Direct {
+                return self
+                    .field_from_header(br, &header, &field)
+                    .map(BVopInterlacedMb::Field);
+            }
+        }
+
+        // Direct macroblock: interlaced direct when the future MB was
+        // field-predicted, progressive direct otherwise (§7.7.2.2).
+        if header.mb_type == BVopMbType::Direct {
+            if let Some(future) = anchor.future_field_mvs {
+                return self
+                    .interlaced_direct_from_header(br, &header, future, anchor.top_field_first)
+                    .map(BVopInterlacedMb::InterlacedDirect);
+            }
+            return self
+                .decode_direct(br, &header, anchor.progressive.mv)
+                .map(BVopInterlacedMb::Progressive);
+        }
+
+        // Progressive frame-predicted forward / backward / interpolated.
+        match header.mb_type {
+            BVopMbType::Forward => self.decode_forward(br, &header),
+            BVopMbType::Backward => self.decode_backward(br, &header),
+            BVopMbType::Interpolated => self.decode_bidirectional(br, &header),
+            BVopMbType::Direct => unreachable!("Direct handled above"),
+        }
+        .map(BVopInterlacedMb::Progressive)
     }
 
     /// Decode the motion state of an entire progressive B-VOP in raster
@@ -2448,6 +2612,187 @@ mod tests {
         // δ top = 1 → TRB=2*2+1=5, TRD=2*4+1=9; mvf top.x = 5*6/9 = 3.
         assert_eq!(decode.mvs.forward_top.x, 3);
         assert_eq!(decode.forward_top_ref, FieldReference::Bottom);
+    }
+
+    // -----------------------------------------------------------------
+    // Unified interlaced B-VOP dispatch (decode_interlaced_macroblock)
+    // -----------------------------------------------------------------
+
+    fn plain_anchor() -> BVopInterlacedAnchor {
+        BVopInterlacedAnchor {
+            progressive: CoLocatedAnchor::default(),
+            future_field_mvs: None,
+            top_field_first: false,
+        }
+    }
+
+    #[test]
+    fn dispatch_routes_progressive_forward() {
+        let vol = make_interlaced_vol();
+        let mut w = BitWriter::new();
+        w.write_bits(0b01, 2); // modb "01"
+        w.write_bits(0b0001, 4); // forward
+        w.write_bits(0b0, 1); // field_prediction = 0 → frame
+        write_mv_data_two(&mut w);
+        write_mv_data_two(&mut w);
+        w.align();
+        let data = w.buf;
+        let mut br = BitReader::new(&data);
+        let mut driver = BVopMvDriver::new(1, 1, 1, 1, 1, 2);
+        driver.start_row();
+        let mb = driver
+            .decode_interlaced_macroblock(&mut br, &vol, VopCodingType::B, 0, 0, plain_anchor())
+            .unwrap();
+        match mb {
+            BVopInterlacedMb::Progressive(d) => {
+                assert_eq!(d.mb_type, BVopMbType::Forward);
+                assert_eq!(d.mvs[0].forward, MotionVector { x: 2, y: 2 });
+            }
+            other => panic!("expected Progressive, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_routes_field_predicted() {
+        let vol = make_interlaced_vol();
+        let mut w = BitWriter::new();
+        w.write_bits(0b01, 2); // modb "01"
+        w.write_bits(0b0001, 4); // forward
+        w.write_bits(0b1, 1); // field_prediction = 1
+        w.write_bits(0b0, 1); // forward_top → Top
+        w.write_bits(0b0, 1); // forward_bottom → Top
+        w.write_zero_mv_data_pair();
+        w.write_zero_mv_data_pair();
+        w.align();
+        let data = w.buf;
+        let mut br = BitReader::new(&data);
+        let mut driver = BVopMvDriver::new(1, 1, 1, 1, 1, 2);
+        driver.start_row();
+        let mb = driver
+            .decode_interlaced_macroblock(&mut br, &vol, VopCodingType::B, 0, 0, plain_anchor())
+            .unwrap();
+        assert!(matches!(
+            mb,
+            BVopInterlacedMb::Field(d) if matches!(d.mode, BVopFieldMode::Forward(_))
+        ));
+    }
+
+    #[test]
+    fn dispatch_routes_interlaced_direct_when_future_field_predicted() {
+        let vol = make_interlaced_vol();
+        let mut w = BitWriter::new();
+        w.write_bits(0b1, 1); // modb "1" → default direct
+        w.align();
+        let data = w.buf;
+        let mut br = BitReader::new(&data);
+        let mut driver = BVopMvDriver::new(1, 1, 1, 1, 1, 2);
+        let anchor = BVopInterlacedAnchor {
+            progressive: CoLocatedAnchor::default(),
+            future_field_mvs: Some(ColocatedFutureFieldMvs {
+                top: future_field(6, -6, FieldReference::Top),
+                bottom: future_field(6, -6, FieldReference::Bottom),
+            }),
+            top_field_first: false,
+        };
+        let mb = driver
+            .decode_interlaced_macroblock(&mut br, &vol, VopCodingType::B, 0, 0, anchor)
+            .unwrap();
+        match mb {
+            BVopInterlacedMb::InterlacedDirect(d) => {
+                // δ=(0,0), TRB=2, TRD=4 → mvf top = (3, -3).
+                assert_eq!(d.mvs.forward_top, MotionVector { x: 3, y: -3 });
+            }
+            other => panic!("expected InterlacedDirect, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_routes_progressive_direct_when_no_future_field_mvs() {
+        // A Direct MB with no future field MVs (future MB not
+        // field-predicted) resolves to progressive direct mode.
+        let vol = make_interlaced_vol();
+        let mut w = BitWriter::new();
+        w.write_bits(0b1, 1); // modb "1" → default direct
+        w.align();
+        let data = w.buf;
+        let mut br = BitReader::new(&data);
+        let mut driver = BVopMvDriver::new(1, 1, 1, 1, 1, 2);
+        let anchor = BVopInterlacedAnchor {
+            progressive: CoLocatedAnchor {
+                skipped: false,
+                mv: DirectCoLocatedMv::Mv(MotionVector { x: 6, y: -6 }),
+            },
+            future_field_mvs: None,
+            top_field_first: false,
+        };
+        let mb = driver
+            .decode_interlaced_macroblock(&mut br, &vol, VopCodingType::B, 0, 0, anchor)
+            .unwrap();
+        match mb {
+            BVopInterlacedMb::Progressive(d) => {
+                assert_eq!(d.mb_type, BVopMbType::Direct);
+                // Progressive direct: TRB=1, TRD=2, MV=(6,-6) → MVF=(3,-3).
+                assert_eq!(d.mvs[0].forward, MotionVector { x: 3, y: -3 });
+            }
+            other => panic!("expected Progressive direct, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_co_located_skipped_overrides_to_progressive() {
+        // A skipped co-located anchor forces progressive direct/forward
+        // even in an interlaced VOL, regardless of future field MVs.
+        let vol = make_interlaced_vol();
+        let mut w = BitWriter::new();
+        w.write_bits(0b1, 1); // modb "1"
+        w.align();
+        let data = w.buf;
+        let mut br = BitReader::new(&data);
+        let mut driver = BVopMvDriver::new(1, 1, 1, 1, 1, 2);
+        let anchor = BVopInterlacedAnchor {
+            progressive: CoLocatedAnchor {
+                skipped: true,
+                mv: DirectCoLocatedMv::Mv(MotionVector { x: 8, y: 0 }),
+            },
+            future_field_mvs: Some(ColocatedFutureFieldMvs {
+                top: future_field(6, -6, FieldReference::Top),
+                bottom: future_field(6, -6, FieldReference::Bottom),
+            }),
+            top_field_first: false,
+        };
+        let mb = driver
+            .decode_interlaced_macroblock(&mut br, &vol, VopCodingType::B, 0, 0, anchor)
+            .unwrap();
+        // §7.6.9.6: modb "1" + skipped → direct, zero delta, from MV (8,0).
+        // TRB=1, TRD=2 → MVF.x = (1*8)/2 = 4.
+        match mb {
+            BVopInterlacedMb::Progressive(d) => {
+                assert_eq!(d.mb_type, BVopMbType::Direct);
+                assert_eq!(d.mvs[0].forward, MotionVector { x: 4, y: 0 });
+            }
+            other => panic!("expected Progressive (skip override), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_out_of_bounds_rejected() {
+        let vol = make_interlaced_vol();
+        let mut w = BitWriter::new();
+        w.write_bits(0b1, 1);
+        w.align();
+        let data = w.buf;
+        let mut br = BitReader::new(&data);
+        let mut driver = BVopMvDriver::new(1, 1, 1, 1, 1, 2);
+        let err = driver
+            .decode_interlaced_macroblock(&mut br, &vol, VopCodingType::B, 9, 9, plain_anchor())
+            .unwrap_err();
+        assert_eq!(
+            err,
+            BVopMvDriverError::OutOfBounds {
+                mb_row: 9,
+                mb_col: 9
+            }
+        );
     }
 
     #[test]

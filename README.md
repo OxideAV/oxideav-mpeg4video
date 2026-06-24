@@ -198,6 +198,15 @@ encoder.
   [`ColocatedFutureFieldMvs::from_field_motion`], which builds them from a
   decoded interlaced P-VOP macroblock's reconstructed forward field MVs
   ([`FieldMotionVectors`]) and its §6.3.6.3 top/bottom field references.
+  A single **unified dispatch** entry
+  [`BVopMvDriver::decode_interlaced_macroblock`] parses the §6.2.6 header
+  once and routes each macroblock to the progressive / field-prediction /
+  interlaced-direct path automatically (driven by a per-MB
+  [`BVopInterlacedAnchor`] and returning a tagged [`BVopInterlacedMb`]),
+  so an interlaced B-VOP frame loop never has to peek the header to
+  pre-select a decode path. What remains for a full interlaced B-VOP
+  *frame* decode is the raster loop supplying each macroblock's
+  co-located future/anchor state from the reference-frame chain.
 - Encoder.
 - The end-to-end wiring of the §E.1.4.4 two-way RVLC error recovery: the
   forward / backward Tcoef decodes (§E.1.4.4.1) and the §E.1.4.4.2.1

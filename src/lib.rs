@@ -374,9 +374,9 @@ pub use bvop_field_predictor::{
     FieldMvDirection, FieldPmvBank, PMV_BOT_BWD, PMV_BOT_FWD, PMV_TOP_BWD, PMV_TOP_FWD,
 };
 pub use bvop_mv::{
-    BVopAnchorPlanes, BVopFieldMbDecode, BVopFieldMode, BVopInterlacedDirectMbDecode, BVopMbDecode,
-    BVopMbTexturedDecode, BVopMvDriver, BVopMvDriverError, BVopTextureParams, CoLocatedAnchor,
-    ColocatedFutureFieldMvs,
+    BVopAnchorPlanes, BVopFieldMbDecode, BVopFieldMode, BVopInterlacedAnchor,
+    BVopInterlacedDirectMbDecode, BVopInterlacedMb, BVopMbDecode, BVopMbTexturedDecode,
+    BVopMvDriver, BVopMvDriverError, BVopTextureParams, CoLocatedAnchor, ColocatedFutureFieldMvs,
 };
 pub use bvop_prediction::{
     average_bidirectional, average_bidirectional_into, generate_b_vop_luma_prediction,

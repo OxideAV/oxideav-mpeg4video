@@ -8,6 +8,27 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Unified interlaced B-VOP macroblock dispatch**
+  (`BVopMvDriver::decode_interlaced_macroblock`): a single entry that
+  parses the §6.2.6 header once and routes to the progressive (§7.6.9),
+  interlaced field-prediction (§7.7.2.2 forward / backward /
+  bidirectional), or interlaced-direct (§7.7.2.2) decode based on the
+  decoded `mb_type` + `field_prediction` — so an interlaced B-VOP frame
+  loop no longer has to peek the header to pre-select which dedicated
+  method to call. The new `BVopInterlacedAnchor` bundles the per-MB anchor
+  state every path might need (the §7.6.9.5.1 / §7.6.9.6 progressive
+  co-located anchor, the optional co-located *future* field MVs for
+  interlaced direct, and `top_field_first`); the result is a tagged
+  `BVopInterlacedMb` (`Progressive` / `Field` / `InterlacedDirect`)
+  carrying the same per-MB decode each dedicated entry produces. Dispatch
+  honours the §7.6.9.6 co-located-skipped override first, then routes a
+  field-predicted non-direct MB to the field path, a Direct MB with
+  future field MVs to interlaced direct, and everything else (including a
+  progressive-direct MB with no future field MVs) to the progressive
+  path. The three dedicated methods now share extracted post-header
+  helpers (`field_from_header` / `interlaced_direct_from_header`) so the
+  unified path and the dedicated paths decode identically. 6 tests: each
+  routing case + the co-located-skipped override + out-of-bounds.
 - **§7.7.2.2 interlaced-direct reference-frame-chain bridge**
   (`ColocatedFutureFieldMvs::from_field_motion`): builds the co-located
   future field MVs an interlaced-direct B-VOP macroblock consumes from a
