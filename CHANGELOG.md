@@ -8,6 +8,16 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **§7.7.2.2 interlaced-direct reference-frame-chain bridge**
+  (`ColocatedFutureFieldMvs::from_field_motion`): builds the co-located
+  future field MVs an interlaced-direct B-VOP macroblock consumes from a
+  decoded interlaced P-VOP macroblock's reconstructed forward field motion
+  vectors (`FieldMotionVectors`) and its `top_field_reference` /
+  `bottom_field_reference` flags (§6.3.6.3). This closes the last
+  interlaced-direct plumbing step: the future macroblock's two forward
+  field MVs + reference fields feed straight into
+  `decode_interlaced_direct_macroblock`. 1 test (constructor + end-to-end
+  through the driver with a δ-shifted field-temporal derivation).
 - **§7.7.2.2 interlaced-direct B-VOP frame-driver wiring**
   (`BVopMvDriver::decode_interlaced_direct_macroblock`): the frame driver
   now decodes an interlaced-direct B-VOP macroblock end-to-end instead of

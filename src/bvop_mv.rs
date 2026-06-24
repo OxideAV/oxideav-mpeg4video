@@ -489,6 +489,36 @@ pub struct ColocatedFutureFieldMvs {
     pub bottom: ColocatedFutureField,
 }
 
+impl ColocatedFutureFieldMvs {
+    /// Build the §7.7.2.2 co-located future field MVs from a decoded
+    /// interlaced P-VOP macroblock's reconstructed forward field motion
+    /// vectors ([`crate::field_motion::FieldMotionVectors`]) and that
+    /// macroblock's `top_field_reference` / `bottom_field_reference`
+    /// flags (§6.3.6.3).
+    ///
+    /// This is the reference-frame-chain bridge: when a B-VOP's co-located
+    /// future P-VOP macroblock was field-predicted, its two forward field
+    /// MVs (`MVx f1 / MVy f1`, `MVx f2 / MVy f2`) and the reference fields
+    /// it selected drive interlaced direct mode. Feed the result straight
+    /// into [`BVopMvDriver::decode_interlaced_direct_macroblock`].
+    pub fn from_field_motion(
+        field_mvs: crate::field_motion::FieldMotionVectors,
+        top_field_reference: FieldReference,
+        bottom_field_reference: FieldReference,
+    ) -> Self {
+        Self {
+            top: ColocatedFutureField {
+                mv: field_mvs.top,
+                reference_field: top_field_reference,
+            },
+            bottom: ColocatedFutureField {
+                mv: field_mvs.bottom,
+                reference_field: bottom_field_reference,
+            },
+        }
+    }
+}
+
 /// One fully-decoded interlaced **direct** B-VOP macroblock (§7.7.2.2
 /// last pseudo-code block). Produced by
 /// [`BVopMvDriver::decode_interlaced_direct_macroblock`]; reconstructed to
@@ -2374,6 +2404,50 @@ mod tests {
                 assert_eq!(px, 120);
             }
         }
+    }
+
+    #[test]
+    fn colocated_future_from_field_motion_bridges_reference_chain() {
+        // The reference-frame-chain bridge: a decoded P-VOP field-MV pair
+        // + the future MB's field references build the ColocatedFutureFieldMvs.
+        use crate::field_motion::FieldMotionVectors;
+        let field_mvs = FieldMotionVectors {
+            top: MotionVector { x: 6, y: -6 },
+            bottom: MotionVector { x: 4, y: 2 },
+        };
+        let future = ColocatedFutureFieldMvs::from_field_motion(
+            field_mvs,
+            FieldReference::Bottom,
+            FieldReference::Top,
+        );
+        assert_eq!(future.top.mv, MotionVector { x: 6, y: -6 });
+        assert_eq!(future.top.reference_field, FieldReference::Bottom);
+        assert_eq!(future.bottom.mv, MotionVector { x: 4, y: 2 });
+        assert_eq!(future.bottom.reference_field, FieldReference::Top);
+
+        // Feed straight into the interlaced-direct decode. modb "1" → zero
+        // delta. Top ref Bottom, bottom ref Top, tff=0 → δ=(1,-1).
+        let vol = make_interlaced_vol();
+        let mut w = BitWriter::new();
+        w.write_bits(0b1, 1);
+        w.align();
+        let data = w.buf;
+        let mut br = BitReader::new(&data);
+        let mut driver = BVopMvDriver::new(1, 1, 1, 1, 2, 4);
+        let decode = driver
+            .decode_interlaced_direct_macroblock(
+                &mut br,
+                &vol,
+                VopCodingType::B,
+                0,
+                0,
+                future,
+                false,
+            )
+            .unwrap();
+        // δ top = 1 → TRB=2*2+1=5, TRD=2*4+1=9; mvf top.x = 5*6/9 = 3.
+        assert_eq!(decode.mvs.forward_top.x, 3);
+        assert_eq!(decode.forward_top_ref, FieldReference::Bottom);
     }
 
     #[test]

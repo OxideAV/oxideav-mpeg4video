@@ -194,7 +194,10 @@ encoder.
   the §7.7.2.2 → §7.3 forward/backward field-MC + average + residual add
   + display clip. The caller establishes interlaced-direct applicability
   (future macroblock field-predicted) and supplies the future field MVs
-  from the reference-frame chain.
+  from the reference-frame chain via
+  [`ColocatedFutureFieldMvs::from_field_motion`], which builds them from a
+  decoded interlaced P-VOP macroblock's reconstructed forward field MVs
+  ([`FieldMotionVectors`]) and its §6.3.6.3 top/bottom field references.
 - Encoder.
 - The end-to-end wiring of the §E.1.4.4 two-way RVLC error recovery: the
   forward / backward Tcoef decodes (§E.1.4.4.1) and the §E.1.4.4.2.1
