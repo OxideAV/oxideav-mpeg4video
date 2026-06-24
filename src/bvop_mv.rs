@@ -627,6 +627,41 @@ pub enum BVopInterlacedMb {
     InterlacedDirect(BVopInterlacedDirectMbDecode),
 }
 
+impl BVopInterlacedMb {
+    /// The macroblock's `cbpb` (coded-block pattern), `None` when no
+    /// residual is coded — uniform across the three path variants.
+    pub fn cbpb(&self) -> Option<u8> {
+        match self {
+            BVopInterlacedMb::Progressive(d) => d.cbpb,
+            BVopInterlacedMb::Field(d) => d.cbpb,
+            BVopInterlacedMb::InterlacedDirect(d) => d.cbpb,
+        }
+    }
+
+    /// The macroblock's `dbquant` delta (§6.3.6), `None` when absent —
+    /// uniform across the three path variants.
+    pub fn dbquant_delta(&self) -> Option<i8> {
+        match self {
+            BVopInterlacedMb::Progressive(d) => d.dbquant_delta,
+            BVopInterlacedMb::Field(d) => d.dbquant_delta,
+            BVopInterlacedMb::InterlacedDirect(d) => d.dbquant_delta,
+        }
+    }
+}
+
+/// One fully-decoded interlaced B-VOP macroblock: the path-tagged motion
+/// state plus its §7.4 inter residual and the running quantiser scale that
+/// decoded it. Produced by [`BVopMvDriver::decode_interlaced_vop`].
+#[derive(Debug, Clone)]
+pub struct BVopInterlacedTexturedDecode {
+    /// The path-tagged motion state.
+    pub motion: BVopInterlacedMb,
+    /// The §7.4 inter residual (wholly zero when no `cbpb` was coded).
+    pub residual: InterMacroblock,
+    /// The §6.3.6 running quantiser scale used to dequantise the residual.
+    pub quantiser_scale: u32,
+}
+
 /// The §7.6.8 progressive, non-scalable B-VOP motion-vector decode
 /// driver.
 ///
@@ -1083,6 +1118,84 @@ impl BVopMvDriver {
             BVopMbType::Direct => unreachable!("Direct handled above"),
         }
         .map(BVopInterlacedMb::Progressive)
+    }
+
+    /// Decode an entire **interlaced** B-VOP end-to-end in raster order:
+    /// the unified per-macroblock motion dispatch
+    /// ([`BVopMvDriver::decode_interlaced_macroblock`]) threaded with the
+    /// §6.2.6 / §7.4 residual decode + `dbquant` running-quantiser
+    /// accumulation, mirroring the progressive
+    /// [`BVopMvDriver::decode_vop`].
+    ///
+    /// For each `(mb_row, mb_col)` it calls [`BVopMvDriver::start_row`] at
+    /// row starts (resetting both the progressive and the §7.7.2.2
+    /// four-PMV predictors), dispatches the macroblock's motion through the
+    /// unified path, applies its `dbquant` to the running quantiser scale
+    /// (clipped to `[1, max_quantiser_scale]`, §6.3.6), then consumes the
+    /// §7.4 inter residual gated by the macroblock's `cbpb`. Returns one
+    /// [`BVopInterlacedTexturedDecode`] per macroblock (row-major), each
+    /// carrying the path-tagged motion, the residual, and the quantiser
+    /// scale — ready for the matching `reconstruct`.
+    ///
+    /// `anchor` supplies the per-MB [`BVopInterlacedAnchor`] (progressive
+    /// co-located anchor + optional co-located future field MVs +
+    /// `top_field_first`) exactly once per macroblock in raster order.
+    /// `br` is left positioned immediately after the final macroblock's
+    /// last texture block. As with the progressive loop this assumes the
+    /// texture immediately follows the motion bodies of the same
+    /// macroblock; a VOP carrying `resync_marker`-split texture must drive
+    /// macroblocks one at a time.
+    pub fn decode_interlaced_vop<F>(
+        &mut self,
+        br: &mut BitReader<'_>,
+        vol: &VolHeader,
+        vop_coding_type: VopCodingType,
+        texture: BVopTextureParams,
+        mut anchor: F,
+    ) -> Result<Vec<BVopInterlacedTexturedDecode>, BVopMvDriverError>
+    where
+        F: FnMut(usize, usize) -> BVopInterlacedAnchor,
+    {
+        let quant_matrix = crate::block::nonintra_quant_matrix(vol);
+        let mut out = Vec::with_capacity(self.mb_rows * self.mb_cols);
+        let mut quantiser_scale = texture.base_quantiser_scale;
+        for mb_row in 0..self.mb_rows {
+            self.start_row();
+            for mb_col in 0..self.mb_cols {
+                let mb_anchor = anchor(mb_row, mb_col);
+                let motion = self.decode_interlaced_macroblock(
+                    br,
+                    vol,
+                    vop_coding_type,
+                    mb_row,
+                    mb_col,
+                    mb_anchor,
+                )?;
+
+                // §6.3.6: apply this macroblock's dbquant to the running
+                // quantiser scale, clipped to `[1, max_quantiser_scale]`.
+                if let Some(delta) = motion.dbquant_delta() {
+                    let updated = quantiser_scale as i64 + delta as i64;
+                    quantiser_scale = updated.clamp(1, texture.max_quantiser_scale as i64) as u32;
+                }
+
+                let ctx = MacroblockTextureContext {
+                    quantiser_scale,
+                    bits_per_pixel: texture.bits_per_pixel,
+                    quant_type: texture.quant_type,
+                    ac_pred_flag: false,
+                };
+                let residual =
+                    decode_b_vop_inter_macroblock(br, motion.cbpb(), ctx, &quant_matrix)?;
+
+                out.push(BVopInterlacedTexturedDecode {
+                    motion,
+                    residual,
+                    quantiser_scale,
+                });
+            }
+        }
+        Ok(out)
     }
 
     /// Decode the motion state of an entire progressive B-VOP in raster
@@ -2772,6 +2885,60 @@ mod tests {
             }
             other => panic!("expected Progressive (skip override), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn decode_interlaced_vop_threads_mixed_modes_and_residual() {
+        // 1×2 interlaced B-VOP: MB0 field-forward (zero MVs, no cbpb),
+        // MB1 progressive forward with a coded residual (cbpb block 0).
+        // The walker dispatches each to its path and threads the residual.
+        let vol = make_interlaced_vol();
+        let mut w = BitWriter::new();
+        // MB0 — field-forward, no cbpb.
+        w.write_bits(0b01, 2); // modb "01"
+        w.write_bits(0b0001, 4); // forward
+        w.write_bits(0b1, 1); // field_prediction = 1
+        w.write_bits(0b0, 1); // forward_top → Top
+        w.write_bits(0b0, 1); // forward_bottom → Top
+        w.write_zero_mv_data_pair(); // MVD[0]
+        w.write_zero_mv_data_pair(); // MVD[1]
+                                     // MB1 — progressive forward, cbpb block 0 coded + residual.
+        w.write_bits(0b00, 2); // modb "00" — mb_type + cbpb
+        w.write_bits(0b0001, 4); // forward
+        w.write_bits(0b10_0000, 6); // cbpb — block 0 coded
+        w.write_bits(0b0, 1); // dbquant code 0 → delta 0
+                              // §6.2.6.3 interlaced_information: cbp != 0 → dct_type bit, then
+                              // field_prediction bit (both inside the body, after dbquant).
+        w.write_bits(0b0, 1); // dct_type = 0 (frame DCT)
+        w.write_bits(0b0, 1); // field_prediction = 0 → frame
+        w.write_zero_mv_data_pair(); // frame mvdf (0, 0)
+        w.write_bits(0b0111, 4); // block-0 inter EVENT
+        w.write_bits(0b0, 1); // sign +
+        w.align();
+        let data = w.buf;
+        let mut br = BitReader::new(&data);
+        let mut driver = BVopMvDriver::new(1, 2, 1, 1, 1, 2);
+        let mbs = driver
+            .decode_interlaced_vop(&mut br, &vol, VopCodingType::B, texture_params(), |_, _| {
+                plain_anchor()
+            })
+            .unwrap();
+        assert_eq!(mbs.len(), 2);
+        // MB0 routed to the field path, zero residual.
+        assert!(matches!(mbs[0].motion, BVopInterlacedMb::Field(_)));
+        assert!(mbs[0]
+            .residual
+            .luma
+            .iter()
+            .all(|r| r.iter().all(|&p| p == 0)));
+        // MB1 routed to the progressive path, residual ~2 in block 0.
+        assert!(matches!(mbs[1].motion, BVopInterlacedMb::Progressive(_)));
+        for y in 0..8 {
+            for x in 0..8 {
+                assert!((mbs[1].residual.luma[y][x] - 2).abs() <= 1);
+            }
+        }
+        assert_eq!(mbs[1].quantiser_scale, 8);
     }
 
     #[test]

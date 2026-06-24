@@ -204,9 +204,16 @@ encoder.
   interlaced-direct path automatically (driven by a per-MB
   [`BVopInterlacedAnchor`] and returning a tagged [`BVopInterlacedMb`]),
   so an interlaced B-VOP frame loop never has to peek the header to
-  pre-select a decode path. What remains for a full interlaced B-VOP
-  *frame* decode is the raster loop supplying each macroblock's
-  co-located future/anchor state from the reference-frame chain.
+  pre-select a decode path. [`BVopMvDriver::decode_interlaced_vop`] then
+  closes the raster loop — the interlaced analogue of `decode_vop`: it
+  walks the interlaced B-VOP in raster order driving each macroblock
+  through the unified dispatch, resets both the progressive and §7.7.2.2
+  four-PMV predictors per row, applies each `dbquant`, and threads the
+  §7.4 residual decode into the same loop, returning one
+  [`BVopInterlacedTexturedDecode`] per macroblock. What remains for a
+  full interlaced B-VOP *frame* decode is the caller supplying each
+  macroblock's co-located future/anchor state from the reference-frame
+  chain and blitting the per-MB reconstruction.
 - Encoder.
 - The end-to-end wiring of the §E.1.4.4 two-way RVLC error recovery: the
   forward / backward Tcoef decodes (§E.1.4.4.1) and the §E.1.4.4.2.1

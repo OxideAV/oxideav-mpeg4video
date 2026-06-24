@@ -8,6 +8,22 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **End-to-end interlaced B-VOP frame walker**
+  (`BVopMvDriver::decode_interlaced_vop`): the interlaced analogue of the
+  progressive `decode_vop`. It walks an interlaced B-VOP in raster order,
+  dispatching each macroblock's motion through the unified
+  `decode_interlaced_macroblock` (progressive / field-prediction /
+  interlaced-direct), resetting both the progressive and §7.7.2.2 four-PMV
+  predictors at each row start, applying each macroblock's `dbquant` to a
+  running quantiser scale (§6.3.6), and threading the §7.4 inter residual
+  decode gated by `cbpb` into the same loop. Returns one
+  `BVopInterlacedTexturedDecode` (path-tagged motion + residual +
+  quantiser scale) per macroblock. New `BVopInterlacedMb::cbpb()` /
+  `dbquant_delta()` accessors expose the residual-gating fields uniformly
+  across the three path variants. 1 test: a mixed-mode 1×2 VOP
+  (field-forward MB + progressive-forward MB with a coded residual)
+  confirming per-MB dispatch + residual threading + the §6.2.6.3
+  `dct_type` + `field_prediction` body ordering.
 - **Unified interlaced B-VOP macroblock dispatch**
   (`BVopMvDriver::decode_interlaced_macroblock`): a single entry that
   parses the §6.2.6 header once and routes to the progressive (§7.6.9),
