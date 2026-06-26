@@ -332,6 +332,7 @@ pub mod motion;
 pub mod mv_predictor_grid;
 pub mod neighbour;
 pub mod obmc;
+pub mod perspective_warp;
 pub mod predictor;
 pub mod pvop_mv;
 pub mod quarter_sample;
