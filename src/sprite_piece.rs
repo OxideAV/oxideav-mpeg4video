@@ -99,6 +99,11 @@ pub enum SpritePieceError {
     /// `brightness_change_factor_size` ran past the 4-bit Table B.35
     /// maximum without a terminating `0`.
     BrightnessSizeOverflow,
+    /// §7.8.3.2: an update-piece refines a macroblock whose corresponding
+    /// object macroblock has not yet been transmitted (an update MB cannot
+    /// precede its object MB; the carried `(x, y)` is the offending grid
+    /// position).
+    UpdateBeforeObject(usize, usize),
 }
 
 impl core::fmt::Display for SpritePieceError {
@@ -118,6 +123,12 @@ impl core::fmt::Display for SpritePieceError {
                 write!(
                     f,
                     "brightness_change_factor_size exceeded the 4-bit Table B.35 maximum"
+                )
+            }
+            SpritePieceError::UpdateBeforeObject(x, y) => {
+                write!(
+                    f,
+                    "update-piece MB ({x}, {y}) precedes its object MB (§7.8.3.2)"
                 )
             }
         }
@@ -254,6 +265,48 @@ impl SpriteObjectBuffer {
     /// transmitted (the object is fully assembled).
     pub fn is_complete(&self) -> bool {
         self.sent.iter().all(|&s| s)
+    }
+
+    /// Validate an **update**-piece against this object buffer (§7.8.3.2):
+    /// every macroblock the update-piece touches must already exist in the
+    /// object buffer (an update MB cannot precede its object MB). The
+    /// caller supplies the per-macroblock `not_coded` flags of the update
+    /// piece in raster order (length `piece_width * piece_height`):
+    /// `not_coded == false` means the macroblock is *refined*.
+    ///
+    /// Returns the grid positions of the refined macroblocks
+    /// (`not_coded == false`). Object MBs are **not** marked sent — an
+    /// update refines existing texture, it does not establish a new MB.
+    /// Errors with [`SpritePieceError::UpdateBeforeObject`] for the first
+    /// touched MB whose object MB is missing, or
+    /// [`SpritePieceError::Truncated`] if the `not_coded` slice length does
+    /// not match the piece geometry.
+    pub fn update_piece_refined_macroblocks(
+        &self,
+        header: &SpritePieceHeader,
+        not_coded: &[bool],
+    ) -> Result<Vec<(usize, usize)>, SpritePieceError> {
+        if not_coded.len() != header.macroblock_count() {
+            return Err(SpritePieceError::Truncated);
+        }
+        let x0 = header.piece_xoffset as usize;
+        let y0 = header.piece_yoffset as usize;
+        let mut refined = Vec::new();
+        for dy in 0..header.piece_height as usize {
+            for dx in 0..header.piece_width as usize {
+                let x = x0 + dx;
+                let y = y0 + dy;
+                // §7.8.3.2: the update MB's object MB must already exist.
+                if !self.send_mb(x, y) {
+                    return Err(SpritePieceError::UpdateBeforeObject(x, y));
+                }
+                let idx = dy * header.piece_width as usize + dx;
+                if !not_coded[idx] {
+                    refined.push((x, y));
+                }
+            }
+        }
+        Ok(refined)
     }
 }
 
@@ -965,6 +1018,68 @@ mod tests {
     fn object_buffer_rejects_zero_area() {
         assert!(SpriteObjectBuffer::new(0, 4).is_none());
         assert!(SpriteObjectBuffer::new(4, 0).is_none());
+    }
+
+    #[test]
+    fn update_piece_refines_existing_macroblocks() {
+        // Object piece fills a 2×2 region; an update piece over the same
+        // region refines the MBs whose not_coded == false.
+        let mut buf = SpriteObjectBuffer::new(4, 4).unwrap();
+        let obj = SpritePieceHeader {
+            piece_quant: 5,
+            piece_width: 2,
+            piece_height: 2,
+            piece_xoffset: 0,
+            piece_yoffset: 0,
+        };
+        buf.object_piece_new_macroblocks(&obj);
+        // Update over the same region: refine (0,0) and (1,1), skip the
+        // other two (not_coded = true).
+        let not_coded = [false, true, true, false];
+        let refined = buf
+            .update_piece_refined_macroblocks(&obj, &not_coded)
+            .unwrap();
+        assert_eq!(refined, vec![(0, 0), (1, 1)]);
+        // Update does not establish new MBs — completeness unchanged.
+        assert!(!buf.is_complete());
+    }
+
+    #[test]
+    fn update_before_object_is_rejected() {
+        // An update piece touching a MB the object buffer has not yet seen
+        // must error (§7.8.3.2: the first piece must be an object-piece).
+        let buf = SpriteObjectBuffer::new(4, 4).unwrap();
+        let hdr = SpritePieceHeader {
+            piece_quant: 5,
+            piece_width: 1,
+            piece_height: 1,
+            piece_xoffset: 2,
+            piece_yoffset: 1,
+        };
+        assert_eq!(
+            buf.update_piece_refined_macroblocks(&hdr, &[false])
+                .unwrap_err(),
+            SpritePieceError::UpdateBeforeObject(2, 1)
+        );
+    }
+
+    #[test]
+    fn update_piece_length_mismatch_is_truncated() {
+        let mut buf = SpriteObjectBuffer::new(2, 2).unwrap();
+        let hdr = SpritePieceHeader {
+            piece_quant: 1,
+            piece_width: 2,
+            piece_height: 2,
+            piece_xoffset: 0,
+            piece_yoffset: 0,
+        };
+        buf.object_piece_new_macroblocks(&hdr);
+        // Wrong not_coded length (3, expected 4).
+        assert_eq!(
+            buf.update_piece_refined_macroblocks(&hdr, &[false, false, false])
+                .unwrap_err(),
+            SpritePieceError::Truncated
+        );
     }
 
     #[test]
