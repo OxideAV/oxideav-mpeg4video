@@ -8,6 +8,16 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **§7.8.3.1 / §7.8.3.2 sprite-object-buffer hole handling**
+  (`SpriteObjectBuffer`): tracks the per-macroblock `send_mb()` occupancy
+  of the sprite-object grid (`object_piece_new_macroblocks` returns the
+  new MBs an object-piece carries a body for, skipping holes already sent
+  by an earlier piece) and validates update-pieces
+  (`update_piece_refined_macroblocks` — every refined MB's object MB must
+  already exist, per the §7.8.3.2 ordering rule).
+- **§7.8.5 perspective static-sprite chroma + per-MB warp**
+  (`static_sprite_chroma_perspective`,
+  `static_sprite_luma_macroblock_perspective`).
 - **§6.2.5.4 low-latency static-sprite piece transmission** (`sprite_piece`):
   the `SpriteTransmitMode` (Table 6-26 stop/piece/update/pause),
   `decode_sprite_piece()` header (`piece_quant` / `piece_width` /

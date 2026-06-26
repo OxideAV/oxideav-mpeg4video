@@ -276,10 +276,17 @@ encoder.
   brightness + piece loop). The §7.8.5 **four-point perspective** warp
   (`perspective_warp::PerspectiveWarp`, the
   `no_of_sprite_warping_points == 4` case) is implemented and wired into
-  static-sprite reconstruction (`static_sprite_luma_perspective`). What
-  remains end-to-end is decoding each piece's `sprite_shape_texture()`
-  body into sprite memory (the object-piece I-VOP / update-piece P-VOP
-  macroblock subset) and the §7.8.3.2 hole-handling.
+  static-sprite reconstruction (`static_sprite_luma_perspective`). The
+  §7.8.3.1 / §7.8.3.2 **hole handling** is modelled by
+  `SpriteObjectBuffer`: it tracks the per-macroblock `send_mb()`
+  occupancy of the sprite-object grid (`object_piece_new_macroblocks`
+  returns the new MBs an object-piece carries a body for, skipping holes
+  already sent by an earlier piece) and validates update-pieces
+  (`update_piece_refined_macroblocks` — every refined MB's object MB must
+  already exist, per the §7.8.3.2 ordering rule). What remains end-to-end
+  is decoding each piece's `sprite_shape_texture()` macroblock body into
+  sprite memory (the object-piece I-VOP / update-piece P-VOP macroblock
+  texture subset).
 - Scalability enhancement layers, Studio Profile, and non-rectangular
   shapes (rejected with typed errors). GMC global-motion warping *is*
   supported; the §6.3.6 `mcsel` flag is now routed into the §7.3 recon
