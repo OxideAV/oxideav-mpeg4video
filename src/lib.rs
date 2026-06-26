@@ -342,6 +342,7 @@ pub mod s_gmc_recon;
 pub mod sample_padding;
 pub mod scan;
 pub mod sprite;
+pub mod sprite_piece;
 pub mod static_sprite;
 pub mod texture;
 pub mod transform_select;
