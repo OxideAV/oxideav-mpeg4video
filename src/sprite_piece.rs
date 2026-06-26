@@ -191,6 +191,79 @@ pub fn decode_sprite_piece(br: &mut BitReader<'_>) -> Result<SpritePieceHeader, 
     })
 }
 
+/// One iteration of the §6.2.5 low-latency piece loop: the
+/// `sprite_transmit_mode` that was read and — when that mode carried a
+/// `decode_sprite_piece()` body — the decoded header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpritePieceLoopEntry {
+    /// The `sprite_transmit_mode` read at the top of this iteration.
+    pub mode: SpriteTransmitMode,
+    /// The `decode_sprite_piece()` header, present iff `mode.has_piece()`.
+    pub header: Option<SpritePieceHeader>,
+}
+
+/// Maximum piece-loop iterations before the driver bails with
+/// [`SpritePieceError::Truncated`]. A well-formed stream terminates at a
+/// `stop` / `pause` mode; the cap guards against a malformed loop that
+/// never emits one.
+const MAX_PIECE_ITERATIONS: usize = 4096;
+
+/// Drive the per-S-VOP §6.2.5 low-latency piece loop (spec lines
+/// 4335..=4356).
+///
+/// The §6.2.5 syntax only enters the loop when the *prior*
+/// `sprite_transmit_mode` was not `stop` (the VOL initialises it to
+/// `piece`, §10903) and `low_latency_sprite_enable == 1`. The caller is
+/// responsible for that outer gate; this driver runs the inner
+/// `do {…} while` once entered:
+///
+/// ```text
+/// do {
+///     sprite_transmit_mode           // 2 bits
+///     if (mode == piece || mode == update)
+///         decode_sprite_piece()      // header + sprite_shape_texture()
+/// } while (mode != stop && mode != pause)
+/// ```
+///
+/// Because the `sprite_shape_texture()` body is a full macroblock-layer
+/// walk (object-pieces use the I-VOP subset, update-pieces the P-VOP
+/// inter subset, §7.8.3), the driver delegates advancing past each piece
+/// body to `skip_body`: it is called with the decoded header after the
+/// header is read and must leave `br` positioned at the next
+/// `sprite_transmit_mode` (or `next_start_code()` boundary). For a
+/// header-only structural walk (no texture present, e.g. unit tests or a
+/// caller that records geometry without decoding pixels) pass a no-op.
+///
+/// Returns one [`SpritePieceLoopEntry`] per iteration, in order. The
+/// final entry's `mode` is always a loop terminator (`stop` or `pause`)
+/// with no header.
+pub fn drive_sprite_piece_loop<F>(
+    br: &mut BitReader<'_>,
+    mut skip_body: F,
+) -> Result<Vec<SpritePieceLoopEntry>, SpritePieceError>
+where
+    F: FnMut(&mut BitReader<'_>, &SpritePieceHeader) -> Result<(), SpritePieceError>,
+{
+    let mut entries = Vec::new();
+    for _ in 0..MAX_PIECE_ITERATIONS {
+        let code = br.read_bits(2).map_err(|_| SpritePieceError::Truncated)?;
+        let mode = SpriteTransmitMode::from_code(code);
+        let header = if mode.has_piece() {
+            let hdr = decode_sprite_piece(br)?;
+            skip_body(br, &hdr)?;
+            Some(hdr)
+        } else {
+            None
+        };
+        let terminates = mode.terminates_loop();
+        entries.push(SpritePieceLoopEntry { mode, header });
+        if terminates {
+            return Ok(entries);
+        }
+    }
+    Err(SpritePieceError::Truncated)
+}
+
 /// Decode a §6.2.5.4 `brightness_change_factor()` codeword (Table B.35).
 ///
 /// The codeword is a VLC `brightness_change_factor_size` (`0`, `10`,
@@ -517,5 +590,82 @@ mod tests {
             decode_sprite_piece(&mut br).unwrap_err(),
             SpritePieceError::Truncated
         );
+    }
+
+    /// Emit a `decode_sprite_piece()` header into a writer (no body).
+    fn write_piece_header(w: &mut BitWriter, q: u32, pw: u32, ph: u32, xo: u32, yo: u32) {
+        w.write_bits(q, 5);
+        w.write_bits(pw, 9);
+        w.write_bits(ph, 9);
+        w.write_bits(1, 1); // marker
+        w.write_bits(xo, 9);
+        w.write_bits(yo, 9);
+    }
+
+    #[test]
+    fn loop_single_piece_then_stop() {
+        // piece(01) + header, then stop(00). No texture body (skip_body
+        // is a no-op).
+        let mut w = BitWriter::new();
+        w.write_bits(0b01, 2); // mode = piece
+        write_piece_header(&mut w, 3, 4, 4, 0, 0);
+        w.write_bits(0b00, 2); // mode = stop
+        let buf = w.finish();
+        let mut br = BitReader::new(&buf);
+        let entries = drive_sprite_piece_loop(&mut br, |_, _| Ok(())).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].mode, SpriteTransmitMode::Piece);
+        assert_eq!(entries[0].header.unwrap().piece_quant, 3);
+        assert_eq!(entries[0].header.unwrap().macroblock_count(), 16);
+        assert_eq!(entries[1].mode, SpriteTransmitMode::Stop);
+        assert!(entries[1].header.is_none());
+    }
+
+    #[test]
+    fn loop_piece_then_update_then_pause() {
+        let mut w = BitWriter::new();
+        w.write_bits(0b01, 2); // piece
+        write_piece_header(&mut w, 5, 2, 3, 1, 1);
+        w.write_bits(0b10, 2); // update
+        write_piece_header(&mut w, 7, 2, 3, 1, 1);
+        w.write_bits(0b11, 2); // pause
+        let buf = w.finish();
+        let mut br = BitReader::new(&buf);
+        let entries = drive_sprite_piece_loop(&mut br, |_, _| Ok(())).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].mode, SpriteTransmitMode::Piece);
+        assert_eq!(entries[1].mode, SpriteTransmitMode::Update);
+        assert_eq!(entries[1].header.unwrap().piece_quant, 7);
+        assert_eq!(entries[2].mode, SpriteTransmitMode::Pause);
+    }
+
+    #[test]
+    fn loop_immediate_stop_no_pieces() {
+        let mut w = BitWriter::new();
+        w.write_bits(0b00, 2); // stop right away
+        let buf = w.finish();
+        let mut br = BitReader::new(&buf);
+        let entries = drive_sprite_piece_loop(&mut br, |_, _| Ok(())).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].mode, SpriteTransmitMode::Stop);
+    }
+
+    #[test]
+    fn loop_skip_body_advances_reader() {
+        // Piece carries a 13-bit "texture" filler; skip_body must consume
+        // it so the next read lands on the stop code.
+        let mut w = BitWriter::new();
+        w.write_bits(0b01, 2);
+        write_piece_header(&mut w, 1, 1, 1, 0, 0);
+        w.write_bits(0b1010101010101, 13); // mock body
+        w.write_bits(0b00, 2); // stop
+        let buf = w.finish();
+        let mut br = BitReader::new(&buf);
+        let entries = drive_sprite_piece_loop(&mut br, |br, _hdr| {
+            br.skip_bits(13).map_err(|_| SpritePieceError::Truncated)
+        })
+        .unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].mode, SpriteTransmitMode::Stop);
     }
 }
