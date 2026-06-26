@@ -94,6 +94,62 @@ pub enum RvlcRecovery {
     },
 }
 
+impl RvlcRecovery {
+    /// Stitch a recovery into the final per-macroblock decode set,
+    /// applying both the §E.1.4.4.2.1 keep decision (forward result for
+    /// the first `keep_front` MBs, backward result for the last
+    /// `keep_back` MBs, the errored middle discarded) and the
+    /// §E.1.4.4.2.2 INTRA-MB concealment (every INTRA MB in an *errored*
+    /// packet is concealed, even one the strategy would otherwise keep).
+    ///
+    /// `total_mbs` is the macroblock count of the video packet (`N`).
+    /// `is_intra(i)` reports whether MB `i` is INTRA-coded (from the
+    /// already-decoded motion / shape partition). The result has one
+    /// entry per macroblock: `Some(mb)` for a kept, displayed MB or
+    /// `None` for a discarded (middle) or concealed (INTRA) MB.
+    ///
+    /// A [`RvlcRecovery::Clean`] result returns every MB as `Some(_)`
+    /// (no error → no concealment); `is_intra` is unused in that case.
+    pub fn stitch(
+        &self,
+        total_mbs: usize,
+        mut is_intra: impl FnMut(usize) -> bool,
+    ) -> Vec<Option<RecoveredMb>> {
+        match self {
+            RvlcRecovery::Clean { mbs } => mbs.iter().cloned().map(Some).collect(),
+            RvlcRecovery::Recovered {
+                arbitration,
+                forward,
+                backward,
+            } => {
+                let keep_front = arbitration.keep_front.min(total_mbs);
+                let keep_back = arbitration.keep_back.min(total_mbs);
+                let back_start = total_mbs.saturating_sub(keep_back).max(keep_front);
+                let mut out: Vec<Option<RecoveredMb>> = Vec::with_capacity(total_mbs);
+                for i in 0..total_mbs {
+                    // §E.1.4.4.2.2: conceal every INTRA MB in the packet.
+                    if is_intra(i) {
+                        out.push(None);
+                        continue;
+                    }
+                    if i < keep_front {
+                        out.push(forward.get(i).cloned());
+                    } else if i >= back_start {
+                        // backward is in forward scan order; its entry for
+                        // MB `i` is at index `i - (total - backward.len())`.
+                        let off = total_mbs.saturating_sub(backward.len());
+                        out.push(backward.get(i.saturating_sub(off)).cloned());
+                    } else {
+                        // Errored middle region — discarded.
+                        out.push(None);
+                    }
+                }
+                out
+            }
+        }
+    }
+}
+
 /// Decode one coded block's forward EVENT run (`while (!last)`),
 /// returning the EVENTs. Propagates the first per-EVENT error.
 fn forward_block(
@@ -509,6 +565,60 @@ mod tests {
             out.push(cur);
         }
         (out, nbits)
+    }
+
+    #[test]
+    fn stitch_clean_returns_all_mbs() {
+        let (data, nbits) = one_event_stream(3);
+        let layouts = vec![
+            MbBlockLayout {
+                blocks: vec![TcoefTable::Inter],
+            };
+            3
+        ];
+        let out = recover_video_packet_dct(&data, 0, nbits, &layouts).unwrap();
+        let stitched = out.stitch(3, |_| false);
+        assert_eq!(stitched.len(), 3);
+        assert!(stitched.iter().all(|m| m.is_some()));
+    }
+
+    #[test]
+    fn stitch_recovered_keeps_front_back_discards_middle_conceals_intra() {
+        use crate::rvlc_arbitration::{RvlcArbitration, RvlcStrategy};
+        // Hand-build a Recovered with N=5, keep_front=2, keep_back=1.
+        let mb = |lvl: i32| RecoveredMb {
+            blocks: vec![vec![AcEvent {
+                last: true,
+                run: 0,
+                level: lvl,
+            }]],
+        };
+        let rec = RvlcRecovery::Recovered {
+            arbitration: RvlcArbitration {
+                strategy: RvlcStrategy::Strategy1,
+                keep_front: 2,
+                keep_back: 1,
+            },
+            // forward valid for indices 0,1.
+            forward: vec![mb(10), mb(11)],
+            // backward in forward scan order; valid for index 4 (last).
+            backward: vec![mb(40), mb(41), mb(42), mb(43), mb(44)],
+        };
+        // No intra concealment: MBs 0,1 from forward; 2,3 discarded; 4
+        // from backward.
+        let stitched = rec.stitch(5, |_| false);
+        assert_eq!(stitched.len(), 5);
+        assert_eq!(stitched[0].as_ref().unwrap().blocks[0][0].level, 10);
+        assert_eq!(stitched[1].as_ref().unwrap().blocks[0][0].level, 11);
+        assert!(stitched[2].is_none());
+        assert!(stitched[3].is_none());
+        assert_eq!(stitched[4].as_ref().unwrap().blocks[0][0].level, 44);
+
+        // Conceal MB 1 (intra): now index 1 is None even though kept.
+        let with_concealment = rec.stitch(5, |i| i == 1);
+        assert_eq!(with_concealment[0].as_ref().unwrap().blocks[0][0].level, 10);
+        assert!(with_concealment[1].is_none()); // concealed intra
+        assert_eq!(with_concealment[4].as_ref().unwrap().blocks[0][0].level, 44);
     }
 
     #[test]

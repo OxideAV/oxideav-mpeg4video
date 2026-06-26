@@ -8,6 +8,16 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **§E.1.4.4.2 kept-MB stitching + INTRA concealment** (`RvlcRecovery::stitch`):
+  collapses a two-way recovery into the final per-macroblock decode set,
+  applying the §E.1.4.4.2.1 keep decision (forward result for the first
+  `keep_front` MBs, backward for the last `keep_back`, the errored middle
+  discarded → `None`) *and* the §E.1.4.4.2.2 INTRA-MB concealment (every
+  INTRA MB in an errored packet returns `None` even when the strategy
+  would keep it). A `Clean` recovery returns every MB unconditionally. 2
+  tests: clean pass-through, and a five-MB recovered case validating
+  front/back keep, the discarded middle, and INTRA concealment of a kept
+  index.
 - **Data-partition → RVLC-recovery bridge** (`mb_block_layout`): derives
   the §E.1.4.4 texture-partition `MbBlockLayout` for one data-partitioned
   macroblock from its parsed partition-1 record + partition-2 texture
