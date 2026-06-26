@@ -8,6 +8,15 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **§6.2.5.2 `motion_coding` helper for data-partitioned P-VOPs**
+  (`decode_motion_coding`): consumes the `motion_coding("forward",
+  type_of_mb)` MV-delta field group (one `motion_vector` body, or four
+  for an Inter4V macroblock) via `decode_motion_vector_delta`, returning
+  the raw forward deltas — a ready-made `decode_motion` closure body for
+  `parse_data_partitioned_p_vop` so the P-VOP partition-1 motion no
+  longer needs a hand-rolled closure. 2 tests: a full data-partitioned
+  P-VOP packet driven through the helper (one inter MB, `(0,0)` delta),
+  and an Inter4V reading exactly four deltas.
 - **§E.1.4.4.2 kept-MB stitching + INTRA concealment** (`RvlcRecovery::stitch`):
   collapses a two-way recovery into the final per-macroblock decode set,
   applying the §E.1.4.4.2.1 keep decision (forward result for the first

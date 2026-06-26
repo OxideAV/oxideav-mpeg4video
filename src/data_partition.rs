@@ -256,6 +256,42 @@ fn decode_intra_dc_six(br: &mut BitReader<'_>) -> Result<[i32; 6], DataPartition
     Ok(dc)
 }
 
+/// Consume the §6.2.5.2 `motion_coding("forward", type_of_mb)` MV-delta
+/// field group of a data-partitioned P-VOP macroblock, returning the raw
+/// forward MV deltas.
+///
+/// `motion_coding(mode, type_of_mb)` reads one `motion_vector(mode)`,
+/// plus three more when `type_of_mb == 2` (the inter-4V macroblock with
+/// four 8×8 block vectors). Each `motion_vector` body is decoded by
+/// [`crate::motion::decode_motion_vector_delta`] with the forward mode
+/// and `vop_fcode_forward`. The returned deltas are *not* yet combined
+/// with a predictor — the §7.6.5 median predictor + §7.6.3 reconstruction
+/// is the caller's responsibility (it needs the running predictor grid),
+/// matching how the combined path separates delta decode from
+/// reconstruction. This is a ready-made `decode_motion` closure body for
+/// [`parse_data_partitioned_p_vop`].
+pub fn decode_motion_coding(
+    br: &mut BitReader<'_>,
+    mb_type: DerivedMbType,
+    vop_fcode_forward: u8,
+) -> Result<Vec<crate::motion::MotionVectorDelta>, crate::motion::MotionParseError> {
+    use crate::motion::{decode_motion_vector_delta, MvMode};
+    let count = if matches!(mb_type, DerivedMbType::Inter4V) {
+        4
+    } else {
+        1
+    };
+    let mut deltas = Vec::with_capacity(count);
+    for _ in 0..count {
+        deltas.push(decode_motion_vector_delta(
+            br,
+            MvMode::Forward,
+            vop_fcode_forward,
+        )?);
+    }
+    Ok(deltas)
+}
+
 /// Derive the §E.1.4.4 texture-partition [`MbBlockLayout`] for one
 /// data-partitioned macroblock from its parsed partition-1 record and
 /// partition-2 texture header.
@@ -652,6 +688,54 @@ mod tests {
             err,
             DataPartitionError::MarkerNotFound { decoded: 2 }
         ));
+    }
+
+    #[test]
+    fn p_vop_with_concrete_motion_coding_closure() {
+        // One coded inter MB whose motion is decoded by the stock
+        // decode_motion_coding helper (fcode 1 → no residuals; mv_data
+        // code "1" → 0). motion_coding(forward, inter) = mvd_x "1" + mvd_y
+        // "1" = "11" (delta 0,0).
+        let stream = bits(concat!(
+            // partition 1
+            "0",  // not_coded = 0
+            "1",  // mcbpc P "1" → inter (type 0)
+            "11", // motion_coding: mvd_x "1", mvd_y "1" (both 0)
+            // motion_marker
+            "1 1111 0000 0000 0001",
+            // partition 2: inter MB → cbpy "11" (inter column 0000)
+            "11",
+            "0000",
+        ));
+        let mut br = BitReader::new(&stream);
+        let mut captured = Vec::new();
+        let out = parse_data_partitioned_p_vop(&mut br, 4, false, 7, 31, |b, ty| {
+            let deltas = decode_motion_coding(b, ty, 1)
+                .map_err(|_| DataPartitionError::Macroblock(MacroblockParseError::Truncated))?;
+            captured = deltas;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(out.mbs.len(), 1);
+        assert_eq!(out.mbs[0].mb_type, Some(DerivedMbType::Inter));
+        // One forward MV delta (0, 0).
+        assert_eq!(captured.len(), 1);
+        assert_eq!((captured[0].dx, captured[0].dy), (0, 0));
+        assert_eq!(out.tex_headers[0].cbpy, 0); // inter column of "11"
+    }
+
+    #[test]
+    fn decode_motion_coding_inter4v_reads_four() {
+        // Inter4V (type 2): motion_coding reads four MVs. fcode 1, all
+        // mv_data "1" → four (0,0) deltas, 8 bits total.
+        let stream = bits("11 11 11 11 0000");
+        let mut br = BitReader::new(&stream);
+        let deltas = decode_motion_coding(&mut br, DerivedMbType::Inter4V, 1).unwrap();
+        assert_eq!(deltas.len(), 4);
+        for d in &deltas {
+            assert_eq!((d.dx, d.dy), (0, 0));
+        }
+        assert_eq!(br.bit_position(), 8);
     }
 
     #[test]

@@ -396,9 +396,10 @@ pub use chroma_shape::{
     stack_interlaced_chroma_shape, CHROMA_FIELD_LINES,
 };
 pub use data_partition::{
-    mb_block_layout, parse_data_partitioned_i_vop, parse_data_partitioned_p_vop, use_intra_dc_vlc,
-    DataPartitionError, DataPartitionedIVop, DataPartitionedMb, DataPartitionedPVop,
-    DataPartitionedTexHeader, DC_MARKER, DC_MARKER_BITS, MOTION_MARKER, MOTION_MARKER_BITS,
+    decode_motion_coding, mb_block_layout, parse_data_partitioned_i_vop,
+    parse_data_partitioned_p_vop, use_intra_dc_vlc, DataPartitionError, DataPartitionedIVop,
+    DataPartitionedMb, DataPartitionedPVop, DataPartitionedTexHeader, DC_MARKER, DC_MARKER_BITS,
+    MOTION_MARKER, MOTION_MARKER_BITS,
 };
 pub use extended_padding::{
     extended_padding_chroma, extended_padding_luma, extended_padding_macroblock, mid_grey_value,
