@@ -137,7 +137,7 @@ impl<'a> BitReader<'a> {
 /// Provenance: the reverse-decode discipline is described in §E.1.3 /
 /// §E.1.4.4 of ISO/IEC 14496-2:2004 (3rd edition), read from
 /// `docs/video/mpeg4-visual/ISO_IEC_14496-2-2004-3rd-edition.txt`.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct BackwardBitReader<'a> {
     data: &'a [u8],
     /// Absolute bit index, from the start of `data`, of the *most

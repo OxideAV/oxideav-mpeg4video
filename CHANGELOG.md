@@ -8,6 +8,27 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **§E.1.4.4 two-way RVLC error-recovery driver** (new `rvlc_recovery`
+  module): assembles the previously-composable RVLC pieces — the forward
+  EVENT decoder, the backward EVENT decoder, and the §E.1.4.4.2.1
+  arbitration — into the actual recovery walk. `recover_video_packet_dct`
+  forward-decodes a video packet's DCT-coefficient region
+  macroblock-by-macroblock (per a caller-supplied `MbBlockLayout` giving
+  each MB's coded blocks + Tcoef tables), tracking per-MB cumulative bit
+  costs (L1 / N1). On a §E.1.4.4.1 forward error (illegal RVLC, bad
+  escape, missing `LAST`, or a >64-coefficient block) it backward-decodes
+  from the packet end — segmenting EVENTs into blocks on the `LAST` flag
+  via a non-consuming peek (the `BackwardBitReader` is now `Clone`) —
+  gathers L2 / N2, runs `RvlcArbitration::select`, and returns
+  `RvlcRecovery::Recovered { arbitration, forward, backward }`. A clean
+  forward decode returns `RvlcRecovery::Clean`; an unrecoverable tail
+  propagates the backward error. This closes the README's
+  "video-packet driver that detects the forward-decode error, runs both
+  directions, gathers the L/N/L1/L2/N1/N2 inputs, and applies the kept-MB
+  decision" gap. 5 tests: the (1,0,1) inter reversible codeword sanity
+  check, a clean three-MB decode, a no-coded-blocks MB, a forward-error →
+  two-way trigger, and a multi-EVENT block round-tripped forward and
+  backward to validate the tail-first per-block segmentation.
 - **§6.2.5.3 data-partitioned macroblock-layer parsing** (new
   `data_partition` module): parses the `data_partitioned_i_vop()` and
   `data_partitioned_p_vop()` rectangular bitstream layouts that the

@@ -337,6 +337,7 @@ pub mod pvop_mv;
 pub mod quarter_sample;
 pub mod reconstruct;
 pub mod rvlc_arbitration;
+pub mod rvlc_recovery;
 pub mod s_gmc_recon;
 pub mod sample_padding;
 pub mod scan;
@@ -476,6 +477,7 @@ pub use reconstruct::{
     MACROBLOCK_CHROMA_SIDE, MACROBLOCK_LUMA_SIDE,
 };
 pub use rvlc_arbitration::{RvlcArbitration, RvlcArbitrationInput, RvlcStrategy, RVLC_THRESHOLD};
+pub use rvlc_recovery::{recover_video_packet_dct, MbBlockLayout, RecoveredMb, RvlcRecovery};
 pub use s_gmc_recon::{gmc_prediction_macroblock, s_gmc_prediction_macroblock, GmcReferencePlanes};
 pub use sample_padding::{
     horizontal_repetitive_padding_chroma, horizontal_repetitive_padding_luma,
