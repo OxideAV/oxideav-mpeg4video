@@ -116,7 +116,8 @@ encoder.
   (`warping_mv_code` VLC, Table B.34, → `du[i]`/`dv[i]`), the §7.8.4
   sprite reference-point + virtual-point geometry, the §7.8.5 warping
   transform `(F,G)`/`(Fc,Gc)` for 0/1/2/3 warping points (stationary /
-  translation / affine — perspective is disallowed under GMC), and the
+  translation / affine — perspective is disallowed under GMC but
+  supported for static sprites via `perspective_warp`), and the
   §7.8.6 sample reconstruction that bilinearly warps a reference VOP
   into a 16×16 luma / 8×8 chroma GMC prediction block with
   `vop_rounding_type` control and §7.6.4 edge clamping.
@@ -261,15 +262,24 @@ encoder.
   transform bodies). What remains is calling it from the residual loop
   with the per-block `opaque_pels` count and `f_shape` derived from the
   decoded binary shape of the current macroblock.
-- The §7.8.3 low-latency static-sprite piece-update machinery (the
-  `sprite_transmit_mode` piece/update transmit loop). The **basic**
-  static sprite (`low_latency_sprite_enable == 0`) is now supported: the
-  §6.2.3 static VOL body parses (`sprite_geometry`, `low_latency`), and
-  `static_sprite` warps the §7.8.2 sprite memory onto the visible VOP
-  via the §7.8.6 static blend (incl. the `brightness_change_factor`
-  post-adjustment). What remains for static sprites end-to-end is the
-  decode of the initial sprite-object I-VOP into sprite memory and the
-  §7.8.3 low-latency piece/update path.
+- The §7.8.3 low-latency static-sprite piece-update machinery. The
+  **basic** static sprite (`low_latency_sprite_enable == 0`) warps the
+  §7.8.2 sprite memory onto the visible VOP via the §7.8.6 static blend
+  (incl. the `brightness_change_factor` post-adjustment). The
+  **low-latency** syntax shell is now parsed too: `sprite_piece` decodes
+  the §6.2.5.4 `decode_sprite_piece()` header (`piece_quant` /
+  `piece_width` / `piece_height` / `piece_xoffset` / `piece_yoffset`),
+  the Table 6-26 `sprite_transmit_mode` (stop / piece / update / pause)
+  with its `do {…} while` piece loop (`drive_sprite_piece_loop`), the
+  Table B.35 `brightness_change_factor()` VLC, and the composed §6.2.5
+  static S-VOP block (`parse_static_sprite_vop_block` — trajectory +
+  brightness + piece loop). The §7.8.5 **four-point perspective** warp
+  (`perspective_warp::PerspectiveWarp`, the
+  `no_of_sprite_warping_points == 4` case) is implemented and wired into
+  static-sprite reconstruction (`static_sprite_luma_perspective`). What
+  remains end-to-end is decoding each piece's `sprite_shape_texture()`
+  body into sprite memory (the object-piece I-VOP / update-piece P-VOP
+  macroblock subset) and the §7.8.3.2 hole-handling.
 - Scalability enhancement layers, Studio Profile, and non-rectangular
   shapes (rejected with typed errors). GMC global-motion warping *is*
   supported; the §6.3.6 `mcsel` flag is now routed into the §7.3 recon

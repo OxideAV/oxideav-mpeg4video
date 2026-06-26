@@ -8,6 +8,23 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **§6.2.5.4 low-latency static-sprite piece transmission** (`sprite_piece`):
+  the `SpriteTransmitMode` (Table 6-26 stop/piece/update/pause),
+  `decode_sprite_piece()` header (`piece_quant` / `piece_width` /
+  `piece_height` / `piece_xoffset` / `piece_yoffset`), the
+  `brightness_change_factor()` VLC (Table B.35, five magnitude bands),
+  the §6.2.5 `do { sprite_transmit_mode; … } while` piece loop
+  (`drive_sprite_piece_loop`), and the composed §6.2.5 static S-VOP
+  sprite block (`parse_static_sprite_vop_block` — trajectory + brightness
+  + piece loop).
+- **§7.8.5 four-point perspective sprite warp** (`perspective_warp`):
+  `PerspectiveWarp` derives the §7.8.5 perspective coefficients
+  (`g`/`h`/`D`, `a..f`) from the four §7.8.4 sprite reference points and
+  maps a VOP pixel to its `1/s`-pel luma `(F,G)` / chroma `(Fc,Gc)`
+  reference coordinate in `i128` (per the §7.8.5 32-bit-overflow NOTE),
+  reporting degenerate (zero-denominator) parameter sets. Wired into
+  static-sprite reconstruction via `static_sprite_luma_perspective` and
+  fed by `decode_sprite_trajectory_static` (up to 4 warping points).
 - **§6.2.5.2 `motion_coding` helper for data-partitioned P-VOPs**
   (`decode_motion_coding`): consumes the `motion_coding("forward",
   type_of_mb)` MV-delta field group (one `motion_vector` body, or four
