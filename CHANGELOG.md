@@ -8,6 +8,26 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **§6.2.5.3 data-partitioned macroblock-layer parsing** (new
+  `data_partition` module): parses the `data_partitioned_i_vop()` and
+  `data_partitioned_p_vop()` rectangular bitstream layouts that the
+  combined (non-partitioned) path never covered. `parse_data_partitioned_i_vop`
+  walks partition 1 (`mcbpc` + `dquant` + intra-DC when `use_intra_dc_vlc`)
+  to the 19-bit §6.3.5 `dc_marker` `110 1011 0000 0000 0001`, then
+  partition 2 (`ac_pred_flag` + `cbpy`) for every macroblock, returning the
+  bit offset of the partition-3 `block()` texture region.
+  `parse_data_partitioned_p_vop` walks partition 1 (`not_coded` + `mcbpc`
+  + §6.3.6 `mcsel` + caller-supplied `motion_coding()` closure) to the
+  17-bit `motion_marker` `1 1111 0000 0000 0001`, then partition 2
+  (`ac_pred_flag` + `cbpy` + `dquant` + intra-DC). New `use_intra_dc_vlc`
+  helper transcribes the Table 6-25 `intra_dc_vlc_thr` → running-Qp
+  threshold derivation. The `MacroblockHeader` primitives
+  (`decode_mcbpc` / `decode_cbpy4` / the B.6/B.7 `mcbpc` tables) are now
+  shared `pub(crate)` and `DerivedMbType::from_raw` maps the raw Table B.1
+  integer. 7 tests covering marker bit-exactness, the Table 6-25
+  derivation, exact `dc_marker` detection, an I-VOP two-intra-MB packet
+  (byte-exact `texture_start_bit`), a missing-marker error, and a P-VOP
+  packet mixing a skipped MB with a coded inter MB.
 - **Unified interlaced B-VOP reconstruction**
   (`BVopInterlacedTexturedDecode::reconstruct`): closes the §7.6.9 /
   §7.7.2.2 → §7.3 reconstruction loop for an interlaced B-VOP macroblock.

@@ -317,6 +317,7 @@ pub mod bvop_mv;
 pub mod bvop_prediction;
 pub mod chroma_mv;
 pub mod chroma_shape;
+pub mod data_partition;
 pub mod extended_padding;
 pub mod field_motion;
 pub mod gmc;
@@ -392,6 +393,11 @@ pub use chroma_shape::{
     decimate_chroma_shape, decimate_chroma_shape_interlaced_field,
     decimate_chroma_shape_progressive, decimate_chroma_shape_sample, split_luma_shape_into_fields,
     stack_interlaced_chroma_shape, CHROMA_FIELD_LINES,
+};
+pub use data_partition::{
+    parse_data_partitioned_i_vop, parse_data_partitioned_p_vop, use_intra_dc_vlc,
+    DataPartitionError, DataPartitionedIVop, DataPartitionedMb, DataPartitionedPVop,
+    DataPartitionedTexHeader, DC_MARKER, DC_MARKER_BITS, MOTION_MARKER, MOTION_MARKER_BITS,
 };
 pub use extended_padding::{
     extended_padding_chroma, extended_padding_luma, extended_padding_macroblock, mid_grey_value,

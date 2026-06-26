@@ -115,6 +115,20 @@ impl DerivedMbType {
     pub fn has_dquant(self) -> bool {
         matches!(self, DerivedMbType::InterQ | DerivedMbType::IntraQ)
     }
+
+    /// Map a raw `0..=4` `derived_mb_type` integer (Table B.1) to the
+    /// typed variant. Returns `None` for the stuffing code (`5`) or any
+    /// out-of-range value.
+    pub fn from_raw(raw: u8) -> Option<Self> {
+        Some(match raw {
+            0 => DerivedMbType::Inter,
+            1 => DerivedMbType::InterQ,
+            2 => DerivedMbType::Inter4V,
+            3 => DerivedMbType::Intra,
+            4 => DerivedMbType::IntraQ,
+            _ => return None,
+        })
+    }
 }
 
 /// `dquant` differential per Table 6-32, expanded to `i8`.
@@ -461,9 +475,17 @@ fn match_vlc_u8<T: Copy>(
     None
 }
 
+/// Table B.6 `mcbpc` codes for an I-VOP, exposed for the §6.2.5.3
+/// data-partitioned I-VOP parser which shares this table.
+pub(crate) const MCBPC_I: &[(u16, u8, u8, u8)] = MCBPC_I_TABLE;
+
+/// Table B.7 `mcbpc` codes for a P-VOP / S(GMC)-VOP, exposed for the
+/// §6.2.5.3 data-partitioned P-VOP parser which shares this table.
+pub(crate) const MCBPC_P: &[(u16, u8, u8, u8)] = MCBPC_P_TABLE;
+
 /// Decode an `mcbpc` codeword and return `(consumed_len,
 /// derived_mb_type, cbpc)`.
-fn decode_mcbpc(
+pub(crate) fn decode_mcbpc(
     br: &mut BitReader<'_>,
     table: &[(u16, u8, u8, u8)],
 ) -> Result<(u8, u8, u8), MacroblockParseError> {
@@ -483,7 +505,7 @@ fn decode_mcbpc(
 
 /// Decode a `cbpy` codeword against Table B.8 (4 non-transparent
 /// blocks) and return `(consumed_len, cbpy_intra, cbpy_inter)`.
-fn decode_cbpy4(br: &mut BitReader<'_>) -> Result<(u8, u8, u8), MacroblockParseError> {
+pub(crate) fn decode_cbpy4(br: &mut BitReader<'_>) -> Result<(u8, u8, u8), MacroblockParseError> {
     let remaining = br.remaining_bits().min(6);
     if remaining == 0 {
         return Err(MacroblockParseError::Truncated);
