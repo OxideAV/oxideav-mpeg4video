@@ -36,9 +36,14 @@ use crate::bitreader::BitReader;
 /// Maximum warping points a GMC stream may carry. The perspective
 /// (4-point) transform is disallowed under `sprite_enable == "GMC"`
 /// (§6.3.3), so the GMC trajectory holds at most 3 points. Static
-/// sprites can use 4, but the static path is not yet wired; the
-/// trajectory container sizes for the GMC maximum.
+/// sprites can use 4 (the §7.8.5 perspective transform); see
+/// [`decode_sprite_trajectory_static`].
 pub const MAX_GMC_WARPING_POINTS: usize = 3;
+
+/// Maximum warping points a static-sprite stream may carry: the §7.8.5
+/// perspective transform uses 4 (`no_of_sprite_warping_points == 4`,
+/// Table 6-88).
+pub const MAX_STATIC_WARPING_POINTS: usize = 4;
 
 /// Errors raised while decoding a `sprite_trajectory()`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,6 +195,34 @@ pub fn decode_sprite_trajectory(
         traj.points[i] = [du, dv];
     }
     Ok(traj)
+}
+
+/// Decode a §6.2.5 `sprite_trajectory()` body for a **static** sprite,
+/// which may carry up to [`MAX_STATIC_WARPING_POINTS`] (4) points — the
+/// §7.8.5 perspective transform case the GMC-capped
+/// [`decode_sprite_trajectory`] rejects.
+///
+/// Returns the raw `[du[i], dv[i]]` pairs (unused tail entries are `0`)
+/// plus the active `count`. The 4-point array feeds
+/// [`crate::perspective_warp::PerspectiveWarp::decode`]; counts 0..=3 feed
+/// [`crate::warp::WarpGeometry::decode`] after taking the leading three
+/// pairs.
+pub fn decode_sprite_trajectory_static(
+    br: &mut BitReader<'_>,
+    no_of_sprite_warping_points: u8,
+) -> Result<(u8, [[i32; 2]; MAX_STATIC_WARPING_POINTS]), SpriteTrajectoryError> {
+    if no_of_sprite_warping_points as usize > MAX_STATIC_WARPING_POINTS {
+        return Err(SpriteTrajectoryError::TooManyPoints(
+            no_of_sprite_warping_points,
+        ));
+    }
+    let mut points = [[0i32; 2]; MAX_STATIC_WARPING_POINTS];
+    for p in points.iter_mut().take(no_of_sprite_warping_points as usize) {
+        let du = decode_warping_mv_code(br)?;
+        let dv = decode_warping_mv_code(br)?;
+        *p = [du, dv];
+    }
+    Ok((no_of_sprite_warping_points, points))
 }
 
 #[cfg(test)]
@@ -361,5 +394,47 @@ mod tests {
             decode_sprite_trajectory(&mut br, 4).unwrap_err(),
             SpriteTrajectoryError::TooManyPoints(4)
         );
+    }
+
+    #[test]
+    fn static_trajectory_four_points() {
+        // 4 warping points (perspective). du/dv pairs:
+        // (+1,-1),(+3,-2),(-1,-3),(+2,+2).
+        let mut w = BitWriter::new();
+        w.write_warping(1, 1); // du0 = +1
+        w.write_warping(1, 0); // dv0 = -1
+        w.write_warping(2, 0b11); // du1 = +3
+        w.write_warping(2, 0b01); // dv1 = -2
+        w.write_warping(1, 0); // du2 = -1
+        w.write_warping(2, 0b00); // dv2 = -3
+        w.write_warping(2, 0b10); // du3 = +2
+        w.write_warping(2, 0b10); // dv3 = +2
+        let buf = w.finish();
+        let mut br = BitReader::new(&buf);
+        let (count, points) = decode_sprite_trajectory_static(&mut br, 4).unwrap();
+        assert_eq!(count, 4);
+        assert_eq!(points[0], [1, -1]);
+        assert_eq!(points[1], [3, -2]);
+        assert_eq!(points[2], [-1, -3]);
+        assert_eq!(points[3], [2, 2]);
+    }
+
+    #[test]
+    fn static_trajectory_rejects_five_points() {
+        let buf = [0u8; 8];
+        let mut br = BitReader::new(&buf);
+        assert_eq!(
+            decode_sprite_trajectory_static(&mut br, 5).unwrap_err(),
+            SpriteTrajectoryError::TooManyPoints(5)
+        );
+    }
+
+    #[test]
+    fn static_trajectory_zero_points_consumes_nothing() {
+        let buf = [0xFFu8; 2];
+        let mut br = BitReader::new(&buf);
+        let (count, points) = decode_sprite_trajectory_static(&mut br, 0).unwrap();
+        assert_eq!(count, 0);
+        assert_eq!(points, [[0, 0]; MAX_STATIC_WARPING_POINTS]);
     }
 }

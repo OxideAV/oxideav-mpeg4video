@@ -257,9 +257,34 @@ pub fn static_sprite_luma_macroblock(
     out
 }
 
+/// Warp the static-sprite luminance memory into the visible VOP using the
+/// §7.8.5 **four-point perspective** transform
+/// ([`crate::perspective_warp::PerspectiveWarp`]) instead of the affine
+/// [`WarpGeometry`]. Mirrors [`static_sprite_luma`]: each output pixel is
+/// the §7.8.6 static blend of the perspective warp coordinate. A pixel
+/// whose perspective denominator vanishes (disallowed for opaque/boundary
+/// pixels, §7.8.5) is surfaced as an error.
+pub fn static_sprite_luma_perspective(
+    warp: &crate::perspective_warp::PerspectiveWarp,
+    sprite: &SpriteMemory<'_>,
+    vop_width: usize,
+    vop_height: usize,
+    params: &StaticSpriteParams,
+) -> Result<Vec<u8>, crate::perspective_warp::PerspectiveWarpError> {
+    let mut out = vec![0u8; vop_width * vop_height];
+    for j in 0..vop_height {
+        for i in 0..vop_width {
+            let [cap_f, cap_g] = warp.luma_fg(i as i64, j as i64)?;
+            out[j * vop_width + i] = reconstruct_static_sample(sprite, cap_f, cap_g, params);
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::perspective_warp::PerspectiveWarp;
     use crate::sprite::SpriteTrajectory;
 
     fn flat_sprite(w: usize, h: usize, v: u8) -> Vec<u8> {
@@ -392,6 +417,32 @@ mod tests {
                 assert_eq!(mb[y * MB_LUMA_SIDE + x], plane[pi], "({x},{y})");
             }
         }
+    }
+
+    #[test]
+    fn perspective_zero_trajectory_matches_affine_identity() {
+        // With a zero 4-point trajectory the perspective warp collapses to
+        // the identity (F = s i, G = s j), so the reconstructed plane must
+        // equal the zero-point affine static warp over the same region.
+        let w = 64usize;
+        let h = 64usize;
+        let mut data = vec![0u8; w * h];
+        for r in 0..h {
+            for c in 0..w {
+                data[r * w + c] = ((r * 5 + c * 2) & 0xff) as u8;
+            }
+        }
+        let sprite = SpriteMemory::new(&data, w, h, 0, 0).unwrap();
+        let params = StaticSpriteParams::new(SpriteWarpingAccuracy::HalfPel, 8);
+
+        let traj0 = SpriteTrajectory::stationary();
+        let geo = WarpGeometry::decode(&traj0, 48, 48, SpriteWarpingAccuracy::HalfPel);
+        let affine = static_sprite_luma(&geo, &sprite, 48, 48, &params);
+
+        let pwarp = PerspectiveWarp::decode(&[[0, 0]; 4], 48, 48, SpriteWarpingAccuracy::HalfPel);
+        let persp = static_sprite_luma_perspective(&pwarp, &sprite, 48, 48, &params).unwrap();
+
+        assert_eq!(affine, persp);
     }
 
     #[test]
