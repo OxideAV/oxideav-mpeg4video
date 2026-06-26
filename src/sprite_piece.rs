@@ -160,6 +160,103 @@ impl SpritePieceHeader {
     }
 }
 
+/// §7.8.3.1 sprite-object-buffer macroblock occupancy tracker.
+///
+/// The static-sprite object buffer is a `sprite_width_in_mb ×
+/// sprite_height_in_mb` macroblock grid assembled progressively from
+/// object-pieces. For an object-piece, `sprite_shape_texture()` iterates
+/// the piece's `piece_width × piece_height` macroblocks in raster order
+/// and consults `send_mb()` per macroblock: a macroblock that was already
+/// transmitted by an earlier piece (a *hole* in this piece's bitstream)
+/// returns `1` and carries **no** `macroblock()` body — the decoder
+/// retrieves it from the earlier piece (§7.8.3.1). A fresh macroblock
+/// returns `0` and is decoded from this piece's bitstream.
+///
+/// This tracker maintains the per-macroblock "already-sent" bitmap so a
+/// caller walking a piece can answer `send_mb()` and mark macroblocks as
+/// they are transmitted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpriteObjectBuffer {
+    width_mb: usize,
+    height_mb: usize,
+    /// `sent[y * width_mb + x] == true` once MB `(x, y)` of the sprite
+    /// object grid has been transmitted by some piece.
+    sent: Vec<bool>,
+}
+
+impl SpriteObjectBuffer {
+    /// Create an empty object buffer of `width_mb × height_mb`
+    /// macroblocks (all macroblocks un-sent). Returns `None` for a
+    /// zero-area grid.
+    pub fn new(width_mb: usize, height_mb: usize) -> Option<Self> {
+        if width_mb == 0 || height_mb == 0 {
+            return None;
+        }
+        Some(SpriteObjectBuffer {
+            width_mb,
+            height_mb,
+            sent: vec![false; width_mb * height_mb],
+        })
+    }
+
+    /// `send_mb()` (§11475): `true` if the sprite-object macroblock at
+    /// grid position `(x, y)` was already transmitted by an earlier
+    /// piece. Out-of-grid coordinates are treated as already-sent (they
+    /// are never decoded from a piece).
+    #[inline]
+    pub fn send_mb(&self, x: usize, y: usize) -> bool {
+        if x >= self.width_mb || y >= self.height_mb {
+            return true;
+        }
+        self.sent[y * self.width_mb + x]
+    }
+
+    /// Mark the sprite-object macroblock at grid `(x, y)` as transmitted.
+    /// Out-of-grid coordinates are ignored.
+    #[inline]
+    pub fn mark_sent(&mut self, x: usize, y: usize) {
+        if x < self.width_mb && y < self.height_mb {
+            self.sent[y * self.width_mb + x] = true;
+        }
+    }
+
+    /// Walk one object-piece's `piece_width × piece_height` macroblock
+    /// region (top-left at `(piece_xoffset, piece_yoffset)` in
+    /// sprite-object grid coordinates) in raster order, returning the
+    /// grid positions of the macroblocks that are *new* (`send_mb()` is
+    /// `0`) — the ones that carry a `macroblock()` body in this piece's
+    /// bitstream — and marking them as sent.
+    ///
+    /// Macroblocks that are holes (`send_mb()` is `1`, already sent or
+    /// out of grid) are skipped, mirroring the §7.8.3.1
+    /// `if (!send_mb()) macroblock()` guard.
+    pub fn object_piece_new_macroblocks(
+        &mut self,
+        header: &SpritePieceHeader,
+    ) -> Vec<(usize, usize)> {
+        let mut new_mbs = Vec::new();
+        let x0 = header.piece_xoffset as usize;
+        let y0 = header.piece_yoffset as usize;
+        for dy in 0..header.piece_height as usize {
+            for dx in 0..header.piece_width as usize {
+                let x = x0 + dx;
+                let y = y0 + dy;
+                if !self.send_mb(x, y) {
+                    self.mark_sent(x, y);
+                    new_mbs.push((x, y));
+                }
+            }
+        }
+        new_mbs
+    }
+
+    /// Whether every macroblock of the sprite-object grid has been
+    /// transmitted (the object is fully assembled).
+    pub fn is_complete(&self) -> bool {
+        self.sent.iter().all(|&s| s)
+    }
+}
+
 /// Parse the §6.2.5.4 `decode_sprite_piece()` header.
 ///
 /// Field order (spec lines 4947..=4954): `piece_quant` (5), `piece_width`
@@ -796,6 +893,78 @@ mod tests {
         assert!(block.brightness_change.is_none());
         assert!(block.piece_loop.is_empty());
         assert_eq!(br.bit_position(), 0, "no bits consumed");
+    }
+
+    #[test]
+    fn object_buffer_first_piece_all_new() {
+        // A fresh 4×4 object buffer: a 2×2 piece at (0,0) is all-new.
+        let mut buf = SpriteObjectBuffer::new(4, 4).unwrap();
+        let hdr = SpritePieceHeader {
+            piece_quant: 5,
+            piece_width: 2,
+            piece_height: 2,
+            piece_xoffset: 0,
+            piece_yoffset: 0,
+        };
+        let new = buf.object_piece_new_macroblocks(&hdr);
+        assert_eq!(new, vec![(0, 0), (1, 0), (0, 1), (1, 1)]);
+        assert!(buf.send_mb(0, 0));
+        assert!(!buf.send_mb(2, 0));
+        assert!(!buf.is_complete());
+    }
+
+    #[test]
+    fn object_buffer_overlapping_piece_has_holes() {
+        // First piece fills (0,0)..(1,1). A second 3×3 piece at (0,0)
+        // overlaps it: the overlapping MBs are holes (already sent), only
+        // the new ones carry a body.
+        let mut buf = SpriteObjectBuffer::new(4, 4).unwrap();
+        let p1 = SpritePieceHeader {
+            piece_quant: 5,
+            piece_width: 2,
+            piece_height: 2,
+            piece_xoffset: 0,
+            piece_yoffset: 0,
+        };
+        buf.object_piece_new_macroblocks(&p1);
+        let p2 = SpritePieceHeader {
+            piece_quant: 5,
+            piece_width: 3,
+            piece_height: 3,
+            piece_xoffset: 0,
+            piece_yoffset: 0,
+        };
+        let new = buf.object_piece_new_macroblocks(&p2);
+        // (0,0),(1,0),(0,1),(1,1) are holes; the L-shaped frontier is new.
+        assert_eq!(new, vec![(2, 0), (2, 1), (0, 2), (1, 2), (2, 2)]);
+    }
+
+    #[test]
+    fn object_buffer_completes_when_grid_filled() {
+        let mut buf = SpriteObjectBuffer::new(2, 2).unwrap();
+        let hdr = SpritePieceHeader {
+            piece_quant: 1,
+            piece_width: 2,
+            piece_height: 2,
+            piece_xoffset: 0,
+            piece_yoffset: 0,
+        };
+        buf.object_piece_new_macroblocks(&hdr);
+        assert!(buf.is_complete());
+    }
+
+    #[test]
+    fn object_buffer_out_of_grid_is_sent() {
+        let buf = SpriteObjectBuffer::new(2, 2).unwrap();
+        // A coordinate beyond the grid is always "sent" (never decoded).
+        assert!(buf.send_mb(5, 0));
+        assert!(buf.send_mb(0, 9));
+    }
+
+    #[test]
+    fn object_buffer_rejects_zero_area() {
+        assert!(SpriteObjectBuffer::new(0, 4).is_none());
+        assert!(SpriteObjectBuffer::new(4, 0).is_none());
     }
 
     #[test]
