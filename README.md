@@ -122,13 +122,36 @@ encoder.
   `vop_rounding_type` control and §7.6.4 edge clamping.
 - **Half-sample / quarter-sample** motion compensation, OBMC, and the
   padding stages (sample / vertical / extended / interlaced).
-- **RVLC error recovery**: the §E.1.4.4.2.1 two-way strategy selection —
-  the Strategy 1–4 arbitration (`RvlcArbitration::select`) that picks
-  how many macroblocks to keep from the forward decode at the head and
-  from the backward decode at the tail, from the `L1+L2 >= L` /
-  `N1+N2 >= N` predicates, the `f_mb` / `b_mb` step-inverse counters, and
-  the threshold `T = 90` — plus the §E.1.4.4.2.2 intra-MB concealment
-  pass (`displayed_mbs`).
+- **RVLC error recovery — now driven end-to-end**: the §E.1.4.4.2.1
+  two-way strategy selection — the Strategy 1–4 arbitration
+  (`RvlcArbitration::select`) that picks how many macroblocks to keep
+  from the forward decode at the head and from the backward decode at
+  the tail, from the `L1+L2 >= L` / `N1+N2 >= N` predicates, the `f_mb` /
+  `b_mb` step-inverse counters, and the threshold `T = 90` — plus the
+  §E.1.4.4.2.2 intra-MB concealment pass (`displayed_mbs`). These were
+  composable pieces; [`recover_video_packet_dct`] now assembles them
+  into the actual recovery walk: it forward-decodes a video packet's
+  DCT-coefficient region macroblock-by-macroblock (per a
+  [`MbBlockLayout`] giving each MB's coded blocks + Tcoef tables),
+  tracking per-MB cumulative bit costs `L1` / `N1`; on a §E.1.4.4.1
+  forward error it backward-decodes from the packet end (segmenting
+  EVENTs into blocks on the `LAST` flag via a non-consuming peek over a
+  `Clone`d `BackwardBitReader`), gathers `L2` / `N2`, runs the
+  arbitration, and returns a `RvlcRecovery::Recovered`.
+  [`RvlcRecovery::stitch`] then collapses the recovery into the final
+  per-macroblock decode set — applying the keep decision (errored middle
+  discarded) and the §E.1.4.4.2.2 INTRA concealment.
+- **§6.2.5.3 data partitioning**: [`parse_data_partitioned_i_vop`] /
+  [`parse_data_partitioned_p_vop`] walk the rectangular data-partitioned
+  I-/P-VOP layouts — partition 1 (`mcbpc` + `dquant` + intra-DC, or
+  `not_coded` + `mcbpc` + `mcsel` + `motion_coding`) to the §6.3.5
+  19-bit `dc_marker` / 17-bit `motion_marker`, then partition 2
+  (`ac_pred_flag` + `cbpy` [+ `dquant` + intra-DC for P]) — and return
+  the bit offset of the partition-3 `block()` texture region.
+  [`use_intra_dc_vlc`] transcribes the Table 6-25 derivation; the
+  [`mb_block_layout`] bridge turns a parsed MB into the [`MbBlockLayout`]
+  the RVLC driver consumes, closing the data-partitioned bitstream →
+  texture-decode loop.
 
 ## Not yet supported
 
@@ -218,13 +241,15 @@ encoder.
   caller supplying each macroblock's co-located future/anchor state from
   the reference-frame chain and blitting the per-MB reconstruction.
 - Encoder.
-- The end-to-end wiring of the §E.1.4.4 two-way RVLC error recovery: the
-  forward / backward Tcoef decodes (§E.1.4.4.1) and the §E.1.4.4.2.1
-  Strategy 1–4 arbitration + §E.1.4.4.2.2 intra-MB concealment are all
-  implemented as composable pieces, but the video-packet driver that
-  detects the forward-decode error, runs both directions, gathers the
-  `L/N/L1/L2/N1/N2` inputs, and applies the kept-MB decision to the
-  reconstructed frame is not yet assembled.
+- Blitting the §E.1.4.4 RVLC recovery into a reconstructed *frame*. The
+  driver is now assembled — [`recover_video_packet_dct`] detects the
+  forward-decode error, runs both directions, gathers the
+  `L/N/L1/L2/N1/N2` inputs, and [`RvlcRecovery::stitch`] applies the
+  kept-MB decision + §E.1.4.4.2.2 INTRA concealment to produce the final
+  per-macroblock EVENT set. What remains is the caller feeding the kept
+  EVENT runs through the §7.4 reconstruction and writing the resulting
+  pixels into the output VOP (the same per-MB residual blit the
+  non-partitioned path already uses).
 - The final routing of the §7.3.5 / Table 7-2 per-block transform
   selection from a *live decoded shape* inside the macroblock
   reconstruction loop. The decision rule itself is now implemented
