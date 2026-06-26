@@ -256,6 +256,46 @@ fn decode_intra_dc_six(br: &mut BitReader<'_>) -> Result<[i32; 6], DataPartition
     Ok(dc)
 }
 
+/// Derive the §E.1.4.4 texture-partition [`MbBlockLayout`] for one
+/// data-partitioned macroblock from its parsed partition-1 record and
+/// partition-2 texture header.
+///
+/// The texture partition (partition 3) of a data-partitioned VOP carries
+/// the `block()` AC-coefficient runs for every coded block, in §6.3.5
+/// block order (luma 0..3 then chroma 4..5). A block is *coded* — i.e.
+/// contributes a Tcoef EVENT run to the texture partition — when its
+/// §6.3.7 pattern bit is set: the `cbpy` luminance bits (block 0..3) and
+/// the `cbpc` chrominance bits from `mcbpc` (block 4..5). Each coded
+/// block uses Table B.16 (intra) or Table B.17 (inter) depending on
+/// whether the macroblock is intra (`derived_mb_type >= 3`).
+///
+/// A `not_coded` P-VOP macroblock contributes no texture blocks (empty
+/// layout). Note that in data-partitioned mode the intra DC is carried in
+/// partition 1 / 2 (not the texture partition), so the texture-partition
+/// EVENT run of an intra block is its AC coefficients only — but the
+/// Tcoef table selection (intra vs. inter) is unchanged.
+pub fn mb_block_layout(
+    mb: &DataPartitionedMb,
+    tex: &DataPartitionedTexHeader,
+) -> crate::rvlc_recovery::MbBlockLayout {
+    use crate::rvlc_recovery::MbBlockLayout;
+    use crate::texture::TcoefTable;
+
+    if mb.not_coded {
+        return MbBlockLayout::empty();
+    }
+    let is_intra = mb.mb_type.map(|t| t.is_intra()).unwrap_or(false);
+    let table = if is_intra {
+        TcoefTable::Intra
+    } else {
+        TcoefTable::Inter
+    };
+    // §6.3.7 pattern: cbpy → luma blocks 0..3, cbpc → chroma blocks 4..5.
+    let coded = crate::block::pattern_code(tex.cbpy, mb.cbpc);
+    let blocks: Vec<TcoefTable> = coded.iter().filter(|&&c| c).map(|_| table).collect();
+    MbBlockLayout { blocks }
+}
+
 /// Parse the §6.2.5.3 `data_partitioned_i_vop()` body of one video
 /// packet (rectangular shape).
 ///
@@ -612,6 +652,120 @@ mod tests {
             err,
             DataPartitionError::MarkerNotFound { decoded: 2 }
         ));
+    }
+
+    #[test]
+    fn i_vop_data_partitioned_to_rvlc_recovery_end_to_end() {
+        use crate::rvlc_recovery::{recover_video_packet_dct, RvlcRecovery};
+        // Build a data-partitioned, reversible-VLC I-VOP packet with two
+        // intra MBs, each with exactly one coded luma block (block 0):
+        //   cbpy intra 1000 → block 0 coded only → Table B.8 code "0001 0"
+        //   (5 bits, intra 1000 / inter 0111).
+        // Partition 1: two mcbpc "1" (intra, cbpc 00), no dquant, no
+        //   intra-DC (thr 7 → AC VLC for the VOP → use_intra_dc_vlc false).
+        // dc_marker.
+        // Partition 2: two (ac_pred=0, cbpy "00010") pairs.
+        // Texture partition (RVLC): each block one EVENT
+        //   (LAST=1,RUN=0,LEVEL=1) intra reversible = "1011" + sign "0".
+        let stream = bits(concat!(
+            // partition 1
+            "1",
+            "1",
+            // dc_marker
+            "110 1011 0000 0000 0001",
+            // partition 2: (ac_pred 0, cbpy 00010) x2
+            "0",
+            "00010",
+            "0",
+            "00010",
+            // texture partition: two RVLC EVENTs "1011 0" each
+            "1011 0",
+            "1011 0",
+        ));
+        let mut br = BitReader::new(&stream);
+        let parsed = parse_data_partitioned_i_vop(&mut br, 4, 7, 31).unwrap();
+        assert_eq!(parsed.mbs.len(), 2);
+        // Each MB has cbpy 1000 (block 0 coded).
+        for th in &parsed.tex_headers {
+            assert_eq!(th.cbpy, 0b1000);
+        }
+        // Build layouts and run the RVLC recovery over the texture region.
+        let layouts: Vec<_> = parsed
+            .mbs
+            .iter()
+            .zip(&parsed.tex_headers)
+            .map(|(mb, tex)| mb_block_layout(mb, tex))
+            .collect();
+        for l in &layouts {
+            assert_eq!(l.blocks.len(), 1); // one coded block per MB
+        }
+        let end_bit = stream.len() * 8;
+        let rec =
+            recover_video_packet_dct(&stream, parsed.texture_start_bit, end_bit, &layouts).unwrap();
+        match rec {
+            RvlcRecovery::Clean { mbs } => {
+                assert_eq!(mbs.len(), 2);
+                for mb in &mbs {
+                    assert_eq!(mb.blocks.len(), 1);
+                    assert_eq!(mb.blocks[0].len(), 1);
+                    let ev = mb.blocks[0][0];
+                    assert_eq!((ev.last, ev.run, ev.level), (true, 0, 1));
+                }
+            }
+            RvlcRecovery::Recovered { .. } => panic!("clean stream must not recover"),
+        }
+    }
+
+    #[test]
+    fn mb_block_layout_intra_and_inter() {
+        use crate::texture::TcoefTable;
+        // Intra MB, cbpy = 1010 (blocks 0 + 2 coded), cbpc = 01 (block 5).
+        let mb = DataPartitionedMb {
+            not_coded: false,
+            mb_type: Some(DerivedMbType::Intra),
+            cbpc: 0b01,
+            dquant_delta: None,
+            mcsel: None,
+            intra_dc: None,
+        };
+        let tex = DataPartitionedTexHeader {
+            ac_pred_flag: false,
+            cbpy: 0b1010,
+            dquant_delta: None,
+            intra_dc: None,
+        };
+        let layout = mb_block_layout(&mb, &tex);
+        // blocks 0, 2 (luma) + 5 (Cr) → 3 coded blocks, all intra table.
+        assert_eq!(layout.blocks, vec![TcoefTable::Intra; 3]);
+
+        // Inter MB, cbpy = 1111 (all four luma), cbpc = 11 (both chroma).
+        let mb_i = DataPartitionedMb {
+            not_coded: false,
+            mb_type: Some(DerivedMbType::Inter),
+            cbpc: 0b11,
+            dquant_delta: None,
+            mcsel: None,
+            intra_dc: None,
+        };
+        let tex_i = DataPartitionedTexHeader {
+            ac_pred_flag: false,
+            cbpy: 0b1111,
+            dquant_delta: None,
+            intra_dc: None,
+        };
+        let layout_i = mb_block_layout(&mb_i, &tex_i);
+        assert_eq!(layout_i.blocks, vec![TcoefTable::Inter; 6]);
+
+        // not_coded → empty layout.
+        let skipped = DataPartitionedMb {
+            not_coded: true,
+            mb_type: None,
+            cbpc: 0,
+            dquant_delta: None,
+            mcsel: None,
+            intra_dc: None,
+        };
+        assert!(mb_block_layout(&skipped, &tex_i).blocks.is_empty());
     }
 
     #[test]

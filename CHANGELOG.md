@@ -8,6 +8,19 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Data-partition → RVLC-recovery bridge** (`mb_block_layout`): derives
+  the §E.1.4.4 texture-partition `MbBlockLayout` for one data-partitioned
+  macroblock from its parsed partition-1 record + partition-2 texture
+  header, mapping the §6.3.7 `cbpy` / `cbpc` coded-block pattern to the
+  per-block Tcoef table (Table B.16 intra / B.17 inter) so the texture
+  partition of a `data_partitioned` + `reversible_vlc` VOP can be fed
+  straight into `recover_video_packet_dct`. An end-to-end test builds a
+  two-intra-MB data-partitioned I-VOP packet (partition-1 mcbpc →
+  dc_marker → partition-2 ac_pred/cbpy → reversible-VLC texture
+  partition), parses it with `parse_data_partitioned_i_vop`, derives the
+  layouts, and runs the RVLC recovery to recover each MB's EVENT —
+  closing the data-partitioned bitstream → texture-decode loop. 2 tests
+  (layout derivation across intra/inter/not-coded + the full pipeline).
 - **§E.1.4.4 two-way RVLC error-recovery driver** (new `rvlc_recovery`
   module): assembles the previously-composable RVLC pieces — the forward
   EVENT decoder, the backward EVENT decoder, and the §E.1.4.4.2.1

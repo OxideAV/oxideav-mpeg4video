@@ -396,7 +396,7 @@ pub use chroma_shape::{
     stack_interlaced_chroma_shape, CHROMA_FIELD_LINES,
 };
 pub use data_partition::{
-    parse_data_partitioned_i_vop, parse_data_partitioned_p_vop, use_intra_dc_vlc,
+    mb_block_layout, parse_data_partitioned_i_vop, parse_data_partitioned_p_vop, use_intra_dc_vlc,
     DataPartitionError, DataPartitionedIVop, DataPartitionedMb, DataPartitionedPVop,
     DataPartitionedTexHeader, DC_MARKER, DC_MARKER_BITS, MOTION_MARKER, MOTION_MARKER_BITS,
 };
