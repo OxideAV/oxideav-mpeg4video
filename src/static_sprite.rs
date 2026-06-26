@@ -281,6 +281,50 @@ pub fn static_sprite_luma_perspective(
     Ok(out)
 }
 
+/// Warp one chrominance component of the static-sprite memory into the
+/// visible VOP using the §7.8.5 **four-point perspective** transform.
+/// Produces a `(vop_width / 2) × (vop_height / 2)` plane (4:2:0) from the
+/// perspective chroma warp `(Fc, Gc)`.
+pub fn static_sprite_chroma_perspective(
+    warp: &crate::perspective_warp::PerspectiveWarp,
+    sprite: &SpriteMemory<'_>,
+    vop_width: usize,
+    vop_height: usize,
+    params: &StaticSpriteParams,
+) -> Result<Vec<u8>, crate::perspective_warp::PerspectiveWarpError> {
+    let cw = vop_width / 2;
+    let ch = vop_height / 2;
+    let mut out = vec![0u8; cw * ch];
+    for jc in 0..ch {
+        for ic in 0..cw {
+            let [cap_fc, cap_gc] = warp.chroma_fg(ic as i64, jc as i64)?;
+            out[jc * cw + ic] = reconstruct_static_sample(sprite, cap_fc, cap_gc, params);
+        }
+    }
+    Ok(out)
+}
+
+/// Warp one 16×16 luminance macroblock of the static sprite via the
+/// §7.8.5 four-point perspective transform, whose top-left visible-VOP
+/// pixel is `(mb_x, mb_y)`. Mirrors [`static_sprite_luma_macroblock`]
+/// but uses [`crate::perspective_warp::PerspectiveWarp`].
+pub fn static_sprite_luma_macroblock_perspective(
+    warp: &crate::perspective_warp::PerspectiveWarp,
+    sprite: &SpriteMemory<'_>,
+    mb_x: i64,
+    mb_y: i64,
+    params: &StaticSpriteParams,
+) -> Result<[u8; MB_LUMA_SIDE * MB_LUMA_SIDE], crate::perspective_warp::PerspectiveWarpError> {
+    let mut out = [0u8; MB_LUMA_SIDE * MB_LUMA_SIDE];
+    for y in 0..MB_LUMA_SIDE {
+        for x in 0..MB_LUMA_SIDE {
+            let [cap_f, cap_g] = warp.luma_fg(mb_x + x as i64, mb_y + y as i64)?;
+            out[y * MB_LUMA_SIDE + x] = reconstruct_static_sample(sprite, cap_f, cap_g, params);
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -443,6 +487,56 @@ mod tests {
         let persp = static_sprite_luma_perspective(&pwarp, &sprite, 48, 48, &params).unwrap();
 
         assert_eq!(affine, persp);
+    }
+
+    #[test]
+    fn perspective_chroma_zero_trajectory_matches_affine() {
+        let w = 64usize;
+        let h = 64usize;
+        let mut data = vec![0u8; w * h];
+        for r in 0..h {
+            for c in 0..w {
+                data[r * w + c] = ((r * 3 + c * 7) & 0xff) as u8;
+            }
+        }
+        let sprite = SpriteMemory::new(&data, w, h, 0, 0).unwrap();
+        let params = StaticSpriteParams::new(SpriteWarpingAccuracy::QuarterPel, 8);
+
+        let traj0 = SpriteTrajectory::stationary();
+        let geo = WarpGeometry::decode(&traj0, 32, 32, SpriteWarpingAccuracy::QuarterPel);
+        let affine = static_sprite_chroma(&geo, &sprite, 32, 32, &params);
+
+        let pwarp =
+            PerspectiveWarp::decode(&[[0, 0]; 4], 32, 32, SpriteWarpingAccuracy::QuarterPel);
+        let persp = static_sprite_chroma_perspective(&pwarp, &sprite, 32, 32, &params).unwrap();
+
+        assert_eq!(affine, persp);
+    }
+
+    #[test]
+    fn perspective_macroblock_matches_full_plane_subregion() {
+        let w = 96usize;
+        let h = 96usize;
+        let mut data = vec![0u8; w * h];
+        for r in 0..h {
+            for c in 0..w {
+                data[r * w + c] = ((r * 11 + c * 5) & 0xff) as u8;
+            }
+        }
+        let sprite = SpriteMemory::new(&data, w, h, 0, 0).unwrap();
+        let params = StaticSpriteParams::new(SpriteWarpingAccuracy::HalfPel, 8);
+        // A mild non-degenerate perspective trajectory.
+        let traj = [[2, 0], [0, 2], [-2, 1], [1, -1]];
+        let pwarp = PerspectiveWarp::decode(&traj, 64, 64, SpriteWarpingAccuracy::HalfPel);
+        let plane = static_sprite_luma_perspective(&pwarp, &sprite, 64, 64, &params).unwrap();
+        let mb =
+            static_sprite_luma_macroblock_perspective(&pwarp, &sprite, 16, 16, &params).unwrap();
+        for y in 0..MB_LUMA_SIDE {
+            for x in 0..MB_LUMA_SIDE {
+                let pi = (16 + y) * 64 + (16 + x);
+                assert_eq!(mb[y * MB_LUMA_SIDE + x], plane[pi], "({x},{y})");
+            }
+        }
     }
 
     #[test]
