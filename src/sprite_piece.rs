@@ -264,6 +264,85 @@ where
     Err(SpritePieceError::Truncated)
 }
 
+/// The decoded §6.2.5 static-sprite S-VOP sprite block: the
+/// `sprite_trajectory()` (`du[i]`/`dv[i]` pairs, `None` when
+/// `no_of_sprite_warping_points == 0`), the optional
+/// `brightness_change_factor()`, and the low-latency piece loop entries
+/// (empty when `low_latency_sprite_enable == 0`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaticSpriteVopBlock {
+    /// `no_of_sprite_warping_points` active points.
+    pub warping_points: u8,
+    /// `[du[i], dv[i]]` warping-vector pairs (only the first
+    /// `warping_points` entries are valid).
+    pub trajectory: [[i32; 2]; 4],
+    /// `brightness_change_factor()` value (§7.8.6), `None` when
+    /// `sprite_brightness_change == 0`.
+    pub brightness_change: Option<i32>,
+    /// The §6.2.5 low-latency piece-loop entries, in order. Empty when
+    /// `low_latency_sprite_enable == 0` (no loop is present).
+    pub piece_loop: Vec<SpritePieceLoopEntry>,
+}
+
+/// Parse the §6.2.5 static-sprite S-VOP sprite block (spec lines
+/// 4328..=4357): `sprite_trajectory()`, optional
+/// `brightness_change_factor()`, and — when `low_latency_sprite_enable`
+/// — the `do { sprite_transmit_mode; … } while` piece loop.
+///
+/// The §6.2.5 `vop()` syntax reaches this block after `intra_dc_vlc_thr`
+/// (and the interlaced fields) for `sprite_enable == "static" &&
+/// vop_coding_type == "S"`, and follows it with `next_start_code();
+/// return()` — i.e. a static S-VOP carries *no* macroblock-layer texture
+/// of its own; all sprite samples arrive through the piece stream. This
+/// parser stops at the end of the piece loop, leaving `br` at the
+/// `next_start_code()` boundary the caller aligns.
+///
+/// `no_of_sprite_warping_points` / `sprite_brightness_change` /
+/// `low_latency_sprite_enable` are VOL-header fields the caller supplies.
+/// `skip_body` advances past each piece's `sprite_shape_texture()` body
+/// (see [`drive_sprite_piece_loop`]).
+pub fn parse_static_sprite_vop_block<F>(
+    br: &mut BitReader<'_>,
+    no_of_sprite_warping_points: u8,
+    sprite_brightness_change: bool,
+    low_latency_sprite_enable: bool,
+    skip_body: F,
+) -> Result<StaticSpriteVopBlock, SpritePieceError>
+where
+    F: FnMut(&mut BitReader<'_>, &SpritePieceHeader) -> Result<(), SpritePieceError>,
+{
+    // sprite_trajectory() — present iff no_of_sprite_warping_points > 0.
+    let (warping_points, trajectory) = if no_of_sprite_warping_points > 0 {
+        crate::sprite::decode_sprite_trajectory_static(br, no_of_sprite_warping_points)
+            .map_err(|_| SpritePieceError::Truncated)?
+    } else {
+        (0, [[0i32; 2]; 4])
+    };
+
+    // brightness_change_factor() — present iff sprite_brightness_change.
+    let brightness_change = if sprite_brightness_change {
+        Some(decode_brightness_change_factor(br)?)
+    } else {
+        None
+    };
+
+    // Low-latency piece loop — present iff low_latency_sprite_enable. The
+    // §10903 note initialises sprite_transmit_mode to "piece" at VOL
+    // start, so the `!= "stop"` guard is satisfied on first entry.
+    let piece_loop = if low_latency_sprite_enable {
+        drive_sprite_piece_loop(br, skip_body)?
+    } else {
+        Vec::new()
+    };
+
+    Ok(StaticSpriteVopBlock {
+        warping_points,
+        trajectory,
+        brightness_change,
+        piece_loop,
+    })
+}
+
 /// Decode a §6.2.5.4 `brightness_change_factor()` codeword (Table B.35).
 ///
 /// The codeword is a VLC `brightness_change_factor_size` (`0`, `10`,
@@ -667,5 +746,73 @@ mod tests {
         .unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[1].mode, SpriteTransmitMode::Stop);
+    }
+
+    /// Emit a `warping_mv_code(dmv)`: unary SSS, FLC, marker.
+    fn write_warping(w: &mut BitWriter, sss: u32, code: u32) {
+        for _ in 0..sss {
+            w.write_bits(1, 1);
+        }
+        w.write_bits(0, 1);
+        if sss != 0 {
+            w.write_bits(code, sss as usize);
+        }
+        w.write_bits(1, 1); // marker
+    }
+
+    #[test]
+    fn static_block_trajectory_brightness_and_loop() {
+        // 2 warping points + brightness + a single piece then stop.
+        let mut w = BitWriter::new();
+        write_warping(&mut w, 1, 1); // du0 = +1
+        write_warping(&mut w, 1, 0); // dv0 = -1
+        write_warping(&mut w, 2, 0b10); // du1 = +2
+        write_warping(&mut w, 2, 0b01); // dv1 = -2
+        w.write_bits(0, 1); // brightness size 1
+        w.write_bits(0b10000, 5); // brightness +1
+        w.write_bits(0b01, 2); // transmit_mode = piece
+        write_piece_header(&mut w, 4, 2, 2, 0, 0);
+        w.write_bits(0b00, 2); // stop
+        let buf = w.finish();
+        let mut br = BitReader::new(&buf);
+        let block = parse_static_sprite_vop_block(&mut br, 2, true, true, |_, _| Ok(())).unwrap();
+        assert_eq!(block.warping_points, 2);
+        assert_eq!(block.trajectory[0], [1, -1]);
+        assert_eq!(block.trajectory[1], [2, -2]);
+        assert_eq!(block.brightness_change, Some(1));
+        assert_eq!(block.piece_loop.len(), 2);
+        assert_eq!(block.piece_loop[0].mode, SpriteTransmitMode::Piece);
+        assert_eq!(block.piece_loop[1].mode, SpriteTransmitMode::Stop);
+    }
+
+    #[test]
+    fn static_block_no_lowlatency_skips_loop() {
+        // 0 points, no brightness, no low-latency ⇒ empty block, no bits
+        // consumed beyond the (absent) trajectory.
+        let buf = [0xFFu8; 2];
+        let mut br = BitReader::new(&buf);
+        let block = parse_static_sprite_vop_block(&mut br, 0, false, false, |_, _| Ok(())).unwrap();
+        assert_eq!(block.warping_points, 0);
+        assert!(block.brightness_change.is_none());
+        assert!(block.piece_loop.is_empty());
+        assert_eq!(br.bit_position(), 0, "no bits consumed");
+    }
+
+    #[test]
+    fn static_block_brightness_only_when_flagged() {
+        // 1 warping point, no brightness flag ⇒ brightness absent, the
+        // bits after the trajectory belong to the loop.
+        let mut w = BitWriter::new();
+        write_warping(&mut w, 1, 1); // du0 = +1
+        write_warping(&mut w, 1, 1); // dv0 = +1
+        w.write_bits(0b00, 2); // transmit_mode = stop (low-latency on)
+        let buf = w.finish();
+        let mut br = BitReader::new(&buf);
+        let block = parse_static_sprite_vop_block(&mut br, 1, false, true, |_, _| Ok(())).unwrap();
+        assert_eq!(block.warping_points, 1);
+        assert_eq!(block.trajectory[0], [1, 1]);
+        assert!(block.brightness_change.is_none());
+        assert_eq!(block.piece_loop.len(), 1);
+        assert_eq!(block.piece_loop[0].mode, SpriteTransmitMode::Stop);
     }
 }
