@@ -320,6 +320,7 @@ pub mod chroma_shape;
 pub mod data_partition;
 pub mod extended_padding;
 pub mod field_motion;
+pub mod frame_decode;
 pub mod framestore;
 pub mod gmc;
 pub mod half_sample;
@@ -411,6 +412,9 @@ pub use extended_padding::{
 pub use field_motion::{
     div2_round, field_motion_compensate_one_reference, field_motion_compensate_one_reference_qpel,
     half_pel_chroma_mv_from_qpel, mc, reconstruct_field_motion_vectors, FieldMotionVectors,
+};
+pub use frame_decode::{
+    assemble_p_vop_frame, decode_i_vop, decode_p_vop, FrameDecodeError, PVopMbContent,
 };
 pub use framestore::{DecodedFrame, FrameStore, FrameStoreError};
 pub use gmc::{

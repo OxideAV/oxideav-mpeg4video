@@ -336,6 +336,20 @@ pub struct InterMacroblock {
     pub cr: [[i32; 8]; 8],
 }
 
+impl InterMacroblock {
+    /// An all-zero residual — the §7.4 result for a macroblock whose
+    /// coded-block pattern is empty (`cbp == 0`). Added to a
+    /// motion-compensated prediction in the §7.3 step-2 sum it is the
+    /// identity, so the reconstruction is a pure motion-compensated copy.
+    pub fn zero() -> Self {
+        Self {
+            luma: [[0i32; 16]; 16],
+            cb: [[0i32; 8]; 8],
+            cr: [[0i32; 8]; 8],
+        }
+    }
+}
+
 /// Derive the six `pattern_code[i]` flags from the macroblock header's
 /// `cbpy` (luminance, blocks 0..=3) and `cbpc` (chrominance, blocks
 /// 4..=5), per §6.3.7 / §6.2.7.

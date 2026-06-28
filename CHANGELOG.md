@@ -20,6 +20,14 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   `b_vop_references` / `b_vop_reference_views` select the bracketing
   forward+backward anchor pair (and its six `ReferenceVop` views) for a
   B-VOP per the line-17446..17467 reference-VOP rules.
+- **P-VOP / I-VOP frame-assembly drivers** (`frame_decode`):
+  `assemble_p_vop_frame` reconstructs a complete P-VOP from per-macroblock
+  content (`PVopMbContent::Inter { motion, residual }` or
+  `PVopMbContent::Intra`) against the §7.5.2.1.2 forward reference plane
+  pulled from the `FrameStore`, blitting each `ReconstructedMacroblock`
+  into a fresh `DecodedFrame`; `decode_p_vop` / `decode_i_vop` assemble
+  and advance the reference-frame chain in one call. `InterMacroblock::zero`
+  constructs the empty-`cbp` residual.
 - **§7.8.3.1 / §7.8.3.2 sprite-object-buffer hole handling**
   (`SpriteObjectBuffer`): tracks the per-macroblock `send_mb()` occupancy
   of the sprite-object grid (`object_piece_new_macroblocks` returns the
