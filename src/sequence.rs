@@ -26,7 +26,8 @@
 //! ## Usage
 //!
 //! Feed coded VOPs in bitstream order via [`SequenceDecoder::push_i_vop`]
-//! / [`Self::push_p_vop`] / [`Self::push_s_gmc_vop`] / [`Self::push_b_vop`].
+//! / [`SequenceDecoder::push_p_vop`] / [`SequenceDecoder::push_s_gmc_vop`]
+//! / [`SequenceDecoder::push_b_vop`].
 //! Each call returns the **display-order** frames that became ready as a
 //! result (zero, one, or — at a flush — more). After the last VOP, call
 //! [`SequenceDecoder::flush`] to release the final held anchor.

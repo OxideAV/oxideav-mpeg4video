@@ -3,7 +3,8 @@
 //! blit the results into a fresh [`DecodedFrame`].
 //!
 //! The motion-vector + residual decode for each macroblock already lands
-//! at the per-MB level ([`MvDriver`], [`BVopMvDriver`], the §7.4 texture
+//! at the per-MB level ([`MvDriver`](crate::pvop_mv::MvDriver),
+//! [`BVopMvDriver`](crate::bvop_mv::BVopMvDriver), the §7.4 texture
 //! routines). What this module adds is the *frame-level* loop that:
 //!
 //! 1. pulls the correct reference plane(s) out of the [`FrameStore`] per
@@ -77,9 +78,9 @@ impl From<FrameStoreError> for FrameDecodeError {
 /// by the frame loop, not the caller.
 #[derive(Debug, Clone)]
 pub enum PVopMbContent {
-    /// An inter macroblock: the [`PvopMbMotion`] the [`MvDriver`] decoded
-    /// plus the §7.4 inter residual. Reconstructed against the forward
-    /// reference plane.
+    /// An inter macroblock: the [`PvopMbMotion`] the
+    /// [`MvDriver`](crate::pvop_mv::MvDriver) decoded plus the §7.4 inter
+    /// residual. Reconstructed against the forward reference plane.
     Inter {
         /// Decoded motion (1-MV / 4-MV / skipped). `Intra` here is a
         /// caller error — use [`PVopMbContent::Intra`] instead.
@@ -227,8 +228,8 @@ pub fn decode_i_vop<'a>(
 /// `entries` must contain exactly `mb_width * mb_height`
 /// [`BVopMbTexturedDecode`]s in raster order (each carrying its §7.6.8
 /// motion + §7.4 residual). Each is reconstructed via
-/// [`BVopMbDecode::reconstruct`] against the six §7.6.9.5.1 anchor planes
-/// built from the chain.
+/// [`BVopMbDecode::reconstruct`](crate::bvop_mv::BVopMbDecode::reconstruct)
+/// against the six §7.6.9.5.1 anchor planes built from the chain.
 ///
 /// Returns [`FrameDecodeError::MissingReference`] if either anchor is
 /// absent (a B-VOP before two anchors have been decoded).
@@ -315,7 +316,8 @@ pub enum SGmcMbContent {
 /// The single reference is the §7.5.2.1.2 forward (most-recent) anchor —
 /// [`FrameStore::p_vop_reference`] (a P- or S(GMC)-VOP shares this rule).
 /// Each `mcsel == 1` macroblock is built by warping that plane via
-/// `geometry` ([`s_gmc_prediction_macroblock`] GMC branch); each
+/// `geometry` ([`s_gmc_prediction_macroblock`](crate::s_gmc_recon::s_gmc_prediction_macroblock)
+/// GMC branch); each
 /// `mcsel == 0` macroblock is built by the §7.6.2 local-MC path; each
 /// intra macroblock is blitted as-is. The result is **not** pushed into
 /// the chain — use [`FrameStore::push_anchor`] (an S(GMC)-VOP is an

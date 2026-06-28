@@ -16,8 +16,8 @@
 //!   macroblock decode loop [`DecodedFrame::blit_macroblock`]s each
 //!   [`ReconstructedMacroblock`] into place; the finished frame then
 //!   hands out [`ReferenceVop`] plane views via
-//!   [`DecodedFrame::luma_reference`] / [`Self::cb_reference`] /
-//!   [`Self::cr_reference`] for the next VOP's motion compensation.
+//!   [`DecodedFrame::luma_reference`] / [`DecodedFrame::cb_reference`] /
+//!   [`DecodedFrame::cr_reference`] for the next VOP's motion compensation.
 //!
 //! * [`FrameStore`] — holds the forward (past) and backward (future)
 //!   anchor frames and threads the §7.6.1 reference-frame chain: after

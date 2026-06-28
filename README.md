@@ -12,10 +12,16 @@ MP4V) — *not* the pre-standard Microsoft MPEG-4 family, which lives in
 Clean-room rebuild in progress. The decode pipeline is implemented as a
 set of composable, per-stage public modules covering configuration- and
 frame-header parsing, motion-vector reconstruction, residual decode and
-pixel reconstruction for I-, P-, and B-VOPs. It is not yet wired into
-the runtime codec registry — `register` is a no-op placeholder, so the
-codec is consumed today through its direct module APIs. There is no
-encoder.
+pixel reconstruction for I-, P-, B-, and S(GMC)-VOPs. The
+**reference-frame chain is now closed end-to-end**: a [`DecodedFrame`] /
+[`FrameStore`] decoded-picture buffer (§7.6.1) owns each decoded VOP's
+planes, the [`frame_decode`] frame-assembly drivers reconstruct a whole
+I-/P-/B-/S(GMC)-VOP against the correct reference plane(s) and blit it
+into a fresh frame, and the [`sequence::SequenceDecoder`] applies §6.1.3.8
+VOP reordering to emit frames in display order from a coding-order VOP
+stream. It is not yet wired into the runtime codec registry — `register`
+is a no-op placeholder, so the codec is consumed today through its direct
+module APIs (including the new frame-level drivers). There is no encoder.
 
 ## What works today
 
@@ -121,6 +127,20 @@ encoder.
   §7.8.6 sample reconstruction that bilinearly warps a reference VOP
   into a 16×16 luma / 8×8 chroma GMC prediction block with
   `vop_rounding_type` control and §7.6.4 edge clamping.
+- **Frame-level decode pipeline** (§7.6.1 / §6.1.3.8): the
+  [`framestore`] decoded-picture buffer — [`DecodedFrame`] owns one VOP's
+  three 4:2:0 planes, blits each [`ReconstructedMacroblock`] into the
+  macroblock grid, and hands out [`ReferenceVop`] plane views; [`FrameStore`]
+  threads the §7.5.2.1.2 forward (past) + backward (future) anchor chain
+  (`push_anchor` advances on I/P/S-VOPs, B-VOPs never enter the chain),
+  selecting the single P/S reference and the bracketing B-VOP anchor pair.
+  The [`frame_decode`] assemblers reconstruct a complete VOP against those
+  references and blit it: `assemble_p_vop_frame` / `decode_p_vop` /
+  `decode_i_vop` (forward reference), `assemble_b_vop_frame` (bracketing
+  anchors), `assemble_s_gmc_vop_frame` (§7.8.7.1 per-MB warped/local
+  `mcsel` selection). The [`sequence::SequenceDecoder`] applies §6.1.3.8
+  VOP reordering — a one-slot anchor delay that turns a coding-order VOP
+  stream into display order (`1I 4P 2B 3B` → `1I 2B 3B 4P`).
 - **Half-sample / quarter-sample** motion compensation, OBMC, and the
   padding stages (sample / vertical / extended / interlaced).
 - **RVLC error recovery — now driven end-to-end**: the §E.1.4.4.2.1
@@ -175,18 +195,23 @@ encoder.
   returning a `ReconstructedMacroblock` ready to blit (verified by a
   frame-level test that drives a four-macroblock motion bitstream
   through [`MvDriver`] and reassembles a 32×32 luma / 16×16 chroma
-  frame). What remains for a *full* frame decoder is threading the
-  per-macroblock §7.4 residual-texture decode into the same loop (the
-  residual is currently supplied by the caller) and selecting the
-  reference plane per the VOP reference-frame chain. The **B-VOP motion
+  frame). **Reference-plane selection is now resolved**: the §7.6.1
+  [`FrameStore`] hands the forward reference plane to
+  [`assemble_p_vop_frame`], which reconstructs and blits a whole P-VOP;
+  what remains for a *fully bitstream-driven* P-VOP frame decoder is
+  threading the per-macroblock §7.4 residual-texture decode into the same
+  loop (the residual is currently supplied by the caller as
+  [`PVopMbContent`]). The **B-VOP motion
   subsystem is now wired one step further**: [`BVopMvDriver::decode_vop`]
   walks a progressive B-VOP in raster order with the §7.6.8 row-reset
   predictor threading **and** threads the §6.2.6 / §7.4 residual decode
   + `dbquant` running-quantiser accumulation into the same loop,
   returning one [`BVopMbTexturedDecode`] (motion + residual) per
   macroblock; [`BVopMbDecode::reconstruct`] closes the §7.6.9 → §7.3
-  bridge per macroblock. The remaining work for a full B-VOP frame
-  decode is reference-plane selection per the VOP reference-frame chain.
+  bridge per macroblock. **Reference-plane selection is now resolved for
+  progressive B-VOPs too**: [`assemble_b_vop_frame`] pulls the bracketing
+  forward+backward anchors from the [`FrameStore`] and reconstructs +
+  blits a whole progressive B-VOP frame.
   The **interlaced field-prediction B-VOP path is now wired into the
   frame driver** for the three non-direct field modes:
   [`BVopMvDriver::decode_field_macroblock`] decodes a field-predicted
