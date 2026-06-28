@@ -320,6 +320,7 @@ pub mod chroma_shape;
 pub mod data_partition;
 pub mod extended_padding;
 pub mod field_motion;
+pub mod framestore;
 pub mod gmc;
 pub mod half_sample;
 pub mod idct;
@@ -411,6 +412,7 @@ pub use field_motion::{
     div2_round, field_motion_compensate_one_reference, field_motion_compensate_one_reference_qpel,
     half_pel_chroma_mv_from_qpel, mc, reconstruct_field_motion_vectors, FieldMotionVectors,
 };
+pub use framestore::{DecodedFrame, FrameStore, FrameStoreError};
 pub use gmc::{
     gmc_chroma_prediction, gmc_luma_prediction, MB_CHROMA_SIDE as GMC_MB_CHROMA_SIDE,
     MB_LUMA_SIDE as GMC_MB_LUMA_SIDE,

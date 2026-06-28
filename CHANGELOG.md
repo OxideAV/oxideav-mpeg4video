@@ -8,6 +8,18 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **§7.6.1 decoded-picture buffer / reference-frame chain** (`framestore`):
+  `DecodedFrame` owns the three 4:2:0 sample planes of one decoded VOP as
+  flat `Vec<u8>` buffers, blits each reconstructed macroblock into place
+  (`blit_macroblock`), and hands out `ReferenceVop` plane views
+  (`luma_reference` / `cb_reference` / `cr_reference`) for the next VOP's
+  motion compensation. `FrameStore` threads the §7.6.1 / §7.5.2.1.2
+  forward (past) + backward (future) anchor chain: `push_anchor` advances
+  the chain for an I-/P-/S(GMC)-VOP (B-VOPs never enter the chain),
+  `p_vop_reference` selects the single P-/S-VOP reference, and
+  `b_vop_references` / `b_vop_reference_views` select the bracketing
+  forward+backward anchor pair (and its six `ReferenceVop` views) for a
+  B-VOP per the line-17446..17467 reference-VOP rules.
 - **§7.8.3.1 / §7.8.3.2 sprite-object-buffer hole handling**
   (`SpriteObjectBuffer`): tracks the per-macroblock `send_mb()` occupancy
   of the sprite-object grid (`object_piece_new_macroblocks` returns the
