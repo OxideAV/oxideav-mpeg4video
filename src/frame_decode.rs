@@ -24,6 +24,8 @@
 //! "reference-plane selection per the VOP reference-frame chain" gap.
 
 use crate::block::InterMacroblock;
+use crate::bvop_mv::{BVopAnchorPlanes, BVopMbTexturedDecode};
+use crate::bvop_prediction::BVopSampleMode;
 use crate::framestore::{DecodedFrame, FrameStore, FrameStoreError};
 use crate::pvop_mv::{reconstruct_pvop_macroblock, PvopMbMotion};
 use crate::reconstruct::ReconstructedMacroblock;
@@ -210,6 +212,76 @@ pub fn decode_i_vop<'a>(
         .expect("anchor just pushed must be present"))
 }
 
+/// Assemble a complete **progressive B-VOP** frame from per-macroblock
+/// textured decodes against the bracketing forward+backward anchors in
+/// `store`.
+///
+/// §7.6.1: a B-VOP interpolates between the forward (past) and backward
+/// (future) anchors — the two I/P/S-VOPs that bracket it in display order
+/// — and is **never** pushed into the reference-frame chain. The store is
+/// therefore taken by shared reference; the assembled frame is returned
+/// for display and discarded from the chain's point of view.
+///
+/// `entries` must contain exactly `mb_width * mb_height`
+/// [`BVopMbTexturedDecode`]s in raster order (each carrying its §7.6.8
+/// motion + §7.4 residual). Each is reconstructed via
+/// [`BVopMbDecode::reconstruct`] against the six §7.6.9.5.1 anchor planes
+/// built from the chain.
+///
+/// Returns [`FrameDecodeError::MissingReference`] if either anchor is
+/// absent (a B-VOP before two anchors have been decoded).
+pub fn assemble_b_vop_frame(
+    store: &FrameStore,
+    mb_width: usize,
+    mb_height: usize,
+    entries: &[BVopMbTexturedDecode],
+    vop_rounding_type: u8,
+    sample_mode: BVopSampleMode,
+    bits_per_pixel: u32,
+) -> Result<DecodedFrame, FrameDecodeError> {
+    let expected = mb_width * mb_height;
+    if entries.len() != expected {
+        return Err(FrameDecodeError::MacroblockCountMismatch {
+            supplied: entries.len(),
+            expected,
+        });
+    }
+    let (forward, backward) = store
+        .b_vop_references()
+        .ok_or(FrameDecodeError::MissingReference)?;
+    let fwd_luma = forward.luma_reference();
+    let bwd_luma = backward.luma_reference();
+    let fwd_cb = forward.cb_reference();
+    let bwd_cb = backward.cb_reference();
+    let fwd_cr = forward.cr_reference();
+    let bwd_cr = backward.cr_reference();
+    let anchors = BVopAnchorPlanes {
+        forward_luma: &fwd_luma,
+        backward_luma: &bwd_luma,
+        forward_cb: &fwd_cb,
+        backward_cb: &bwd_cb,
+        forward_cr: &fwd_cr,
+        backward_cr: &bwd_cr,
+    };
+
+    let mut frame = DecodedFrame::new(mb_width * 16, mb_height * 16, VopCodingType::B)?;
+    for (idx, entry) in entries.iter().enumerate() {
+        let mb_col = idx % mb_width;
+        let mb_row = idx / mb_width;
+        let reconstructed = entry.motion.reconstruct(
+            &anchors,
+            &entry.residual,
+            (mb_col * 16) as i32,
+            (mb_row * 16) as i32,
+            vop_rounding_type,
+            sample_mode,
+            bits_per_pixel,
+        );
+        frame.blit_macroblock(mb_col, mb_row, &reconstructed)?;
+    }
+    Ok(frame)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,5 +423,114 @@ mod tests {
         assert_eq!(store.forward().unwrap().luma_at(0, 0), Some(50));
         assert_eq!(store.backward().unwrap().luma_at(0, 0), Some(50));
         assert_eq!(store.backward().unwrap().coding_type(), VopCodingType::P);
+    }
+
+    // --- B-VOP frame assembly ---
+
+    use crate::bvop::BVopMbType;
+    use crate::bvop_mv::BVopMbDecode;
+    use crate::bvop_prediction::{BVopMvPair, BVopPredictionMode};
+
+    /// A single-direction B-VOP textured decode with zero MVs and zero
+    /// residual: a pure motion-compensated copy of one anchor.
+    fn zero_b_mb(mode: BVopPredictionMode, mb_type: BVopMbType) -> BVopMbTexturedDecode {
+        let zero = MotionVector { x: 0, y: 0 };
+        BVopMbTexturedDecode {
+            motion: BVopMbDecode {
+                mb_type,
+                prediction_mode: mode,
+                cbpb: None,
+                dbquant_delta: None,
+                mvs: [BVopMvPair {
+                    forward: zero,
+                    backward: zero,
+                }; 4],
+                forward_chroma_mv: zero,
+                backward_chroma_mv: zero,
+            },
+            residual: InterMacroblock::zero(),
+            quantiser_scale: 8,
+        }
+    }
+
+    fn two_anchor_store() -> FrameStore {
+        let mut store = FrameStore::new();
+        // I-VOP forward anchor: luma 40. P-VOP backward anchor: luma 80.
+        decode_i_vop(&mut store, 1, 1, &[flat_recon(40, 10, 20)]).unwrap();
+        let p = vec![PVopMbContent::Intra(flat_recon(80, 30, 50))];
+        decode_p_vop(&mut store, 1, 1, &p, 0, 8).unwrap();
+        store
+    }
+
+    #[test]
+    fn b_vop_without_two_anchors_errors() {
+        let mut store = FrameStore::new();
+        decode_i_vop(&mut store, 1, 1, &[flat_recon(40, 40, 40)]).unwrap();
+        let entries = vec![zero_b_mb(
+            BVopPredictionMode::ForwardOnly,
+            BVopMbType::Forward,
+        )];
+        let r = assemble_b_vop_frame(&store, 1, 1, &entries, 0, BVopSampleMode::HalfPel, 8);
+        assert_eq!(r, Err(FrameDecodeError::MissingReference));
+    }
+
+    #[test]
+    fn b_vop_forward_mode_copies_forward_anchor() {
+        let store = two_anchor_store();
+        let entries = vec![zero_b_mb(
+            BVopPredictionMode::ForwardOnly,
+            BVopMbType::Forward,
+        )];
+        let frame =
+            assemble_b_vop_frame(&store, 1, 1, &entries, 0, BVopSampleMode::HalfPel, 8).unwrap();
+        // Forward anchor is the I-VOP (luma 40).
+        assert_eq!(frame.luma_at(0, 0), Some(40));
+        assert_eq!(frame.cb_samples()[0], 10);
+        // B-VOP must NOT have entered the chain.
+        assert_eq!(frame.coding_type(), VopCodingType::B);
+    }
+
+    #[test]
+    fn b_vop_backward_mode_copies_backward_anchor() {
+        let store = two_anchor_store();
+        let entries = vec![zero_b_mb(
+            BVopPredictionMode::BackwardOnly,
+            BVopMbType::Backward,
+        )];
+        let frame =
+            assemble_b_vop_frame(&store, 1, 1, &entries, 0, BVopSampleMode::HalfPel, 8).unwrap();
+        // Backward anchor is the P-VOP (luma 80).
+        assert_eq!(frame.luma_at(0, 0), Some(80));
+        assert_eq!(frame.cb_samples()[0], 30);
+    }
+
+    #[test]
+    fn b_vop_bidirectional_averages_anchors() {
+        let store = two_anchor_store();
+        let entries = vec![zero_b_mb(
+            BVopPredictionMode::Bidirectional,
+            BVopMbType::Interpolated,
+        )];
+        let frame =
+            assemble_b_vop_frame(&store, 1, 1, &entries, 0, BVopSampleMode::HalfPel, 8).unwrap();
+        // §7.6.9.4 average of forward (40) and backward (80): (40+80+1)>>1
+        // = 60.
+        assert_eq!(frame.luma_at(0, 0), Some(60));
+        // Chroma average of Cb (10, 30) = 20.
+        assert_eq!(frame.cb_samples()[0], 20);
+    }
+
+    #[test]
+    fn b_vop_does_not_advance_chain() {
+        let store = two_anchor_store();
+        let entries = vec![zero_b_mb(
+            BVopPredictionMode::ForwardOnly,
+            BVopMbType::Forward,
+        )];
+        let _ =
+            assemble_b_vop_frame(&store, 1, 1, &entries, 0, BVopSampleMode::HalfPel, 8).unwrap();
+        // Chain unchanged: forward=I(40), backward=P(80).
+        assert_eq!(store.forward().unwrap().luma_at(0, 0), Some(40));
+        assert_eq!(store.backward().unwrap().luma_at(0, 0), Some(80));
     }
 }

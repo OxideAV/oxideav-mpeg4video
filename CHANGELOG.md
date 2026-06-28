@@ -28,6 +28,14 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   into a fresh `DecodedFrame`; `decode_p_vop` / `decode_i_vop` assemble
   and advance the reference-frame chain in one call. `InterMacroblock::zero`
   constructs the empty-`cbp` residual.
+- **Progressive B-VOP frame-assembly driver** (`assemble_b_vop_frame`):
+  reconstructs a complete progressive B-VOP from per-macroblock
+  `BVopMbTexturedDecode`s against the bracketing forward+backward anchors
+  pulled from the `FrameStore` (§7.6.1; a B-VOP is never pushed into the
+  chain), building the six §7.6.9.5.1 `BVopAnchorPlanes` views and routing
+  each macroblock through `BVopMbDecode::reconstruct`. Tests verify
+  forward-only copies the past anchor, backward-only the future anchor,
+  and bidirectional the §7.6.9.4 `(fwd + bwd + 1) >> 1` average.
 - **§7.8.3.1 / §7.8.3.2 sprite-object-buffer hole handling**
   (`SpriteObjectBuffer`): tracks the per-macroblock `send_mb()` occupancy
   of the sprite-object grid (`object_piece_new_macroblocks` returns the
