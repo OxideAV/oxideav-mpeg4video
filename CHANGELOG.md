@@ -36,6 +36,13 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   each macroblock through `BVopMbDecode::reconstruct`. Tests verify
   forward-only copies the past anchor, backward-only the future anchor,
   and bidirectional the §7.6.9.4 `(fwd + bwd + 1) >> 1` average.
+- **S(GMC)-VOP frame-assembly driver** (`assemble_s_gmc_vop_frame`):
+  reconstructs a complete S(GMC)-VOP from per-macroblock `SGmcMbContent`
+  (`Gmc` / `Local` / `Intra`) against the §7.5.2.1.2 forward anchor pulled
+  from the `FrameStore`. `mcsel == 1` macroblocks warp the reference plane
+  via the supplied `WarpGeometry` (§7.8.7.1 GMC branch); `mcsel == 0`
+  macroblocks take the §7.6.2 local-MC P-VOP path; intra macroblocks blit
+  as-is. The S(GMC)-VOP is an anchor (the caller pushes it into the chain).
 - **§7.8.3.1 / §7.8.3.2 sprite-object-buffer hole handling**
   (`SpriteObjectBuffer`): tracks the per-macroblock `send_mb()` occupancy
   of the sprite-object grid (`object_piece_new_macroblocks` returns the

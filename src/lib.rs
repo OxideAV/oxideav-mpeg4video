@@ -414,8 +414,8 @@ pub use field_motion::{
     half_pel_chroma_mv_from_qpel, mc, reconstruct_field_motion_vectors, FieldMotionVectors,
 };
 pub use frame_decode::{
-    assemble_b_vop_frame, assemble_p_vop_frame, decode_i_vop, decode_p_vop, FrameDecodeError,
-    PVopMbContent,
+    assemble_b_vop_frame, assemble_p_vop_frame, assemble_s_gmc_vop_frame, decode_i_vop,
+    decode_p_vop, FrameDecodeError, PVopMbContent, SGmcMbContent,
 };
 pub use framestore::{DecodedFrame, FrameStore, FrameStoreError};
 pub use gmc::{

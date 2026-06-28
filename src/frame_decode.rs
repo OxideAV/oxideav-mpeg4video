@@ -27,9 +27,11 @@ use crate::block::InterMacroblock;
 use crate::bvop_mv::{BVopAnchorPlanes, BVopMbTexturedDecode};
 use crate::bvop_prediction::BVopSampleMode;
 use crate::framestore::{DecodedFrame, FrameStore, FrameStoreError};
-use crate::pvop_mv::{reconstruct_pvop_macroblock, PvopMbMotion};
-use crate::reconstruct::ReconstructedMacroblock;
+use crate::pvop_mv::{predict_inter_macroblock, reconstruct_pvop_macroblock, PvopMbMotion};
+use crate::reconstruct::{reconstruct_inter_macroblock, ReconstructedMacroblock};
+use crate::s_gmc_recon::{gmc_prediction_macroblock, GmcReferencePlanes};
 use crate::vop::VopCodingType;
+use crate::warp::WarpGeometry;
 
 /// Errors raised while assembling a frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -277,6 +279,111 @@ pub fn assemble_b_vop_frame(
             sample_mode,
             bits_per_pixel,
         );
+        frame.blit_macroblock(mb_col, mb_row, &reconstructed)?;
+    }
+    Ok(frame)
+}
+
+/// Per-macroblock content for an **S(GMC)-VOP** frame assembly.
+///
+/// §6.3.6 / §7.8.7.1: each inter macroblock of an S(GMC)-VOP carries an
+/// `mcsel` flag selecting global-motion (warp) vs. local-MC prediction.
+/// Intra macroblocks are supplied already reconstructed.
+#[derive(Debug, Clone)]
+pub enum SGmcMbContent {
+    /// `mcsel == 1`: global-motion-compensated. The §7.8 warp is applied
+    /// to the forward reference plane; only the §7.4 residual is carried.
+    Gmc {
+        /// §7.4 inter residual.
+        residual: InterMacroblock,
+    },
+    /// `mcsel == 0`: local-motion-compensated exactly as in a P-VOP.
+    Local {
+        /// Decoded local motion.
+        motion: PvopMbMotion,
+        /// §7.4 inter residual.
+        residual: InterMacroblock,
+    },
+    /// An intra macroblock already reconstructed to pixels.
+    Intra(ReconstructedMacroblock),
+}
+
+/// Assemble a complete **S(GMC)-VOP** frame from per-macroblock content
+/// against the §7.8.7.1 warped / local prediction of the forward
+/// reference plane in `store`.
+///
+/// The single reference is the §7.5.2.1.2 forward (most-recent) anchor —
+/// [`FrameStore::p_vop_reference`] (a P- or S(GMC)-VOP shares this rule).
+/// Each `mcsel == 1` macroblock is built by warping that plane via
+/// `geometry` ([`s_gmc_prediction_macroblock`] GMC branch); each
+/// `mcsel == 0` macroblock is built by the §7.6.2 local-MC path; each
+/// intra macroblock is blitted as-is. The result is **not** pushed into
+/// the chain — use [`FrameStore::push_anchor`] (an S(GMC)-VOP is an
+/// anchor).
+///
+/// `geometry` is the §7.8.4/§7.8.5 warp the caller decoded from the
+/// VOP's `sprite_trajectory()`.
+pub fn assemble_s_gmc_vop_frame(
+    store: &FrameStore,
+    mb_width: usize,
+    mb_height: usize,
+    entries: &[SGmcMbContent],
+    geometry: &WarpGeometry,
+    vop_rounding_type: u8,
+    bits_per_pixel: u32,
+) -> Result<DecodedFrame, FrameDecodeError> {
+    let expected = mb_width * mb_height;
+    if entries.len() != expected {
+        return Err(FrameDecodeError::MacroblockCountMismatch {
+            supplied: entries.len(),
+            expected,
+        });
+    }
+    let reference = store
+        .p_vop_reference()
+        .ok_or(FrameDecodeError::MissingReference)?;
+    let luma_ref = reference.luma_reference();
+    let cb_ref = reference.cb_reference();
+    let cr_ref = reference.cr_reference();
+    let gmc_planes = GmcReferencePlanes {
+        luma: luma_ref,
+        cb: cb_ref,
+        cr: cr_ref,
+    };
+
+    let mut frame = DecodedFrame::new(mb_width * 16, mb_height * 16, VopCodingType::S)?;
+    for (idx, entry) in entries.iter().enumerate() {
+        let mb_col = idx % mb_width;
+        let mb_row = idx / mb_width;
+        let mb_x = (mb_col * 16) as i32;
+        let mb_y = (mb_row * 16) as i32;
+        let reconstructed = match entry {
+            SGmcMbContent::Intra(mb) => mb.clone(),
+            SGmcMbContent::Gmc { residual } => {
+                let prediction = gmc_prediction_macroblock(
+                    geometry,
+                    &gmc_planes,
+                    mb_x as i64,
+                    mb_y as i64,
+                    vop_rounding_type,
+                    bits_per_pixel,
+                );
+                reconstruct_inter_macroblock(&prediction, residual, bits_per_pixel)
+            }
+            SGmcMbContent::Local { motion, residual } => {
+                let prediction = predict_inter_macroblock(
+                    *motion,
+                    &gmc_planes.luma,
+                    &gmc_planes.cb,
+                    &gmc_planes.cr,
+                    mb_x,
+                    mb_y,
+                    vop_rounding_type,
+                )
+                .ok_or(FrameDecodeError::InterPredictionFailed { mb_col, mb_row })?;
+                reconstruct_inter_macroblock(&prediction, residual, bits_per_pixel)
+            }
+        };
         frame.blit_macroblock(mb_col, mb_row, &reconstructed)?;
     }
     Ok(frame)
@@ -532,5 +639,103 @@ mod tests {
         // Chain unchanged: forward=I(40), backward=P(80).
         assert_eq!(store.forward().unwrap().luma_at(0, 0), Some(40));
         assert_eq!(store.backward().unwrap().luma_at(0, 0), Some(80));
+    }
+
+    // --- S(GMC)-VOP frame assembly ---
+
+    use crate::sprite::SpriteTrajectory;
+    use crate::vol::SpriteWarpingAccuracy;
+
+    fn stationary_geometry(w: u32, h: u32) -> WarpGeometry {
+        let traj = SpriteTrajectory::stationary();
+        WarpGeometry::decode(&traj, w, h, SpriteWarpingAccuracy::HalfPel)
+    }
+
+    #[test]
+    fn s_gmc_without_reference_errors() {
+        let store = FrameStore::new();
+        let geo = stationary_geometry(16, 16);
+        let entries = vec![SGmcMbContent::Gmc {
+            residual: InterMacroblock::zero(),
+        }];
+        let r = assemble_s_gmc_vop_frame(&store, 1, 1, &entries, &geo, 0, 8);
+        assert_eq!(r, Err(FrameDecodeError::MissingReference));
+    }
+
+    #[test]
+    fn s_gmc_stationary_warp_copies_reference() {
+        // Reference: flat luma 70. A stationary GMC warp samples each
+        // output pel from the identical reference position -> copy.
+        let mut store = FrameStore::new();
+        decode_i_vop(&mut store, 1, 1, &[flat_recon(70, 21, 31)]).unwrap();
+        let geo = stationary_geometry(16, 16);
+        let entries = vec![SGmcMbContent::Gmc {
+            residual: InterMacroblock::zero(),
+        }];
+        let frame = assemble_s_gmc_vop_frame(&store, 1, 1, &entries, &geo, 0, 8).unwrap();
+        assert_eq!(frame.luma_at(0, 0), Some(70));
+        assert_eq!(frame.luma_at(15, 15), Some(70));
+        assert_eq!(frame.cb_samples()[0], 21);
+        assert_eq!(frame.cr_samples()[0], 31);
+        assert_eq!(frame.coding_type(), VopCodingType::S);
+    }
+
+    #[test]
+    fn s_gmc_local_mcsel0_uses_p_vop_path() {
+        // mcsel == 0 macroblock predicts exactly as a P-VOP. Two-MB
+        // reference (50 | 60); a +16-pel local MV on the left MB samples
+        // the right reference MB, matching the P-VOP behaviour.
+        let mut store = FrameStore::new();
+        decode_i_vop(
+            &mut store,
+            2,
+            1,
+            &[flat_recon(50, 11, 22), flat_recon(60, 33, 44)],
+        )
+        .unwrap();
+        let geo = stationary_geometry(32, 16);
+        let mv = MotionVector { x: 32, y: 0 };
+        let entries = vec![
+            SGmcMbContent::Local {
+                motion: PvopMbMotion::OneMv(mv),
+                residual: InterMacroblock::zero(),
+            },
+            SGmcMbContent::Local {
+                motion: PvopMbMotion::Skipped,
+                residual: InterMacroblock::zero(),
+            },
+        ];
+        let frame = assemble_s_gmc_vop_frame(&store, 2, 1, &entries, &geo, 0, 8).unwrap();
+        // Left MB read the right reference MB (luma 60).
+        assert_eq!(frame.luma_at(0, 0), Some(60));
+        // Right MB skipped -> copy of reference MB (luma 60).
+        assert_eq!(frame.luma_at(16, 0), Some(60));
+    }
+
+    #[test]
+    fn s_gmc_intra_blits_verbatim() {
+        let mut store = FrameStore::new();
+        decode_i_vop(&mut store, 1, 1, &[flat_recon(70, 70, 70)]).unwrap();
+        let geo = stationary_geometry(16, 16);
+        let entries = vec![SGmcMbContent::Intra(flat_recon(123, 45, 67))];
+        let frame = assemble_s_gmc_vop_frame(&store, 1, 1, &entries, &geo, 0, 8).unwrap();
+        assert_eq!(frame.luma_at(0, 0), Some(123));
+        assert_eq!(frame.cb_samples()[0], 45);
+        assert_eq!(frame.cr_samples()[0], 67);
+    }
+
+    #[test]
+    fn s_gmc_vop_pushes_as_anchor() {
+        // An S(GMC)-VOP is an anchor: pushing it advances the chain.
+        let mut store = FrameStore::new();
+        decode_i_vop(&mut store, 1, 1, &[flat_recon(70, 70, 70)]).unwrap();
+        let geo = stationary_geometry(16, 16);
+        let entries = vec![SGmcMbContent::Gmc {
+            residual: InterMacroblock::zero(),
+        }];
+        let frame = assemble_s_gmc_vop_frame(&store, 1, 1, &entries, &geo, 0, 8).unwrap();
+        store.push_anchor(frame);
+        assert_eq!(store.backward().unwrap().coding_type(), VopCodingType::S);
+        assert_eq!(store.forward().unwrap().coding_type(), VopCodingType::I);
     }
 }
