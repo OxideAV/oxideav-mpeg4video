@@ -43,6 +43,15 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   via the supplied `WarpGeometry` (§7.8.7.1 GMC branch); `mcsel == 0`
   macroblocks take the §7.6.2 local-MC P-VOP path; intra macroblocks blit
   as-is. The S(GMC)-VOP is an anchor (the caller pushes it into the chain).
+- **§6.1.3.8 VOP reordering / coding→display sequence driver**
+  (`sequence::SequenceDecoder`): consumes coded VOPs in bitstream
+  (decoding) order via `push_i_vop` / `push_p_vop` / `push_s_gmc_vop` /
+  `push_b_vop` and emits frames in **display order**, applying the
+  §6.1.3.8 one-slot anchor reorder delay (an I/P/S-VOP holds back one
+  slot; B-VOPs display immediately between their bracketing anchors;
+  `flush` releases the final anchor). Owns the `FrameStore` reference
+  chain internally. A test reproduces the §6.1.3.8 worked example —
+  coded `1I 4P 2B 3B` → displayed `1I 2B 3B 4P`.
 - **§7.8.3.1 / §7.8.3.2 sprite-object-buffer hole handling**
   (`SpriteObjectBuffer`): tracks the per-macroblock `send_mb()` occupancy
   of the sprite-object grid (`object_piece_new_macroblocks` returns the

@@ -344,6 +344,7 @@ pub mod rvlc_recovery;
 pub mod s_gmc_recon;
 pub mod sample_padding;
 pub mod scan;
+pub mod sequence;
 pub mod sprite;
 pub mod sprite_piece;
 pub mod static_sprite;
@@ -498,6 +499,7 @@ pub use scan::{
     events_to_pqf, events_to_qfs, inverse_scan, select_scan_type, DcPredictionDirection,
     InverseScanError, ScanType,
 };
+pub use sequence::SequenceDecoder;
 pub use sprite::{
     decode_sprite_trajectory, decode_warping_mv_code, SpriteTrajectory, SpriteTrajectoryError,
     MAX_GMC_WARPING_POINTS,
