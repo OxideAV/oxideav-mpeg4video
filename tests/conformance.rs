@@ -160,3 +160,24 @@ fn mv4_ipb_stream_matches_reference_decode() {
     // with the §7.6.9.5.3 K=4 chroma reduction).
     assert_stream_matches("mv4_ipb_64x64.m4v", "mv4_ipb_64x64.yuv", 3, 0.40);
 }
+
+#[test]
+fn interlaced_intra_stream_matches_reference_decode() {
+    // Interlaced VOL (`interlaced == 1`), intra-only: exercises the
+    // §6.2.6.3 interlaced_information() dct_type bit and the §7.7.1
+    // inverse field-DCT line permutation (top/bottom-field blocks back
+    // to frame lines) on real field-coded macroblocks.
+    assert_stream_matches("ilaced_intra_64x64.m4v", "ilaced_intra_64x64.yuv", 2, 0.40);
+}
+
+#[test]
+fn interlaced_alternate_scan_intra_stream_matches_reference_decode() {
+    // As above plus the §6.3.5 alternate_vertical_scan_flag: every
+    // block of the VOP inverse-scans with the Figure 7-4 (b) pattern.
+    assert_stream_matches(
+        "ilaced_altscan_intra_64x64.m4v",
+        "ilaced_altscan_intra_64x64.yuv",
+        2,
+        0.40,
+    );
+}

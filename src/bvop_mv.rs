@@ -372,6 +372,10 @@ impl Default for DirectionPredictor {
 pub struct BVopTextureParams {
     /// §6.3.5 `vop_quant` — the B-VOP base quantiser scale.
     pub base_quantiser_scale: u32,
+    /// §6.3.5 `alternate_vertical_scan_flag` from the interlaced VOP
+    /// header — selects the Figure 7-4 (b) inverse scan for every
+    /// block of the VOP. `false` for progressive VOLs.
+    pub alternate_vertical_scan: bool,
     /// `2^quant_precision - 1` — the §6.3.3 upper clip for the running
     /// quantiser after each `dbquant` (31 for the default 5-bit
     /// precision).
@@ -1299,6 +1303,7 @@ impl BVopMvDriver {
                     bits_per_pixel: texture.bits_per_pixel,
                     quant_type: texture.quant_type,
                     ac_pred_flag: false,
+                    alternate_vertical_scan: texture.alternate_vertical_scan,
                 };
                 let residual =
                     decode_b_vop_inter_macroblock(br, motion.cbpb(), ctx, &quant_matrix)?;
@@ -1438,6 +1443,7 @@ impl BVopMvDriver {
                     bits_per_pixel: texture.bits_per_pixel,
                     quant_type: texture.quant_type,
                     ac_pred_flag: false,
+                    alternate_vertical_scan: texture.alternate_vertical_scan,
                 };
                 let residual = decode_b_vop_inter_macroblock(br, motion.cbpb, ctx, &quant_matrix)?;
 
@@ -2325,6 +2331,7 @@ mod tests {
 
     fn texture_params() -> BVopTextureParams {
         BVopTextureParams {
+            alternate_vertical_scan: false,
             base_quantiser_scale: 8,
             max_quantiser_scale: 31,
             bits_per_pixel: 8,

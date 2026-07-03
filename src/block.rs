@@ -306,6 +306,12 @@ pub struct MacroblockTextureContext {
     /// `ac_pred_flag` from the macroblock header — gates the §7.4.3.3 AC
     /// prediction and the §7.4.2 alternate-scan selection.
     pub ac_pred_flag: bool,
+    /// §6.3.5 `alternate_vertical_scan_flag` from the VOP header of an
+    /// interlaced VOL: when set, the Figure 7-4 (b) alternate-vertical
+    /// inverse scan is used for the VOP's blocks, overriding the
+    /// §7.4.2 per-block selection. Always `false` for progressive
+    /// VOLs.
+    pub alternate_vertical_scan: bool,
 }
 
 /// A reconstructed intra 4:2:0 macroblock: a 16×16 luminance plane plus
@@ -499,7 +505,13 @@ pub fn decode_intra_block_full(
 
     // §7.4.3.1 — pick the DC prediction direction from the neighbour DCs.
     let direction = select_dc_direction(predictors.fa_dc, predictors.fb_dc, predictors.fc_dc);
-    let scan_type = select_scan_type(true, ctx.ac_pred_flag, direction);
+    // §6.3.5 alternate_vertical_scan_flag (interlaced VOPs) overrides
+    // the §7.4.2 per-block selection.
+    let scan_type = if ctx.alternate_vertical_scan {
+        crate::scan::ScanType::AlternateVertical
+    } else {
+        select_scan_type(true, ctx.ac_pred_flag, direction)
+    };
 
     // §7.4.2 — 1-D QFS into the 2-D PQF block.
     let pqf = inverse_scan(&qfs, scan_type);
@@ -763,7 +775,14 @@ pub fn decode_inter_block(
     // §7.4.2 — expand to QFS[0..=63] (no DC: pass `None` for the
     // §7.4.1.1 intra-DC slot) then 1-D → 2-D under the zigzag scan.
     let qfs = events_to_qfs(&events, None)?;
-    let pqf = inverse_scan(&qfs, crate::scan::ScanType::Zigzag);
+    let inter_scan = if ctx.alternate_vertical_scan {
+        // §6.3.5 alternate_vertical_scan_flag: the interlaced VOP's
+        // blocks use the Figure 7-4 (b) scan.
+        crate::scan::ScanType::AlternateVertical
+    } else {
+        crate::scan::ScanType::Zigzag
+    };
+    let pqf = inverse_scan(&qfs, inter_scan);
 
     // For an inter block PQF[v][u] = QF[v][u] directly (§7.4.3 spatial
     // DC/AC prediction is intra-only). Saturate to [-2048, 2047] per
@@ -1017,6 +1036,7 @@ mod tests {
             bits_per_pixel: 8,
             quant_type: false,
             ac_pred_flag: false,
+            alternate_vertical_scan: false,
         };
         let predictors = BlockPredictors::outside(8, 8);
 
@@ -1062,6 +1082,7 @@ mod tests {
             bits_per_pixel: 8,
             quant_type: false,
             ac_pred_flag: false,
+            alternate_vertical_scan: false,
         };
         let predictors = BlockPredictors::outside(8, 8);
 
@@ -1104,6 +1125,7 @@ mod tests {
             bits_per_pixel: 8,
             quant_type: false,
             ac_pred_flag: false,
+            alternate_vertical_scan: false,
         };
         let predictors = BlockPredictors::outside(8, 8);
         let data = [0xAAu8; 4]; // arbitrary — must remain unread
@@ -1144,6 +1166,7 @@ mod tests {
             bits_per_pixel: 8,
             quant_type: false,
             ac_pred_flag: false,
+            alternate_vertical_scan: false,
         };
         let predictors = BlockPredictors::outside(8, 8);
         let mut w = BitWriter::default();
@@ -1180,6 +1203,7 @@ mod tests {
             bits_per_pixel: 8,
             quant_type: false,
             ac_pred_flag: false,
+            alternate_vertical_scan: false,
         };
         let predictors = BlockPredictors::outside(8, 8);
         let mut w = BitWriter::default();
@@ -1230,6 +1254,7 @@ mod tests {
             bits_per_pixel: 8,
             quant_type: false,
             ac_pred_flag: false,
+            alternate_vertical_scan: false,
         };
         let predictors = BlockPredictors::outside(8, 8);
 
@@ -1289,6 +1314,7 @@ mod tests {
             bits_per_pixel: 8,
             quant_type: false,
             ac_pred_flag: false,
+            alternate_vertical_scan: false,
         };
         let predictors = BlockPredictors::outside(8, 8);
 
@@ -1338,6 +1364,7 @@ mod tests {
             bits_per_pixel: 8,
             quant_type: false,
             ac_pred_flag: false,
+            alternate_vertical_scan: false,
         };
         let data = [0u8; 4];
         let mut br = BitReader::new(&data);
@@ -1369,6 +1396,7 @@ mod tests {
             bits_per_pixel: 8,
             quant_type: false,
             ac_pred_flag: false,
+            alternate_vertical_scan: false,
         };
         let data = [0u8; 4];
         let mut br = BitReader::new(&data);
@@ -1393,6 +1421,7 @@ mod tests {
             bits_per_pixel: 8,
             quant_type: false,
             ac_pred_flag: false,
+            alternate_vertical_scan: false,
         };
         // Two bytes of garbage — none of it should be consumed because
         // `coded == false` short-circuits before the bit reader is touched.
@@ -1424,6 +1453,7 @@ mod tests {
             bits_per_pixel: 8,
             quant_type: false,
             ac_pred_flag: false,
+            alternate_vertical_scan: false,
         };
 
         let mut w = BitWriter::default();
@@ -1460,6 +1490,7 @@ mod tests {
             bits_per_pixel: 8,
             quant_type: false,
             ac_pred_flag: false,
+            alternate_vertical_scan: false,
         };
 
         let mut w = BitWriter::default();
@@ -1501,6 +1532,7 @@ mod tests {
             bits_per_pixel: 8,
             quant_type: false,
             ac_pred_flag: false,
+            alternate_vertical_scan: false,
         };
         let data = [0u8; 4];
         let mut br = BitReader::new(&data);
@@ -1544,6 +1576,7 @@ mod tests {
             bits_per_pixel: 8,
             quant_type: false,
             ac_pred_flag: false,
+            alternate_vertical_scan: false,
         };
 
         let mut w = BitWriter::default();
@@ -1608,6 +1641,7 @@ mod tests {
             bits_per_pixel: 8,
             quant_type: false,
             ac_pred_flag: false,
+            alternate_vertical_scan: false,
         };
         let data = [0u8; 4];
         let mut br = BitReader::new(&data);
@@ -1644,6 +1678,7 @@ mod tests {
             bits_per_pixel: 8,
             quant_type: false,
             ac_pred_flag: false,
+            alternate_vertical_scan: false,
         };
         let data = [0u8; 4];
         let mut br = BitReader::new(&data);
@@ -1674,6 +1709,7 @@ mod tests {
             bits_per_pixel: 8,
             quant_type: false,
             ac_pred_flag: false,
+            alternate_vertical_scan: false,
         };
         let mut w = BitWriter::default();
         // Block 0 — one positive (LAST=1, RUN=0, LEVEL=1) inter EVENT.
@@ -1733,6 +1769,7 @@ mod tests {
             bits_per_pixel: 8,
             quant_type: false,
             ac_pred_flag: false,
+            alternate_vertical_scan: false,
         };
         let data = [0u8; 4];
         let mut br = BitReader::new(&data);
@@ -1769,6 +1806,7 @@ mod tests {
             bits_per_pixel: 8,
             quant_type: true,
             ac_pred_flag: false,
+            alternate_vertical_scan: false,
         };
 
         let mut w = BitWriter::default();
@@ -1807,6 +1845,7 @@ mod tests {
             bits_per_pixel: 8,
             quant_type: true,
             ac_pred_flag: false,
+            alternate_vertical_scan: false,
         };
         let predictors = BlockPredictors::outside(8, 8);
 

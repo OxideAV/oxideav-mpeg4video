@@ -154,7 +154,11 @@ pub fn vop_mb_dimensions(vol: &VolHeader) -> (usize, usize) {
     )
 }
 
-/// Validate the shared VOL gates of the progressive rectangular walks.
+/// Validate the shared VOL gates of the rectangular walks.
+///
+/// `interlaced == 1` is walk-specific: the I-VOP walk decodes it (the
+/// §6.2.6.3 `dct_type` field DCT), the inter walks still gate it off
+/// until the §7.7.2 field-MC paths are wired.
 fn check_vol_supported(vol: &VolHeader) -> Result<(), VopDecodeError> {
     if vol.video_object_layer_shape != 0 {
         return Err(VopDecodeError::Unsupported("non-rectangular shape"));
@@ -162,10 +166,39 @@ fn check_vol_supported(vol: &VolHeader) -> Result<(), VopDecodeError> {
     if vol.data_partitioned {
         return Err(VopDecodeError::Unsupported("data_partitioned"));
     }
+    Ok(())
+}
+
+/// The inter walks' interlaced gate (see [`check_vol_supported`]).
+fn check_progressive(vol: &VolHeader) -> Result<(), VopDecodeError> {
     if vol.interlaced {
         return Err(VopDecodeError::Unsupported("interlaced"));
     }
     Ok(())
+}
+
+/// §7.7.1 inverse field-DCT permutation: with `dct_type == 1` the four
+/// luminance blocks hold field lines (Figure 6-12 — the upper half is
+/// the top field, the lower half the bottom field); after the IDCT the
+/// lines interleave back to frame order. Chrominance is unaffected.
+fn inverse_field_dct_luma(luma: &[[i32; 16]; 16]) -> [[i32; 16]; 16] {
+    let mut out = [[0i32; 16]; 16];
+    for k in 0..8 {
+        out[2 * k] = luma[k];
+        out[2 * k + 1] = luma[8 + k];
+    }
+    out
+}
+
+/// Whether one parsed macroblock header selected the §6.2.6.3 field
+/// DCT (`dct_type == 1`).
+fn header_field_dct(header: &crate::macroblock::MacroblockHeader) -> bool {
+    header
+        .interlaced_info
+        .as_ref()
+        .and_then(|info| info.dct_type)
+        .map(|d| matches!(d, crate::interlaced_information::DctType::Field))
+        .unwrap_or(false)
 }
 
 /// The running quantiser ceiling `2^quant_precision - 1` (§6.3.3).
@@ -253,6 +286,7 @@ fn decode_intra_mb_with_grid(
     mb_col: usize,
     coded: [bool; 6],
     use_dc_vlc: bool,
+    field_dct: bool,
     ctx: MacroblockTextureContext,
     quant_matrix: &[[u8; 8]; 8],
 ) -> Result<IntraMacroblock, VopDecodeError> {
@@ -286,6 +320,11 @@ fn decode_intra_mb_with_grid(
                 luma[row_off + y][col_off + x] = blocks[b][y][x];
             }
         }
+    }
+    // §7.7.1: with dct_type == 1 the assembled upper/lower halves are
+    // the top/bottom fields — inverse-permute back to frame lines.
+    if field_dct {
+        luma = inverse_field_dct_luma(&luma);
     }
     Ok(IntraMacroblock {
         luma,
@@ -354,6 +393,7 @@ pub fn decode_i_vop_macroblocks(
                 bits_per_pixel: bpp,
                 quant_type: vol.quant_type,
                 ac_pred_flag: header.ac_pred_flag,
+                alternate_vertical_scan: vop.alternate_vertical_scan,
             };
             let coded = pattern_code(header.cbpy, header.cbpc);
             let mb = decode_intra_mb_with_grid(
@@ -363,6 +403,7 @@ pub fn decode_i_vop_macroblocks(
                 mb_col,
                 coded,
                 use_dc_vlc,
+                header_field_dct(&header),
                 ctx,
                 &quant_matrix,
             )?;
@@ -401,6 +442,7 @@ pub fn decode_p_vop_macroblocks(
     vop: &VopHeader,
 ) -> Result<Vec<PVopMbContent>, VopDecodeError> {
     check_vol_supported(vol)?;
+    check_progressive(vol)?;
     if !matches!(vop.coding_type, VopCodingType::P) {
         return Err(VopDecodeError::Unsupported("not a P-VOP"));
     }
@@ -460,6 +502,7 @@ pub fn decode_p_vop_macroblocks(
                 bits_per_pixel: bpp,
                 quant_type: vol.quant_type,
                 ac_pred_flag: header.ac_pred_flag,
+                alternate_vertical_scan: vop.alternate_vertical_scan,
             };
 
             let is_intra = header.mb_type.map(|t| t.is_intra()).unwrap_or(false);
@@ -476,6 +519,7 @@ pub fn decode_p_vop_macroblocks(
                     mb_col,
                     coded,
                     use_dc_vlc,
+                    header_field_dct(&header),
                     ctx,
                     &intra_matrix,
                 )?;
@@ -544,6 +588,7 @@ pub fn decode_b_vop_macroblocks(
     anchor_motion: Option<&[PvopMbMotion]>,
 ) -> Result<Vec<BVopMbTexturedDecode>, VopDecodeError> {
     check_vol_supported(vol)?;
+    check_progressive(vol)?;
     if !matches!(vop.coding_type, VopCodingType::B) {
         return Err(VopDecodeError::Unsupported("not a B-VOP"));
     }
@@ -557,6 +602,7 @@ pub fn decode_b_vop_macroblocks(
         .with_quarter_sample(vol.quarter_sample);
     let texture = BVopTextureParams {
         base_quantiser_scale: u32::from(vop.quant).clamp(1, max_qp),
+        alternate_vertical_scan: vop.alternate_vertical_scan,
         max_quantiser_scale: max_qp,
         bits_per_pixel: u32::from(vol.bits_per_pixel),
         quant_type: vol.quant_type,
@@ -640,6 +686,7 @@ pub fn decode_b_vop_macroblocks(
                 bits_per_pixel: texture.bits_per_pixel,
                 quant_type: texture.quant_type,
                 ac_pred_flag: false,
+                alternate_vertical_scan: vop.alternate_vertical_scan,
             };
             let residual = decode_b_vop_inter_macroblock(br, motion.cbpb, ctx, &quant_matrix)
                 .map_err(|e| VopDecodeError::BVop(BVopMvDriverError::Texture(e)))?;
@@ -737,6 +784,7 @@ pub fn decode_s_gmc_vop_macroblocks(
     vop: &VopHeader,
 ) -> Result<(Vec<SGmcMbContent>, WarpGeometry), VopDecodeError> {
     check_vol_supported(vol)?;
+    check_progressive(vol)?;
     if !matches!(vop.coding_type, VopCodingType::S) {
         return Err(VopDecodeError::Unsupported("not an S-VOP"));
     }
@@ -809,6 +857,7 @@ pub fn decode_s_gmc_vop_macroblocks(
                 bits_per_pixel: bpp,
                 quant_type: vol.quant_type,
                 ac_pred_flag: header.ac_pred_flag,
+                alternate_vertical_scan: vop.alternate_vertical_scan,
             };
 
             let is_intra = header.mb_type.map(|t| t.is_intra()).unwrap_or(false);
@@ -823,6 +872,7 @@ pub fn decode_s_gmc_vop_macroblocks(
                     mb_col,
                     coded,
                     use_dc_vlc,
+                    header_field_dct(&header),
                     ctx,
                     &intra_matrix,
                 )?;

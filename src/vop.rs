@@ -239,6 +239,16 @@ pub struct VopHeader {
     /// `no_of_sprite_warping_points > 0`. `None` for every non-GMC VOP
     /// and for the stationary (0-point) GMC case.
     pub sprite_trajectory: Option<SpriteTrajectory>,
+    /// §6.3.5 `top_field_first` — present only when the VOL coded
+    /// `interlaced == 1`: the top field (containing the top line) of
+    /// the reconstructed VOP displays first. Defaults to `false` for
+    /// progressive VOLs.
+    pub top_field_first: bool,
+    /// §6.3.5 `alternate_vertical_scan_flag` — present only when the
+    /// VOL coded `interlaced == 1`: selects the Figure 7-4 (b)
+    /// alternate-vertical inverse scan for the VOP's blocks. Defaults
+    /// to `false` for progressive VOLs.
+    pub alternate_vertical_scan: bool,
 }
 
 /// Errors produced by the VOP / GOV header parsers. We reuse
@@ -503,6 +513,8 @@ fn parse_video_object_plane_body(
             fcode_fwd: 0,
             fcode_bwd: 0,
             sprite_trajectory: None,
+            top_field_first: false,
+            alternate_vertical_scan: false,
         });
     }
 
@@ -548,14 +560,11 @@ fn parse_video_object_plane_body(
 
     // intra_dc_vlc_thr (Table 6-25). 3 bits, 0..=7.
     let intra_dc_vlc_thr = br.read_bits(3)? as u8;
-    if ctx.interlaced {
-        // top_field_first + alternate_vertical_scan_flag — we read them
-        // structurally to stay aligned, but do not surface them on the
-        // typed view. A later round adds the interlaced VopHeader
-        // fields.
-        let _top_field_first = br.read_bool()?;
-        let _alt_vert_scan = br.read_bool()?;
-    }
+    let (top_field_first, alternate_vertical_scan) = if ctx.interlaced {
+        (br.read_bool()?, br.read_bool()?)
+    } else {
+        (false, false)
+    };
 
     // §6.2.5 S(GMC)-VOP sprite branch (spec lines 4328..=4333). For
     // `sprite_enable == "GMC"` the trajectory is followed (when
@@ -624,6 +633,8 @@ fn parse_video_object_plane_body(
         fcode_fwd,
         fcode_bwd,
         sprite_trajectory,
+        top_field_first,
+        alternate_vertical_scan,
     })
 }
 
