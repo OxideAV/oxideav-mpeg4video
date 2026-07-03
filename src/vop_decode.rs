@@ -43,12 +43,15 @@ use crate::block::{
     decode_inter_macroblock, decode_intra_block_full, intra_quant_matrix, nonintra_quant_matrix,
     pattern_code, BlockAssemblyError, IntraMacroblock, MacroblockTextureContext,
 };
+use crate::bvop_mv::{
+    BVopMbTexturedDecode, BVopMvDriver, BVopMvDriverError, BVopTextureParams, CoLocatedAnchor,
+};
 use crate::data_partition::use_intra_dc_vlc;
 use crate::frame_decode::{PVopMbContent, SGmcMbContent};
 use crate::macroblock::{parse_macroblock_header, MacroblockParseError};
-use crate::motion::{averaged_motion_vector, MotionVector, AMV_PIXEL_COUNT};
+use crate::motion::{averaged_motion_vector, DirectCoLocatedMv, MotionVector, AMV_PIXEL_COUNT};
 use crate::neighbour::{BlockNeighbour, IntraBlockGrid};
-use crate::pvop_mv::{MvDriver, PvopMvError};
+use crate::pvop_mv::{MvDriver, PvopMbMotion, PvopMvError};
 use crate::reconstruct::{reconstruct_intra_macroblock, ReconstructedMacroblock};
 use crate::sprite::SpriteTrajectory;
 use crate::vol::{SpriteEnable, SpriteWarpingAccuracy, VolHeader};
@@ -69,6 +72,8 @@ pub enum VopDecodeError {
     Motion(PvopMvError),
     /// A §6.2.7 / §7.4 texture decode failed.
     Texture(BlockAssemblyError),
+    /// A B-VOP macroblock decode (header / motion / residual) failed.
+    BVop(BVopMvDriverError),
 }
 
 impl core::fmt::Display for VopDecodeError {
@@ -80,6 +85,7 @@ impl core::fmt::Display for VopDecodeError {
             VopDecodeError::Macroblock(e) => write!(f, "vop decode: macroblock header: {e}"),
             VopDecodeError::Motion(e) => write!(f, "vop decode: motion: {e}"),
             VopDecodeError::Texture(e) => write!(f, "vop decode: texture: {e}"),
+            VopDecodeError::BVop(e) => write!(f, "vop decode: b-vop macroblock: {e}"),
         }
     }
 }
@@ -364,6 +370,95 @@ pub fn decode_p_vop_macroblocks(
         }
     }
     Ok(out)
+}
+
+/// Resolve the §7.6.9.5.1 / §7.6.9.6 co-located anchor state for one
+/// B-VOP macroblock from the *future* (most recently decoded) anchor's
+/// per-macroblock motion.
+///
+/// * a skipped anchor MB → the §7.6.9.6 override flag,
+/// * a 1-MV inter MB → its vector,
+/// * a 4-MV inter MB → its **first** sub-block vector (the driver's
+///   direct derivation applies one co-located vector per macroblock;
+///   per-sub-block co-located vectors are a later refinement),
+/// * an intra MB (or a GMC MB, which carries no local vector) → the
+///   §7.6.9.5.1 final-sentence zero-vector fallback.
+fn co_located_from_motion(motion: PvopMbMotion) -> CoLocatedAnchor {
+    match motion {
+        PvopMbMotion::Skipped => CoLocatedAnchor {
+            skipped: true,
+            mv: DirectCoLocatedMv::TransparentOrAbsent,
+        },
+        PvopMbMotion::OneMv(mv) => CoLocatedAnchor {
+            skipped: false,
+            mv: DirectCoLocatedMv::Mv(mv),
+        },
+        PvopMbMotion::FourMv(mvs) => CoLocatedAnchor {
+            skipped: false,
+            mv: DirectCoLocatedMv::Mv(mvs[0]),
+        },
+        PvopMbMotion::Intra => CoLocatedAnchor::default(),
+    }
+}
+
+/// Decode a complete rectangular progressive **B-VOP**'s macroblock
+/// layer straight off the bitstream, returning one
+/// [`BVopMbTexturedDecode`] per macroblock in raster order — ready for
+/// [`crate::frame_decode::assemble_b_vop_frame`] /
+/// [`crate::sequence::SequenceDecoder::push_b_vop`].
+///
+/// This is the header-level wrapper over
+/// [`BVopMvDriver::decode_vop`](crate::bvop_mv::BVopMvDriver::decode_vop):
+/// it derives the driver's dimensions / f_codes / texture parameters
+/// from the VOL + VOP headers and adapts the future anchor's decoded
+/// per-macroblock motion (`anchor_motion`, raster order — e.g. the
+/// [`PvopMbMotion`]s the P-VOP walk produced, or `None` after an
+/// intra-only anchor) into the per-MB §7.6.9.5.1 / §7.6.9.6 co-located
+/// state.
+///
+/// `trb` / `trd` are the §7.6.7 temporal references in
+/// `vop_time_increment_resolution` ticks (`trb`: this B-VOP minus the
+/// past anchor; `trd`: future anchor minus past anchor).
+pub fn decode_b_vop_macroblocks(
+    br: &mut BitReader<'_>,
+    vol: &VolHeader,
+    vop: &VopHeader,
+    trb: i32,
+    trd: i32,
+    anchor_motion: Option<&[PvopMbMotion]>,
+) -> Result<Vec<BVopMbTexturedDecode>, VopDecodeError> {
+    check_vol_supported(vol)?;
+    if !matches!(vop.coding_type, VopCodingType::B) {
+        return Err(VopDecodeError::Unsupported("not a B-VOP"));
+    }
+    if !vop.coded {
+        return Err(VopDecodeError::Unsupported("vop_coded == 0"));
+    }
+    if vol.quarter_sample {
+        return Err(VopDecodeError::Unsupported("quarter_sample"));
+    }
+
+    let (mb_width, mb_height) = vop_mb_dimensions(vol);
+    let max_qp = max_quantiser_scale(vol);
+    let mut driver = BVopMvDriver::new(mb_height, mb_width, vop.fcode_fwd, vop.fcode_bwd, trb, trd);
+    let texture = BVopTextureParams {
+        base_quantiser_scale: u32::from(vop.quant).clamp(1, max_qp),
+        max_quantiser_scale: max_qp,
+        bits_per_pixel: u32::from(vol.bits_per_pixel),
+        quant_type: vol.quant_type,
+    };
+    driver
+        .decode_vop(
+            br,
+            vol,
+            vop.coding_type,
+            texture,
+            |mb_row, mb_col| match anchor_motion {
+                Some(motion) => co_located_from_motion(motion[mb_row * mb_width + mb_col]),
+                None => CoLocatedAnchor::default(),
+            },
+        )
+        .map_err(VopDecodeError::BVop)
 }
 
 /// Compute the §7.8.7.3 averaged motion vector of one `mcsel == 1`
@@ -1036,6 +1131,137 @@ mod tests {
             crate::frame_decode::assemble_s_gmc_vop_frame(&store, 1, 1, &entries, &geometry, 0, 8)
                 .unwrap();
         assert_eq!(frame.luma_at(0, 0), Some(128));
+    }
+
+    /// A coded B-VOP header (quant 8, fcode_fwd = fcode_bwd = 1).
+    fn test_b_vop(vol: &VolHeader, quant: u32) -> VopHeader {
+        let mut w = BitWriter::default();
+        w.write_bits(0x0000_01B6, 32);
+        w.write_bits(0b10, 2); // vop_coding_type: B
+        w.write_bits(0, 1); // modulo_time_base
+        w.write_bits(1, 1); // marker
+        w.write_bits(0, 5); // time increment
+        w.write_bits(1, 1); // marker
+        w.write_bits(1, 1); // vop_coded
+        w.write_bits(0, 3); // intra_dc_vlc_thr
+        w.write_bits(quant, 5); // vop_quant
+        w.write_bits(1, 3); // vop_fcode_forward
+        w.write_bits(1, 3); // vop_fcode_backward
+        let data = w.finish();
+        crate::vop::parse_video_object_plane_header(
+            &data,
+            vol.time_increment_resolution,
+            VopContext::from_vol(vol),
+        )
+        .expect("test B-VOP must parse")
+    }
+
+    /// A store with distinguishable anchors: forward I (flat 40),
+    /// backward P (flat 80, intra content).
+    fn two_flat_anchor_store() -> FrameStore {
+        use crate::reconstruct::{
+            ReconstructedMacroblock, MACROBLOCK_CHROMA_SIDE, MACROBLOCK_LUMA_SIDE,
+        };
+        let flat = |v: i32| ReconstructedMacroblock {
+            luma: [[v; MACROBLOCK_LUMA_SIDE]; MACROBLOCK_LUMA_SIDE],
+            cb: [[v; MACROBLOCK_CHROMA_SIDE]; MACROBLOCK_CHROMA_SIDE],
+            cr: [[v; MACROBLOCK_CHROMA_SIDE]; MACROBLOCK_CHROMA_SIDE],
+        };
+        let mut store = FrameStore::new();
+        decode_i_vop(&mut store, 1, 1, &[flat(40)]).unwrap();
+        let entries = vec![PVopMbContent::Intra(flat(80))];
+        crate::frame_decode::decode_p_vop(&mut store, 1, 1, &entries, 0, 8).unwrap();
+        store
+    }
+
+    #[test]
+    fn b_vop_forward_mb_copies_forward_anchor() {
+        // modb "01" (mb_type present, no cbpb) + mb_type "0001"
+        // (forward) + zero MVDf ("1", "1") → a forward copy of the past
+        // anchor (luma 40).
+        let vol = test_vol(16, 16);
+        let store = two_flat_anchor_store();
+        let bvop = test_b_vop(&vol, 8);
+
+        let mut w = BitWriter::default();
+        w.write_bits(0b01, 2); // modb
+        w.write_bits(0b0001, 4); // mb_type: forward
+        w.write_bits(1, 1); // MVDfx = 0
+        w.write_bits(1, 1); // MVDfy = 0
+        let data = w.finish();
+        let mut br = BitReader::new(&data);
+        let anchor = [PvopMbMotion::Intra];
+        let entries = decode_b_vop_macroblocks(&mut br, &vol, &bvop, 1, 2, Some(&anchor)).unwrap();
+        assert_eq!(entries.len(), 1);
+        let frame = crate::frame_decode::assemble_b_vop_frame(
+            &store,
+            1,
+            1,
+            &entries,
+            0,
+            crate::bvop_prediction::BVopSampleMode::HalfPel,
+            8,
+        )
+        .unwrap();
+        assert_eq!(frame.luma_at(0, 0), Some(40));
+    }
+
+    #[test]
+    fn b_vop_modb1_direct_zero_averages_anchors() {
+        // modb "1": no mb_type / cbpb / motion bits — direct mode with
+        // a zero delta over a zero co-located MV → both derived MVs are
+        // zero → the §7.6.9.4 average of the anchors: (40+80+1)>>1 = 60.
+        let vol = test_vol(16, 16);
+        let store = two_flat_anchor_store();
+        let bvop = test_b_vop(&vol, 8);
+
+        let mut w = BitWriter::default();
+        w.write_bits(0b1, 1); // modb = "1"
+        let data = w.finish();
+        let mut br = BitReader::new(&data);
+        let anchor = [PvopMbMotion::OneMv(MotionVector { x: 0, y: 0 })];
+        let entries = decode_b_vop_macroblocks(&mut br, &vol, &bvop, 1, 2, Some(&anchor)).unwrap();
+        assert_eq!(br.bit_position(), 1, "modb '1' consumes exactly one bit");
+        let frame = crate::frame_decode::assemble_b_vop_frame(
+            &store,
+            1,
+            1,
+            &entries,
+            0,
+            crate::bvop_prediction::BVopSampleMode::HalfPel,
+            8,
+        )
+        .unwrap();
+        assert_eq!(frame.luma_at(0, 0), Some(60));
+    }
+
+    #[test]
+    fn b_vop_skipped_co_located_forces_override() {
+        // The co-located future-anchor MB was skipped: §7.6.9.6 forces
+        // the modb "1" macroblock to direct-zero regardless — and the
+        // walk must route the skipped flag through.
+        let vol = test_vol(16, 16);
+        let store = two_flat_anchor_store();
+        let bvop = test_b_vop(&vol, 8);
+
+        let mut w = BitWriter::default();
+        w.write_bits(0b1, 1); // modb = "1"
+        let data = w.finish();
+        let mut br = BitReader::new(&data);
+        let anchor = [PvopMbMotion::Skipped];
+        let entries = decode_b_vop_macroblocks(&mut br, &vol, &bvop, 1, 2, Some(&anchor)).unwrap();
+        let frame = crate::frame_decode::assemble_b_vop_frame(
+            &store,
+            1,
+            1,
+            &entries,
+            0,
+            crate::bvop_prediction::BVopSampleMode::HalfPel,
+            8,
+        )
+        .unwrap();
+        // Direct zero over zero co-located → the bidirectional average.
+        assert_eq!(frame.luma_at(0, 0), Some(60));
     }
 
     #[test]

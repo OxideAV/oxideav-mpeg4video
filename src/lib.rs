@@ -545,8 +545,8 @@ pub use vop::{
     VOP_START_CODE,
 };
 pub use vop_decode::{
-    decode_i_vop_macroblocks, decode_p_vop_macroblocks, decode_s_gmc_vop_macroblocks,
-    vop_mb_dimensions, VopDecodeError,
+    decode_b_vop_macroblocks, decode_i_vop_macroblocks, decode_p_vop_macroblocks,
+    decode_s_gmc_vop_macroblocks, vop_mb_dimensions, VopDecodeError,
 };
 pub use warp::{div_sdr, WarpGeometry};
 
