@@ -531,6 +531,16 @@ fn motion_of_p_entries(entries: &[PVopMbContent]) -> Vec<PvopMbMotion> {
         .iter()
         .map(|e| match e {
             PVopMbContent::Inter { motion, .. } => *motion,
+            // A field-predicted anchor macroblock collapses to its
+            // Div2Round-averaged vector for the progressive co-located
+            // consumers (the §7.7.2.2 interlaced direct mode is gated
+            // off with the interlaced B walk).
+            PVopMbContent::FieldInter { mvs, .. } => {
+                PvopMbMotion::OneMv(crate::motion::MotionVector {
+                    x: crate::field_motion::div2_round(mvs.top.x + mvs.bottom.x),
+                    y: crate::field_motion::div2_round(mvs.top.y + mvs.bottom.y),
+                })
+            }
             PVopMbContent::Intra(_) => PvopMbMotion::Intra,
         })
         .collect()

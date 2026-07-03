@@ -181,3 +181,14 @@ fn interlaced_alternate_scan_intra_stream_matches_reference_decode() {
         0.40,
     );
 }
+
+#[test]
+fn interlaced_ip_stream_matches_reference_decode() {
+    // Interlaced I + 4 P frames encoded with field motion estimation:
+    // exercises the §7.7.2.1 field-predicted macroblocks (two field MV
+    // bodies, shared CASE 1/2/3 predictor, Div2Round chroma vectors,
+    // per-field reference selection), the §7.7.1 field DCT on both
+    // intra macroblocks and inter residuals, and the CASE 2 collapse
+    // of field neighbours for frame-predicted macroblocks.
+    assert_stream_matches("ilaced_ip_64x64.m4v", "ilaced_ip_64x64.yuv", 3, 0.40);
+}

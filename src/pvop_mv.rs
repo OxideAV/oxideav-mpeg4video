@@ -276,6 +276,39 @@ impl MvDriver {
         }
     }
 
+    /// Decode the §7.7.2.1 **field-predicted** macroblock's two field
+    /// motion vectors at raster position `(mb_row, mb_col)`.
+    ///
+    /// The shared predictor `(Px, Py)` is the CASE 1 / 2 / 3 median
+    /// over the Figure 7-46 / 7-47 candidates
+    /// ([`MvGrid::field_predictor_candidates`] — a field-predicted
+    /// neighbour contributes its `Div2Round(MVf1 + MVf2)` average, a
+    /// frame-predicted one its block vector). The §6.2.6 bodies carry
+    /// the top-field then the bottom-field differential; both fields
+    /// share the predictor, with the vertical component reconstructed
+    /// on the field grid (`MVy = 2 * (MVDy + Py / 2)`, §7.7.2.1). The
+    /// decoded pair is recorded into the grid as a field entry so
+    /// later macroblocks' CASE 2 / CASE 3 gathering sees it.
+    pub fn decode_field_macroblock(
+        &mut self,
+        br: &mut BitReader<'_>,
+        mb_row: usize,
+        mb_col: usize,
+    ) -> Result<crate::field_motion::FieldMotionVectors, PvopMvError> {
+        let candidates = self.grid.field_predictor_candidates(mb_row, mb_col)?;
+        let predictor = crate::motion::predict_field_motion_vector(candidates);
+        let pair = crate::motion::decode_field_motion_vector_pair(
+            br,
+            MvMode::Forward,
+            self.vop_fcode_forward,
+        )?;
+        let mvs =
+            crate::field_motion::reconstruct_field_motion_vectors(pair, predictor.x, predictor.y);
+        self.grid
+            .record_field(mb_row, mb_col, mvs.top, mvs.bottom)?;
+        Ok(mvs)
+    }
+
     /// §7.8.7.3: record an `mcsel == 1` S(GMC)-VOP macroblock's
     /// **averaged motion vector** into the predictor grid without
     /// consuming any bits.
@@ -737,6 +770,25 @@ mod tests {
             out.push(byte);
         }
         out
+    }
+
+    #[test]
+    fn field_macroblock_decodes_and_records_field_pair() {
+        // Field-predicted MB at the top-left (all candidates invalid →
+        // predictor (0, 0)). Four zero-delta components → MVf1 = MVf2
+        // = (0, 0). Then a second field MB to its right: predictor =
+        // median with the left neighbour contributing
+        // Div2Round(top + bottom) = (0, 0) → still zero.
+        let mut driver = MvDriver::new(1, 2, 1);
+        let data = zero_delta_bits(2); // two MVs = four components
+        let mut br = BitReader::new(&data);
+        let mvs = driver.decode_field_macroblock(&mut br, 0, 0).unwrap();
+        assert_eq!(mvs.top, MotionVector { x: 0, y: 0 });
+        assert_eq!(mvs.bottom, MotionVector { x: 0, y: 0 });
+        // The grid recorded a field entry: a frame-mode gather at the
+        // right neighbour sees the Div2Round-averaged (0, 0) as valid.
+        let cands = driver.grid().predictor_candidates(0, 1, 0).unwrap();
+        assert_eq!(cands[0], Some(MotionVector { x: 0, y: 0 }));
     }
 
     #[test]

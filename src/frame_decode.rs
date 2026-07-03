@@ -89,6 +89,22 @@ pub enum PVopMbContent {
         /// all-zero `cbp`).
         residual: InterMacroblock,
     },
+    /// A §7.7.2.1 **field-predicted** inter macroblock of an interlaced
+    /// VOL: two field motion vectors (frame coordinates, even vertical
+    /// components) plus the §6.2.6.3 reference-field selection bits and
+    /// the §7.4 residual (its luminance already inverse-field-DCT
+    /// permuted when the macroblock coded `dct_type == 1`).
+    FieldInter {
+        /// The reconstructed top/bottom field motion vectors.
+        mvs: crate::field_motion::FieldMotionVectors,
+        /// `forward_top_field_reference` (§6.3.7.2 raw bit — `false` =
+        /// top reference field, `true` = bottom).
+        top_field_ref: bool,
+        /// `forward_bottom_field_reference` (same convention).
+        bottom_field_ref: bool,
+        /// §7.4 inter residual.
+        residual: InterMacroblock,
+    },
     /// An intra macroblock already reconstructed to pixels.
     Intra(ReconstructedMacroblock),
 }
@@ -152,6 +168,46 @@ pub fn assemble_p_vop_frame(
                 bits_per_pixel,
             )
             .ok_or(FrameDecodeError::InterPredictionFailed { mb_col, mb_row })?,
+            PVopMbContent::FieldInter {
+                mvs,
+                top_field_ref,
+                bottom_field_ref,
+                residual,
+            } => {
+                // §7.7.2.1 field_motion_compensate_one_reference — the
+                // quarter-sample VOL swaps in the §7.6.2.2 field
+                // interpolation for the two luma field blocks.
+                let prediction = match sample_mode {
+                    BVopSampleMode::HalfPel => {
+                        crate::field_motion::field_motion_compensate_one_reference(
+                            &luma_ref,
+                            &cb_ref,
+                            &cr_ref,
+                            *mvs,
+                            *top_field_ref,
+                            *bottom_field_ref,
+                            (mb_col * 16) as i32,
+                            (mb_row * 16) as i32,
+                            vop_rounding_type,
+                        )
+                    }
+                    BVopSampleMode::QuarterPel { bits_per_pixel } => {
+                        crate::field_motion::field_motion_compensate_one_reference_qpel(
+                            &luma_ref,
+                            &cb_ref,
+                            &cr_ref,
+                            *mvs,
+                            *top_field_ref,
+                            *bottom_field_ref,
+                            (mb_col * 16) as i32,
+                            (mb_row * 16) as i32,
+                            vop_rounding_type,
+                            bits_per_pixel,
+                        )
+                    }
+                };
+                reconstruct_inter_macroblock(&prediction, residual, bits_per_pixel)
+            }
             PVopMbContent::Intra(mb) => mb.clone(),
         };
         frame.blit_macroblock(mb_col, mb_row, &reconstructed)?;
@@ -188,6 +244,17 @@ fn obmc_block_field(entries: &[PVopMbContent], mb_width: usize) -> Vec<ObmcBlock
             let by = 2 * mb_row + (b >> 1);
             field[by * bw + bx] = match entry {
                 PVopMbContent::Intra(_) => ObmcBlockState::Intra,
+                // §7.7.2.1: a field-predicted neighbour's OBMC vector is
+                // the Div2Round-averaged pair, "computed in the same
+                // manner as the candidate predictor vectors". (The walk
+                // gates the interlaced + OBMC combination off, so this
+                // arm is exercised only by direct API callers.)
+                PVopMbContent::FieldInter { mvs, .. } => {
+                    ObmcBlockState::Mv(crate::motion::MotionVector {
+                        x: crate::field_motion::div2_round(mvs.top.x + mvs.bottom.x),
+                        y: crate::field_motion::div2_round(mvs.top.y + mvs.bottom.y),
+                    })
+                }
                 PVopMbContent::Inter { motion, .. } => match motion {
                     PvopMbMotion::Skipped => ObmcBlockState::NotCoded,
                     PvopMbMotion::Intra => ObmcBlockState::Intra,
@@ -274,6 +341,27 @@ pub fn assemble_p_vop_frame_obmc(
         let mb_row = idx / mb_width;
         let reconstructed = match entry {
             PVopMbContent::Intra(mb) => mb.clone(),
+            // §7.7.2.1: "the OBMC is not applied if the current MB is
+            // field-predicted" — plain field motion compensation.
+            PVopMbContent::FieldInter {
+                mvs,
+                top_field_ref,
+                bottom_field_ref,
+                residual,
+            } => {
+                let prediction = crate::field_motion::field_motion_compensate_one_reference(
+                    &luma_ref,
+                    &cb_ref,
+                    &cr_ref,
+                    *mvs,
+                    *top_field_ref,
+                    *bottom_field_ref,
+                    (mb_col * 16) as i32,
+                    (mb_row * 16) as i32,
+                    vop_rounding_type,
+                );
+                reconstruct_inter_macroblock(&prediction, residual, bits_per_pixel)
+            }
             PVopMbContent::Inter { motion, residual } => {
                 if matches!(motion, PvopMbMotion::Intra) {
                     return Err(FrameDecodeError::InterPredictionFailed { mb_col, mb_row });

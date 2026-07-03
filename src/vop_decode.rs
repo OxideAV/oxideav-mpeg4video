@@ -190,6 +190,19 @@ fn inverse_field_dct_luma(luma: &[[i32; 16]; 16]) -> [[i32; 16]; 16] {
     out
 }
 
+/// The §6.2.6.3 forward reference-field selection bits of a
+/// field-predicted P-/S(GMC)-VOP macroblock (`field_prediction == 1`),
+/// as raw §6.3.7.2 bits (`false` = top reference field). `None` for a
+/// frame-predicted (or progressive) macroblock.
+fn header_forward_field_refs(header: &crate::macroblock::MacroblockHeader) -> Option<(bool, bool)> {
+    header
+        .interlaced_info
+        .as_ref()
+        .and_then(|info| info.field_prediction)
+        .and_then(|fp| fp.forward)
+        .map(|(top, bottom)| (top.as_bit(), bottom.as_bit()))
+}
+
 /// Whether one parsed macroblock header selected the §6.2.6.3 field
 /// DCT (`dct_type == 1`).
 fn header_field_dct(header: &crate::macroblock::MacroblockHeader) -> bool {
@@ -442,7 +455,12 @@ pub fn decode_p_vop_macroblocks(
     vop: &VopHeader,
 ) -> Result<Vec<PVopMbContent>, VopDecodeError> {
     check_vol_supported(vol)?;
-    check_progressive(vol)?;
+    if vol.interlaced && !vol.obmc_disable {
+        // §7.7.2.1 defines OBMC-with-field-neighbour semantics, but
+        // the combination is outside the supported profiles; keep it
+        // typed-rejected rather than half-wired.
+        return Err(VopDecodeError::Unsupported("obmc + interlaced"));
+    }
     if !matches!(vop.coding_type, VopCodingType::P) {
         return Err(VopDecodeError::Unsupported("not a P-VOP"));
     }
@@ -524,10 +542,29 @@ pub fn decode_p_vop_macroblocks(
                     &intra_matrix,
                 )?;
                 out.push(PVopMbContent::Intra(reconstruct_intra_macroblock(&mb, bpp)));
+            } else if let Some((top_ref, bottom_ref)) = header_forward_field_refs(&header) {
+                // §7.7.2.1 field-predicted macroblock: two field MV
+                // bodies with the shared CASE 1/2/3 predictor.
+                let mvs = driver.decode_field_macroblock(br, mb_row, mb_col)?;
+                let mut residual = decode_inter_macroblock(br, &header, ctx, &inter_matrix)?;
+                if header_field_dct(&header) {
+                    residual.luma = inverse_field_dct_luma(&residual.luma);
+                }
+                out.push(PVopMbContent::FieldInter {
+                    mvs,
+                    top_field_ref: top_ref,
+                    bottom_field_ref: bottom_ref,
+                    residual,
+                });
             } else {
                 // §6.2.6: the motion_vector() bodies precede the texture.
                 let motion = driver.decode_macroblock(br, mb_row, mb_col, false, header.mb_type)?;
-                let residual = decode_inter_macroblock(br, &header, ctx, &inter_matrix)?;
+                let mut residual = decode_inter_macroblock(br, &header, ctx, &inter_matrix)?;
+                // §7.7.1: an interlaced frame-predicted inter MB may
+                // still code its residual with the field DCT.
+                if header_field_dct(&header) {
+                    residual.luma = inverse_field_dct_luma(&residual.luma);
+                }
                 out.push(PVopMbContent::Inter { motion, residual });
             }
         }
@@ -1218,7 +1255,7 @@ mod tests {
                 PVopMbContent::Inter { motion, .. } => {
                     assert_eq!(motion.one_mv(), Some(MotionVector { x: 0, y: 0 }));
                 }
-                PVopMbContent::Intra(_) => panic!("expected inter"),
+                other => panic!("expected inter, got {other:?}"),
             }
         }
     }
