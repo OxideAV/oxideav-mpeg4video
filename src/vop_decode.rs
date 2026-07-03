@@ -30,7 +30,7 @@
 //! ## Scope
 //!
 //! Rectangular shape, progressive, non-data-partitioned,
-//! non-short-video-header VOPs with `obmc_disable == 1`. Half-sample
+//! non-short-video-header VOPs. Half-sample
 //! (§7.6.2.1) and quarter-sample (§7.6.2.2) VOLs both walk here — the
 //! §7.6.3 motion syntax is unit-agnostic; the sub-pel grid only
 //! matters at frame assembly.
@@ -392,8 +392,9 @@ pub fn decode_i_vop_macroblocks(
 /// Both the half-sample (§7.6.2.1) and quarter-sample (§7.6.2.2) VOLs
 /// decode here — the §7.6.3 motion-vector syntax is unit-agnostic, so
 /// the walk is identical; the caller selects the matching sub-pel
-/// interpolation at frame assembly. `obmc_disable == 0` is rejected up
-/// front.
+/// interpolation at frame assembly (and the §7.6.6 OBMC assembly when
+/// the VOL coded `obmc_disable == 0` — the macroblock syntax itself is
+/// unaffected by OBMC).
 pub fn decode_p_vop_macroblocks(
     br: &mut BitReader<'_>,
     vol: &VolHeader,
@@ -406,8 +407,10 @@ pub fn decode_p_vop_macroblocks(
     if !vop.coded {
         return Err(VopDecodeError::Unsupported("vop_coded == 0"));
     }
-    if !vol.obmc_disable {
-        return Err(VopDecodeError::Unsupported("obmc"));
+    if !vol.obmc_disable && vol.quarter_sample {
+        // §7.6.6 is a half-sample-mode tool; a VOL asserting both is
+        // outside any conforming profile.
+        return Err(VopDecodeError::Unsupported("obmc + quarter_sample"));
     }
 
     let (mb_width, mb_height) = vop_mb_dimensions(vol);

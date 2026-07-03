@@ -118,6 +118,29 @@ impl SequenceDecoder {
         Ok(self.accept_anchor(frame))
     }
 
+    /// Decode a P-VOP whose VOL coded `obmc_disable == 0`: the §7.6.6
+    /// overlapped-motion-compensation assembly
+    /// ([`assemble_p_vop_frame_obmc`](crate::frame_decode::assemble_p_vop_frame_obmc)).
+    /// Reordered exactly as [`SequenceDecoder::push_p_vop`].
+    pub fn push_p_vop_obmc(
+        &mut self,
+        mb_width: usize,
+        mb_height: usize,
+        entries: &[PVopMbContent],
+        vop_rounding_type: u8,
+        bits_per_pixel: u32,
+    ) -> Result<Vec<DecodedFrame>, FrameDecodeError> {
+        let frame = crate::frame_decode::assemble_p_vop_frame_obmc(
+            &self.store,
+            mb_width,
+            mb_height,
+            entries,
+            vop_rounding_type,
+            bits_per_pixel,
+        )?;
+        Ok(self.accept_anchor(frame))
+    }
+
     /// Decode an S(GMC)-VOP in coding order. Reordered exactly as a
     /// P-VOP (§6.1.3.8).
     #[allow(clippy::too_many_arguments)]

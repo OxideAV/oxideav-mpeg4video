@@ -294,14 +294,27 @@ impl Mpeg4VideoDecoder {
                 }
                 let entries = decode_p_vop_macroblocks(&mut br, &vol, &vop)?;
                 self.anchor_motion = Some(motion_of_p_entries(&entries));
-                out.extend(self.sequence.push_p_vop(
-                    mb_width,
-                    mb_height,
-                    &entries,
-                    vop.rounding_type,
-                    sample_mode,
-                    u32::from(vol.bits_per_pixel),
-                )?);
+                out.extend(if vol.obmc_disable {
+                    self.sequence.push_p_vop(
+                        mb_width,
+                        mb_height,
+                        &entries,
+                        vop.rounding_type,
+                        sample_mode,
+                        u32::from(vol.bits_per_pixel),
+                    )?
+                } else {
+                    // §7.6.6: overlapped motion compensation for the
+                    // luminance plane (half-sample mode only — the
+                    // walk gates the qpel+OBMC combination).
+                    self.sequence.push_p_vop_obmc(
+                        mb_width,
+                        mb_height,
+                        &entries,
+                        vop.rounding_type,
+                        u32::from(vol.bits_per_pixel),
+                    )?
+                });
             }
             VopCodingType::S => {
                 if self.sequence.store().p_vop_reference().is_none() {
@@ -894,6 +907,59 @@ mod tests {
         assert_eq!(frames.len(), 2);
         // The uncoded P is a copy of the I.
         assert_eq!(frames[1].luma_at(0, 0), Some(128));
+    }
+
+    /// The test VOL with `obmc_disable = 0` (all other fields as
+    /// [`write_vol`]).
+    fn write_obmc_vol(w: &mut BitWriter, width: u32, height: u32) {
+        w.write_bits(0x0000_0120, 32);
+        w.write_bits(0, 1); // random_accessible_vol
+        w.write_bits(1, 8); // video_object_type_indication
+        w.write_bits(0, 1); // is_object_layer_identifier
+        w.write_bits(1, 4); // aspect_ratio_info 1:1
+        w.write_bits(0, 1); // vol_control_parameters
+        w.write_bits(0, 2); // shape rectangular
+        w.write_bits(1, 1); // marker
+        w.write_bits(30, 16); // vop_time_increment_resolution
+        w.write_bits(1, 1); // marker
+        w.write_bits(0, 1); // fixed_vop_rate
+        w.write_bits(1, 1); // marker
+        w.write_bits(width, 13);
+        w.write_bits(1, 1); // marker
+        w.write_bits(height, 13);
+        w.write_bits(1, 1); // marker
+        w.write_bits(0, 1); // interlaced
+        w.write_bits(0, 1); // obmc_disable = 0 → §7.6.6 applies
+        w.write_bits(0, 1); // sprite_enable
+        w.write_bits(0, 1); // not_8_bit
+        w.write_bits(0, 1); // quant_type
+        w.write_bits(1, 1); // complexity_estimation_disable
+        w.write_bits(1, 1); // resync_marker_disable
+        w.write_bits(0, 1); // data_partitioned
+        w.write_bits(0, 1); // scalability
+        w.align();
+    }
+
+    #[test]
+    fn obmc_vol_p_vop_decodes_via_overlapped_assembly() {
+        // A VOL with obmc_disable == 0 must decode (the macroblock
+        // syntax is unchanged; only the luminance prediction blends).
+        // Flat-grey I + all-skipped P: every §7.6.6 fetch sees 128, so
+        // the overlapped copy is exact.
+        let mut w = BitWriter::default();
+        write_vos(&mut w);
+        write_obmc_vol(&mut w, 32, 16);
+        write_i_vop(&mut w, 2, 0);
+        write_skipped_p_vop(&mut w, 2, 1);
+        let stream = w.finish();
+        let mut dec = Mpeg4VideoDecoder::new();
+        let mut frames = dec.decode(&stream).unwrap();
+        frames.extend(dec.flush());
+        assert_eq!(frames.len(), 2);
+        assert!(!dec.vol().unwrap().obmc_disable);
+        assert_eq!(frames[1].coding_type(), VopCodingType::P);
+        assert_eq!(frames[1].luma_at(0, 0), Some(128));
+        assert_eq!(frames[1].luma_at(31, 15), Some(128));
     }
 
     #[test]

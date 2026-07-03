@@ -160,6 +160,201 @@ pub fn assemble_p_vop_frame(
     Ok(frame)
 }
 
+/// Per-8×8-luminance-block motion classification feeding the §7.6.6
+/// remote-MV substitution rules.
+#[derive(Debug, Clone, Copy)]
+enum ObmcBlockState {
+    /// The owning macroblock is intra-coded (§7.6.6 rule 2).
+    Intra,
+    /// The owning macroblock was not coded / skipped (§7.6.6 rule 1;
+    /// its own OBMC prediction runs with the zero vector).
+    NotCoded,
+    /// An inter block with its §7.6.1.6-padded motion vector
+    /// (half-sample units — OBMC is a half-sample-mode tool).
+    Mv(crate::motion::MotionVector),
+}
+
+/// Expand the per-macroblock P-VOP content into the frame's 8×8-block
+/// motion field (`2·mb_width × 2·mb_height`, Figure 6-8 order within
+/// each macroblock).
+fn obmc_block_field(entries: &[PVopMbContent], mb_width: usize) -> Vec<ObmcBlockState> {
+    let mut field = vec![ObmcBlockState::NotCoded; entries.len() * 4];
+    let bw = 2 * mb_width;
+    for (idx, entry) in entries.iter().enumerate() {
+        let mb_col = idx % mb_width;
+        let mb_row = idx / mb_width;
+        for b in 0..4usize {
+            let bx = 2 * mb_col + (b & 1);
+            let by = 2 * mb_row + (b >> 1);
+            field[by * bw + bx] = match entry {
+                PVopMbContent::Intra(_) => ObmcBlockState::Intra,
+                PVopMbContent::Inter { motion, .. } => match motion {
+                    PvopMbMotion::Skipped => ObmcBlockState::NotCoded,
+                    PvopMbMotion::Intra => ObmcBlockState::Intra,
+                    PvopMbMotion::OneMv(mv) => ObmcBlockState::Mv(*mv),
+                    PvopMbMotion::FourMv(mvs) => ObmcBlockState::Mv(mvs[b]),
+                },
+            };
+        }
+    }
+    field
+}
+
+/// Resolve one §7.6.6 remote neighbour: outside the VOP → rule 3
+/// (`Absent`, current MV); an intra macroblock → rule 2; a not-coded
+/// macroblock → rule 1 (zero vector); otherwise the block's vector.
+fn obmc_remote_kind(
+    field: &[ObmcBlockState],
+    bw: usize,
+    bh: usize,
+    bx: isize,
+    by: isize,
+) -> crate::obmc::RemoteBlockKind {
+    use crate::obmc::{ObmcMv, RemoteBlockKind};
+    if bx < 0 || by < 0 || bx as usize >= bw || by as usize >= bh {
+        return RemoteBlockKind::Absent;
+    }
+    match field[by as usize * bw + bx as usize] {
+        ObmcBlockState::Intra => RemoteBlockKind::Intra,
+        ObmcBlockState::NotCoded => RemoteBlockKind::NotCoded,
+        ObmcBlockState::Mv(mv) => RemoteBlockKind::Inter(ObmcMv::new(mv.x, mv.y)),
+    }
+}
+
+/// Assemble a complete P-VOP frame with §7.6.6 **overlapped motion
+/// compensation** (`obmc_disable == 0`) for the luminance plane.
+///
+/// Every inter macroblock's four 8×8 luminance prediction blocks are
+/// the three-vector weighted blends of [`crate::obmc::obmc_predict_block`]:
+/// the block's own vector plus the per-pixel above-or-below and
+/// left-or-right remote vectors, gathered from the frame-wide 8×8
+/// motion field with the four §7.6.6 substitution rules (not-coded →
+/// zero, intra → current, outside the VOP → current, below-MB → the
+/// current vector). A skipped macroblock is overlapped too — its own
+/// vector is zero but its neighbours' vectors still blend in.
+///
+/// Chrominance is never overlapped (§7.6.6 covers luminance only):
+/// the §7.6.5 `MVDCHR` path of the plain assembly applies unchanged.
+///
+/// OBMC is a half-sample-mode tool; motion vectors are taken in
+/// half-sample units.
+pub fn assemble_p_vop_frame_obmc(
+    store: &FrameStore,
+    mb_width: usize,
+    mb_height: usize,
+    entries: &[PVopMbContent],
+    vop_rounding_type: u8,
+    bits_per_pixel: u32,
+) -> Result<DecodedFrame, FrameDecodeError> {
+    use crate::half_sample::{fetch_clamped_sample, split_half_pel};
+    use crate::obmc::{obmc_predict_block, ObmcConfig, ObmcMv, ObmcNeighbourhood};
+    use crate::reconstruct::InterPredictionMacroblock;
+
+    let expected = mb_width * mb_height;
+    if entries.len() != expected {
+        return Err(FrameDecodeError::MacroblockCountMismatch {
+            supplied: entries.len(),
+            expected,
+        });
+    }
+    let reference = store
+        .p_vop_reference()
+        .ok_or(FrameDecodeError::MissingReference)?;
+    let luma_ref = reference.luma_reference();
+    let cb_ref = reference.cb_reference();
+    let cr_ref = reference.cr_reference();
+
+    let field = obmc_block_field(entries, mb_width);
+    let bw = 2 * mb_width;
+    let bh = 2 * mb_height;
+
+    let mut frame = DecodedFrame::new(mb_width * 16, mb_height * 16, VopCodingType::P)?;
+    for (idx, entry) in entries.iter().enumerate() {
+        let mb_col = idx % mb_width;
+        let mb_row = idx / mb_width;
+        let reconstructed = match entry {
+            PVopMbContent::Intra(mb) => mb.clone(),
+            PVopMbContent::Inter { motion, residual } => {
+                if matches!(motion, PvopMbMotion::Intra) {
+                    return Err(FrameDecodeError::InterPredictionFailed { mb_col, mb_row });
+                }
+                let mut pred = InterPredictionMacroblock::zero();
+                for b in 0..4usize {
+                    let bx = 2 * mb_col + (b & 1);
+                    let by = 2 * mb_row + (b >> 1);
+                    let mv0 = match field[by * bw + bx] {
+                        ObmcBlockState::Mv(mv) => ObmcMv::new(mv.x, mv.y),
+                        _ => ObmcMv::ZERO,
+                    };
+                    let neighbours = ObmcNeighbourhood {
+                        above: obmc_remote_kind(&field, bw, bh, bx as isize, by as isize - 1),
+                        below: obmc_remote_kind(&field, bw, bh, bx as isize, by as isize + 1),
+                        left: obmc_remote_kind(&field, bw, bh, bx as isize - 1, by as isize),
+                        right: obmc_remote_kind(&field, bw, bh, bx as isize + 1, by as isize),
+                        // §7.6.6 rule 4: only the bottom row of the
+                        // macroblock has its below-MB remote replaced.
+                        current_block_at_mb_bottom: (b >> 1) == 1,
+                    };
+                    let origin_x = (bx * 8) as i32;
+                    let origin_y = (by * 8) as i32;
+                    let block =
+                        obmc_predict_block(mv0, neighbours, ObmcConfig::enabled(), |mv, i, j| {
+                            let (ix, hx) = split_half_pel(mv.x);
+                            let (iy, hy) = split_half_pel(mv.y);
+                            fetch_clamped_sample(
+                                &luma_ref,
+                                origin_x + i as i32 + ix,
+                                origin_y + j as i32 + iy,
+                                hx,
+                                hy,
+                                vop_rounding_type,
+                            )
+                        });
+                    let col0 = 8 * (b & 1);
+                    let row0 = 8 * (b >> 1);
+                    for (j, row) in block.iter().enumerate() {
+                        for (i, &px) in row.iter().enumerate() {
+                            pred.luma[row0 + j][col0 + i] = i32::from(px);
+                        }
+                    }
+                }
+                // §7.6.6: chrominance is not overlapped — plain §7.6.5
+                // MVDCHR + §7.6.2.1 bilinear interpolation.
+                let cmb_x = (mb_col * 8) as i32;
+                let cmb_y = (mb_row * 8) as i32;
+                let mode = BVopSampleMode::HalfPel;
+                let cb = crate::pvop_mv::predict_chroma_macroblock(
+                    *motion,
+                    &cb_ref,
+                    cmb_x,
+                    cmb_y,
+                    vop_rounding_type,
+                    mode,
+                )
+                .ok_or(FrameDecodeError::InterPredictionFailed { mb_col, mb_row })?;
+                let cr = crate::pvop_mv::predict_chroma_macroblock(
+                    *motion,
+                    &cr_ref,
+                    cmb_x,
+                    cmb_y,
+                    vop_rounding_type,
+                    mode,
+                )
+                .ok_or(FrameDecodeError::InterPredictionFailed { mb_col, mb_row })?;
+                for y in 0..8 {
+                    for x in 0..8 {
+                        pred.cb[y][x] = i32::from(cb[y * 8 + x]);
+                        pred.cr[y][x] = i32::from(cr[y * 8 + x]);
+                    }
+                }
+                reconstruct_inter_macroblock(&pred, residual, bits_per_pixel)
+            }
+        };
+        frame.blit_macroblock(mb_col, mb_row, &reconstructed)?;
+    }
+    Ok(frame)
+}
+
 /// Decode a P-VOP and advance the reference-frame chain in one call.
 ///
 /// This is the typical frame-decode-loop entry: assemble the P-VOP
@@ -658,6 +853,118 @@ mod tests {
         // Chain unchanged: forward=I(40), backward=P(80).
         assert_eq!(store.forward().unwrap().luma_at(0, 0), Some(40));
         assert_eq!(store.backward().unwrap().luma_at(0, 0), Some(80));
+    }
+
+    // --- §7.6.6 OBMC P-VOP frame assembly ---
+
+    /// A reference frame whose luma is a horizontal ramp (`luma(x, y)
+    /// = 2x`), chroma flat.
+    fn ramp_store(mb_width: usize) -> FrameStore {
+        let mut store = FrameStore::new();
+        let mbs: Vec<ReconstructedMacroblock> = (0..mb_width)
+            .map(|mb| {
+                let mut m = flat_recon(0, 90, 91);
+                for (y, row) in m.luma.iter_mut().enumerate() {
+                    for (x, px) in row.iter_mut().enumerate() {
+                        let _ = y;
+                        *px = 2 * (mb * 16 + x) as i32;
+                    }
+                }
+                m
+            })
+            .collect();
+        decode_i_vop(&mut store, mb_width, 1, &mbs).unwrap();
+        store
+    }
+
+    #[test]
+    fn obmc_uniform_motion_field_matches_plain_assembly() {
+        // When every block shares one motion vector, all three §7.6.6
+        // fetches see the same sample and (q+r+s weighted, weights sum
+        // 8) reproduce the plain motion-compensated prediction.
+        let store = ramp_store(2);
+        let mv = MotionVector { x: 2, y: 0 }; // +1 full pel
+        let entries = vec![
+            PVopMbContent::Inter {
+                motion: PvopMbMotion::OneMv(mv),
+                residual: InterMacroblock::zero(),
+            },
+            PVopMbContent::Inter {
+                motion: PvopMbMotion::OneMv(mv),
+                residual: InterMacroblock::zero(),
+            },
+        ];
+        let plain =
+            assemble_p_vop_frame(&store, 2, 1, &entries, 0, BVopSampleMode::HalfPel, 8).unwrap();
+        let obmc = assemble_p_vop_frame_obmc(&store, 2, 1, &entries, 0, 8).unwrap();
+        assert_eq!(plain.luma_samples(), obmc.luma_samples());
+        assert_eq!(plain.cb_samples(), obmc.cb_samples());
+    }
+
+    #[test]
+    fn obmc_blends_neighbouring_block_vector() {
+        // Left MB at rest, right MB displaced +4 full pels on a
+        // luma(x) = 2x ramp. In the left MB's block 1 (its right 8x8
+        // block), right-half pixels blend the right neighbour's
+        // vector: p = (q*H0 + q*H1 + s*H2 + 4)/8 with s = q + 8
+        // (above remote is outside the VOP → rule 3 → current).
+        let store = ramp_store(2);
+        let entries = vec![
+            PVopMbContent::Inter {
+                motion: PvopMbMotion::OneMv(MotionVector { x: 0, y: 0 }),
+                residual: InterMacroblock::zero(),
+            },
+            PVopMbContent::Inter {
+                motion: PvopMbMotion::OneMv(MotionVector { x: 8, y: 0 }),
+                residual: InterMacroblock::zero(),
+            },
+        ];
+        let frame = assemble_p_vop_frame_obmc(&store, 2, 1, &entries, 0, 8).unwrap();
+        use crate::obmc::{OBMC_H0, OBMC_H1, OBMC_H2};
+        // Pixel (x = 15, y = 3): block 1 of MB 0, in-block (i = 7,
+        // j = 3). q = r = 2*15 = 30 (current MV zero; above remote is
+        // outside → current). s = ramp at x+4 = 2*19 = 38 (right
+        // remote (8,0) = +4 pels).
+        let (i, j) = (7usize, 3usize);
+        let q = 30u32;
+        let sref = 38u32;
+        let expect = (q * u32::from(OBMC_H0[j][i])
+            + q * u32::from(OBMC_H1[j][i])
+            + sref * u32::from(OBMC_H2[j][i])
+            + 4)
+            / 8;
+        assert_eq!(frame.luma_at(15, 3), Some(expect as u8));
+        // Left-half pixels of the same block take the in-MB left
+        // neighbour (same zero MV) → plain value 30 survives only if
+        // every fetch agrees; verify no bleed at (x = 8, y = 3).
+        assert_eq!(frame.luma_at(8, 3), Some(16));
+    }
+
+    #[test]
+    fn obmc_skipped_macroblock_still_overlaps() {
+        // A skipped MB owns the zero vector but §7.6.6 still blends
+        // its inter neighbour's vector into the boundary pixels.
+        let store = ramp_store(2);
+        let entries = vec![
+            PVopMbContent::Inter {
+                motion: PvopMbMotion::Skipped,
+                residual: InterMacroblock::zero(),
+            },
+            PVopMbContent::Inter {
+                motion: PvopMbMotion::OneMv(MotionVector { x: 8, y: 0 }),
+                residual: InterMacroblock::zero(),
+            },
+        ];
+        let plain =
+            assemble_p_vop_frame(&store, 2, 1, &entries, 0, BVopSampleMode::HalfPel, 8).unwrap();
+        let obmc = assemble_p_vop_frame_obmc(&store, 2, 1, &entries, 0, 8).unwrap();
+        // §7.6.6 rule 1 in the *other* direction: the skipped MB is a
+        // not-coded neighbour of the moving MB, whose left-half pixels
+        // take the zero vector — and the skipped MB's own right edge
+        // blends the moving MB's vector. Either way the frames differ
+        // near the boundary but agree far from it.
+        assert_ne!(plain.luma_samples(), obmc.luma_samples());
+        assert_eq!(plain.luma_at(0, 8), obmc.luma_at(0, 8));
     }
 
     // --- S(GMC)-VOP frame assembly ---
