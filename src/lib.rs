@@ -360,10 +360,10 @@ pub mod warp;
 pub use bitreader::{BitReader, BitReaderError};
 pub use block::{
     cbpb_pattern_code, de_zigzag, decode_b_vop_inter_macroblock, decode_inter_block,
-    decode_inter_macroblock, decode_intra_block, decode_intra_macroblock, intra_quant_matrix,
-    nonintra_quant_matrix, pattern_code, BlockAssemblyError, BlockPredictors, InterMacroblock,
-    IntraMacroblock, MacroblockTextureContext, DEFAULT_INTRA_QUANT_MATRIX,
-    DEFAULT_NONINTRA_QUANT_MATRIX,
+    decode_inter_macroblock, decode_intra_block, decode_intra_block_full, decode_intra_macroblock,
+    intra_quant_matrix, nonintra_quant_matrix, pattern_code, BlockAssemblyError, BlockPredictors,
+    InterMacroblock, IntraBlockDecode, IntraMacroblock, MacroblockTextureContext,
+    DEFAULT_INTRA_QUANT_MATRIX, DEFAULT_NONINTRA_QUANT_MATRIX,
 };
 pub use bvop::{
     decode_b_vop_mb_motion_vectors, default_b_mb_type, parse_b_vop_mb_header, parse_dbquant,
@@ -539,8 +539,9 @@ pub use vol::{
     VISUAL_OBJECT_SEQUENCE_START_CODE, VISUAL_OBJECT_START_CODE,
 };
 pub use vop::{
-    parse_group_of_vop_header, parse_video_object_plane_header, GovHeader, TimeCode, VopCodingType,
-    VopContext, VopHeader, VopParseError, GROUP_OF_VOP_START_CODE, VOP_START_CODE,
+    parse_group_of_vop_header, parse_video_object_plane_header, parse_vop_header_body, GovHeader,
+    TimeCode, VopCodingType, VopContext, VopHeader, VopParseError, GROUP_OF_VOP_START_CODE,
+    VOP_START_CODE,
 };
 pub use warp::{div_sdr, WarpGeometry};
 

@@ -395,6 +395,29 @@ fn block_component(i: usize) -> DcComponent {
     DcComponent::from_block_index(i)
 }
 
+/// One intra `block(i)` decode with its §7.4.3 predictor by-products.
+///
+/// [`decode_intra_block_full`] returns not just the reconstructed
+/// spatial samples but also the two values the §7.4.3 predictor
+/// neighbourhood of *later* blocks needs from this block:
+///
+/// * `qf` — the quantised coefficient block after the §7.4.3.2 /
+///   §7.4.3.3 prediction adds and the §7.4.3.4 saturation. Its first
+///   row / first column are what a neighbouring block's §7.4.3.3 AC
+///   prediction reads (see
+///   [`BlockNeighbour::from_qf`](crate::neighbour::BlockNeighbour::from_qf)).
+/// * `dc` — the inverse-quantised DC `F[0][0]` (§7.4.4.1.1), the value
+///   the §7.4.3.1 `|FA − FB| < |FB − FC|` direction rule compares.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IntraBlockDecode {
+    /// Reconstructed spatial samples, clipped to `[0, 2^bpp - 1]`.
+    pub spatial: [[i32; 8]; 8],
+    /// Quantised coefficients after prediction add + §7.4.3.4 saturate.
+    pub qf: [[i32; 8]; 8],
+    /// Inverse-quantised DC `F[0][0]` (§7.4.4.1.1).
+    pub dc: i32,
+}
+
 /// Run the §6.2.7 `block(i)` intra texture syntax for one block and the
 /// full §7.4.x reconstruction chain, returning the reconstructed
 /// spatial 8×8 block clipped to the display range `[0, 2^bpp - 1]`.
@@ -406,6 +429,11 @@ fn block_component(i: usize) -> DcComponent {
 /// isolated macroblock). `quant_matrix` is the raster-order `W[0]` intra
 /// matrix used when `ctx.quant_type == true` (method 1); it is ignored
 /// for method 2.
+///
+/// This entry decodes the `use_intra_dc_vlc == 1` path (differential
+/// intra DC coded with the Table B.13 / B.14 DC VLCs). For the Table
+/// 6-25 `use_intra_dc_vlc == 0` path (DC coded as an AC coefficient)
+/// use [`decode_intra_block_full`].
 #[allow(clippy::too_many_arguments)]
 pub fn decode_intra_block(
     br: &mut BitReader<'_>,
@@ -415,11 +443,46 @@ pub fn decode_intra_block(
     predictors: BlockPredictors,
     quant_matrix: &[[u8; 8]; 8],
 ) -> Result<[[i32; 8]; 8], BlockAssemblyError> {
+    decode_intra_block_full(br, i, coded, true, ctx, predictors, quant_matrix)
+        .map(|full| full.spatial)
+}
+
+/// [`decode_intra_block`] with the §6.3.5 / Table 6-25
+/// `use_intra_dc_vlc` selection and the §7.4.3 predictor by-products.
+///
+/// * `use_intra_dc_vlc == true` — the §6.2.7 intra-DC prologue is
+///   present: `dct_dc_size_*` + `dct_dc_differential` (Tables B.13 /
+///   B.14 / B.15) code the differential DC, and the AC EVENT loop
+///   (when `coded`) fills scan positions 1..=63.
+/// * `use_intra_dc_vlc == false` — no DC prologue; the differential DC
+///   is coded **as an AC coefficient** (§6.3.5 intra_dc_vlc_thr /
+///   Table 6-25 "intra AC VLC" rows), i.e. the EVENT loop fills scan
+///   positions 0..=63 and `QFS[0]` carries the differential DC. When
+///   `coded == false` no bits are consumed at all and the differential
+///   DC is zero.
+///
+/// In both cases the §7.4.3 spatial DC/AC prediction, §7.4.4 inverse
+/// quantisation, and §7.4.5 IDCT run identically — the threshold only
+/// moves *where* the differential DC sits in the bitstream.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_intra_block_full(
+    br: &mut BitReader<'_>,
+    i: usize,
+    coded: bool,
+    use_intra_dc_vlc: bool,
+    ctx: MacroblockTextureContext,
+    predictors: BlockPredictors,
+    quant_matrix: &[[u8; 8]; 8],
+) -> Result<IntraBlockDecode, BlockAssemblyError> {
     let component = block_component(i);
 
-    // §6.2.7 — differential intra DC (always present for an intra block
-    // when use_intra_dc_vlc == 1, the path we decode).
-    let dc = decode_intra_dc(br, component)?;
+    // §6.2.7 — differential intra DC prologue, present only when
+    // use_intra_dc_vlc == 1 (Table 6-25).
+    let intra_dc = if use_intra_dc_vlc {
+        Some(decode_intra_dc(br, component)?.differential)
+    } else {
+        None
+    };
 
     // §6.2.7 — the AC EVENT loop runs only when pattern_code[i] == 1.
     let events = if coded {
@@ -428,9 +491,11 @@ pub fn decode_intra_block(
         Vec::new()
     };
 
-    // §7.4.1 / §7.4.2 — assemble the one-dimensional QFS[64] (differential
-    // DC at scan position 0) and choose the §7.4.2 scan pattern.
-    let qfs = events_to_qfs(&events, Some(dc.differential))?;
+    // §7.4.1 / §7.4.2 — assemble the one-dimensional QFS[64]. With the
+    // DC VLC the differential DC occupies scan position 0 and the
+    // EVENTs fill 1..; without it the EVENTs fill from position 0 (the
+    // first EVENT's run counts from QFS[0], which carries the DC).
+    let qfs = events_to_qfs(&events, intra_dc)?;
 
     // §7.4.3.1 — pick the DC prediction direction from the neighbour DCs.
     let direction = select_dc_direction(predictors.fa_dc, predictors.fb_dc, predictors.fc_dc);
@@ -526,7 +591,11 @@ pub fn decode_intra_block(
             out[y][x] = spatial[y][x].clamp(0, hi);
         }
     }
-    Ok(out)
+    Ok(IntraBlockDecode {
+        spatial: out,
+        qf,
+        dc: f[0][0],
+    })
 }
 
 /// Resolve the raster-order `W[0]` intra quantisation matrix for the
@@ -1023,6 +1092,123 @@ mod tests {
             }
         }
         assert_eq!(expected, 130);
+    }
+
+    /// `use_intra_dc_vlc == 0` + `pattern_code[i] == 0`: no bits are
+    /// consumed at all; the differential DC is zero and the block
+    /// reconstructs exactly as the DC-VLC zero-differential case.
+    #[test]
+    fn no_dc_vlc_uncoded_block_consumes_no_bits() {
+        let ctx = MacroblockTextureContext {
+            quantiser_scale: 8,
+            bits_per_pixel: 8,
+            quant_type: false,
+            ac_pred_flag: false,
+        };
+        let predictors = BlockPredictors::outside(8, 8);
+        let data = [0xAAu8; 4]; // arbitrary — must remain unread
+        let mut br = BitReader::new(&data);
+        let full = decode_intra_block_full(
+            &mut br,
+            0,
+            false, // pattern_code[i] == 0
+            false, // use_intra_dc_vlc == 0
+            ctx,
+            predictors,
+            &DEFAULT_INTRA_QUANT_MATRIX,
+        )
+        .unwrap();
+        assert_eq!(br.bit_position(), 0, "no bits may be consumed");
+        // Same reconstruction as the dc_only_block_is_flat case: the
+        // predicted DC alone → flat 128.
+        for row in full.spatial.iter() {
+            for &px in row.iter() {
+                assert_eq!(px, 128);
+            }
+        }
+        // Traced predictor by-products: QF[0][0] = 1024/16 = 64 and the
+        // inverse-quantised DC F[0][0] = 16 * 64 = 1024.
+        assert_eq!(full.qf[0][0], 64);
+        assert_eq!(full.dc, 1024);
+    }
+
+    /// `use_intra_dc_vlc == 0` + coded block: the differential DC is
+    /// carried by the first AC EVENT at scan position 0. A single
+    /// (LAST=1, RUN=0, LEVEL=+1) intra EVENT (Table B.16 code `0111` +
+    /// sign `0`) must reconstruct identically to the DC-VLC `+1`
+    /// differential case.
+    #[test]
+    fn no_dc_vlc_coded_block_reads_dc_from_events() {
+        let ctx = MacroblockTextureContext {
+            quantiser_scale: 8,
+            bits_per_pixel: 8,
+            quant_type: false,
+            ac_pred_flag: false,
+        };
+        let predictors = BlockPredictors::outside(8, 8);
+        let mut w = BitWriter::default();
+        w.write_bits(0b0111, 4); // Table B.16 (LAST=1, RUN=0, LEVEL=1)
+        w.write_bits(0, 1); // sign: positive
+        let data = w.finish();
+        let mut br = BitReader::new(&data);
+        let full = decode_intra_block_full(
+            &mut br,
+            0,
+            true, // pattern_code[i] == 1
+            false,
+            ctx,
+            predictors,
+            &DEFAULT_INTRA_QUANT_MATRIX,
+        )
+        .unwrap();
+        // Matches known_dc_differential_reconstructs: QF[0][0] = 1 + 64,
+        // F[0][0] = 16 * 65 = 1040, flat 130.
+        for row in full.spatial.iter() {
+            for &px in row.iter() {
+                assert_eq!(px, 130);
+            }
+        }
+        assert_eq!(full.dc, 1040);
+    }
+
+    /// The traced entry and the plain entry decode the same bits to the
+    /// same spatial block on the `use_intra_dc_vlc == 1` path.
+    #[test]
+    fn traced_and_plain_intra_block_agree() {
+        let ctx = MacroblockTextureContext {
+            quantiser_scale: 8,
+            bits_per_pixel: 8,
+            quant_type: false,
+            ac_pred_flag: false,
+        };
+        let predictors = BlockPredictors::outside(8, 8);
+        let mut w = BitWriter::default();
+        write_dc_size1_luma(&mut w, false); // -1 differential
+        let data = w.finish();
+
+        let mut br1 = BitReader::new(&data);
+        let plain = decode_intra_block(
+            &mut br1,
+            0,
+            false,
+            ctx,
+            predictors,
+            &DEFAULT_INTRA_QUANT_MATRIX,
+        )
+        .unwrap();
+        let mut br2 = BitReader::new(&data);
+        let full = decode_intra_block_full(
+            &mut br2,
+            0,
+            false,
+            true,
+            ctx,
+            predictors,
+            &DEFAULT_INTRA_QUANT_MATRIX,
+        )
+        .unwrap();
+        assert_eq!(plain, full.spatial);
+        assert_eq!(br1.bit_position(), br2.bit_position());
     }
 
     /// Full §6.2.7 macroblock assembly: six DC-only blocks (cbpy/cbpc 0)

@@ -431,6 +431,24 @@ pub fn parse_video_object_plane_header(
     parse_video_object_plane_body(&mut br, resolution, ctx)
 }
 
+/// Parse a §6.2.5 VOP header **body** (everything after the 32-bit
+/// `vop_start_code`) from an existing bit reader, leaving the reader
+/// positioned at the first bit that follows the header.
+///
+/// For a rectangular, non-scalable VOL that first bit is the start of
+/// `motion_shape_texture()` — the macroblock layer (§6.2.5: the
+/// `combined_motion_shape_texture()` data follows `vop_fcode_backward`
+/// directly). This is the entry point the frame-level bitstream
+/// drivers use; [`parse_video_object_plane_header`] wraps it for
+/// callers holding a byte slice that starts at the start code.
+pub fn parse_vop_header_body(
+    br: &mut BitReader<'_>,
+    resolution: u16,
+    ctx: VopContext,
+) -> Result<VopHeader, VopParseError> {
+    parse_video_object_plane_body(br, resolution, ctx)
+}
+
 fn parse_video_object_plane_body(
     br: &mut BitReader<'_>,
     resolution: u16,
