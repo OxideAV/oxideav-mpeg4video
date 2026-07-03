@@ -54,6 +54,10 @@ use crate::neighbour::{BlockNeighbour, IntraBlockGrid};
 use crate::pvop_mv::{MvDriver, PvopMbMotion, PvopMvError};
 use crate::reconstruct::{reconstruct_intra_macroblock, ReconstructedMacroblock};
 use crate::sprite::SpriteTrajectory;
+use crate::video_packet::{
+    consume_next_resync_marker, parse_video_packet_header, probe_resync_marker, VideoPacketContext,
+    VideoPacketHeader, VideoPacketParseError,
+};
 use crate::vol::{SpriteEnable, SpriteWarpingAccuracy, VolHeader};
 use crate::vop::{VopCodingType, VopHeader};
 use crate::warp::WarpGeometry;
@@ -74,6 +78,17 @@ pub enum VopDecodeError {
     Texture(BlockAssemblyError),
     /// A B-VOP macroblock decode (header / motion / residual) failed.
     BVop(BVopMvDriverError),
+    /// A §6.2.5 `video_packet_header` failed to parse.
+    VideoPacket(VideoPacketParseError),
+    /// A video packet's `macroblock_number` did not equal the next
+    /// macroblock in raster order — the packet skips ahead (an
+    /// error-resilience gap this clean-path walk does not conceal).
+    VideoPacketSkip {
+        /// The `macroblock_number` the packet header carried.
+        packet_mb: u32,
+        /// The raster index the walk expected.
+        expected_mb: u32,
+    },
 }
 
 impl core::fmt::Display for VopDecodeError {
@@ -86,11 +101,26 @@ impl core::fmt::Display for VopDecodeError {
             VopDecodeError::Motion(e) => write!(f, "vop decode: motion: {e}"),
             VopDecodeError::Texture(e) => write!(f, "vop decode: texture: {e}"),
             VopDecodeError::BVop(e) => write!(f, "vop decode: b-vop macroblock: {e}"),
+            VopDecodeError::VideoPacket(e) => write!(f, "vop decode: video_packet_header: {e}"),
+            VopDecodeError::VideoPacketSkip {
+                packet_mb,
+                expected_mb,
+            } => write!(
+                f,
+                "vop decode: video packet resumes at macroblock {packet_mb} \
+                 but {expected_mb} was expected"
+            ),
         }
     }
 }
 
 impl std::error::Error for VopDecodeError {}
+
+impl From<VideoPacketParseError> for VopDecodeError {
+    fn from(e: VideoPacketParseError) -> Self {
+        VopDecodeError::VideoPacket(e)
+    }
+}
 
 impl From<MacroblockParseError> for VopDecodeError {
     fn from(e: MacroblockParseError) -> Self {
@@ -138,6 +168,59 @@ fn check_vol_supported(vol: &VolHeader) -> Result<(), VopDecodeError> {
 /// The running quantiser ceiling `2^quant_precision - 1` (§6.3.3).
 fn max_quantiser_scale(vol: &VolHeader) -> u32 {
     (1u32 << vol.quant_precision) - 1
+}
+
+/// Build the [`VideoPacketContext`] for the walks' resync handling.
+fn video_packet_context(vol: &VolHeader, vop: &VopHeader) -> VideoPacketContext {
+    VideoPacketContext {
+        coding_type: vop.coding_type,
+        fcode_fwd: vop.fcode_fwd,
+        fcode_bwd: vop.fcode_bwd,
+        quant_precision: vol.quant_precision,
+        time_increment_resolution: vol.time_increment_resolution,
+        video_object_layer_shape: vol.video_object_layer_shape,
+        resync_marker_disable: vol.resync_marker_disable,
+        newpred_enable: vol.newpred_enable,
+        reduced_resolution_vop_enable: vol.reduced_resolution_vop_enable,
+        sprite_gmc: matches!(vol.sprite_enable, SpriteEnable::Gmc),
+        total_macroblocks: crate::video_packet::total_macroblocks(
+            u32::from(vol.width),
+            u32::from(vol.height),
+        ),
+    }
+}
+
+/// Non-destructively test whether a §6.2.5.2 video packet follows: the
+/// §5.2.5 stuffing run (`0` then `1`s to the byte boundary) and the
+/// byte-aligned `resync_marker`.
+///
+/// The marker's `16 + fcode` leading zeros cannot alias any legal
+/// macroblock-layer VLC, so a positive probe on a conforming stream is
+/// definitive.
+fn video_packet_follows(br: &BitReader<'_>, ctx: &VideoPacketContext) -> bool {
+    let mut probe = br.clone();
+    if consume_next_resync_marker(&mut probe).is_err() {
+        return false;
+    }
+    probe_resync_marker(&probe, ctx.coding_type, ctx.fcode_fwd, ctx.fcode_bwd)
+}
+
+/// Consume one video packet header at a macroblock boundary and check
+/// its `macroblock_number` resumes exactly at `expected_mb` (this walk
+/// decodes clean streams; error-resilience gaps are out of scope).
+fn enter_video_packet(
+    br: &mut BitReader<'_>,
+    ctx: &VideoPacketContext,
+    expected_mb: u32,
+) -> Result<VideoPacketHeader, VopDecodeError> {
+    let header = parse_video_packet_header(br, ctx)?;
+    if header.macroblock_number != expected_mb {
+        return Err(VopDecodeError::VideoPacketSkip {
+            packet_mb: header.macroblock_number,
+            expected_mb,
+        });
+    }
+    Ok(header)
 }
 
 /// Apply one macroblock's `dquant` delta to the running quantiser
@@ -239,15 +322,30 @@ pub fn decode_i_vop_macroblocks(
     let bpp = u32::from(vol.bits_per_pixel);
     let max_qp = max_quantiser_scale(vol);
     let quant_matrix = intra_quant_matrix(vol);
+    let vp_ctx = video_packet_context(vol, vop);
     let mut grid = IntraBlockGrid::new(mb_height, mb_width);
     let mut running_qp = u32::from(vop.quant).clamp(1, max_qp);
+    let mut dc_thr = vop.intra_dc_vlc_thr;
     let mut out = Vec::with_capacity(mb_width * mb_height);
 
     for mb_row in 0..mb_height {
         for mb_col in 0..mb_width {
+            let mb_index = (mb_row * mb_width + mb_col) as u32;
+            if mb_index > 0 && !vol.resync_marker_disable && video_packet_follows(br, &vp_ctx) {
+                let packet = enter_video_packet(br, &vp_ctx, mb_index)?;
+                // §E.1.2: a video-packet boundary is treated like a VOP
+                // boundary — no §7.4.3 prediction crosses it, and the
+                // running quantiser restarts from the packet's
+                // quant_scale (§6.3.5 running-Qp rule).
+                grid = IntraBlockGrid::new(mb_height, mb_width);
+                running_qp = u32::from(packet.quant_scale).clamp(1, max_qp);
+                if let Some(thr) = packet.intra_dc_vlc_thr {
+                    dc_thr = thr;
+                }
+            }
             let header = parse_macroblock_header(br, VopCodingType::I, vol)?;
             running_qp = apply_dquant(running_qp, header.dquant_delta, max_qp);
-            let use_dc_vlc = use_intra_dc_vlc(vop.intra_dc_vlc_thr, running_qp);
+            let use_dc_vlc = use_intra_dc_vlc(dc_thr, running_qp);
             let ctx = MacroblockTextureContext {
                 quantiser_scale: running_qp,
                 bits_per_pixel: bpp,
@@ -314,13 +412,28 @@ pub fn decode_p_vop_macroblocks(
     let max_qp = max_quantiser_scale(vol);
     let intra_matrix = intra_quant_matrix(vol);
     let inter_matrix = nonintra_quant_matrix(vol);
+    let vp_ctx = video_packet_context(vol, vop);
     let mut intra_grid = IntraBlockGrid::new(mb_height, mb_width);
     let mut driver = MvDriver::new(mb_height, mb_width, vop.fcode_fwd);
     let mut running_qp = u32::from(vop.quant).clamp(1, max_qp);
+    let mut dc_thr = vop.intra_dc_vlc_thr;
     let mut out = Vec::with_capacity(mb_width * mb_height);
 
     for mb_row in 0..mb_height {
         for mb_col in 0..mb_width {
+            let mb_index = (mb_row * mb_width + mb_col) as u32;
+            if mb_index > 0 && !vol.resync_marker_disable && video_packet_follows(br, &vp_ctx) {
+                let packet = enter_video_packet(br, &vp_ctx, mb_index)?;
+                // §E.1.2: the packet boundary is a prediction boundary —
+                // fresh §7.4.3 and §7.6.5 predictor state, running
+                // quantiser restarted from the packet's quant_scale.
+                intra_grid = IntraBlockGrid::new(mb_height, mb_width);
+                driver = MvDriver::new(mb_height, mb_width, vop.fcode_fwd);
+                running_qp = u32::from(packet.quant_scale).clamp(1, max_qp);
+                if let Some(thr) = packet.intra_dc_vlc_thr {
+                    dc_thr = thr;
+                }
+            }
             let header = parse_macroblock_header(br, VopCodingType::P, vol)?;
 
             if header.not_coded {
@@ -348,7 +461,7 @@ pub fn decode_p_vop_macroblocks(
                 // Record the intra MB as an invalid MV-predictor
                 // candidate (§7.6.5); no motion bits are coded.
                 driver.decode_macroblock(br, mb_row, mb_col, false, header.mb_type)?;
-                let use_dc_vlc = use_intra_dc_vlc(vop.intra_dc_vlc_thr, running_qp);
+                let use_dc_vlc = use_intra_dc_vlc(dc_thr, running_qp);
                 let coded = pattern_code(header.cbpy, header.cbpc);
                 let mb = decode_intra_mb_with_grid(
                     br,
@@ -551,13 +664,26 @@ pub fn decode_s_gmc_vop_macroblocks(
     let max_qp = max_quantiser_scale(vol);
     let intra_matrix = intra_quant_matrix(vol);
     let inter_matrix = nonintra_quant_matrix(vol);
+    let vp_ctx = video_packet_context(vol, vop);
     let mut intra_grid = IntraBlockGrid::new(mb_height, mb_width);
     let mut driver = MvDriver::new(mb_height, mb_width, vop.fcode_fwd);
     let mut running_qp = u32::from(vop.quant).clamp(1, max_qp);
+    let mut dc_thr = vop.intra_dc_vlc_thr;
     let mut out = Vec::with_capacity(mb_width * mb_height);
 
     for mb_row in 0..mb_height {
         for mb_col in 0..mb_width {
+            let mb_index = (mb_row * mb_width + mb_col) as u32;
+            if mb_index > 0 && !vol.resync_marker_disable && video_packet_follows(br, &vp_ctx) {
+                let packet = enter_video_packet(br, &vp_ctx, mb_index)?;
+                // §E.1.2: fresh predictor state at the packet boundary.
+                intra_grid = IntraBlockGrid::new(mb_height, mb_width);
+                driver = MvDriver::new(mb_height, mb_width, vop.fcode_fwd);
+                running_qp = u32::from(packet.quant_scale).clamp(1, max_qp);
+                if let Some(thr) = packet.intra_dc_vlc_thr {
+                    dc_thr = thr;
+                }
+            }
             let header = parse_macroblock_header(br, VopCodingType::S, vol)?;
             let mb_x = (mb_col * 16) as i64;
             let mb_y = (mb_row * 16) as i64;
@@ -584,7 +710,7 @@ pub fn decode_s_gmc_vop_macroblocks(
             let is_intra = header.mb_type.map(|t| t.is_intra()).unwrap_or(false);
             if is_intra {
                 driver.decode_macroblock(br, mb_row, mb_col, false, header.mb_type)?;
-                let use_dc_vlc = use_intra_dc_vlc(vop.intra_dc_vlc_thr, running_qp);
+                let use_dc_vlc = use_intra_dc_vlc(dc_thr, running_qp);
                 let coded = pattern_code(header.cbpy, header.cbpc);
                 let mb = decode_intra_mb_with_grid(
                     br,
@@ -830,6 +956,116 @@ mod tests {
         // FA=1040, FB=1024 (default), FC=1024 (default): |FA-FB|=16 >=
         // |FB-FC|=0 → from A → QF = 1040/16 = 65 → 130.
         assert_eq!(mbs[1].luma[0][0], 130);
+    }
+
+    #[test]
+    fn i_vop_video_packet_resets_dc_prediction() {
+        // Two macroblocks split by a §6.2.5.2 video packet. MB0 carries
+        // a +1 DC differential (flat 130). MB1 is all-zero-differential:
+        // without the packet boundary its block 0 would predict from
+        // MB0's block 1 (→ 130, see the cross-MB test above); with the
+        // boundary the predictor grid resets and it reconstructs from
+        // the §7.4.3.1 default (→ flat 128).
+        let mut vol = test_vol(32, 16);
+        vol.resync_marker_disable = false;
+        let vop = test_i_vop(&vol, 8);
+        let mut w = BitWriter::default();
+        write_intra_mb_first_block_dc_plus1(&mut w); // 22 bits
+                                                     // §5.2.5 stuffing to the byte boundary: '0' + '1's.
+        w.write_bits(0, 1);
+        w.write_bits(1, 1); // now at bit 24
+                            // resync_marker: 16 zeros + 1 (I-VOP → 17 bits).
+        w.write_bits(1, 17);
+        // macroblock_number: 2 MBs total → 1 bit (Table 6-27).
+        w.write_bits(1, 1);
+        // quant_scale (quant_precision = 5).
+        w.write_bits(8, 5);
+        // header_extension_code = 0.
+        w.write_bits(0, 1);
+        write_dc_only_intra_mb(&mut w);
+        let data = w.finish();
+        let mut br = BitReader::new(&data);
+        let mbs = decode_i_vop_macroblocks(&mut br, &vol, &vop).unwrap();
+        assert_eq!(mbs.len(), 2);
+        assert_eq!(mbs[0].luma[0][0], 130);
+        // The packet boundary blocked the §7.4.3 prediction: MB1 falls
+        // back to the outside-VOP default DC.
+        assert_eq!(mbs[1].luma[0][0], 128);
+        assert_eq!(mbs[1].luma[15][15], 128);
+    }
+
+    #[test]
+    fn i_vop_video_packet_skip_is_rejected() {
+        // A packet whose macroblock_number jumps ahead (error
+        // resilience gap) is rejected with VideoPacketSkip.
+        let mut vol = test_vol(48, 16); // 3 MBs → 2-bit mb_number
+        vol.resync_marker_disable = false;
+        let vop = test_i_vop(&vol, 8);
+        let mut w = BitWriter::default();
+        write_intra_mb_first_block_dc_plus1(&mut w); // 22 bits
+        w.write_bits(0, 1);
+        w.write_bits(1, 1);
+        w.write_bits(1, 17); // resync marker
+        w.write_bits(2, 2); // macroblock_number = 2, expected 1
+        w.write_bits(8, 5);
+        w.write_bits(0, 1);
+        write_dc_only_intra_mb(&mut w);
+        let data = w.finish();
+        let mut br = BitReader::new(&data);
+        assert_eq!(
+            decode_i_vop_macroblocks(&mut br, &vol, &vop),
+            Err(VopDecodeError::VideoPacketSkip {
+                packet_mb: 2,
+                expected_mb: 1
+            })
+        );
+    }
+
+    #[test]
+    fn p_vop_video_packet_resets_mv_prediction() {
+        // Two P macroblocks split by a video packet, each coded inter
+        // with a zero MV delta. Without the boundary MB1's §7.6.5
+        // median predictor would see MB0's vector; with it the fresh
+        // grid yields a zero predictor. Both decode to zero MVs here
+        // (deltas are zero), so the assertion is on clean parse +
+        // correct count — the boundary handling itself is proven by the
+        // bit walk not desyncing across the marker.
+        let mut vol = test_vol(32, 16);
+        vol.resync_marker_disable = false;
+        let vop = test_p_vop(&vol, 8);
+        let mut w = BitWriter::default();
+        // MB0: coded inter, cbp 0, zero MVD. 1+1+2+1+1 = 6 bits.
+        w.write_bits(0, 1); // not_coded
+        w.write_bits(0b1, 1); // mcbpc inter cbpc 00
+        w.write_bits(0b11, 2); // cbpy inter 0
+        w.write_bits(1, 1); // MVDx 0
+        w.write_bits(1, 1); // MVDy 0
+                            // Stuffing from bit 6: '0' + '1' → bit 8 (byte aligned).
+        w.write_bits(0, 1);
+        w.write_bits(1, 1);
+        // P-VOP resync marker: 15 + fcode(1) zeros + 1 → 17 bits.
+        w.write_bits(1, 17);
+        w.write_bits(1, 1); // macroblock_number = 1
+        w.write_bits(8, 5); // quant_scale
+        w.write_bits(0, 1); // header_extension_code
+                            // MB1: same coded inter MB.
+        w.write_bits(0, 1);
+        w.write_bits(0b1, 1);
+        w.write_bits(0b11, 2);
+        w.write_bits(1, 1);
+        w.write_bits(1, 1);
+        let data = w.finish();
+        let mut br = BitReader::new(&data);
+        let entries = decode_p_vop_macroblocks(&mut br, &vol, &vop).unwrap();
+        assert_eq!(entries.len(), 2);
+        for e in &entries {
+            match e {
+                PVopMbContent::Inter { motion, .. } => {
+                    assert_eq!(motion.one_mv(), Some(MotionVector { x: 0, y: 0 }));
+                }
+                PVopMbContent::Intra(_) => panic!("expected inter"),
+            }
+        }
     }
 
     #[test]

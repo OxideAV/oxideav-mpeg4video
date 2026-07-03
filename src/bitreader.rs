@@ -30,7 +30,7 @@ pub enum BitReaderError {
 }
 
 /// MSB-first bit reader.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct BitReader<'a> {
     data: &'a [u8],
     /// Bit offset from the start of `data`. `bit_pos / 8` is the
