@@ -81,6 +81,10 @@ pub struct DecodedFrame {
     width: usize,
     height: usize,
     coding_type: VopCodingType,
+    /// Presentation timestamps attached by the stream decoder — see
+    /// [`DecodedFrame::pts`] / [`DecodedFrame::pts_ticks`].
+    pts: Option<i64>,
+    pts_ticks: Option<i64>,
 }
 
 impl DecodedFrame {
@@ -114,7 +118,44 @@ impl DecodedFrame {
             width,
             height,
             coding_type,
+            pts: None,
+            pts_ticks: None,
         })
+    }
+
+    /// Container-supplied presentation timestamp, in the container's
+    /// packet time base (display order — attached by
+    /// [`Mpeg4VideoDecoder::decode_with_pts`](crate::decoder::Mpeg4VideoDecoder::decode_with_pts)
+    /// from the packet that carried this frame's VOP). `None` when the
+    /// container gave none.
+    #[inline]
+    pub const fn pts(&self) -> Option<i64> {
+        self.pts
+    }
+
+    /// The §6.3.5 composed VOP display time in ticks of
+    /// `1 / vop_time_increment_resolution` seconds (GOV `time_code`
+    /// seconds + accumulated `modulo_time_base` + `vop_time_increment`),
+    /// derived purely from the bitstream time model. Present on every
+    /// frame the stream decoder emits; useful when the container
+    /// carries no timestamps.
+    #[inline]
+    pub const fn pts_ticks(&self) -> Option<i64> {
+        self.pts_ticks
+    }
+
+    /// Attach the container presentation timestamp (see
+    /// [`DecodedFrame::pts`]).
+    #[inline]
+    pub fn set_pts(&mut self, pts: Option<i64>) {
+        self.pts = pts;
+    }
+
+    /// Attach the §6.3.5 composed tick time (see
+    /// [`DecodedFrame::pts_ticks`]).
+    #[inline]
+    pub fn set_pts_ticks(&mut self, ticks: Option<i64>) {
+        self.pts_ticks = ticks;
     }
 
     /// Luma plane width in samples (macroblock-padded).

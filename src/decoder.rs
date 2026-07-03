@@ -195,12 +195,30 @@ impl Mpeg4VideoDecoder {
     /// processed in stream order; configuration headers update the
     /// decoder state, VOPs decode to frames.
     pub fn decode(&mut self, data: &[u8]) -> Result<Vec<DecodedFrame>, StreamDecodeError> {
+        self.decode_with_pts(data, None)
+    }
+
+    /// [`Mpeg4VideoDecoder::decode`] with a container presentation
+    /// timestamp: every frame produced by a VOP in `data` gets
+    /// `container_pts` as its [`DecodedFrame::pts`] (a container
+    /// packet's pts is a display-order stamp for the VOP it carries,
+    /// so it survives the §6.1.3.8 reorder attached to the right
+    /// frame). Frames *released* by this call but produced by an
+    /// earlier packet keep that packet's stamp. Every frame also
+    /// carries the §6.3.5 composed tick time
+    /// ([`DecodedFrame::pts_ticks`], units of
+    /// `1 / vop_time_increment_resolution`).
+    pub fn decode_with_pts(
+        &mut self,
+        data: &[u8],
+        container_pts: Option<i64>,
+    ) -> Result<Vec<DecodedFrame>, StreamDecodeError> {
         let mut out = Vec::new();
         let starts = scan_start_codes(data);
         for (idx, &start) in starts.iter().enumerate() {
             let end = starts.get(idx + 1).copied().unwrap_or(data.len());
             let unit = &data[start..end];
-            self.decode_unit(unit, &mut out)?;
+            self.decode_unit(unit, container_pts, &mut out)?;
         }
         Ok(out)
     }
@@ -214,6 +232,7 @@ impl Mpeg4VideoDecoder {
     fn decode_unit(
         &mut self,
         unit: &[u8],
+        container_pts: Option<i64>,
         out: &mut Vec<DecodedFrame>,
     ) -> Result<(), StreamDecodeError> {
         let code = u32::from_be_bytes([unit[0], unit[1], unit[2], unit[3]]);
@@ -243,7 +262,7 @@ impl Mpeg4VideoDecoder {
                 self.b_base_sec = secs;
             }
             VOP_START_CODE => {
-                self.decode_vop_unit(unit, out)?;
+                self.decode_vop_unit(unit, container_pts, out)?;
             }
             _ => {
                 // Unknown / reserved start code: skip. (Stuffing and
@@ -257,6 +276,7 @@ impl Mpeg4VideoDecoder {
     fn decode_vop_unit(
         &mut self,
         unit: &[u8],
+        container_pts: Option<i64>,
         out: &mut Vec<DecodedFrame>,
     ) -> Result<(), StreamDecodeError> {
         let vol = self.vol.ok_or(StreamDecodeError::MissingVol)?;
@@ -278,8 +298,28 @@ impl Mpeg4VideoDecoder {
         // luminance sub-pel grid for every inter path of this VOL.
         let sample_mode = sample_mode_of(&vol);
 
+        // §6.3.5 composed display time of *this* VOP, in ticks of
+        // 1 / vop_time_increment_resolution: an anchor counts its
+        // modulo_time_base from the previous anchor's sync point, a
+        // B-VOP from the past anchor in display order.
+        let base_sec = if is_anchor {
+            self.sync_sec
+        } else {
+            self.b_base_sec
+        };
+        let vop_ticks = (base_sec + u64::from(vop.modulo_time_base)) as i64 * res
+            + i64::from(vop.time_increment);
+
         if !vop.coded {
-            return self.decode_uncoded_vop(&vop, mb_count, mb_width, mb_height, res, out);
+            return self.decode_uncoded_vop(
+                &vop,
+                mb_count,
+                mb_width,
+                mb_height,
+                res,
+                (container_pts, vop_ticks),
+                out,
+            );
         }
 
         match vop.coding_type {
@@ -353,8 +393,18 @@ impl Mpeg4VideoDecoder {
             }
         }
 
+        // Stamp the frame this VOP produced: a B-VOP was appended to
+        // `out` (displayed immediately); an anchor is the held
+        // §6.1.3.8 pending frame.
         if is_anchor {
+            if let Some(pending) = self.sequence.pending_anchor_mut() {
+                pending.set_pts(container_pts);
+                pending.set_pts_ticks(Some(vop_ticks));
+            }
             self.advance_anchor_time(&vop, res);
+        } else if let Some(frame) = out.last_mut() {
+            frame.set_pts(container_pts);
+            frame.set_pts_ticks(Some(vop_ticks));
         }
         Ok(())
     }
@@ -363,6 +413,7 @@ impl Mpeg4VideoDecoder {
     /// forward reference (per §7.6.7). An uncoded anchor still enters
     /// the reference chain and advances the time base; an uncoded
     /// B-VOP displays the copy immediately.
+    #[allow(clippy::too_many_arguments)]
     fn decode_uncoded_vop(
         &mut self,
         vop: &VopHeader,
@@ -370,6 +421,7 @@ impl Mpeg4VideoDecoder {
         mb_width: usize,
         mb_height: usize,
         res: i64,
+        (container_pts, vop_ticks): (Option<i64>, i64),
         out: &mut Vec<DecodedFrame>,
     ) -> Result<(), StreamDecodeError> {
         if self.sequence.store().p_vop_reference().is_none() {
@@ -390,6 +442,10 @@ impl Mpeg4VideoDecoder {
                     BVopSampleMode::HalfPel,
                     bpp,
                 )?);
+                if let Some(frame) = out.last_mut() {
+                    frame.set_pts(container_pts);
+                    frame.set_pts_ticks(Some(vop_ticks));
+                }
             }
             _ => {
                 // Anchor: an all-skipped P assembly copies the forward
@@ -412,6 +468,10 @@ impl Mpeg4VideoDecoder {
                     sample_mode,
                     bpp,
                 )?);
+                if let Some(pending) = self.sequence.pending_anchor_mut() {
+                    pending.set_pts(container_pts);
+                    pending.set_pts_ticks(Some(vop_ticks));
+                }
                 self.advance_anchor_time(vop, res);
             }
         }
@@ -575,10 +635,15 @@ impl Mpeg4PacketDecoder {
     /// Convert one decoded VOP into the framework's planar 4:2:0
     /// [`VideoFrame`](oxideav_core::VideoFrame) (Y then Cb then Cr,
     /// each plane row-major with its natural stride).
+    ///
+    /// The frame `pts` is the container packet pts when the demuxer
+    /// supplied one, else the §6.3.5 bitstream tick time (units of
+    /// `1 / vop_time_increment_resolution` — the natural stream time
+    /// base for a raw MPEG-4 Visual elementary stream).
     fn frame_to_video(frame: &DecodedFrame) -> oxideav_core::VideoFrame {
         let w = frame.width();
         oxideav_core::VideoFrame {
-            pts: None,
+            pts: frame.pts().or(frame.pts_ticks()),
             planes: vec![
                 oxideav_core::VideoPlane {
                     stride: w,
@@ -603,7 +668,10 @@ impl oxideav_core::Decoder for Mpeg4PacketDecoder {
     }
 
     fn send_packet(&mut self, packet: &oxideav_core::Packet) -> oxideav_core::Result<()> {
-        let frames = self.inner.decode(&packet.data).map_err(to_core_error)?;
+        let frames = self
+            .inner
+            .decode_with_pts(&packet.data, packet.pts)
+            .map_err(to_core_error)?;
         self.check_limits()?;
         self.ready.extend(frames);
         Ok(())
@@ -893,6 +961,88 @@ mod tests {
     }
 
     #[test]
+    fn pts_ticks_follow_display_order() {
+        // Coding order I(t=0) P(t=2) B(t=1) → display order I B P with
+        // §6.3.5 tick times 0, 1, 2 (res = 30 ticks/s, all inside the
+        // first second).
+        let mut w = BitWriter::default();
+        write_vos(&mut w);
+        write_vol(&mut w, 16, 16);
+        write_i_vop(&mut w, 1, 0);
+        write_skipped_p_vop(&mut w, 1, 2);
+        write_direct_b_vop(&mut w, 1, 1);
+        let stream = w.finish();
+        let mut dec = Mpeg4VideoDecoder::new();
+        let mut frames = dec.decode(&stream).unwrap();
+        frames.extend(dec.flush());
+        let ticks: Vec<_> = frames.iter().map(|f| f.pts_ticks()).collect();
+        assert_eq!(ticks, vec![Some(0), Some(1), Some(2)]);
+        // No container timestamps were supplied.
+        assert!(frames.iter().all(|f| f.pts().is_none()));
+    }
+
+    #[test]
+    fn modulo_time_base_advances_pts_ticks() {
+        // An anchor whose modulo_time_base crosses a second boundary
+        // composes ticks = (seconds * res) + increment.
+        let mut w = BitWriter::default();
+        write_vol(&mut w, 16, 16);
+        write_i_vop(&mut w, 1, 0);
+        // P with modulo_time_base = 1 (one second) and tinc = 5.
+        w.write_bits(0x0000_01B6, 32);
+        w.write_bits(0b01, 2); // P
+        w.write_bits(0b10, 2); // modulo_time_base = 1
+        w.write_bits(1, 1); // marker
+        w.write_bits(5, 5); // tinc
+        w.write_bits(1, 1); // marker
+        w.write_bits(1, 1); // vop_coded
+        w.write_bits(0, 1); // rounding
+        w.write_bits(0, 3); // intra_dc_vlc_thr
+        w.write_bits(8, 5); // quant
+        w.write_bits(1, 3); // fcode fwd
+        w.write_bits(1, 1); // not_coded
+        w.align();
+        let stream = w.finish();
+        let mut dec = Mpeg4VideoDecoder::new();
+        let mut frames = dec.decode(&stream).unwrap();
+        frames.extend(dec.flush());
+        assert_eq!(frames[0].pts_ticks(), Some(0)); // I at t = 0
+        assert_eq!(frames[1].pts_ticks(), Some(35)); // P at 1 s + 5 ticks
+    }
+
+    #[test]
+    fn container_pts_survives_reorder() {
+        // Three packets in coding order carrying display-order pts
+        // I=100, P=300, B=200: the display-order frames must come out
+        // stamped 100, 200, 300.
+        let mut w = BitWriter::default();
+        write_vos(&mut w);
+        write_vol(&mut w, 16, 16);
+        write_i_vop(&mut w, 1, 0);
+        let unit_i = w.finish();
+        let mut w = BitWriter::default();
+        write_skipped_p_vop(&mut w, 1, 2);
+        let unit_p = w.finish();
+        let mut w = BitWriter::default();
+        write_direct_b_vop(&mut w, 1, 1);
+        let unit_b = w.finish();
+
+        let mut dec = Mpeg4VideoDecoder::new();
+        let mut frames = Vec::new();
+        frames.extend(dec.decode_with_pts(&unit_i, Some(100)).unwrap());
+        frames.extend(dec.decode_with_pts(&unit_p, Some(300)).unwrap());
+        frames.extend(dec.decode_with_pts(&unit_b, Some(200)).unwrap());
+        frames.extend(dec.flush());
+        let pts: Vec<_> = frames.iter().map(|f| f.pts()).collect();
+        assert_eq!(pts, vec![Some(100), Some(200), Some(300)]);
+        let types: Vec<_> = frames.iter().map(|f| f.coding_type()).collect();
+        assert_eq!(
+            types,
+            vec![VopCodingType::I, VopCodingType::B, VopCodingType::P]
+        );
+    }
+
+    #[test]
     fn uncoded_p_vop_copies_forward_reference() {
         let mut w = BitWriter::default();
         write_vos(&mut w);
@@ -1086,6 +1236,9 @@ mod registry_tests {
             panic!("expected a video frame");
         };
         assert_eq!(v.planes.len(), 3);
+        // No container pts on the packet → §6.3.5 tick fallback
+        // (I-VOP at t = 0).
+        assert_eq!(v.pts, Some(0));
         assert_eq!(v.planes[0].stride, 32);
         assert_eq!(v.planes[0].data.len(), 32 * 16);
         assert_eq!(v.planes[0].data[0], 128); // flat mid-grey I-VOP
@@ -1098,6 +1251,7 @@ mod registry_tests {
         let oxideav_core::Frame::Video(v) = frame else {
             panic!("expected a video frame");
         };
+        assert_eq!(v.pts, Some(1)); // P-VOP tick time (tinc = 1)
         assert_eq!(v.planes[0].data[0], 128);
         assert!(matches!(dec.receive_frame(), Err(oxideav_core::Error::Eof)));
     }

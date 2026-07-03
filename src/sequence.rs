@@ -193,6 +193,15 @@ impl SequenceDecoder {
         Ok(vec![frame])
     }
 
+    /// Mutable access to the §6.1.3.8 held (pending) anchor — the
+    /// frame most recently pushed and not yet released for display.
+    /// The stream decoder uses it to stamp presentation timestamps on
+    /// the frame the current VOP produced.
+    #[inline]
+    pub fn pending_anchor_mut(&mut self) -> Option<&mut DecodedFrame> {
+        self.pending_anchor.as_mut()
+    }
+
     /// Release the final held anchor at end-of-sequence. Returns the
     /// held anchor (if any) for display, leaving the decoder empty of a
     /// pending anchor.
