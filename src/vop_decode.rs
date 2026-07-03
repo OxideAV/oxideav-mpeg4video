@@ -44,13 +44,16 @@ use crate::block::{
     pattern_code, BlockAssemblyError, IntraMacroblock, MacroblockTextureContext,
 };
 use crate::data_partition::use_intra_dc_vlc;
-use crate::frame_decode::PVopMbContent;
+use crate::frame_decode::{PVopMbContent, SGmcMbContent};
 use crate::macroblock::{parse_macroblock_header, MacroblockParseError};
+use crate::motion::{averaged_motion_vector, MotionVector, AMV_PIXEL_COUNT};
 use crate::neighbour::{BlockNeighbour, IntraBlockGrid};
 use crate::pvop_mv::{MvDriver, PvopMvError};
 use crate::reconstruct::{reconstruct_intra_macroblock, ReconstructedMacroblock};
-use crate::vol::VolHeader;
+use crate::sprite::SpriteTrajectory;
+use crate::vol::{SpriteEnable, SpriteWarpingAccuracy, VolHeader};
 use crate::vop::{VopCodingType, VopHeader};
+use crate::warp::WarpGeometry;
 
 /// Errors raised by the bitstream-driven VOP macroblock walks.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -361,6 +364,160 @@ pub fn decode_p_vop_macroblocks(
         }
     }
     Ok(out)
+}
+
+/// Compute the §7.8.7.3 averaged motion vector of one `mcsel == 1`
+/// macroblock from the warp: the 256 luminance pel-wise warping vectors
+/// `(F(i,j) − s·i, G(i,j) − s·j)` (each in `1/s`-pel units), summed and
+/// quantised to the half-pel (or quarter-pel) grid with the Table 7-9
+/// clip for `vop_fcode`.
+fn gmc_averaged_mv(
+    geometry: &WarpGeometry,
+    mb_x: i64,
+    mb_y: i64,
+    quarter_sample: bool,
+    vop_fcode: u8,
+) -> Result<MotionVector, VopDecodeError> {
+    let mut mvs_x = [0i64; AMV_PIXEL_COUNT];
+    let mut mvs_y = [0i64; AMV_PIXEL_COUNT];
+    for j in 0..16i64 {
+        for i in 0..16i64 {
+            let px = mb_x + i;
+            let py = mb_y + j;
+            let [f, g] = geometry.luma_fg(px, py);
+            let idx = (j * 16 + i) as usize;
+            mvs_x[idx] = f - geometry.s * px;
+            mvs_y[idx] = g - geometry.s * py;
+        }
+    }
+    averaged_motion_vector(&mvs_x, &mvs_y, geometry.s as u32, quarter_sample, vop_fcode)
+        .map_err(|e| VopDecodeError::Motion(PvopMvError::Motion(e)))
+}
+
+/// Decode a complete rectangular progressive **S(GMC)-VOP**'s
+/// macroblock layer straight off the bitstream, returning one
+/// [`SGmcMbContent`] per macroblock in raster order plus the decoded
+/// §7.8.4/§7.8.5 [`WarpGeometry`] — ready for
+/// [`crate::frame_decode::assemble_s_gmc_vop_frame`] /
+/// [`crate::sequence::SequenceDecoder::push_s_gmc_vop`].
+///
+/// `br` must be positioned at the first bit of
+/// `combined_motion_shape_texture()` (the VOP header — including the
+/// §6.2.5 `sprite_trajectory()` already captured on
+/// [`VopHeader::sprite_trajectory`] — has been consumed).
+///
+/// Per §6.3.6 the S(GMC) macroblock layer is the P-VOP layer plus the
+/// `mcsel` flag on inter / inter+q macroblocks:
+///
+/// * `not_coded == 1` → implied `mcsel == 1`: a GMC-predicted copy
+///   (zero residual). The §7.8.7.3 averaged warping vector is recorded
+///   as the MV-predictor candidate.
+/// * coded inter with `mcsel == 1` → GMC prediction, no local MV
+///   bodies, §7.4 residual follows; AMV recorded.
+/// * coded inter with `mcsel == 0` (and every inter4v MB — `mcsel` is
+///   only coded for 1-MV inter types) → the plain P-VOP local-MC path.
+/// * intra / intra+q → the grid-threaded §7.4 intra path.
+pub fn decode_s_gmc_vop_macroblocks(
+    br: &mut BitReader<'_>,
+    vol: &VolHeader,
+    vop: &VopHeader,
+) -> Result<(Vec<SGmcMbContent>, WarpGeometry), VopDecodeError> {
+    check_vol_supported(vol)?;
+    if !matches!(vop.coding_type, VopCodingType::S) {
+        return Err(VopDecodeError::Unsupported("not an S-VOP"));
+    }
+    if !matches!(vol.sprite_enable, SpriteEnable::Gmc) {
+        return Err(VopDecodeError::Unsupported("sprite_enable != GMC"));
+    }
+    if !vop.coded {
+        return Err(VopDecodeError::Unsupported("vop_coded == 0"));
+    }
+    if vol.quarter_sample {
+        return Err(VopDecodeError::Unsupported("quarter_sample"));
+    }
+    if !vol.obmc_disable {
+        return Err(VopDecodeError::Unsupported("obmc"));
+    }
+
+    let stationary = SpriteTrajectory::stationary();
+    let trajectory = vop.sprite_trajectory.as_ref().unwrap_or(&stationary);
+    let accuracy = vol
+        .sprite_warping_accuracy
+        .unwrap_or(SpriteWarpingAccuracy::HalfPel);
+    let geometry = WarpGeometry::decode(
+        trajectory,
+        u32::from(vol.width),
+        u32::from(vol.height),
+        accuracy,
+    );
+
+    let (mb_width, mb_height) = vop_mb_dimensions(vol);
+    let bpp = u32::from(vol.bits_per_pixel);
+    let max_qp = max_quantiser_scale(vol);
+    let intra_matrix = intra_quant_matrix(vol);
+    let inter_matrix = nonintra_quant_matrix(vol);
+    let mut intra_grid = IntraBlockGrid::new(mb_height, mb_width);
+    let mut driver = MvDriver::new(mb_height, mb_width, vop.fcode_fwd);
+    let mut running_qp = u32::from(vop.quant).clamp(1, max_qp);
+    let mut out = Vec::with_capacity(mb_width * mb_height);
+
+    for mb_row in 0..mb_height {
+        for mb_col in 0..mb_width {
+            let header = parse_macroblock_header(br, VopCodingType::S, vol)?;
+            let mb_x = (mb_col * 16) as i64;
+            let mb_y = (mb_row * 16) as i64;
+
+            if header.not_coded {
+                // §6.3.6: a not-coded S(GMC) macroblock is GMC-predicted
+                // (implied mcsel == 1) with a zero residual.
+                let amv = gmc_averaged_mv(&geometry, mb_x, mb_y, false, vop.fcode_fwd)?;
+                driver.record_gmc_macroblock(mb_row, mb_col, amv)?;
+                out.push(SGmcMbContent::Gmc {
+                    residual: crate::block::InterMacroblock::zero(),
+                });
+                continue;
+            }
+
+            running_qp = apply_dquant(running_qp, header.dquant_delta, max_qp);
+            let ctx = MacroblockTextureContext {
+                quantiser_scale: running_qp,
+                bits_per_pixel: bpp,
+                quant_type: vol.quant_type,
+                ac_pred_flag: header.ac_pred_flag,
+            };
+
+            let is_intra = header.mb_type.map(|t| t.is_intra()).unwrap_or(false);
+            if is_intra {
+                driver.decode_macroblock(br, mb_row, mb_col, false, header.mb_type)?;
+                let use_dc_vlc = use_intra_dc_vlc(vop.intra_dc_vlc_thr, running_qp);
+                let coded = pattern_code(header.cbpy, header.cbpc);
+                let mb = decode_intra_mb_with_grid(
+                    br,
+                    &mut intra_grid,
+                    mb_row,
+                    mb_col,
+                    coded,
+                    use_dc_vlc,
+                    ctx,
+                    &intra_matrix,
+                )?;
+                out.push(SGmcMbContent::Intra(reconstruct_intra_macroblock(&mb, bpp)));
+            } else if header.mcsel == Some(true) {
+                // §6.3.6: mcsel == 1 codes no local motion vectors; the
+                // texture follows the header directly.
+                let amv = gmc_averaged_mv(&geometry, mb_x, mb_y, false, vop.fcode_fwd)?;
+                driver.record_gmc_macroblock(mb_row, mb_col, amv)?;
+                let residual = decode_inter_macroblock(br, &header, ctx, &inter_matrix)?;
+                out.push(SGmcMbContent::Gmc { residual });
+            } else {
+                // mcsel == 0 (or inter4v): the plain P-VOP local path.
+                let motion = driver.decode_macroblock(br, mb_row, mb_col, false, header.mb_type)?;
+                let residual = decode_inter_macroblock(br, &header, ctx, &inter_matrix)?;
+                out.push(SGmcMbContent::Local { motion, residual });
+            }
+        }
+    }
+    Ok((out, geometry))
 }
 
 #[cfg(test)]
@@ -693,6 +850,203 @@ mod tests {
         let entries = decode_p_vop_macroblocks(&mut br, &vol, &pvop).unwrap();
         let frame = assemble_p_vop_frame(&store, 1, 1, &entries, 0, 8).unwrap();
         assert_eq!(frame.luma_at(0, 0), Some(128));
+    }
+
+    /// A rectangular GMC VOL (verid 2, sprite_enable "10", 0 warping
+    /// points, half-pel accuracy).
+    fn test_gmc_vol(width: u16, height: u16, points: u32) -> VolHeader {
+        let mut w = BitWriter::default();
+        w.write_bits(0x0000_0120, 32);
+        w.write_bits(0, 1); // random_accessible_vol
+        w.write_bits(1, 8); // video_object_type_indication
+        w.write_bits(1, 1); // is_object_layer_identifier
+        w.write_bits(2, 4); // video_object_layer_verid = 2
+        w.write_bits(0, 3); // video_object_layer_priority
+        w.write_bits(1, 4); // aspect_ratio_info 1:1
+        w.write_bits(0, 1); // vol_control_parameters
+        w.write_bits(0, 2); // shape rectangular
+        w.write_bits(1, 1); // marker
+        w.write_bits(30, 16); // vop_time_increment_resolution
+        w.write_bits(1, 1); // marker
+        w.write_bits(0, 1); // fixed_vop_rate
+        w.write_bits(1, 1); // marker
+        w.write_bits(u32::from(width), 13);
+        w.write_bits(1, 1); // marker
+        w.write_bits(u32::from(height), 13);
+        w.write_bits(1, 1); // marker
+        w.write_bits(0, 1); // interlaced
+        w.write_bits(1, 1); // obmc_disable
+        w.write_bits(0b10, 2); // sprite_enable: GMC (verid != 1)
+        w.write_bits(points, 6); // no_of_sprite_warping_points
+        w.write_bits(0, 2); // sprite_warping_accuracy: half-pel
+        w.write_bits(0, 1); // sprite_brightness_change
+        w.write_bits(0, 1); // not_8_bit
+        w.write_bits(0, 1); // quant_type
+        w.write_bits(0, 1); // quarter_sample (verid != 1)
+        w.write_bits(1, 1); // complexity_estimation_disable
+        w.write_bits(1, 1); // resync_marker_disable
+        w.write_bits(0, 1); // data_partitioned
+        w.write_bits(0, 1); // newpred_enable (verid != 1)
+        w.write_bits(0, 1); // reduced_resolution_vop_enable
+        w.write_bits(0, 1); // scalability
+        let data = w.finish();
+        crate::vol::parse_video_object_layer(&data, 0).expect("test GMC VOL must parse")
+    }
+
+    /// A coded S(GMC)-VOP header. `du` supplies the single warping
+    /// point's `(du, dv)` when the VOL declared one point; the Table
+    /// B.34 warping_mv_code for 0 is the 2-bit VLC "00" + no residual
+    /// bits... encode via the sprite module's expectations: dpcm code
+    /// length table row 0 has code "00" and zero magnitude bits.
+    fn test_s_vop(vol: &VolHeader, quant: u32, du: Option<(i32, i32)>) -> VopHeader {
+        let mut w = BitWriter::default();
+        w.write_bits(0x0000_01B6, 32);
+        w.write_bits(0b11, 2); // vop_coding_type: S
+        w.write_bits(0, 1); // modulo_time_base
+        w.write_bits(1, 1); // marker
+        w.write_bits(0, 5); // time increment
+        w.write_bits(1, 1); // marker
+        w.write_bits(1, 1); // vop_coded
+        w.write_bits(0, 1); // vop_rounding_type (S-GMC)
+        w.write_bits(0, 3); // intra_dc_vlc_thr
+        if let Some((du, dv)) = du {
+            // §6.2.5 sprite_trajectory(): one warping point. Table B.34:
+            // value 0 → dmv_length SSS = 0 (a lone "0" unary terminator,
+            // no magnitude bits) + the trailing marker_bit. Only (0, 0)
+            // is emitted by this helper.
+            assert_eq!((du, dv), (0, 0), "helper only encodes a zero du/dv");
+            w.write_bits(0, 1); // warping_mv_code(du): SSS = 0
+            w.write_bits(1, 1); // marker
+            w.write_bits(0, 1); // warping_mv_code(dv): SSS = 0
+            w.write_bits(1, 1); // marker
+        }
+        w.write_bits(quant, 5); // vop_quant
+        w.write_bits(1, 3); // vop_fcode_forward
+        let data = w.finish();
+        crate::vop::parse_video_object_plane_header(
+            &data,
+            vol.time_increment_resolution,
+            VopContext::from_vol(vol),
+        )
+        .expect("test S-VOP must parse")
+    }
+
+    /// Decode a flat I-VOP anchor and install it in a fresh store.
+    fn flat_anchor_store(vol: &VolHeader) -> FrameStore {
+        let ivop = test_i_vop(vol, 8);
+        let (mbw, mbh) = vop_mb_dimensions(vol);
+        let mut w = BitWriter::default();
+        for _ in 0..mbw * mbh {
+            write_dc_only_intra_mb(&mut w);
+        }
+        let data = w.finish();
+        let mut br = BitReader::new(&data);
+        let imbs = decode_i_vop_macroblocks(&mut br, vol, &ivop).unwrap();
+        let mut store = FrameStore::new();
+        decode_i_vop(&mut store, mbw, mbh, &imbs).unwrap();
+        store
+    }
+
+    #[test]
+    fn s_gmc_not_coded_mb_is_stationary_gmc_copy() {
+        // 0 warping points → stationary warp; a not_coded S(GMC) MB is
+        // an implied mcsel == 1 GMC copy of the reference.
+        let vol = test_gmc_vol(16, 16, 0);
+        let store = flat_anchor_store(&vol);
+        let svop = test_s_vop(&vol, 8, None);
+
+        let mut w = BitWriter::default();
+        w.write_bits(1, 1); // not_coded
+        let data = w.finish();
+        let mut br = BitReader::new(&data);
+        let (entries, geometry) = decode_s_gmc_vop_macroblocks(&mut br, &vol, &svop).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(entries[0], SGmcMbContent::Gmc { .. }));
+        let frame =
+            crate::frame_decode::assemble_s_gmc_vop_frame(&store, 1, 1, &entries, &geometry, 0, 8)
+                .unwrap();
+        assert_eq!(frame.luma_at(0, 0), Some(128));
+        assert_eq!(frame.luma_at(15, 15), Some(128));
+    }
+
+    #[test]
+    fn s_gmc_mcsel1_coded_mb_reads_no_motion_bits() {
+        // A coded inter MB with mcsel == 1 and cbp == 0: header bits
+        // only (not_coded 0, mcbpc "1", mcsel 1, cbpy "11"), no MV
+        // bodies, no texture — a pure GMC copy.
+        let vol = test_gmc_vol(16, 16, 0);
+        let store = flat_anchor_store(&vol);
+        let svop = test_s_vop(&vol, 8, None);
+
+        let mut w = BitWriter::default();
+        w.write_bits(0, 1); // not_coded = 0
+        w.write_bits(0b1, 1); // mcbpc: inter, cbpc 00
+        w.write_bits(1, 1); // mcsel = 1
+        w.write_bits(0b11, 2); // cbpy: inter pattern 0
+        let data = w.finish();
+        let mut br = BitReader::new(&data);
+        let (entries, geometry) = decode_s_gmc_vop_macroblocks(&mut br, &vol, &svop).unwrap();
+        assert_eq!(br.bit_position(), 5, "no motion/texture bits consumed");
+        let frame =
+            crate::frame_decode::assemble_s_gmc_vop_frame(&store, 1, 1, &entries, &geometry, 0, 8)
+                .unwrap();
+        assert_eq!(frame.luma_at(0, 0), Some(128));
+    }
+
+    #[test]
+    fn s_gmc_mcsel0_local_mb_takes_p_vop_path() {
+        // mcsel == 0: the plain P-VOP local path (one zero MVD pair).
+        let vol = test_gmc_vol(16, 16, 0);
+        let store = flat_anchor_store(&vol);
+        let svop = test_s_vop(&vol, 8, None);
+
+        let mut w = BitWriter::default();
+        w.write_bits(0, 1); // not_coded = 0
+        w.write_bits(0b1, 1); // mcbpc: inter, cbpc 00
+        w.write_bits(0, 1); // mcsel = 0
+        w.write_bits(0b11, 2); // cbpy: inter pattern 0
+        w.write_bits(1, 1); // MVDx = 0
+        w.write_bits(1, 1); // MVDy = 0
+        let data = w.finish();
+        let mut br = BitReader::new(&data);
+        let (entries, geometry) = decode_s_gmc_vop_macroblocks(&mut br, &vol, &svop).unwrap();
+        assert!(matches!(entries[0], SGmcMbContent::Local { .. }));
+        let frame =
+            crate::frame_decode::assemble_s_gmc_vop_frame(&store, 1, 1, &entries, &geometry, 0, 8)
+                .unwrap();
+        assert_eq!(frame.luma_at(0, 0), Some(128));
+    }
+
+    #[test]
+    fn s_gmc_one_point_zero_trajectory_parses_and_copies() {
+        // One warping point with du = dv = 0 exercises the §6.2.5
+        // sprite_trajectory() capture on the VOP header + the 1-point
+        // translation warp (identity for a zero delta).
+        let vol = test_gmc_vol(16, 16, 1);
+        let store = flat_anchor_store(&vol);
+        let svop = test_s_vop(&vol, 8, Some((0, 0)));
+        assert!(svop.sprite_trajectory.is_some());
+
+        let mut w = BitWriter::default();
+        w.write_bits(1, 1); // not_coded
+        let data = w.finish();
+        let mut br = BitReader::new(&data);
+        let (entries, geometry) = decode_s_gmc_vop_macroblocks(&mut br, &vol, &svop).unwrap();
+        let frame =
+            crate::frame_decode::assemble_s_gmc_vop_frame(&store, 1, 1, &entries, &geometry, 0, 8)
+                .unwrap();
+        assert_eq!(frame.luma_at(0, 0), Some(128));
+    }
+
+    #[test]
+    fn s_gmc_rejects_non_gmc_vol() {
+        let vol = test_vol(16, 16); // sprite_enable: NotUsed
+        let svop = test_i_vop(&vol, 8); // wrong type on purpose
+        let mut br = BitReader::new(&[0u8; 2]);
+        assert!(matches!(
+            decode_s_gmc_vop_macroblocks(&mut br, &vol, &svop),
+            Err(VopDecodeError::Unsupported("not an S-VOP"))
+        ));
     }
 
     #[test]

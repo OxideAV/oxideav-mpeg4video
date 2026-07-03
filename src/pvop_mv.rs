@@ -276,6 +276,26 @@ impl MvDriver {
         }
     }
 
+    /// §7.8.7.3: record an `mcsel == 1` S(GMC)-VOP macroblock's
+    /// **averaged motion vector** into the predictor grid without
+    /// consuming any bits.
+    ///
+    /// A global-motion-compensated macroblock transmits no local motion
+    /// vectors, but §7.8.7.3 substitutes the averaged pel-wise warping
+    /// vector ([`crate::motion::averaged_motion_vector`]) as the
+    /// candidate predictor later macroblocks' §7.6.5 median consults.
+    /// The driver records it as the macroblock's single 16×16 vector so
+    /// the Figure 7-34 candidate gathering sees a *valid* neighbour.
+    pub fn record_gmc_macroblock(
+        &mut self,
+        mb_row: usize,
+        mb_col: usize,
+        averaged_mv: MotionVector,
+    ) -> Result<(), PvopMvError> {
+        self.grid.record_one_mv(mb_row, mb_col, averaged_mv)?;
+        Ok(())
+    }
+
     /// 1-MV path (inter / inter+q). The predictor is the §7.6.5 median
     /// for block 0 (the Figure 7-34 "1-MV mode → top-left case" rule).
     fn decode_one_mv(
