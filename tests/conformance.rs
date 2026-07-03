@@ -127,3 +127,16 @@ fn ipb_stream_matches_reference_decode() {
     // prediction passes.
     assert_stream_matches("ipb_64x64.m4v", "ipb_64x64.yuv", 3, 0.40);
 }
+
+#[test]
+fn qpel_ip_stream_matches_reference_decode() {
+    // §7.6.2.2 quarter-sample mode (VOL `quarter_sample == 1`): I + 4 P
+    // frames encoded with quarter-pel motion. Exercises the 8-tap FIR
+    // half-pel stage, the bilinear quarter positions, the Figure 7-30
+    // per-block boundary mirroring, and the §7.6.5 quarter→half chroma
+    // MV reduction (K = 1 on the eighth-sample grid / Table 7-12). The
+    // FIR is exact integer math, so only the twin-IDCT envelope flows
+    // through the prediction chain — isolated samples reach 3 after
+    // four prediction passes, as in the I/P/B stream.
+    assert_stream_matches("qpel_ip_64x64.m4v", "qpel_ip_64x64.yuv", 3, 0.40);
+}

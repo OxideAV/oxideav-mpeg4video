@@ -274,6 +274,9 @@ impl Mpeg4VideoDecoder {
 
         let res = i64::from(vol.time_increment_resolution.max(1));
         let is_anchor = !matches!(vop.coding_type, VopCodingType::B);
+        // §6.3.3 `quarter_sample`: selects the §7.6.2.1 vs §7.6.2.2
+        // luminance sub-pel grid for every inter path of this VOL.
+        let sample_mode = sample_mode_of(&vol);
 
         if !vop.coded {
             return self.decode_uncoded_vop(&vop, mb_count, mb_width, mb_height, res, out);
@@ -296,6 +299,7 @@ impl Mpeg4VideoDecoder {
                     mb_height,
                     &entries,
                     vop.rounding_type,
+                    sample_mode,
                     u32::from(vol.bits_per_pixel),
                 )?);
             }
@@ -311,6 +315,7 @@ impl Mpeg4VideoDecoder {
                     &entries,
                     &geometry,
                     vop.rounding_type,
+                    sample_mode,
                     u32::from(vol.bits_per_pixel),
                 )?);
             }
@@ -383,10 +388,17 @@ impl Mpeg4VideoDecoder {
                     })
                     .collect();
                 self.anchor_motion = Some(vec![PvopMbMotion::Skipped; mb_count]);
-                out.extend(
-                    self.sequence
-                        .push_p_vop(mb_width, mb_height, &entries, 0, bpp)?,
-                );
+                // All-skipped MBs are integer zero-MV copies, so the
+                // sub-pel mode is immaterial; pass the VOL's anyway.
+                let sample_mode = sample_mode_of(vol);
+                out.extend(self.sequence.push_p_vop(
+                    mb_width,
+                    mb_height,
+                    &entries,
+                    0,
+                    sample_mode,
+                    bpp,
+                )?);
                 self.advance_anchor_time(vop, res);
             }
         }
@@ -425,6 +437,17 @@ impl Mpeg4VideoDecoder {
             return Err(StreamDecodeError::BadTemporalReference { trb, trd });
         }
         Ok((trb as i32, trd as i32))
+    }
+}
+
+/// The §6.3.3 `quarter_sample` → sub-pel-grid selection for one VOL.
+fn sample_mode_of(vol: &VolHeader) -> BVopSampleMode {
+    if vol.quarter_sample {
+        BVopSampleMode::QuarterPel {
+            bits_per_pixel: u32::from(vol.bits_per_pixel),
+        }
+    } else {
+        BVopSampleMode::HalfPel
     }
 }
 

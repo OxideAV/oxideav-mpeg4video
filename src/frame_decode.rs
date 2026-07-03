@@ -107,13 +107,16 @@ pub enum PVopMbContent {
 /// against that plane; each intra macroblock is blitted as-is.
 ///
 /// `vop_rounding_type` is the §7.6.7 half-pel rounding control;
-/// `bits_per_pixel` the §6.3.3 sample depth for the §7.3 clip.
+/// `sample_mode` the VOL-level `quarter_sample` selection (§7.6.2.1 vs
+/// §7.6.2.2 luminance interpolation); `bits_per_pixel` the §6.3.3
+/// sample depth for the §7.3 clip.
 pub fn assemble_p_vop_frame(
     store: &FrameStore,
     mb_width: usize,
     mb_height: usize,
     entries: &[PVopMbContent],
     vop_rounding_type: u8,
+    sample_mode: BVopSampleMode,
     bits_per_pixel: u32,
 ) -> Result<DecodedFrame, FrameDecodeError> {
     let expected = mb_width * mb_height;
@@ -145,6 +148,7 @@ pub fn assemble_p_vop_frame(
                 (mb_col * 16) as i32,
                 (mb_row * 16) as i32,
                 vop_rounding_type,
+                sample_mode,
                 bits_per_pixel,
             )
             .ok_or(FrameDecodeError::InterPredictionFailed { mb_col, mb_row })?,
@@ -168,6 +172,7 @@ pub fn decode_p_vop<'a>(
     mb_height: usize,
     entries: &[PVopMbContent],
     vop_rounding_type: u8,
+    sample_mode: BVopSampleMode,
     bits_per_pixel: u32,
 ) -> Result<&'a DecodedFrame, FrameDecodeError> {
     let frame = assemble_p_vop_frame(
@@ -176,6 +181,7 @@ pub fn decode_p_vop<'a>(
         mb_height,
         entries,
         vop_rounding_type,
+        sample_mode,
         bits_per_pixel,
     )?;
     store.push_anchor(frame);
@@ -324,7 +330,11 @@ pub enum SGmcMbContent {
 /// anchor).
 ///
 /// `geometry` is the §7.8.4/§7.8.5 warp the caller decoded from the
-/// VOP's `sprite_trajectory()`.
+/// VOP's `sprite_trajectory()`. `sample_mode` selects the §7.6.2.1 vs
+/// §7.6.2.2 luminance interpolation for the `mcsel == 0` local-MC
+/// macroblocks (the GMC warp path has its own
+/// `sprite_warping_accuracy` sub-pel handling).
+#[allow(clippy::too_many_arguments)]
 pub fn assemble_s_gmc_vop_frame(
     store: &FrameStore,
     mb_width: usize,
@@ -332,6 +342,7 @@ pub fn assemble_s_gmc_vop_frame(
     entries: &[SGmcMbContent],
     geometry: &WarpGeometry,
     vop_rounding_type: u8,
+    sample_mode: BVopSampleMode,
     bits_per_pixel: u32,
 ) -> Result<DecodedFrame, FrameDecodeError> {
     let expected = mb_width * mb_height;
@@ -381,6 +392,7 @@ pub fn assemble_s_gmc_vop_frame(
                     mb_x,
                     mb_y,
                     vop_rounding_type,
+                    sample_mode,
                 )
                 .ok_or(FrameDecodeError::InterPredictionFailed { mb_col, mb_row })?;
                 reconstruct_inter_macroblock(&prediction, residual, bits_per_pixel)
@@ -412,7 +424,7 @@ mod tests {
             motion: PvopMbMotion::Skipped,
             residual: InterMacroblock::zero(),
         }];
-        let r = assemble_p_vop_frame(&store, 1, 1, &entries, 0, 8);
+        let r = assemble_p_vop_frame(&store, 1, 1, &entries, 0, BVopSampleMode::HalfPel, 8);
         assert_eq!(r, Err(FrameDecodeError::MissingReference));
     }
 
@@ -430,7 +442,7 @@ mod tests {
             motion: PvopMbMotion::Skipped,
             residual: InterMacroblock::zero(),
         }];
-        let r = assemble_p_vop_frame(&store, 2, 1, &entries, 0, 8);
+        let r = assemble_p_vop_frame(&store, 2, 1, &entries, 0, BVopSampleMode::HalfPel, 8);
         assert_eq!(
             r,
             Err(FrameDecodeError::MacroblockCountMismatch {
@@ -464,7 +476,8 @@ mod tests {
                 residual: InterMacroblock::zero(),
             },
         ];
-        let frame = assemble_p_vop_frame(&store, 2, 1, &entries, 0, 8).unwrap();
+        let frame =
+            assemble_p_vop_frame(&store, 2, 1, &entries, 0, BVopSampleMode::HalfPel, 8).unwrap();
         // Left MB copies luma 50; right MB copies luma 60.
         assert_eq!(frame.luma_at(0, 0), Some(50));
         assert_eq!(frame.luma_at(15, 15), Some(50));
@@ -480,7 +493,8 @@ mod tests {
         let mut store = FrameStore::new();
         decode_i_vop(&mut store, 1, 1, &[flat_recon(50, 50, 50)]).unwrap();
         let entries = vec![PVopMbContent::Intra(flat_recon(200, 100, 150))];
-        let frame = assemble_p_vop_frame(&store, 1, 1, &entries, 0, 8).unwrap();
+        let frame =
+            assemble_p_vop_frame(&store, 1, 1, &entries, 0, BVopSampleMode::HalfPel, 8).unwrap();
         assert_eq!(frame.luma_at(0, 0), Some(200));
         assert_eq!(frame.cb_samples()[0], 100);
         assert_eq!(frame.cr_samples()[0], 150);
@@ -512,7 +526,8 @@ mod tests {
                 residual: InterMacroblock::zero(),
             },
         ];
-        let frame = assemble_p_vop_frame(&store, 2, 1, &entries, 0, 8).unwrap();
+        let frame =
+            assemble_p_vop_frame(&store, 2, 1, &entries, 0, BVopSampleMode::HalfPel, 8).unwrap();
         // The left output MB now reads the reference at x in [16,32) ->
         // luma 60.
         assert_eq!(frame.luma_at(0, 0), Some(60));
@@ -527,7 +542,7 @@ mod tests {
             motion: PvopMbMotion::Skipped,
             residual: InterMacroblock::zero(),
         }];
-        decode_p_vop(&mut store, 1, 1, &entries, 0, 8).unwrap();
+        decode_p_vop(&mut store, 1, 1, &entries, 0, BVopSampleMode::HalfPel, 8).unwrap();
         // Chain advanced: I-VOP slid to forward, P-VOP is backward.
         assert_eq!(store.forward().unwrap().luma_at(0, 0), Some(50));
         assert_eq!(store.backward().unwrap().luma_at(0, 0), Some(50));
@@ -567,7 +582,7 @@ mod tests {
         // I-VOP forward anchor: luma 40. P-VOP backward anchor: luma 80.
         decode_i_vop(&mut store, 1, 1, &[flat_recon(40, 10, 20)]).unwrap();
         let p = vec![PVopMbContent::Intra(flat_recon(80, 30, 50))];
-        decode_p_vop(&mut store, 1, 1, &p, 0, 8).unwrap();
+        decode_p_vop(&mut store, 1, 1, &p, 0, BVopSampleMode::HalfPel, 8).unwrap();
         store
     }
 
@@ -660,7 +675,8 @@ mod tests {
         let entries = vec![SGmcMbContent::Gmc {
             residual: InterMacroblock::zero(),
         }];
-        let r = assemble_s_gmc_vop_frame(&store, 1, 1, &entries, &geo, 0, 8);
+        let r =
+            assemble_s_gmc_vop_frame(&store, 1, 1, &entries, &geo, 0, BVopSampleMode::HalfPel, 8);
         assert_eq!(r, Err(FrameDecodeError::MissingReference));
     }
 
@@ -674,7 +690,9 @@ mod tests {
         let entries = vec![SGmcMbContent::Gmc {
             residual: InterMacroblock::zero(),
         }];
-        let frame = assemble_s_gmc_vop_frame(&store, 1, 1, &entries, &geo, 0, 8).unwrap();
+        let frame =
+            assemble_s_gmc_vop_frame(&store, 1, 1, &entries, &geo, 0, BVopSampleMode::HalfPel, 8)
+                .unwrap();
         assert_eq!(frame.luma_at(0, 0), Some(70));
         assert_eq!(frame.luma_at(15, 15), Some(70));
         assert_eq!(frame.cb_samples()[0], 21);
@@ -707,7 +725,9 @@ mod tests {
                 residual: InterMacroblock::zero(),
             },
         ];
-        let frame = assemble_s_gmc_vop_frame(&store, 2, 1, &entries, &geo, 0, 8).unwrap();
+        let frame =
+            assemble_s_gmc_vop_frame(&store, 2, 1, &entries, &geo, 0, BVopSampleMode::HalfPel, 8)
+                .unwrap();
         // Left MB read the right reference MB (luma 60).
         assert_eq!(frame.luma_at(0, 0), Some(60));
         // Right MB skipped -> copy of reference MB (luma 60).
@@ -720,7 +740,9 @@ mod tests {
         decode_i_vop(&mut store, 1, 1, &[flat_recon(70, 70, 70)]).unwrap();
         let geo = stationary_geometry(16, 16);
         let entries = vec![SGmcMbContent::Intra(flat_recon(123, 45, 67))];
-        let frame = assemble_s_gmc_vop_frame(&store, 1, 1, &entries, &geo, 0, 8).unwrap();
+        let frame =
+            assemble_s_gmc_vop_frame(&store, 1, 1, &entries, &geo, 0, BVopSampleMode::HalfPel, 8)
+                .unwrap();
         assert_eq!(frame.luma_at(0, 0), Some(123));
         assert_eq!(frame.cb_samples()[0], 45);
         assert_eq!(frame.cr_samples()[0], 67);
@@ -735,7 +757,9 @@ mod tests {
         let entries = vec![SGmcMbContent::Gmc {
             residual: InterMacroblock::zero(),
         }];
-        let frame = assemble_s_gmc_vop_frame(&store, 1, 1, &entries, &geo, 0, 8).unwrap();
+        let frame =
+            assemble_s_gmc_vop_frame(&store, 1, 1, &entries, &geo, 0, BVopSampleMode::HalfPel, 8)
+                .unwrap();
         store.push_anchor(frame);
         assert_eq!(store.backward().unwrap().coding_type(), VopCodingType::S);
         assert_eq!(store.forward().unwrap().coding_type(), VopCodingType::I);

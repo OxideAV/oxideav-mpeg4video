@@ -355,19 +355,70 @@ impl MvDriver {
     }
 }
 
+/// Interpolate one `w × h` luminance prediction block on the sub-pel
+/// grid `mode` selects: §7.6.2.1 half-sample bilinear or §7.6.2.2
+/// quarter-sample FIR + bilinear (with per-block boundary mirroring).
+// One argument per §7.6.2 interpolation input, mirroring the two
+// wrapped primitives' signatures.
+#[allow(clippy::too_many_arguments)]
+fn interpolate_luma_block_into(
+    reference: &crate::half_sample::ReferenceVop<'_>,
+    mv: MotionVector,
+    origin_x: i32,
+    origin_y: i32,
+    w: usize,
+    h: usize,
+    vop_rounding_type: u8,
+    mode: crate::bvop_prediction::BVopSampleMode,
+    out: &mut [u8],
+) {
+    match mode {
+        crate::bvop_prediction::BVopSampleMode::HalfPel => {
+            crate::half_sample::interpolate_block_into(
+                reference,
+                mv.x,
+                mv.y,
+                origin_x,
+                origin_y,
+                w,
+                h,
+                vop_rounding_type,
+                out,
+            );
+        }
+        crate::bvop_prediction::BVopSampleMode::QuarterPel { bits_per_pixel } => {
+            crate::quarter_sample::interpolate_block_qpel_into(
+                reference,
+                mv.x,
+                mv.y,
+                origin_x,
+                origin_y,
+                w,
+                h,
+                vop_rounding_type,
+                bits_per_pixel,
+                out,
+            );
+        }
+    }
+}
+
 /// Generate the §7.6.2 16×16 luminance prediction block for one decoded
-/// progressive P-VOP macroblock, half-sample interpolated from a
-/// reference plane.
+/// progressive P-VOP macroblock, sub-pel interpolated from a reference
+/// plane.
 ///
 /// This is the bridge from the [`MvDriver`]'s decoded motion vector(s)
-/// to a concrete predicted block — the §7.6.2.1 half-sample path. It
+/// to a concrete predicted block — the §7.6.2.1 half-sample path when
+/// `mode` is [`BVopSampleMode::HalfPel`](crate::bvop_prediction::BVopSampleMode::HalfPel),
+/// or the §7.6.2.2 quarter-sample path (8-tap FIR + bilinear, per-block
+/// boundary mirroring) when the VOL coded `quarter_sample == 1`. It
 /// dispatches on the [`PvopMbMotion`] the driver returned:
 ///
 /// * [`PvopMbMotion::Skipped`] → a zero-MV 16×16 block (the §7.6.2
 ///   skipped-MB copy of the co-located reference samples, MV `(0, 0)`).
-/// * [`PvopMbMotion::OneMv`] → one 16×16 [`interpolate_block`] with the
+/// * [`PvopMbMotion::OneMv`] → one 16×16 interpolation with the
 ///   single MV.
-/// * [`PvopMbMotion::FourMv`] → four 8×8 [`interpolate_block`]s, one per
+/// * [`PvopMbMotion::FourMv`] → four 8×8 interpolations, one per
 ///   Figure 6-8 luminance sub-block, tiled into the 16×16 output. Block
 ///   `i`'s 8×8 origin is `(mb_x + 8*(i & 1), mb_y + 8*(i >> 1))`.
 /// * [`PvopMbMotion::Intra`] → `None`: an intra macroblock carries no
@@ -376,55 +427,65 @@ impl MvDriver {
 ///
 /// `mb_x` / `mb_y` are the macroblock's top-left luma pixel coordinates
 /// in the current VOP (`16 * mb_col`, `16 * mb_row`). The MVs are taken
-/// in §7.6.3 half-sample units (the progressive `quarter_sample == 0`
-/// path). Returns a row-major `[u8; 256]` 16×16 block (length 256),
-/// laid out `block[16*j + i]`.
+/// in the §7.6.3 unitless-integer representation matching `mode`
+/// (half-sample units when `quarter_sample == 0`, quarter-sample units
+/// when `quarter_sample == 1`). Returns a row-major `[u8; 256]` 16×16
+/// block (length 256), laid out `block[16*j + i]`.
 pub fn predict_luma_macroblock(
     motion: PvopMbMotion,
     reference: &crate::half_sample::ReferenceVop<'_>,
     mb_x: i32,
     mb_y: i32,
     vop_rounding_type: u8,
+    mode: crate::bvop_prediction::BVopSampleMode,
 ) -> Option<Vec<u8>> {
-    use crate::half_sample::interpolate_block_into;
-
     match motion {
         PvopMbMotion::Intra => None,
-        PvopMbMotion::Skipped => Some(crate::half_sample::interpolate_block(
-            reference,
-            0,
-            0,
-            mb_x,
-            mb_y,
-            16,
-            16,
-            vop_rounding_type,
-        )),
-        PvopMbMotion::OneMv(mv) => Some(crate::half_sample::interpolate_block(
-            reference,
-            mv.x,
-            mv.y,
-            mb_x,
-            mb_y,
-            16,
-            16,
-            vop_rounding_type,
-        )),
+        PvopMbMotion::Skipped => {
+            let mut out = vec![0u8; 256];
+            interpolate_luma_block_into(
+                reference,
+                MotionVector { x: 0, y: 0 },
+                mb_x,
+                mb_y,
+                16,
+                16,
+                vop_rounding_type,
+                mode,
+                &mut out,
+            );
+            Some(out)
+        }
+        PvopMbMotion::OneMv(mv) => {
+            let mut out = vec![0u8; 256];
+            interpolate_luma_block_into(
+                reference,
+                mv,
+                mb_x,
+                mb_y,
+                16,
+                16,
+                vop_rounding_type,
+                mode,
+                &mut out,
+            );
+            Some(out)
+        }
         PvopMbMotion::FourMv(mvs) => {
             let mut out = vec![0u8; 256];
             let mut tile = vec![0u8; 64];
             for (i, mv) in mvs.iter().enumerate() {
                 let bx = mb_x + 8 * (i as i32 & 1);
                 let by = mb_y + 8 * (i as i32 >> 1);
-                interpolate_block_into(
+                interpolate_luma_block_into(
                     reference,
-                    mv.x,
-                    mv.y,
+                    *mv,
                     bx,
                     by,
                     8,
                     8,
                     vop_rounding_type,
+                    mode,
                     &mut tile,
                 );
                 let dst_col = 8 * (i & 1);
@@ -455,15 +516,30 @@ pub fn predict_luma_macroblock(
 ///   reduced by `sum / 8`.
 /// * [`PvopMbMotion::Intra`] → `None`.
 ///
-/// The MVs are taken in half-sample units (progressive `quarter_sample
-/// == 0`). Returns the chroma MV in half-sample units ready for the
-/// §7.6.2.1 chroma interpolation, or `None` for an intra macroblock.
-pub fn chroma_mv_for_macroblock(motion: PvopMbMotion) -> Option<MotionVector> {
+/// The MVs are taken in the unitless-integer representation matching
+/// `mode`. In quarter-sample mode §7.6.5 divides each vector by 2
+/// before the summation — the sum then sits on a finer grid, handled
+/// by [`crate::chroma_mv::chroma_mv_from_luma_blocks_qpel`] — so the
+/// returned chroma MV is **always** in half-sample units, ready for
+/// the §7.6.2.1 chroma interpolation (§7.6.2.2 applies to luminance
+/// only). Returns `None` for an intra macroblock.
+pub fn chroma_mv_for_macroblock(
+    motion: PvopMbMotion,
+    mode: crate::bvop_prediction::BVopSampleMode,
+) -> Option<MotionVector> {
+    let derive = |mvs: &[MotionVector]| match mode {
+        crate::bvop_prediction::BVopSampleMode::HalfPel => {
+            crate::chroma_mv::chroma_mv_from_luma_blocks(mvs).ok()
+        }
+        crate::bvop_prediction::BVopSampleMode::QuarterPel { .. } => {
+            crate::chroma_mv::chroma_mv_from_luma_blocks_qpel(mvs).ok()
+        }
+    };
     match motion {
         PvopMbMotion::Intra => None,
         PvopMbMotion::Skipped => Some(MotionVector { x: 0, y: 0 }),
-        PvopMbMotion::OneMv(mv) => crate::chroma_mv::chroma_mv_from_luma_blocks(&[mv]).ok(),
-        PvopMbMotion::FourMv(mvs) => crate::chroma_mv::chroma_mv_from_luma_blocks(&mvs).ok(),
+        PvopMbMotion::OneMv(mv) => derive(&[mv]),
+        PvopMbMotion::FourMv(mvs) => derive(&mvs),
     }
 }
 
@@ -483,8 +559,9 @@ pub fn predict_chroma_macroblock(
     cmb_x: i32,
     cmb_y: i32,
     vop_rounding_type: u8,
+    mode: crate::bvop_prediction::BVopSampleMode,
 ) -> Option<Vec<u8>> {
-    let mv = chroma_mv_for_macroblock(motion)?;
+    let mv = chroma_mv_for_macroblock(motion, mode)?;
     Some(crate::half_sample::interpolate_block(
         reference,
         mv.x,
@@ -523,6 +600,8 @@ pub fn predict_chroma_macroblock(
 ///
 /// Returns [`None`] for an intra macroblock (it carries no §7.6.2
 /// prediction — its samples come from the §7.4 intra texture path).
+// The §7.6.2 / §7.3 inputs map one-for-one; see reconstruct_pvop_macroblock.
+#[allow(clippy::too_many_arguments)]
 pub fn predict_inter_macroblock(
     motion: PvopMbMotion,
     luma_ref: &crate::half_sample::ReferenceVop<'_>,
@@ -531,6 +610,7 @@ pub fn predict_inter_macroblock(
     mb_x: i32,
     mb_y: i32,
     vop_rounding_type: u8,
+    mode: crate::bvop_prediction::BVopSampleMode,
 ) -> Option<crate::reconstruct::InterPredictionMacroblock> {
     use crate::reconstruct::{
         InterPredictionMacroblock, MACROBLOCK_CHROMA_SIDE, MACROBLOCK_LUMA_SIDE,
@@ -540,12 +620,12 @@ pub fn predict_inter_macroblock(
         return None;
     }
 
-    let luma_flat = predict_luma_macroblock(motion, luma_ref, mb_x, mb_y, vop_rounding_type)?;
+    let luma_flat = predict_luma_macroblock(motion, luma_ref, mb_x, mb_y, vop_rounding_type, mode)?;
 
     let cmb_x = mb_x / 2;
     let cmb_y = mb_y / 2;
-    let cb_flat = predict_chroma_macroblock(motion, cb_ref, cmb_x, cmb_y, vop_rounding_type)?;
-    let cr_flat = predict_chroma_macroblock(motion, cr_ref, cmb_x, cmb_y, vop_rounding_type)?;
+    let cb_flat = predict_chroma_macroblock(motion, cb_ref, cmb_x, cmb_y, vop_rounding_type, mode)?;
+    let cr_flat = predict_chroma_macroblock(motion, cr_ref, cmb_x, cmb_y, vop_rounding_type, mode)?;
 
     let mut out = InterPredictionMacroblock::zero();
     for y in 0..MACROBLOCK_LUMA_SIDE {
@@ -604,6 +684,7 @@ pub fn reconstruct_pvop_macroblock(
     mb_x: i32,
     mb_y: i32,
     vop_rounding_type: u8,
+    mode: crate::bvop_prediction::BVopSampleMode,
     bits_per_pixel: u32,
 ) -> Option<crate::reconstruct::ReconstructedMacroblock> {
     let prediction = predict_inter_macroblock(
@@ -614,6 +695,7 @@ pub fn reconstruct_pvop_macroblock(
         mb_x,
         mb_y,
         vop_rounding_type,
+        mode,
     )?;
     Some(crate::reconstruct::reconstruct_inter_macroblock(
         &prediction,
@@ -795,6 +877,10 @@ mod tests {
 
     use crate::half_sample::ReferenceVop;
 
+    /// Half-pel sample mode shorthand for the legacy-path tests.
+    const HP: crate::bvop_prediction::BVopSampleMode =
+        crate::bvop_prediction::BVopSampleMode::HalfPel;
+
     /// A `w × h` reference plane whose sample value is `x + y` (mod 256)
     /// — a deterministic gradient with no half-pel ambiguity at integer
     /// MVs.
@@ -817,7 +903,8 @@ mod tests {
         // MB at (16, 0): a skipped MB copies the co-located samples
         // (MV 0,0). Sample (i, j) of the block = reference(16+i, 0+j) =
         // (16 + i + j) mod 256.
-        let block = predict_luma_macroblock(PvopMbMotion::Skipped, &reference, 16, 0, 0).unwrap();
+        let block =
+            predict_luma_macroblock(PvopMbMotion::Skipped, &reference, 16, 0, 0, HP).unwrap();
         for j in 0..16 {
             for i in 0..16 {
                 assert_eq!(block[16 * j + i], ((16 + i + j) & 0xff) as u8);
@@ -829,7 +916,7 @@ mod tests {
     fn intra_mb_has_no_motion_prediction() {
         let plane = gradient_plane(16, 16);
         let reference = ReferenceVop::new(&plane, 16, 16).unwrap();
-        assert!(predict_luma_macroblock(PvopMbMotion::Intra, &reference, 0, 0, 0).is_none());
+        assert!(predict_luma_macroblock(PvopMbMotion::Intra, &reference, 0, 0, 0, HP).is_none());
     }
 
     #[test]
@@ -842,7 +929,8 @@ mod tests {
         let plane = gradient_plane(w, h);
         let reference = ReferenceVop::new(&plane, w, h).unwrap();
         let mv = MotionVector { x: 4, y: 2 };
-        let block = predict_luma_macroblock(PvopMbMotion::OneMv(mv), &reference, 0, 0, 0).unwrap();
+        let block =
+            predict_luma_macroblock(PvopMbMotion::OneMv(mv), &reference, 0, 0, 0, HP).unwrap();
         // block(i, j) = reference(0 + i + 2, 0 + j + 1) = (i + 2 + j + 1).
         for j in 0..16 {
             for i in 0..16 {
@@ -867,7 +955,7 @@ mod tests {
             MotionVector { x: 0, y: 4 }, // block 3 (BR): shift (0, +2)
         ];
         let block =
-            predict_luma_macroblock(PvopMbMotion::FourMv(mvs), &reference, 0, 0, 0).unwrap();
+            predict_luma_macroblock(PvopMbMotion::FourMv(mvs), &reference, 0, 0, 0, HP).unwrap();
         // Block 0 (TL): origin (0,0), shift (+1,0).
         for j in 0..8 {
             for i in 0..8 {
@@ -971,7 +1059,7 @@ mod tests {
         for (mb_row, mb_col, motion) in motions {
             let mb_x = 16 * mb_col as i32;
             let mb_y = 16 * mb_row as i32;
-            let block = predict_luma_macroblock(motion, &reference, mb_x, mb_y, 0).unwrap();
+            let block = predict_luma_macroblock(motion, &reference, mb_x, mb_y, 0, HP).unwrap();
             let mv = motion.one_mv().unwrap();
             // Half-pel MV (1,1) = integer shift (0,0) + half-pel (1,1):
             // bilinear of four neighbours. MV (0,0) = exact copy.
@@ -1014,7 +1102,7 @@ mod tests {
         // §7.6.5 K=1: chroma MV = sum / 2 (half-sample units).
         let m = PvopMbMotion::OneMv(MotionVector { x: 4, y: -2 });
         assert_eq!(
-            chroma_mv_for_macroblock(m),
+            chroma_mv_for_macroblock(m, HP),
             Some(MotionVector { x: 2, y: -1 })
         );
     }
@@ -1024,7 +1112,7 @@ mod tests {
         // §7.6.5 K=4: sum (16, 16) / 8 = (2, 2).
         let m = PvopMbMotion::FourMv([MotionVector { x: 4, y: 4 }; 4]);
         assert_eq!(
-            chroma_mv_for_macroblock(m),
+            chroma_mv_for_macroblock(m, HP),
             Some(MotionVector { x: 2, y: 2 })
         );
     }
@@ -1032,10 +1120,10 @@ mod tests {
     #[test]
     fn chroma_mv_skipped_is_zero_intra_is_none() {
         assert_eq!(
-            chroma_mv_for_macroblock(PvopMbMotion::Skipped),
+            chroma_mv_for_macroblock(PvopMbMotion::Skipped, HP),
             Some(MotionVector { x: 0, y: 0 })
         );
-        assert_eq!(chroma_mv_for_macroblock(PvopMbMotion::Intra), None);
+        assert_eq!(chroma_mv_for_macroblock(PvopMbMotion::Intra, HP), None);
     }
 
     #[test]
@@ -1048,7 +1136,7 @@ mod tests {
         let reference = ReferenceVop::new(&plane, w, h).unwrap();
         let m = PvopMbMotion::OneMv(MotionVector { x: 4, y: 0 });
         // MB col 1 → chroma origin (8, 0).
-        let block = predict_chroma_macroblock(m, &reference, 8, 0, 0).unwrap();
+        let block = predict_chroma_macroblock(m, &reference, 8, 0, 0, HP).unwrap();
         for j in 0..8 {
             for i in 0..8 {
                 // chroma MV (2,0) = shift (+1,0): block(i,j) =
@@ -1062,7 +1150,7 @@ mod tests {
     fn chroma_prediction_intra_is_none() {
         let plane = gradient_plane(8, 8);
         let reference = ReferenceVop::new(&plane, 8, 8).unwrap();
-        assert!(predict_chroma_macroblock(PvopMbMotion::Intra, &reference, 0, 0, 0).is_none());
+        assert!(predict_chroma_macroblock(PvopMbMotion::Intra, &reference, 0, 0, 0, HP).is_none());
     }
 
     // ------------------------------------------------------------------
@@ -1083,7 +1171,8 @@ mod tests {
             &cr_ref,
             0,
             0,
-            0
+            0,
+            HP
         )
         .is_none());
     }
@@ -1108,7 +1197,7 @@ mod tests {
         let motion = PvopMbMotion::OneMv(MotionVector { x: 4, y: 4 });
         // Macroblock at luma (16, 16) → chroma (8, 8).
         let pred =
-            predict_inter_macroblock(motion, &luma_ref, &cb_ref, &cr_ref, 16, 16, 0).unwrap();
+            predict_inter_macroblock(motion, &luma_ref, &cb_ref, &cr_ref, 16, 16, 0, HP).unwrap();
 
         // Luma: shift (+2, +2). p[y][x] = ref(16 + x + 2, 16 + y + 2).
         for y in 0..16 {
@@ -1150,9 +1239,17 @@ mod tests {
         let cr_ref = ReferenceVop::new(&cr, cw, ch).unwrap();
 
         // Skipped MB at (0,0): zero MV → prediction = co-located ref.
-        let pred =
-            predict_inter_macroblock(PvopMbMotion::Skipped, &luma_ref, &cb_ref, &cr_ref, 0, 0, 0)
-                .unwrap();
+        let pred = predict_inter_macroblock(
+            PvopMbMotion::Skipped,
+            &luma_ref,
+            &cb_ref,
+            &cr_ref,
+            0,
+            0,
+            0,
+            HP,
+        )
+        .unwrap();
 
         // Residual = +5 everywhere.
         let residual = InterMacroblock {
@@ -1204,6 +1301,7 @@ mod tests {
             0,
             0,
             0,
+            HP,
             8,
         )
         .is_none());
@@ -1248,7 +1346,7 @@ mod tests {
 
         let motion = PvopMbMotion::OneMv(MotionVector { x: 4, y: 4 });
         let recon = reconstruct_pvop_macroblock(
-            motion, &luma_ref, &cb_ref, &cr_ref, &residual, 16, 16, 0, 8,
+            motion, &luma_ref, &cb_ref, &cr_ref, &residual, 16, 16, 0, HP, 8,
         )
         .unwrap();
 
@@ -1343,6 +1441,7 @@ mod tests {
                 mb_x,
                 mb_y,
                 0,
+                HP,
                 8,
             )
             .unwrap();
@@ -1369,7 +1468,7 @@ mod tests {
         for (mb_row, mb_col, motion) in motions {
             let mb_x = 16 * mb_col as i32;
             let mb_y = 16 * mb_row as i32;
-            let pred = predict_luma_macroblock(motion, &luma_ref, mb_x, mb_y, 0).unwrap();
+            let pred = predict_luma_macroblock(motion, &luma_ref, mb_x, mb_y, 0, HP).unwrap();
             for y in [0usize, 7, 15] {
                 for x in [0usize, 7, 15] {
                     let fb = frame_y[(mb_y as usize + y) * 32 + (mb_x as usize + x)];

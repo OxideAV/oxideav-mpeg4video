@@ -672,6 +672,74 @@ fn compute_l<S: QpelSource>(vop: &S, int_x: i32, int_y: i32, rc: u8, bpp: u32) -
     fir_8tap_clip(&col, rc, bpp)
 }
 
+/// §7.6.2.2 / Figure 7-30 mirrored reference block.
+///
+/// "For each block of size MxN in the reference VOP which position is
+/// defined by the decoded motion vector for the block to be predicted,
+/// a reference block of size (M+1)x(N+1) biased in the direction of
+/// the half or quarter sample position is read from the reconstructed
+/// and padded reference VOP. Then, this reference block is
+/// symmetrically extended at the block boundaries by three samples
+/// using block boundary mirroring according to Figure 7-30."
+///
+/// The `(M+1)×(N+1)` interior samples are fetched once (with the
+/// §7.6.4 last-full-pel clamp — "an edge sample is used **prior to**
+/// block boundary mirroring"); [`QpelSource::fetch`] then serves the
+/// FIR/bilinear cascade in block-relative coordinates, reflecting any
+/// index up to three samples outside the block back into it. Figure
+/// 7-30 mirrors about the boundary *between* samples (the sample
+/// adjacent to the boundary is repeated first): `E[-k] = R[k-1]` and
+/// `E[size-1+k] = R[size-k]` for `k = 1..=3`.
+struct MirroredRefBlock {
+    /// Row-major `(M+1)×(N+1)` interior samples.
+    data: Vec<u8>,
+    /// Interior width `M + 1`.
+    w: i32,
+    /// Interior height `N + 1`.
+    h: i32,
+}
+
+impl MirroredRefBlock {
+    /// Read the `(w)×(h)` interior block whose top-left integer-pel
+    /// sits at source coordinate `(x0, y0)`.
+    fn read<S: QpelSource>(src: &S, x0: i32, y0: i32, w: usize, h: usize) -> Self {
+        let mut data = vec![0u8; w * h];
+        for (j, row) in data.chunks_exact_mut(w).enumerate() {
+            for (i, px) in row.iter_mut().enumerate() {
+                *px = src.fetch(x0 + i as i32, y0 + j as i32);
+            }
+        }
+        Self {
+            data,
+            w: w as i32,
+            h: h as i32,
+        }
+    }
+}
+
+/// Figure 7-30 reflection of one axis index into `0..size`. Only
+/// indices within three samples of the block are ever requested (the
+/// 8-tap FIR reaches at most 3 beyond the `(M+1)`-sample interior).
+#[inline]
+const fn mirror_index(t: i32, size: i32) -> i32 {
+    if t < 0 {
+        -t - 1
+    } else if t >= size {
+        2 * size - 1 - t
+    } else {
+        t
+    }
+}
+
+impl QpelSource for MirroredRefBlock {
+    #[inline]
+    fn fetch(&self, x: i32, y: i32) -> u8 {
+        let mx = mirror_index(x, self.w);
+        let my = mirror_index(y, self.h);
+        self.data[(my * self.w + mx) as usize]
+    }
+}
+
 /// Quarter-sample-interpolate a `block_w × block_h` luminance
 /// prediction block from a reference plane, given an `(mv_x, mv_y)`
 /// motion vector in §7.6.3 quarter-pel units and the block's
@@ -683,8 +751,15 @@ fn compute_l<S: QpelSource>(vop: &S, int_x: i32, int_y: i32, rc: u8, bpp: u32) -
 ///
 /// `mv_x` / `mv_y` are signed quarter-pel motion-vector components;
 /// `vop_rounding_type ∈ {0, 1}` is the VOP-header field;
-/// `bits_per_pixel` is from the VOL header. §7.6.4 edge clamping is
-/// applied per fetch.
+/// `bits_per_pixel` is from the VOL header.
+///
+/// Per §7.6.2.2 the sub-pel cascade runs on a per-block
+/// `(M+1)×(N+1)` reference block that is symmetrically extended by
+/// three samples at each boundary ([`MirroredRefBlock`]) — motion
+/// compensation of four 8×8 blocks with one shared vector therefore
+/// does **not** equal one 16×16 interpolation with that vector
+/// (§7.6.9.5.3 NOTE). §7.6.4 edge clamping applies while reading the
+/// interior block, prior to the mirroring.
 //
 // The signature reflects the §7.6.2.2 inputs one-for-one (motion
 // vector x/y, block origin x/y, block w/h, rounding control, bpp).
@@ -748,12 +823,28 @@ pub fn interpolate_block_qpel_into(
     let (mvx_int, qfx) = split_quarter_pel(mv_x);
     let (mvy_int, qfy) = split_quarter_pel(mv_y);
     let rc = vop_rounding_type & 1;
+    // §7.6.2.2: read the (M+1)x(N+1) reference block (biased toward
+    // the sub-pel direction — the split fraction is non-negative, so
+    // the extra column/row sits at the right/bottom) and mirror-extend
+    // it; the cascade then runs in block-relative coordinates.
+    let block = MirroredRefBlock::read(
+        vop,
+        origin_x + mvx_int,
+        origin_y + mvy_int,
+        block_w + 1,
+        block_h + 1,
+    );
     for j in 0..block_h {
-        let row_y = origin_y + (j as i32) + mvy_int;
         for i in 0..block_w {
-            let col_x = origin_x + (i as i32) + mvx_int;
-            out[j * block_w + i] =
-                interpolate_quarter_pixel(vop, col_x, row_y, qfx, qfy, rc, bits_per_pixel);
+            out[j * block_w + i] = interpolate_quarter_pixel_src(
+                &block,
+                i as i32,
+                j as i32,
+                qfx,
+                qfy,
+                rc,
+                bits_per_pixel,
+            );
         }
     }
 }
@@ -820,12 +911,28 @@ pub fn interpolate_block_qpel_field_into(
     // the frame-coordinate `origin_y` line is field-grid line
     // `origin_y / 2`.
     let origin_field_line = origin_y >> 1;
+    // §7.6.2.2 block-boundary mirroring, in field-line space: the
+    // (M+1)x(N+1) interior block is read from the single-field view
+    // (its vertical axis already steps two frame lines per index) and
+    // mirror-extended by three samples per Figure 7-30.
+    let block = MirroredRefBlock::read(
+        &field,
+        origin_x + mvx_int,
+        origin_field_line + mvy_int_field,
+        block_w + 1,
+        block_h + 1,
+    );
     for j in 0..block_h {
-        let row_y = origin_field_line + (j as i32) + mvy_int_field;
         for i in 0..block_w {
-            let col_x = origin_x + (i as i32) + mvx_int;
-            out[j * block_w + i] =
-                interpolate_quarter_pixel_src(&field, col_x, row_y, qfx, qfy, rc, bits_per_pixel);
+            out[j * block_w + i] = interpolate_quarter_pixel_src(
+                &block,
+                i as i32,
+                j as i32,
+                qfx,
+                qfy,
+                rc,
+                bits_per_pixel,
+            );
         }
     }
 }
@@ -1455,10 +1562,15 @@ mod tests {
         let vop = ReferenceVop::new(&plane, side, side).unwrap();
         let top = FieldRefView::new(&vop, 0);
         // origin_field_line = 24/2 = 12; output field-line j reads the
-        // half-pel at field-line (12 + j). For j in [0, 7] the FIR taps
-        // span field-lines 9..23, all within [0, 31] → no clamp.
+        // half-pel at field-line (12 + j). Only the block-interior rows
+        // are comparable to the plane-wide helper: the §7.6.2.2
+        // mirrored block spans field-lines 12..20 (N+1 = 9 rows), so
+        // the eight vertical taps (j-3 .. j+4 in block rows) stay
+        // inside it for j ∈ {3, 4} only; nearer the block boundary the
+        // Figure 7-30 mirror kicks in and the values legitimately
+        // differ from the plane-clamped helper.
         let block = interpolate_block_qpel_field(&vop, 0, 4, 0, 24, 16, 8, 0, 0, 8);
-        for j in 0..8 {
+        for j in 3..=4 {
             let expected = half_pel_c_src(&top, 5, 12 + j as i32, 0, 8);
             for i in 0..16 {
                 assert_eq!(block[j * 16 + i], expected, "j={j} i={i}");
@@ -1498,7 +1610,13 @@ mod tests {
         let one_line = ReferenceVop::new(&row, side, 1).unwrap();
         for qfx in 0u8..=3 {
             let field = interpolate_block_qpel_field(&vop, qfx as i32, 0, 0, 0, side, 8, 0, 0, 8);
-            for i in 0..side {
+            // Only block-interior columns are comparable to the
+            // plane-clamped per-pixel cascade: the §7.6.2.2 mirrored
+            // block spans columns 0..=16 (M+1 = 17), so the eight
+            // horizontal taps (i-3 .. i+4) stay inside it for
+            // i ∈ 3..=12; nearer the block boundary the Figure 7-30
+            // mirror applies and the values legitimately differ.
+            for i in 3..=12 {
                 // Progressive single-line fetch at the same x sub-pel,
                 // qfy = 0 (no vertical interp).
                 let prog = interpolate_quarter_pixel(&one_line, i as i32, 0, qfx, 0, 0, 8);
@@ -1509,5 +1627,113 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ─────────────── §7.6.2.2 block-boundary mirroring ───────────────
+
+    #[test]
+    fn mirror_index_reflects_up_to_three_samples() {
+        // Figure 7-30: the boundary lies between samples; the sample
+        // adjacent to it repeats first. E[-1]=R[0], E[-2]=R[1],
+        // E[-3]=R[2]; and symmetrically past the far edge.
+        assert_eq!(mirror_index(-1, 9), 0);
+        assert_eq!(mirror_index(-2, 9), 1);
+        assert_eq!(mirror_index(-3, 9), 2);
+        assert_eq!(mirror_index(0, 9), 0);
+        assert_eq!(mirror_index(8, 9), 8);
+        assert_eq!(mirror_index(9, 9), 8);
+        assert_eq!(mirror_index(10, 9), 7);
+        assert_eq!(mirror_index(11, 9), 6);
+    }
+
+    #[test]
+    fn block_qpel_integer_mv_ignores_mirroring() {
+        // A whole-pel MV touches no sub-pel filter, so mirroring has
+        // nothing to contribute: the block is a plain copy.
+        let side = 24;
+        let mut plane = vec![0u8; side * side];
+        for (idx, px) in plane.iter_mut().enumerate() {
+            *px = (idx * 7 % 251) as u8;
+        }
+        let vop = ReferenceVop::new(&plane, side, side).unwrap();
+        let block = interpolate_block_qpel(&vop, 4, -8, 8, 8, 8, 8, 0, 8);
+        for j in 0..8 {
+            for i in 0..8 {
+                assert_eq!(
+                    block[j * 8 + i],
+                    plane[(8 + j - 2) * side + (8 + i + 1)],
+                    "i={i} j={j}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn block_qpel_half_pel_boundary_sample_uses_mirrored_taps() {
+        // Verify one boundary output against a hand-mirrored 8-tap FIR.
+        // 8x8 block at origin (8, 8), MV = (2, 0) → horizontal
+        // half-pel b at columns i + 0.5. At i = 0 the FIR taps are
+        // interior columns (-3..4) of the mirrored block: columns
+        // -3..-1 reflect to interior 2, 1, 0.
+        let side = 24;
+        let mut plane = vec![0u8; side * side];
+        for (idx, px) in plane.iter_mut().enumerate() {
+            *px = (idx * 13 % 239) as u8;
+        }
+        let vop = ReferenceVop::new(&plane, side, side).unwrap();
+        let block = interpolate_block_qpel(&vop, 2, 0, 8, 8, 8, 8, 0, 8);
+        // Interior row 0 of the block reads plane row 8, columns 8..=16.
+        let interior: Vec<u8> = (0..9).map(|i| plane[8 * side + 8 + i]).collect();
+        // Mirrored taps for the half-pel between interior cols 0 and 1:
+        // A_{-4..-1} = E[-3..0] = [int[2], int[1], int[0], int[0]],
+        // A_{1..4} = E[1..4] = [int[1], int[2], int[3], int[4]].
+        let taps = [
+            interior[2],
+            interior[1],
+            interior[0],
+            interior[0],
+            interior[1],
+            interior[2],
+            interior[3],
+            interior[4],
+        ];
+        let expected = fir_8tap_clip(&taps, 0, 8);
+        assert_eq!(block[0], expected);
+    }
+
+    #[test]
+    fn four_8x8_blocks_differ_from_one_16x16_block_at_sub_pel() {
+        // §7.6.9.5.3 NOTE: with the same fractional MV, four 8x8
+        // interpolations do not equal one 16x16 interpolation — each
+        // 8x8 block mirrors at its own boundary.
+        let side = 40;
+        let mut plane = vec![0u8; side * side];
+        for (idx, px) in plane.iter_mut().enumerate() {
+            *px = (idx * 31 % 255) as u8;
+        }
+        let vop = ReferenceVop::new(&plane, side, side).unwrap();
+        let mv = (2, 2); // half-pel `d` position — full FIR cascade.
+        let whole = interpolate_block_qpel(&vop, mv.0, mv.1, 12, 12, 16, 16, 0, 8);
+        let mut tiled = vec![0u8; 256];
+        let mut any_diff = false;
+        for b in 0..4 {
+            let bx = 12 + 8 * (b & 1) as i32;
+            let by = 12 + 8 * (b >> 1) as i32;
+            let tile = interpolate_block_qpel(&vop, mv.0, mv.1, bx, by, 8, 8, 0, 8);
+            for j in 0..8 {
+                for i in 0..8 {
+                    tiled[(8 * (b >> 1) + j) * 16 + 8 * (b & 1) + i] = tile[j * 8 + i];
+                }
+            }
+        }
+        for (a, b) in whole.iter().zip(tiled.iter()) {
+            if a != b {
+                any_diff = true;
+            }
+        }
+        assert!(
+            any_diff,
+            "8x8-tiled and 16x16 sub-pel interpolation must differ (block mirroring)"
+        );
     }
 }

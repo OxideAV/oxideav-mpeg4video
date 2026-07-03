@@ -103,6 +103,7 @@ impl SequenceDecoder {
         mb_height: usize,
         entries: &[PVopMbContent],
         vop_rounding_type: u8,
+        sample_mode: crate::bvop_prediction::BVopSampleMode,
         bits_per_pixel: u32,
     ) -> Result<Vec<DecodedFrame>, FrameDecodeError> {
         let frame = assemble_p_vop_frame(
@@ -111,6 +112,7 @@ impl SequenceDecoder {
             mb_height,
             entries,
             vop_rounding_type,
+            sample_mode,
             bits_per_pixel,
         )?;
         Ok(self.accept_anchor(frame))
@@ -126,6 +128,7 @@ impl SequenceDecoder {
         entries: &[SGmcMbContent],
         geometry: &WarpGeometry,
         vop_rounding_type: u8,
+        sample_mode: crate::bvop_prediction::BVopSampleMode,
         bits_per_pixel: u32,
     ) -> Result<Vec<DecodedFrame>, FrameDecodeError> {
         let frame = assemble_s_gmc_vop_frame(
@@ -135,6 +138,7 @@ impl SequenceDecoder {
             entries,
             geometry,
             vop_rounding_type,
+            sample_mode,
             bits_per_pixel,
         )?;
         Ok(self.accept_anchor(frame))
@@ -254,7 +258,9 @@ mod tests {
         let out = dec.push_i_vop(1, 1, &[flat_recon(10)]).unwrap();
         assert!(out.is_empty());
         // Next anchor (P) releases the I-VOP for display.
-        let out = dec.push_p_vop(1, 1, &skip_p(), 0, 8).unwrap();
+        let out = dec
+            .push_p_vop(1, 1, &skip_p(), 0, BVopSampleMode::HalfPel, 8)
+            .unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].luma_at(0, 0), Some(10));
         assert_eq!(out[0].coding_type(), VopCodingType::I);
@@ -269,7 +275,10 @@ mod tests {
         let mut display = Vec::new();
 
         display.extend(dec.push_i_vop(1, 1, &[flat_recon(10)]).unwrap()); // [] held
-        display.extend(dec.push_p_vop(1, 1, &intra_p(40), 0, 8).unwrap()); // -> 1I
+        display.extend(
+            dec.push_p_vop(1, 1, &intra_p(40), 0, BVopSampleMode::HalfPel, 8)
+                .unwrap(),
+        ); // -> 1I
         display.extend(
             dec.push_b_vop(1, 1, &fwd_b(), 0, BVopSampleMode::HalfPel, 8)
                 .unwrap(),
@@ -305,8 +314,14 @@ mod tests {
         let mut dec = SequenceDecoder::new();
         let mut display = Vec::new();
         display.extend(dec.push_i_vop(1, 1, &[flat_recon(10)]).unwrap()); // []
-        display.extend(dec.push_p_vop(1, 1, &skip_p(), 0, 8).unwrap()); // I
-        display.extend(dec.push_p_vop(1, 1, &skip_p(), 0, 8).unwrap()); // P1
+        display.extend(
+            dec.push_p_vop(1, 1, &skip_p(), 0, BVopSampleMode::HalfPel, 8)
+                .unwrap(),
+        ); // I
+        display.extend(
+            dec.push_p_vop(1, 1, &skip_p(), 0, BVopSampleMode::HalfPel, 8)
+                .unwrap(),
+        ); // P1
         display.extend(dec.flush()); // P2
         assert_eq!(display.len(), 3);
         let coding: Vec<_> = display.iter().map(|f| f.coding_type()).collect();
@@ -322,7 +337,8 @@ mod tests {
         // B-VOP, which should copy the P (backward) anchor = 40.
         let mut dec = SequenceDecoder::new();
         dec.push_i_vop(1, 1, &[flat_recon(10)]).unwrap();
-        dec.push_p_vop(1, 1, &intra_p(40), 0, 8).unwrap();
+        dec.push_p_vop(1, 1, &intra_p(40), 0, BVopSampleMode::HalfPel, 8)
+            .unwrap();
         let zero = MotionVector { x: 0, y: 0 };
         let bwd = vec![BVopMbTexturedDecode {
             motion: BVopMbDecode {

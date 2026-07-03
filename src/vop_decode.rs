@@ -30,8 +30,10 @@
 //! ## Scope
 //!
 //! Rectangular shape, progressive, non-data-partitioned,
-//! non-short-video-header VOPs with `obmc_disable == 1` and
-//! `quarter_sample == 0` (the half-sample §7.6.2.1 prediction path).
+//! non-short-video-header VOPs with `obmc_disable == 1`. Half-sample
+//! (§7.6.2.1) and quarter-sample (§7.6.2.2) VOLs both walk here — the
+//! §7.6.3 motion syntax is unit-agnostic; the sub-pel grid only
+//! matters at frame assembly.
 //! Out-of-scope VOL configurations are rejected with a typed
 //! [`VopDecodeError::Unsupported`] before any bit is consumed, so the
 //! reader never drifts. The data-partitioned layouts live in
@@ -387,8 +389,11 @@ pub fn decode_i_vop_macroblocks(
 /// (intra macroblocks record as invalid candidates, skipped ones as
 /// zero vectors).
 ///
-/// The half-sample §7.6.2.1 path only: `quarter_sample == 1` and
-/// `obmc_disable == 0` are rejected up front.
+/// Both the half-sample (§7.6.2.1) and quarter-sample (§7.6.2.2) VOLs
+/// decode here — the §7.6.3 motion-vector syntax is unit-agnostic, so
+/// the walk is identical; the caller selects the matching sub-pel
+/// interpolation at frame assembly. `obmc_disable == 0` is rejected up
+/// front.
 pub fn decode_p_vop_macroblocks(
     br: &mut BitReader<'_>,
     vol: &VolHeader,
@@ -400,9 +405,6 @@ pub fn decode_p_vop_macroblocks(
     }
     if !vop.coded {
         return Err(VopDecodeError::Unsupported("vop_coded == 0"));
-    }
-    if vol.quarter_sample {
-        return Err(VopDecodeError::Unsupported("quarter_sample"));
     }
     if !vol.obmc_disable {
         return Err(VopDecodeError::Unsupported("obmc"));
@@ -746,9 +748,6 @@ pub fn decode_s_gmc_vop_macroblocks(
     if !vop.coded {
         return Err(VopDecodeError::Unsupported("vop_coded == 0"));
     }
-    if vol.quarter_sample {
-        return Err(VopDecodeError::Unsupported("quarter_sample"));
-    }
     if !vol.obmc_disable {
         return Err(VopDecodeError::Unsupported("obmc"));
     }
@@ -797,7 +796,8 @@ pub fn decode_s_gmc_vop_macroblocks(
             if header.not_coded {
                 // §6.3.6: a not-coded S(GMC) macroblock is GMC-predicted
                 // (implied mcsel == 1) with a zero residual.
-                let amv = gmc_averaged_mv(&geometry, mb_x, mb_y, false, vop.fcode_fwd)?;
+                let amv =
+                    gmc_averaged_mv(&geometry, mb_x, mb_y, vol.quarter_sample, vop.fcode_fwd)?;
                 driver.record_gmc_macroblock(mb_row, mb_col, amv)?;
                 out.push(SGmcMbContent::Gmc {
                     residual: crate::block::InterMacroblock::zero(),
@@ -832,7 +832,8 @@ pub fn decode_s_gmc_vop_macroblocks(
             } else if header.mcsel == Some(true) {
                 // §6.3.6: mcsel == 1 codes no local motion vectors; the
                 // texture follows the header directly.
-                let amv = gmc_averaged_mv(&geometry, mb_x, mb_y, false, vop.fcode_fwd)?;
+                let amv =
+                    gmc_averaged_mv(&geometry, mb_x, mb_y, vol.quarter_sample, vop.fcode_fwd)?;
                 driver.record_gmc_macroblock(mb_row, mb_col, amv)?;
                 let residual = decode_inter_macroblock(br, &header, ctx, &inter_matrix)?;
                 out.push(SGmcMbContent::Gmc { residual });
@@ -1209,7 +1210,16 @@ mod tests {
         let mut br = BitReader::new(&data);
         let entries = decode_p_vop_macroblocks(&mut br, &vol, &pvop).unwrap();
         assert_eq!(entries.len(), 2);
-        let frame = assemble_p_vop_frame(&store, 2, 1, &entries, 0, 8).unwrap();
+        let frame = assemble_p_vop_frame(
+            &store,
+            2,
+            1,
+            &entries,
+            0,
+            crate::bvop_prediction::BVopSampleMode::HalfPel,
+            8,
+        )
+        .unwrap();
         assert_eq!(frame.luma_at(0, 0), Some(128));
         assert_eq!(frame.luma_at(31, 15), Some(128));
     }
@@ -1246,7 +1256,16 @@ mod tests {
         let mut br = BitReader::new(&data);
         let entries = decode_p_vop_macroblocks(&mut br, &vol, &pvop).unwrap();
         assert_eq!(entries.len(), 1);
-        let frame = assemble_p_vop_frame(&store, 1, 1, &entries, 0, 8).unwrap();
+        let frame = assemble_p_vop_frame(
+            &store,
+            1,
+            1,
+            &entries,
+            0,
+            crate::bvop_prediction::BVopSampleMode::HalfPel,
+            8,
+        )
+        .unwrap();
         // Zero MV + zero residual = pure copy of the anchor.
         assert_eq!(frame.luma_at(0, 0), Some(anchor_00));
         assert_eq!(frame.luma_at(15, 15), Some(anchor_1515));
@@ -1285,7 +1304,16 @@ mod tests {
         let data = w.finish();
         let mut br = BitReader::new(&data);
         let entries = decode_p_vop_macroblocks(&mut br, &vol, &pvop).unwrap();
-        let frame = assemble_p_vop_frame(&store, 1, 1, &entries, 0, 8).unwrap();
+        let frame = assemble_p_vop_frame(
+            &store,
+            1,
+            1,
+            &entries,
+            0,
+            crate::bvop_prediction::BVopSampleMode::HalfPel,
+            8,
+        )
+        .unwrap();
         assert_eq!(frame.luma_at(0, 0), Some(128));
     }
 
@@ -1399,9 +1427,17 @@ mod tests {
         let (entries, geometry) = decode_s_gmc_vop_macroblocks(&mut br, &vol, &svop).unwrap();
         assert_eq!(entries.len(), 1);
         assert!(matches!(entries[0], SGmcMbContent::Gmc { .. }));
-        let frame =
-            crate::frame_decode::assemble_s_gmc_vop_frame(&store, 1, 1, &entries, &geometry, 0, 8)
-                .unwrap();
+        let frame = crate::frame_decode::assemble_s_gmc_vop_frame(
+            &store,
+            1,
+            1,
+            &entries,
+            &geometry,
+            0,
+            crate::bvop_prediction::BVopSampleMode::HalfPel,
+            8,
+        )
+        .unwrap();
         assert_eq!(frame.luma_at(0, 0), Some(128));
         assert_eq!(frame.luma_at(15, 15), Some(128));
     }
@@ -1424,9 +1460,17 @@ mod tests {
         let mut br = BitReader::new(&data);
         let (entries, geometry) = decode_s_gmc_vop_macroblocks(&mut br, &vol, &svop).unwrap();
         assert_eq!(br.bit_position(), 5, "no motion/texture bits consumed");
-        let frame =
-            crate::frame_decode::assemble_s_gmc_vop_frame(&store, 1, 1, &entries, &geometry, 0, 8)
-                .unwrap();
+        let frame = crate::frame_decode::assemble_s_gmc_vop_frame(
+            &store,
+            1,
+            1,
+            &entries,
+            &geometry,
+            0,
+            crate::bvop_prediction::BVopSampleMode::HalfPel,
+            8,
+        )
+        .unwrap();
         assert_eq!(frame.luma_at(0, 0), Some(128));
     }
 
@@ -1448,9 +1492,17 @@ mod tests {
         let mut br = BitReader::new(&data);
         let (entries, geometry) = decode_s_gmc_vop_macroblocks(&mut br, &vol, &svop).unwrap();
         assert!(matches!(entries[0], SGmcMbContent::Local { .. }));
-        let frame =
-            crate::frame_decode::assemble_s_gmc_vop_frame(&store, 1, 1, &entries, &geometry, 0, 8)
-                .unwrap();
+        let frame = crate::frame_decode::assemble_s_gmc_vop_frame(
+            &store,
+            1,
+            1,
+            &entries,
+            &geometry,
+            0,
+            crate::bvop_prediction::BVopSampleMode::HalfPel,
+            8,
+        )
+        .unwrap();
         assert_eq!(frame.luma_at(0, 0), Some(128));
     }
 
@@ -1469,9 +1521,17 @@ mod tests {
         let data = w.finish();
         let mut br = BitReader::new(&data);
         let (entries, geometry) = decode_s_gmc_vop_macroblocks(&mut br, &vol, &svop).unwrap();
-        let frame =
-            crate::frame_decode::assemble_s_gmc_vop_frame(&store, 1, 1, &entries, &geometry, 0, 8)
-                .unwrap();
+        let frame = crate::frame_decode::assemble_s_gmc_vop_frame(
+            &store,
+            1,
+            1,
+            &entries,
+            &geometry,
+            0,
+            crate::bvop_prediction::BVopSampleMode::HalfPel,
+            8,
+        )
+        .unwrap();
         assert_eq!(frame.luma_at(0, 0), Some(128));
     }
 
@@ -1512,7 +1572,16 @@ mod tests {
         let mut store = FrameStore::new();
         decode_i_vop(&mut store, 1, 1, &[flat(40)]).unwrap();
         let entries = vec![PVopMbContent::Intra(flat(80))];
-        crate::frame_decode::decode_p_vop(&mut store, 1, 1, &entries, 0, 8).unwrap();
+        crate::frame_decode::decode_p_vop(
+            &mut store,
+            1,
+            1,
+            &entries,
+            0,
+            crate::bvop_prediction::BVopSampleMode::HalfPel,
+            8,
+        )
+        .unwrap();
         store
     }
 
@@ -1619,14 +1688,30 @@ mod tests {
     }
 
     #[test]
-    fn p_vop_rejects_quarter_sample() {
+    fn p_vop_quarter_sample_vol_decodes() {
+        // §7.6.3: the motion-vector syntax is unit-agnostic, so a
+        // quarter-sample VOL walks the same bit layout — the decoded
+        // integers simply are quarter-pel units. A one-MB P-VOP with a
+        // zero-delta inter MB must decode (not be gated off).
         let mut vol = test_vol(16, 16);
-        let pvop = test_p_vop(&vol, 8);
         vol.quarter_sample = true;
-        let mut br = BitReader::new(&[0u8; 4]);
+        let pvop = test_p_vop(&vol, 8);
+        let mut w = BitWriter::default();
+        w.write_bits(0, 1); // not_coded = 0
+        w.write_bits(0b1, 1); // mcbpc: inter, cbpc 00 (Table B.7 "1")
+        w.write_bits(0b11, 2); // cbpy: inter pattern 0 (Table B.8 "11")
+        w.write_bits(1, 1); // MVDx = 0 (Table B.12 code "1")
+        w.write_bits(1, 1); // MVDy = 0
+        let data = w.finish();
+        let mut br = BitReader::new(&data);
+        let entries = decode_p_vop_macroblocks(&mut br, &vol, &pvop).unwrap();
+        assert_eq!(entries.len(), 1);
         assert!(matches!(
-            decode_p_vop_macroblocks(&mut br, &vol, &pvop),
-            Err(VopDecodeError::Unsupported("quarter_sample"))
+            entries[0],
+            PVopMbContent::Inter {
+                motion: PvopMbMotion::OneMv(MotionVector { x: 0, y: 0 }),
+                ..
+            }
         ));
     }
 }

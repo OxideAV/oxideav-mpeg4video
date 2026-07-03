@@ -41,17 +41,16 @@
 //! ## Pre-reduction in quarter-sample mode
 //!
 //! §7.6.5 also says: *"in quarter sample mode the vectors are divided
-//! by 2 before summation."* The MPEG-4 Part 2 spec text does not
-//! specify the rounding for this pre-divide step; this module
-//! therefore exposes only the **half-sample-mode** entry points and
-//! the verbatim table transcriptions. Callers that need the
-//! quarter-sample pre-divide should componentwise apply
-//! [`crate::quarter_sample::reduce_qpel_to_half_pel_chroma`] (the
-//! existing §7.6.9.2 Table 7-13 rounding) to each input MV first,
-//! then pass the resulting half-sample-grid vectors into
-//! [`chroma_mv_from_luma_blocks`]. A future round can introduce a
-//! convenience wrapper once the docs collaborator confirms the
-//! pre-divide rounding rule.
+//! by 2 before summation."* The division is algebraic — the halved
+//! vectors keep their fractional part through the sum, so the result
+//! lands on a grid twice as fine as the half-sample-mode case for the
+//! same `K` (eighth-sample for `K = 1`, sixteenth for `K = 2`), and
+//! **one** table rounding is applied at the end. This reading is
+//! validated sample-exact against a black-box reference decode of a
+//! `quarter_sample == 1` stream (`tests/conformance.rs`); the earlier
+//! per-vector Table 7-13 pre-rounding produced double-rounded chroma
+//! vectors that drifted visibly. Quarter-sample callers use
+//! [`chroma_mv_from_luma_blocks_qpel`].
 //!
 //! ## What this module does **not** do
 //!
@@ -240,6 +239,70 @@ pub fn chroma_mv_from_luma_blocks(
         x: reduce_component_half_pel(sum_x, k),
         y: reduce_component_half_pel(sum_y, k),
     })
+}
+
+/// Derive the §7.6.5 chrominance motion vector from `K` luminance
+/// sub-block vectors given in **quarter-sample units**
+/// (`quarter_sample == 1`).
+///
+/// §7.6.5: *"in quarter sample mode the vectors are divided by 2
+/// before summation"* — the division is algebraic (the halved vectors
+/// keep their fractional part through the sum), so the resulting
+/// component sits on a `1/(8K)`-pel grid before the toward-nearest-
+/// half-sample modification:
+///
+/// * `K = 1` → eighth-sample resolution → [`TABLE_7_12`],
+/// * `K = 2` → sixteenth-sample resolution → [`TABLE_7_10`],
+///
+/// exactly the "sixteenth/twelfth/eighth/fourth" progression §7.6.5
+/// names (each quarter-sample case lands two steps finer than its
+/// half-sample sibling). `K = 1` is validated sample-exact against a
+/// black-box reference decode of a quarter-sample stream
+/// (`tests/conformance.rs`).
+///
+/// For `K ∈ {3, 4}` the algebraic grid would be a twenty-fourth /
+/// thirty-second — finer than any table §7.6.5 provides. The tables'
+/// shared shape (0 for the first quarter of the range, 1 through
+/// ~0.85, then the carry) is applied on the doubled Table 7-11 /
+/// 7-10 index (`residue / 2`), which reproduces every representable
+/// half-sample-grid input exactly and rounds the odd sixteenth
+/// positions with the same toward-half bias.
+pub fn chroma_mv_from_luma_blocks_qpel(
+    luma_mvs: &[MotionVector],
+) -> Result<MotionVector, ChromaMvError> {
+    let k = luma_mvs.len();
+    if !(1..=4).contains(&k) {
+        return Err(ChromaMvError::InvalidBlockCount(k));
+    }
+    let sum_x: i32 = luma_mvs.iter().map(|m| m.x).sum();
+    let sum_y: i32 = luma_mvs.iter().map(|m| m.y).sum();
+    Ok(MotionVector {
+        x: reduce_component_half_pel_qpel(sum_x, k),
+        y: reduce_component_half_pel_qpel(sum_y, k),
+    })
+}
+
+/// Per-component §7.6.5 reduction for quarter-sample-unit sums.
+///
+/// `sum` is the component-sum of the `K` luminance MV components in
+/// quarter-sample units. The chroma displacement is
+/// `(sum / 2) / (2K)` half-samples `= sum / (8K)` whole chroma pels;
+/// the residue indexes the table for the `8K`-per-pel grid.
+#[inline]
+fn reduce_component_half_pel_qpel(sum: i32, k: usize) -> i32 {
+    let eight_k = 8 * (k as i32);
+    let whole_pels = sum.div_euclid(eight_k);
+    let residue = sum.rem_euclid(eight_k) as usize;
+    let offset = match k {
+        1 => TABLE_7_12[residue],
+        2 => TABLE_7_10[residue],
+        // 24- / 32-entry grids have no §7.6.5 table; fold each pair of
+        // fine positions onto the twelfth / sixteenth table entry.
+        3 => TABLE_7_11[residue / 2],
+        4 => TABLE_7_10[residue / 2],
+        _ => 0, // Unreachable — K validated by the caller.
+    };
+    2 * whole_pels + i32::from(offset)
 }
 
 #[cfg(test)]
