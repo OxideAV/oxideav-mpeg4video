@@ -355,6 +355,7 @@ pub mod vertical_padding;
 pub mod video_packet;
 pub mod vol;
 pub mod vop;
+pub mod vop_decode;
 pub mod warp;
 
 pub use bitreader::{BitReader, BitReaderError};
@@ -542,6 +543,9 @@ pub use vop::{
     parse_group_of_vop_header, parse_video_object_plane_header, parse_vop_header_body, GovHeader,
     TimeCode, VopCodingType, VopContext, VopHeader, VopParseError, GROUP_OF_VOP_START_CODE,
     VOP_START_CODE,
+};
+pub use vop_decode::{
+    decode_i_vop_macroblocks, decode_p_vop_macroblocks, vop_mb_dimensions, VopDecodeError,
 };
 pub use warp::{div_sdr, WarpGeometry};
 
