@@ -19,7 +19,7 @@
 //!   variable-length code (1..=14 bits).
 //! * [`resync_marker_length`] — §6.3.3 `resync_marker` length formula:
 //!   17 bits for I-VOPs and binary-only shape, `15 + fcode` for P /
-//!   S(GMC), `max(15 + max(fcode_fwd, fcode_bwd), 17)` for B.
+//!   S(GMC), `max(15 + max(fcode_fwd, fcode_bwd), 17)` zeros for B.
 //! * [`consume_next_resync_marker`] — §5.2.5 `next_resync_marker()`:
 //!   one `0` bit then a run of `1`s up to the next byte boundary,
 //!   which the encoder writes immediately before the resync marker so
@@ -278,9 +278,10 @@ pub fn total_macroblocks(video_object_layer_width: u32, video_object_layer_heigh
 /// * I-VOP: 17 bits (16 zeros + a one).
 /// * P-VOP / S(GMC)-VOP: `15 + vop_fcode_forward` zeros followed by a
 ///   one, i.e. `16 + vop_fcode_forward` bits total.
-/// * B-VOP: `max(15 + max(fcode_fwd, fcode_bwd), 17)` zeros followed
-///   by a one, i.e. `max(16 + max(fcode_fwd, fcode_bwd), 17)` bits
-///   total.
+/// * B-VOP: `max(15 + max(fcode_fwd, fcode_bwd), 17)` **zeros**
+///   followed by a one — the §6.3.3 `max` applies to the zero count,
+///   so the shortest B marker is 17 zeros + 1 = 18 bits (fcode 1 and
+///   fcode 2 both floor at 17 zeros).
 ///
 /// Returns the total marker length in bits (the leading-zeros count
 /// plus the trailing `1`). The minimum is 17 and the maximum is `15 +
@@ -297,8 +298,8 @@ pub fn resync_marker_length(coding_type: VopCodingType, fcode_fwd: u8, fcode_bwd
         }
         VopCodingType::B => {
             let fcode = fcode_fwd.max(fcode_bwd).max(1) as u32;
-            let candidate = 15 + fcode + 1; // zeros + trailing 1
-            candidate.max(17) as u8
+            let zeros = (15 + fcode).max(17); // §6.3.3: max over the zeros
+            (zeros + 1) as u8
         }
     }
 }
@@ -665,11 +666,12 @@ mod tests {
 
     #[test]
     fn resync_marker_length_b_vop_takes_max_and_floors_at_17() {
-        // max(fwd, bwd) = 2; 15+2+1 = 18; floor at 17 → 18.
+        // §6.3.3: max(15 + fcode, 17) ZEROS + a one.
+        // max(fwd, bwd) = 2 → zeros = max(17, 17) = 17 → 18 bits.
         assert_eq!(resync_marker_length(VopCodingType::B, 2, 1), 18);
-        // max = 1; 15+1+1 = 17.
-        assert_eq!(resync_marker_length(VopCodingType::B, 1, 1), 17);
-        // max = 7 → 23.
+        // max = 1 → zeros = max(16, 17) = 17 → 18 bits (the floor).
+        assert_eq!(resync_marker_length(VopCodingType::B, 1, 1), 18);
+        // max = 7 → zeros = 22 → 23 bits.
         assert_eq!(resync_marker_length(VopCodingType::B, 4, 7), 23);
     }
 
@@ -941,7 +943,7 @@ mod tests {
         for _ in 0..7 {
             w.write_bool(true);
         }
-        // B-VOP with fwd=2 bwd=1 → max=2, length = max(15+2+1, 17) = 18.
+        // B-VOP with fwd=2 bwd=1 → max=2, zeros = max(15+2, 17) = 17 → 18 bits.
         w.write_bits(1, 18);
         w.write_bits(1, 7);
         w.write_bits(3, 5);

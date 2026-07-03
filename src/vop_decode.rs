@@ -40,8 +40,9 @@
 
 use crate::bitreader::BitReader;
 use crate::block::{
-    decode_inter_macroblock, decode_intra_block_full, intra_quant_matrix, nonintra_quant_matrix,
-    pattern_code, BlockAssemblyError, IntraMacroblock, MacroblockTextureContext,
+    decode_b_vop_inter_macroblock, decode_inter_macroblock, decode_intra_block_full,
+    intra_quant_matrix, nonintra_quant_matrix, pattern_code, BlockAssemblyError, IntraMacroblock,
+    MacroblockTextureContext,
 };
 use crate::bvop_mv::{
     BVopMbTexturedDecode, BVopMvDriver, BVopMvDriverError, BVopTextureParams, CoLocatedAnchor,
@@ -560,18 +561,123 @@ pub fn decode_b_vop_macroblocks(
         bits_per_pixel: u32::from(vol.bits_per_pixel),
         quant_type: vol.quant_type,
     };
-    driver
-        .decode_vop(
-            br,
-            vol,
-            vop.coding_type,
-            texture,
-            |mb_row, mb_col| match anchor_motion {
-                Some(motion) => co_located_from_motion(motion[mb_row * mb_width + mb_col]),
-                None => CoLocatedAnchor::default(),
-            },
-        )
-        .map_err(VopDecodeError::BVop)
+    // Resync-aware raster loop — the video-packet analogue of
+    // `BVopMvDriver::decode_vop`: per §7.6.8 a resync marker resets the
+    // running MV predictors exactly like a row start, and the running
+    // quantiser restarts from the packet's `quant_scale`.
+    let vp_ctx = video_packet_context(vol, vop);
+    let quant_matrix = nonintra_quant_matrix(vol);
+    let mut quantiser_scale = texture.base_quantiser_scale;
+    let mut out = Vec::with_capacity(mb_width * mb_height);
+    for mb_row in 0..mb_height {
+        driver.start_row();
+        for mb_col in 0..mb_width {
+            let mb_index = (mb_row * mb_width + mb_col) as u32;
+            if mb_index > 0 && !vol.resync_marker_disable && video_packet_follows(br, &vp_ctx) {
+                // A B-VOP packet may resume at a macroblock *ahead* of
+                // the raster index: the intervening `co_located_not_coded`
+                // macroblocks transmit no bits, so a packet cut placed
+                // before one of them appears "early" in the bit walk.
+                // Parse on a clone, accept the resume point if every
+                // in-between macroblock is a non-transmitting one, then
+                // advance the real reader past the header.
+                let mut probe = br.clone();
+                let packet = parse_video_packet_header(&mut probe, &vp_ctx)?;
+                let resume = packet.macroblock_number;
+                let gap_all_skipped = (mb_index..resume).all(|i| {
+                    anchor_motion
+                        .map(|m| matches!(m[i as usize], PvopMbMotion::Skipped))
+                        .unwrap_or(false)
+                });
+                if resume < mb_index || !gap_all_skipped {
+                    return Err(VopDecodeError::VideoPacketSkip {
+                        packet_mb: resume,
+                        expected_mb: mb_index,
+                    });
+                }
+                let consumed = probe.bit_position() - br.bit_position();
+                br.skip_bits(consumed)
+                    .map_err(|_| VopDecodeError::VideoPacket(VideoPacketParseError::Truncated))?;
+                driver.start_row();
+                quantiser_scale =
+                    u32::from(packet.quant_scale).clamp(1, texture.max_quantiser_scale);
+            }
+            let co_motion = anchor_motion.map(|m| m[mb_row * mb_width + mb_col]);
+
+            // §6.2.6 / §6.3.6 `co_located_not_coded`: when the future
+            // reference is a P-VOP and its co-located macroblock was
+            // skipped (`not_coded == 1`), the B macroblock transmits
+            // **no bits at all** — the whole `modb` subtree is gated
+            // out. §7.6.9.6: it reconstructs as forward mode with the
+            // zero motion vector (a copy of the past anchor).
+            if matches!(co_motion, Some(PvopMbMotion::Skipped)) {
+                out.push(forward_zero_b_mb(quantiser_scale));
+                continue;
+            }
+
+            let anchor = co_motion.map(co_located_from_motion).unwrap_or_default();
+            let motion = driver
+                .decode_macroblock(
+                    br,
+                    vol,
+                    vop.coding_type,
+                    mb_row,
+                    mb_col,
+                    anchor.skipped,
+                    anchor.mv,
+                )
+                .map_err(VopDecodeError::BVop)?;
+
+            // §6.3.6: apply this macroblock's dbquant to the running
+            // quantiser scale, clipped to [1, max_quantiser_scale].
+            if let Some(delta) = motion.dbquant_delta {
+                let updated = i64::from(quantiser_scale) + i64::from(delta);
+                quantiser_scale = updated.clamp(1, i64::from(texture.max_quantiser_scale)) as u32;
+            }
+
+            let ctx = MacroblockTextureContext {
+                quantiser_scale,
+                bits_per_pixel: texture.bits_per_pixel,
+                quant_type: texture.quant_type,
+                ac_pred_flag: false,
+            };
+            let residual = decode_b_vop_inter_macroblock(br, motion.cbpb, ctx, &quant_matrix)
+                .map_err(|e| VopDecodeError::BVop(BVopMvDriverError::Texture(e)))?;
+
+            out.push(BVopMbTexturedDecode {
+                motion,
+                residual,
+                quantiser_scale,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// The §7.6.9.6 reconstruction of a syntax-skipped B macroblock
+/// (`co_located_not_coded == 1`): forward mode, zero motion vector,
+/// zero residual — a pure copy of the past (forward) anchor.
+fn forward_zero_b_mb(quantiser_scale: u32) -> BVopMbTexturedDecode {
+    use crate::bvop::BVopMbType;
+    use crate::bvop_mv::BVopMbDecode;
+    use crate::bvop_prediction::{BVopMvPair, BVopPredictionMode};
+    let zero = MotionVector { x: 0, y: 0 };
+    BVopMbTexturedDecode {
+        motion: BVopMbDecode {
+            mb_type: BVopMbType::Forward,
+            prediction_mode: BVopPredictionMode::ForwardOnly,
+            cbpb: None,
+            dbquant_delta: None,
+            mvs: [BVopMvPair {
+                forward: zero,
+                backward: zero,
+            }; 4],
+            forward_chroma_mv: zero,
+            backward_chroma_mv: zero,
+        },
+        residual: crate::block::InterMacroblock::zero(),
+        quantiser_scale,
+    }
 }
 
 /// Compute the §7.8.7.3 averaged motion vector of one `mcsel == 1`
@@ -1472,20 +1578,21 @@ mod tests {
     }
 
     #[test]
-    fn b_vop_skipped_co_located_forces_override() {
-        // The co-located future-anchor MB was skipped: §7.6.9.6 forces
-        // the modb "1" macroblock to direct-zero regardless — and the
-        // walk must route the skipped flag through.
+    fn b_vop_skipped_co_located_transmits_nothing() {
+        // §6.2.6 co_located_not_coded: the co-located future-P-anchor
+        // MB was skipped, so the B macroblock transmits NO bits (the
+        // whole modb subtree is gated out) and reconstructs per
+        // §7.6.9.6 as forward mode with the zero MV — a copy of the
+        // past anchor (luma 40).
         let vol = test_vol(16, 16);
         let store = two_flat_anchor_store();
         let bvop = test_b_vop(&vol, 8);
 
-        let mut w = BitWriter::default();
-        w.write_bits(0b1, 1); // modb = "1"
-        let data = w.finish();
+        let data = [0xFFu8; 2]; // arbitrary — must remain unread
         let mut br = BitReader::new(&data);
         let anchor = [PvopMbMotion::Skipped];
         let entries = decode_b_vop_macroblocks(&mut br, &vol, &bvop, 1, 2, Some(&anchor)).unwrap();
+        assert_eq!(br.bit_position(), 0, "no bits may be consumed");
         let frame = crate::frame_decode::assemble_b_vop_frame(
             &store,
             1,
@@ -1496,8 +1603,8 @@ mod tests {
             8,
         )
         .unwrap();
-        // Direct zero over zero co-located → the bidirectional average.
-        assert_eq!(frame.luma_at(0, 0), Some(60));
+        // Forward-zero copy of the past anchor.
+        assert_eq!(frame.luma_at(0, 0), Some(40));
     }
 
     #[test]

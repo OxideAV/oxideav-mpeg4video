@@ -153,22 +153,23 @@ impl std::error::Error for ChromaMvError {}
 /// (modulo the Table 7-13/12/11/10 rounding).
 #[inline]
 fn reduce_component_half_pel(sum: i32, k: usize) -> i32 {
-    // §7.6.5 step 1: divide the half-sample sum by `2 * K`. The
-    // integer-half quotient is the chroma MV's integer half-sample
-    // part; the residue selects the §7.6.5 table's fractional
-    // half-sample offset for the carry.
-    let two_k = 2 * (k as i32);
-    let int_half = sum.div_euclid(two_k);
-    let residue_half = sum.rem_euclid(two_k);
-    // The table denominator is `4 * K` (the §7.6.5 "fourth /
-    // eighth / twelfth / sixteenth sample resolution" of `sum /
-    // (2K)`'s remainder), which is `2 * (2 * K)` = `2 * two_k`.
-    // The residue produced from a half-sample sum lives on the
-    // `1/(2K)`-half-sample grid, so multiplying by 2 places it on
-    // the `1/(4K)` grid the table indexes.
-    let table_index = (residue_half as usize) * 2;
-    let half_offset = lookup_table(k, table_index);
-    int_half + half_offset as i32
+    // §7.6.5: the chroma displacement is `sum / (2K)` in half-sample
+    // units, i.e. `sum / (4K)` in full chroma pels. Decompose against
+    // the *whole-pel* boundary: the quotient `sum div 4K` is the
+    // integer chroma-pel part (worth two half-sample units each), and
+    // the residue `sum mod 4K` is exactly the Table 7-10/7-11/7-12/
+    // 7-13 "sixteenth / twelfth / eighth / fourth sample" position —
+    // each table has `4K` entries mapping that position to its
+    // nearest-half-sample offset in `{0, 1, 2}` (an output of `2`
+    // carries into the next whole pel).
+    //
+    // Floor division (`div_euclid` / `rem_euclid`) keeps the residue
+    // non-negative for negative sums, matching the tables' one-sided
+    // domain.
+    let four_k = 4 * (k as i32);
+    let whole_pels = sum.div_euclid(four_k);
+    let table_index = sum.rem_euclid(four_k) as usize;
+    2 * whole_pels + i32::from(lookup_table(k, table_index))
 }
 
 #[inline]
@@ -331,38 +332,38 @@ mod tests {
 
     #[test]
     fn k1_odd_half_pel_rounds_via_table_7_13() {
-        // MV = (1, 3) half-sample. sum/(2K) = sum/2.
-        // x: 1/2 = 0 integer-half + residue 1 → table index 2 →
-        //   TABLE_7_13[2] = 1 → result = 0 + 1 = 1 half-sample.
-        // y: 3/2 = 1 integer-half + residue 1 → result = 1 + 1 = 2.
+        // MV = (1, 3) half-sample. The chroma displacement is sum/4
+        // chroma-pels; the residue mod 4 is the Table 7-13 fourth-pel
+        // position.
+        // x: 1 → whole 0, TABLE_7_13[1] = 1 → 1 half-sample.
+        // y: 3 → whole 0, TABLE_7_13[3] = 1 → 1 half-sample (3/4 pel
+        //   rounds DOWN to the half-sample position, not up to 1 pel).
         let chroma = chroma_mv_from_luma_blocks(&[MotionVector { x: 1, y: 3 }]).unwrap();
-        assert_eq!(chroma, MotionVector { x: 1, y: 2 });
+        assert_eq!(chroma, MotionVector { x: 1, y: 1 });
     }
 
     #[test]
     fn k1_div_2_with_floor_for_negatives() {
-        // §7.6.5 says `chroma_mv = sum / (2 * K)`. For K = 1, sum is
-        // just the single MV. With floor (`div_euclid`) the result
-        // for negative MVs rounds toward `-∞` so the function is
-        // anti-symmetric around zero (with the Table 7-13 lookup
-        // mapping every non-zero odd residue to a `+1` half-sample
-        // offset). The pairs below pin the convention.
+        // §7.6.5 says `chroma_mv = sum / (2 * K)` rounded to the
+        // nearest half-sample per Table 7-13. For K = 1 the sum is
+        // the single MV; the whole-chroma-pel part is
+        // `sum.div_euclid(4)` (worth 2 half-samples) and
+        // `sum.rem_euclid(4)` indexes Table 7-13 = [0, 1, 1, 1], so
+        // every fractional position rounds to the half-sample.
         //
-        // mv = -2 (= -1 luma-pel half-sample sum): -2.div_euclid(2)
-        // = -1; rem_euclid = 0; result = -1 half-sample. mv = -1:
-        // -1.div_euclid(2) = -1; rem_euclid = 1; table index = 2 →
-        // TABLE_7_13[2] = 1; result = -1 + 1 = 0 half-sample. mv =
-        // 1: 1.div_euclid(2) = 0; rem_euclid = 1; result = 0 + 1 =
-        // 1 half-sample.
+        // mv = -1: div_euclid(4) = -1 → -2; rem_euclid = 3 →
+        // TABLE_7_13[3] = 1; result = -2 + 1 = -1 half-sample (the
+        // -0.25-pel displacement rounds to -0.5, matching the
+        // positive side's 0.25 → 0.5).
         let cases = [
             (-4i32, -2i32),
-            (-3, -1), // -3.div_euclid(2)=-2; rem 1 → table 2 → +1; result -1
+            (-3, -1),
             (-2, -1),
-            (-1, 0),
+            (-1, -1),
             (0, 0),
             (1, 1),
             (2, 1),
-            (3, 2),
+            (3, 1),
             (4, 2),
         ];
         for (mv, expected) in cases {
@@ -395,16 +396,20 @@ mod tests {
 
     #[test]
     fn k2_residue_rounds_via_table_7_12() {
-        // Sum (in half-sample units) = (1, 0). div_euclid(4) = (0,
-        // 0); rem_euclid(4) = (1, 0).
-        // x: table_index = 1 * 2 = 2 → TABLE_7_12[2] = 1; result = 0
-        //   + 1 = 1.
-        // y: residue 0 → table_index 0 → TABLE_7_12[0] = 0; result =
-        //   0.
+        // K = 2 → the residue mod 8 indexes Table 7-12 =
+        // [0, 0, 1, 1, 1, 1, 1, 2].
+        // Sum (half-sample units) = (5, 3): x → whole 0 +
+        // TABLE_7_12[5] = 1; y → whole 0 + TABLE_7_12[3] = 1.
         let chroma =
-            chroma_mv_from_luma_blocks(&[MotionVector { x: 1, y: 0 }, MotionVector { x: 0, y: 0 }])
+            chroma_mv_from_luma_blocks(&[MotionVector { x: 3, y: 1 }, MotionVector { x: 2, y: 2 }])
                 .unwrap();
-        assert_eq!(chroma, MotionVector { x: 1, y: 0 });
+        assert_eq!(chroma, MotionVector { x: 1, y: 1 });
+        // Sum = (7, 1): x → TABLE_7_12[7] = 2 (carry to the next
+        // whole chroma pel); y → TABLE_7_12[1] = 0.
+        let chroma =
+            chroma_mv_from_luma_blocks(&[MotionVector { x: 4, y: 1 }, MotionVector { x: 3, y: 0 }])
+                .unwrap();
+        assert_eq!(chroma, MotionVector { x: 2, y: 0 });
     }
 
     #[test]
@@ -435,17 +440,25 @@ mod tests {
 
     #[test]
     fn k3_residue_uses_table_7_11() {
-        // Sum = (3, 5). div_euclid(6) = (0, 0); residue = (3, 5).
-        // x: table_index = 3 * 2 = 6 → TABLE_7_11[6] = 1; result = 1.
-        // y: table_index = 5 * 2 = 10 → TABLE_7_11[10] = 2; result =
-        //   0 + 2 = 2 half-sample.
+        // K = 3 → the residue mod 12 indexes Table 7-11 =
+        // [0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 2, 2].
+        // Sum = (3, 5): x → whole 0 + TABLE_7_11[3] = 1;
+        // y → whole 0 + TABLE_7_11[5] = 1.
         let chroma = chroma_mv_from_luma_blocks(&[
             MotionVector { x: 1, y: 2 },
             MotionVector { x: 1, y: 2 },
             MotionVector { x: 1, y: 1 },
         ])
         .unwrap();
-        assert_eq!(chroma, MotionVector { x: 1, y: 2 });
+        assert_eq!(chroma, MotionVector { x: 1, y: 1 });
+        // Sum = (11, 0): x → TABLE_7_11[11] = 2 (carry).
+        let chroma = chroma_mv_from_luma_blocks(&[
+            MotionVector { x: 4, y: 0 },
+            MotionVector { x: 4, y: 0 },
+            MotionVector { x: 3, y: 0 },
+        ])
+        .unwrap();
+        assert_eq!(chroma, MotionVector { x: 2, y: 0 });
     }
 
     // ---------- K = 4 (Table 7-10) ----------
@@ -472,17 +485,25 @@ mod tests {
 
     #[test]
     fn k4_residue_uses_table_7_10() {
-        // Sum = (7, 1). div_euclid(8) = (0, 0); residue = (7, 1).
-        // x: table_index = 7 * 2 = 14 → TABLE_7_10[14] = 2; result =
-        //   0 + 2 = 2 half-sample (carry into the next integer
-        //   chroma-pel).
-        // y: table_index = 1 * 2 = 2 → TABLE_7_10[2] = 0; result =
-        //   0.
+        // K = 4 → the residue mod 16 indexes Table 7-10 =
+        // [0, 0, 0, 1×11, 2, 2].
+        // Sum = (7, 1): x → whole 0 + TABLE_7_10[7] = 1;
+        // y → whole 0 + TABLE_7_10[1] = 0.
         let chroma = chroma_mv_from_luma_blocks(&[
             MotionVector { x: 2, y: 1 },
             MotionVector { x: 2, y: 0 },
             MotionVector { x: 2, y: 0 },
             MotionVector { x: 1, y: 0 },
+        ])
+        .unwrap();
+        assert_eq!(chroma, MotionVector { x: 1, y: 0 });
+        // Sum = (15, 0): x → TABLE_7_10[15] = 2 (carry to one whole
+        // chroma pel).
+        let chroma = chroma_mv_from_luma_blocks(&[
+            MotionVector { x: 4, y: 0 },
+            MotionVector { x: 4, y: 0 },
+            MotionVector { x: 4, y: 0 },
+            MotionVector { x: 3, y: 0 },
         ])
         .unwrap();
         assert_eq!(chroma, MotionVector { x: 2, y: 0 });
@@ -506,12 +527,13 @@ mod tests {
 
     #[test]
     fn negative_inputs_floor_division_is_symmetric_for_k4() {
-        // Sum = (-7, -1). div_euclid(8) = (-1, -1); rem_euclid(8) =
-        // (1, 7).
-        // x: table_index = 1 * 2 = 2 → TABLE_7_10[2] = 0; result =
-        //   -1 + 0 = -1 half-sample.
-        // y: table_index = 7 * 2 = 14 → TABLE_7_10[14] = 2; result =
-        //   -1 + 2 = 1 half-sample.
+        // Sum = (-7, -1). div_euclid(16) = (-1, -1) → -2 half-samples;
+        // rem_euclid(16) = (9, 15).
+        // x: TABLE_7_10[9] = 1 → -2 + 1 = -1 half-sample (the
+        //   -7/16-pel displacement rounds to -0.5, mirroring +7/16 →
+        //   +0.5).
+        // y: TABLE_7_10[15] = 2 → -2 + 2 = 0 (the -1/16-pel
+        //   displacement rounds to zero, mirroring +1/16 → 0).
         let chroma = chroma_mv_from_luma_blocks(&[
             MotionVector { x: -2, y: -1 },
             MotionVector { x: -2, y: 0 },
@@ -519,7 +541,7 @@ mod tests {
             MotionVector { x: -1, y: 0 },
         ])
         .unwrap();
-        assert_eq!(chroma, MotionVector { x: -1, y: 1 });
+        assert_eq!(chroma, MotionVector { x: -1, y: 0 });
     }
 
     #[test]
