@@ -480,6 +480,153 @@ fn forward_copy_b_mb() -> crate::bvop_mv::BVopMbTexturedDecode {
     }
 }
 
+// ─────────────────── runtime-registry integration ───────────────────
+
+/// The registry-facing packet decoder: wraps [`Mpeg4VideoDecoder`]
+/// behind the `oxideav_core` [`Decoder`](oxideav_core::Decoder)
+/// contract (send-packet / receive-frame with §6.1.3.8 display-order
+/// output).
+///
+/// Construction goes through [`make_decoder`] (the crate's direct
+/// factory endpoint) or the runtime registry after
+/// [`crate::register`]. `CodecParameters::extradata` — the container's
+/// decoder-configuration blob, which for MPEG-4 Visual is the
+/// VOS/VO/VOL header run — is decoded once up front so the first data
+/// packet can already reference a configured VOL.
+pub struct Mpeg4PacketDecoder {
+    codec_id: oxideav_core::CodecId,
+    inner: Mpeg4VideoDecoder,
+    /// Display-order frames not yet handed out.
+    ready: std::collections::VecDeque<DecodedFrame>,
+    /// Retained so [`Decoder::reset`](oxideav_core::Decoder::reset)
+    /// can re-prime a fresh inner decoder after a seek.
+    extradata: Vec<u8>,
+    /// `max_pixels_per_frame` DoS cap from `CodecParameters::limits`.
+    max_pixels: u64,
+    flushed: bool,
+}
+
+impl std::fmt::Debug for Mpeg4PacketDecoder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Mpeg4PacketDecoder")
+            .field("codec_id", &self.codec_id.as_str())
+            .field("ready", &self.ready.len())
+            .field("flushed", &self.flushed)
+            .finish()
+    }
+}
+
+/// Map a [`StreamDecodeError`] onto the framework error surface.
+fn to_core_error(e: StreamDecodeError) -> oxideav_core::Error {
+    oxideav_core::Error::invalid(e.to_string())
+}
+
+impl Mpeg4PacketDecoder {
+    /// Enforce the `max_pixels_per_frame` cap once a VOL is known.
+    fn check_limits(&self) -> oxideav_core::Result<()> {
+        if let Some(vol) = self.inner.vol() {
+            let pixels = u64::from(vol.width) * u64::from(vol.height);
+            if pixels > self.max_pixels {
+                return Err(oxideav_core::Error::resource_exhausted(format!(
+                    "mpeg4video: {}x{} exceeds max_pixels_per_frame {}",
+                    vol.width, vol.height, self.max_pixels
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Convert one decoded VOP into the framework's planar 4:2:0
+    /// [`VideoFrame`](oxideav_core::VideoFrame) (Y then Cb then Cr,
+    /// each plane row-major with its natural stride).
+    fn frame_to_video(frame: &DecodedFrame) -> oxideav_core::VideoFrame {
+        let w = frame.width();
+        oxideav_core::VideoFrame {
+            pts: None,
+            planes: vec![
+                oxideav_core::VideoPlane {
+                    stride: w,
+                    data: frame.luma_samples().to_vec(),
+                },
+                oxideav_core::VideoPlane {
+                    stride: w / 2,
+                    data: frame.cb_samples().to_vec(),
+                },
+                oxideav_core::VideoPlane {
+                    stride: w / 2,
+                    data: frame.cr_samples().to_vec(),
+                },
+            ],
+        }
+    }
+}
+
+impl oxideav_core::Decoder for Mpeg4PacketDecoder {
+    fn codec_id(&self) -> &oxideav_core::CodecId {
+        &self.codec_id
+    }
+
+    fn send_packet(&mut self, packet: &oxideav_core::Packet) -> oxideav_core::Result<()> {
+        let frames = self.inner.decode(&packet.data).map_err(to_core_error)?;
+        self.check_limits()?;
+        self.ready.extend(frames);
+        Ok(())
+    }
+
+    fn receive_frame(&mut self) -> oxideav_core::Result<oxideav_core::Frame> {
+        match self.ready.pop_front() {
+            Some(frame) => Ok(oxideav_core::Frame::Video(Self::frame_to_video(&frame))),
+            None if self.flushed => Err(oxideav_core::Error::Eof),
+            None => Err(oxideav_core::Error::NeedMore),
+        }
+    }
+
+    fn flush(&mut self) -> oxideav_core::Result<()> {
+        self.ready.extend(self.inner.flush());
+        self.flushed = true;
+        Ok(())
+    }
+
+    fn reset(&mut self) -> oxideav_core::Result<()> {
+        self.inner = Mpeg4VideoDecoder::new();
+        self.ready.clear();
+        self.flushed = false;
+        if !self.extradata.is_empty() {
+            // Re-prime the configuration headers so the next packet
+            // decodes against the same VOL.
+            let extradata = std::mem::take(&mut self.extradata);
+            let _ = self.inner.decode(&extradata).map_err(to_core_error)?;
+            self.extradata = extradata;
+        }
+        Ok(())
+    }
+}
+
+/// Direct factory endpoint: build a boxed registry-compatible decoder
+/// from [`oxideav_core::CodecParameters`].
+///
+/// `params.extradata` (the VOS/VO/VOL configuration run, when the
+/// container carries one) is decoded immediately; data packets follow
+/// via [`oxideav_core::Decoder::send_packet`].
+pub fn make_decoder(
+    params: &oxideav_core::CodecParameters,
+) -> oxideav_core::Result<Box<dyn oxideav_core::Decoder>> {
+    let mut dec = Mpeg4PacketDecoder {
+        codec_id: params.codec_id.clone(),
+        inner: Mpeg4VideoDecoder::new(),
+        ready: std::collections::VecDeque::new(),
+        extradata: params.extradata.clone(),
+        max_pixels: params.limits.max_pixels_per_frame,
+        flushed: false,
+    };
+    if !dec.extradata.is_empty() {
+        let frames = dec.inner.decode(&params.extradata).map_err(to_core_error)?;
+        dec.check_limits()?;
+        dec.ready.extend(frames);
+    }
+    Ok(Box::new(dec))
+}
+
 /// Return the byte offsets of every `00 00 01 xx` start code in `data`
 /// (the offset of the leading `00`).
 fn scan_start_codes(data: &[u8]) -> Vec<usize> {
@@ -508,14 +655,14 @@ mod tests {
 
     /// MSB-first bit writer for synthesising elementary streams.
     #[derive(Default)]
-    struct BitWriter {
+    pub(crate) struct BitWriter {
         bytes: Vec<u8>,
         bit: u8,
         acc: u8,
     }
 
     impl BitWriter {
-        fn write_bits(&mut self, value: u32, n: usize) {
+        pub(crate) fn write_bits(&mut self, value: u32, n: usize) {
             for i in (0..n).rev() {
                 let b = ((value >> i) & 1) as u8;
                 self.acc = (self.acc << 1) | b;
@@ -529,7 +676,7 @@ mod tests {
         }
         /// §5.2.3-style stuffing: pad to the byte boundary so the next
         /// start code is byte-aligned ('0' then '1's).
-        fn align(&mut self) {
+        pub(crate) fn align(&mut self) {
             if self.bit != 0 {
                 self.write_bits(0, 1);
                 while self.bit != 0 {
@@ -537,7 +684,7 @@ mod tests {
                 }
             }
         }
-        fn finish(mut self) -> Vec<u8> {
+        pub(crate) fn finish(mut self) -> Vec<u8> {
             self.align();
             self.bytes
         }
@@ -545,7 +692,7 @@ mod tests {
 
     /// Write the rectangular test VOL used across the walk tests
     /// (verid 1, method-2 quant, res 30, OBMC off).
-    fn write_vol(w: &mut BitWriter, width: u32, height: u32) {
+    pub(crate) fn write_vol(w: &mut BitWriter, width: u32, height: u32) {
         w.write_bits(0x0000_0120, 32);
         w.write_bits(0, 1); // random_accessible_vol
         w.write_bits(1, 8); // video_object_type_indication
@@ -589,7 +736,7 @@ mod tests {
 
     /// Write an I-VOP unit (quant 8, tinc ticks) whose macroblocks are
     /// all DC-only intra.
-    fn write_i_vop(w: &mut BitWriter, mb_count: usize, tinc: u32) {
+    pub(crate) fn write_i_vop(w: &mut BitWriter, mb_count: usize, tinc: u32) {
         w.write_bits(0x0000_01B6, 32);
         w.write_bits(0b00, 2); // I
         w.write_bits(0, 1); // modulo_time_base
@@ -606,7 +753,7 @@ mod tests {
     }
 
     /// Write a P-VOP unit whose macroblocks are all not_coded.
-    fn write_skipped_p_vop(w: &mut BitWriter, mb_count: usize, tinc: u32) {
+    pub(crate) fn write_skipped_p_vop(w: &mut BitWriter, mb_count: usize, tinc: u32) {
         w.write_bits(0x0000_01B6, 32);
         w.write_bits(0b01, 2); // P
         w.write_bits(0, 1); // modulo_time_base
@@ -656,7 +803,7 @@ mod tests {
         w.align();
     }
 
-    fn write_vos(w: &mut BitWriter) {
+    pub(crate) fn write_vos(w: &mut BitWriter) {
         w.write_bits(VISUAL_OBJECT_SEQUENCE_START_CODE, 32);
         w.write_bits(0x01, 8); // profile_and_level_indication
     }
@@ -800,5 +947,110 @@ mod tests {
             0x00, 0x00, 0x01, 0xB1, // VOS end
         ];
         assert_eq!(scan_start_codes(&data), vec![0, 5, 10]);
+    }
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::tests::{write_i_vop, write_skipped_p_vop, write_vol, write_vos, BitWriter};
+    use super::*;
+    use oxideav_core::{CodecId, CodecParameters, Packet, TimeBase};
+
+    fn packet(data: Vec<u8>) -> Packet {
+        Packet::new(0, TimeBase::new(1, 30), data)
+    }
+
+    #[test]
+    fn registry_round_trip_decodes_display_order_frames() {
+        // Register into a fresh RuntimeContext, resolve by id, then
+        // feed a VOS+VOL config packet and two VOP packets.
+        let mut ctx = oxideav_core::RuntimeContext::new();
+        crate::register(&mut ctx);
+        let params = CodecParameters::video(CodecId::new("mpeg4video"));
+        let mut dec = ctx.codecs.first_decoder(&params).unwrap();
+
+        let mut w = BitWriter::default();
+        write_vos(&mut w);
+        write_vol(&mut w, 32, 16);
+        let config = w.finish();
+        dec.send_packet(&packet(config)).unwrap();
+        assert!(matches!(
+            dec.receive_frame(),
+            Err(oxideav_core::Error::NeedMore)
+        ));
+
+        let mut w = BitWriter::default();
+        write_i_vop(&mut w, 2, 0);
+        dec.send_packet(&packet(w.finish())).unwrap();
+        // The I-VOP is held back by the §6.1.3.8 one-slot reorder.
+        assert!(matches!(
+            dec.receive_frame(),
+            Err(oxideav_core::Error::NeedMore)
+        ));
+
+        let mut w = BitWriter::default();
+        write_skipped_p_vop(&mut w, 2, 1);
+        dec.send_packet(&packet(w.finish())).unwrap();
+        // The P-VOP released the I-VOP.
+        let frame = dec.receive_frame().unwrap();
+        let oxideav_core::Frame::Video(v) = frame else {
+            panic!("expected a video frame");
+        };
+        assert_eq!(v.planes.len(), 3);
+        assert_eq!(v.planes[0].stride, 32);
+        assert_eq!(v.planes[0].data.len(), 32 * 16);
+        assert_eq!(v.planes[0].data[0], 128); // flat mid-grey I-VOP
+        assert_eq!(v.planes[1].stride, 16);
+        assert_eq!(v.planes[1].data.len(), 16 * 8);
+
+        // Flush releases the held P-VOP, then Eof.
+        dec.flush().unwrap();
+        let frame = dec.receive_frame().unwrap();
+        let oxideav_core::Frame::Video(v) = frame else {
+            panic!("expected a video frame");
+        };
+        assert_eq!(v.planes[0].data[0], 128);
+        assert!(matches!(dec.receive_frame(), Err(oxideav_core::Error::Eof)));
+    }
+
+    #[test]
+    fn make_decoder_primes_extradata_and_resets() {
+        // Configuration in extradata; data packets carry only VOPs.
+        let mut w = BitWriter::default();
+        write_vos(&mut w);
+        write_vol(&mut w, 16, 16);
+        let extradata = w.finish();
+
+        let mut params = CodecParameters::video(CodecId::new("mpeg4video"));
+        params.extradata = extradata;
+        let mut dec = make_decoder(&params).unwrap();
+
+        let mut w = BitWriter::default();
+        write_i_vop(&mut w, 1, 0);
+        let ivop = w.finish();
+        dec.send_packet(&packet(ivop.clone())).unwrap();
+        dec.flush().unwrap();
+        assert!(dec.receive_frame().is_ok());
+        assert!(matches!(dec.receive_frame(), Err(oxideav_core::Error::Eof)));
+
+        // reset(): the VOL must survive (re-primed from extradata), so
+        // a fresh I-VOP decodes without a config packet.
+        dec.reset().unwrap();
+        dec.send_packet(&packet(ivop)).unwrap();
+        dec.flush().unwrap();
+        assert!(dec.receive_frame().is_ok());
+    }
+
+    #[test]
+    fn limits_cap_rejects_oversized_vol() {
+        let mut w = BitWriter::default();
+        write_vol(&mut w, 1280, 720);
+        let mut params = CodecParameters::video(CodecId::new("mpeg4video"));
+        params.extradata = w.finish();
+        params.limits.max_pixels_per_frame = 640 * 480;
+        assert!(matches!(
+            make_decoder(&params),
+            Err(oxideav_core::Error::ResourceExhausted(_))
+        ));
     }
 }

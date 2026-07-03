@@ -733,10 +733,38 @@ impl From<SpriteTrajectoryError> for Error {
     }
 }
 
-/// No-op codec registration. Until a `Decoder` impl lands the crate
-/// registers no entries against the runtime context; the function
-/// exists so the `oxideav_core::register!` glue compiles.
-pub fn register(_ctx: &mut RuntimeContext) {}
+pub use decoder::{make_decoder, Mpeg4PacketDecoder};
+
+/// Register the MPEG-4 Part 2 Visual decoder with the runtime codec
+/// registry under the id `mpeg4video`, claiming the common container
+/// tags for the format — the MPEG-4 Visual FourCCs (`XVID` / `DIVX` /
+/// `DX50` / `FMP4` / `MP4V` / `M4S2`) and the MP4
+/// ObjectTypeIndication `0x20` (ISO/IEC 14496-2 Visual).
+///
+/// The direct factory endpoint [`decoder::make_decoder`] remains
+/// available for registry-free consumers.
+pub fn register(ctx: &mut RuntimeContext) {
+    use oxideav_core::{CodecCapabilities, CodecId, CodecInfo, CodecTag};
+
+    let mut caps = CodecCapabilities::video("mpeg4video_sw");
+    caps.decode = true;
+    caps.lossy = true;
+
+    ctx.codecs.register(
+        CodecInfo::new(CodecId::new("mpeg4video"))
+            .capabilities(caps)
+            .decoder(decoder::make_decoder)
+            .tags([
+                CodecTag::fourcc(b"XVID"),
+                CodecTag::fourcc(b"DIVX"),
+                CodecTag::fourcc(b"DX50"),
+                CodecTag::fourcc(b"FMP4"),
+                CodecTag::fourcc(b"MP4V"),
+                CodecTag::fourcc(b"M4S2"),
+                CodecTag::mp4_object_type(0x20),
+            ]),
+    );
+}
 
 oxideav_core::register!("mpeg4video", register);
 
