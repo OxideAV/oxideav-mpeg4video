@@ -1178,6 +1178,9 @@ impl BVopMvDriver {
     ///
     /// `br` is positioned at the start of the macroblock's `modb` field;
     /// on `Ok` it sits after the last motion body (before the texture).
+    /// Returns the decoded macroblock plus its §6.2.6.3 `dct_type ==
+    /// 1` flag — the caller inverse-field-DCT-permutes the residual
+    /// luminance it decodes next (§7.7.1 applies to B residuals too).
     pub fn decode_interlaced_macroblock(
         &mut self,
         br: &mut BitReader<'_>,
@@ -1186,12 +1189,18 @@ impl BVopMvDriver {
         mb_row: usize,
         mb_col: usize,
         anchor: BVopInterlacedAnchor,
-    ) -> Result<BVopInterlacedMb, BVopMvDriverError> {
+    ) -> Result<(BVopInterlacedMb, bool), BVopMvDriverError> {
         if mb_row >= self.mb_rows || mb_col >= self.mb_cols {
             return Err(BVopMvDriverError::OutOfBounds { mb_row, mb_col });
         }
 
         let header = parse_b_vop_mb_header(br, vol, vop_coding_type, BMbTypeTable::B4)?;
+        let field_dct = header
+            .interlaced_info
+            .as_ref()
+            .and_then(|info| info.dct_type)
+            .map(|d| matches!(d, crate::interlaced_information::DctType::Field))
+            .unwrap_or(false);
 
         // §7.6.9.6 co-located-skipped override takes precedence over every
         // path — a skipped co-located anchor forces progressive direct /
@@ -1199,7 +1208,7 @@ impl BVopMvDriver {
         if anchor.progressive.skipped {
             return self
                 .decode_co_located_skipped(br, &header, anchor.progressive.mvs)
-                .map(BVopInterlacedMb::Progressive);
+                .map(|d| (BVopInterlacedMb::Progressive(d), field_dct));
         }
 
         // Field-predicted, non-direct → field path.
@@ -1212,7 +1221,7 @@ impl BVopMvDriver {
             if header.mb_type != BVopMbType::Direct {
                 return self
                     .field_from_header(br, &header, &field)
-                    .map(BVopInterlacedMb::Field);
+                    .map(|d| (BVopInterlacedMb::Field(d), field_dct));
             }
         }
 
@@ -1222,11 +1231,11 @@ impl BVopMvDriver {
             if let Some(future) = anchor.future_field_mvs {
                 return self
                     .interlaced_direct_from_header(br, &header, future, anchor.top_field_first)
-                    .map(BVopInterlacedMb::InterlacedDirect);
+                    .map(|d| (BVopInterlacedMb::InterlacedDirect(d), field_dct));
             }
             return self
                 .decode_direct(br, &header, anchor.progressive.mvs)
-                .map(BVopInterlacedMb::Progressive);
+                .map(|d| (BVopInterlacedMb::Progressive(d), field_dct));
         }
 
         // Progressive frame-predicted forward / backward / interpolated.
@@ -1236,7 +1245,7 @@ impl BVopMvDriver {
             BVopMbType::Interpolated => self.decode_bidirectional(br, &header),
             BVopMbType::Direct => unreachable!("Direct handled above"),
         }
-        .map(BVopInterlacedMb::Progressive)
+        .map(|d| (BVopInterlacedMb::Progressive(d), field_dct))
     }
 
     /// Decode an entire **interlaced** B-VOP end-to-end in raster order:
@@ -1282,7 +1291,7 @@ impl BVopMvDriver {
             self.start_row();
             for mb_col in 0..self.mb_cols {
                 let mb_anchor = anchor(mb_row, mb_col);
-                let motion = self.decode_interlaced_macroblock(
+                let (motion, field_dct) = self.decode_interlaced_macroblock(
                     br,
                     vol,
                     vop_coding_type,
@@ -1305,8 +1314,13 @@ impl BVopMvDriver {
                     ac_pred_flag: false,
                     alternate_vertical_scan: texture.alternate_vertical_scan,
                 };
-                let residual =
+                let mut residual =
                     decode_b_vop_inter_macroblock(br, motion.cbpb(), ctx, &quant_matrix)?;
+                // §7.7.1: a dct_type == 1 residual holds field lines —
+                // re-interleave before the frame-order prediction add.
+                if field_dct {
+                    residual.luma = crate::reconstruct::inverse_field_dct_luma(&residual.luma);
+                }
 
                 out.push(BVopInterlacedTexturedDecode {
                     motion,
@@ -2997,7 +3011,8 @@ mod tests {
         driver.start_row();
         let mb = driver
             .decode_interlaced_macroblock(&mut br, &vol, VopCodingType::B, 0, 0, plain_anchor())
-            .unwrap();
+            .unwrap()
+            .0;
         match mb {
             BVopInterlacedMb::Progressive(d) => {
                 assert_eq!(d.mb_type, BVopMbType::Forward);
@@ -3025,7 +3040,8 @@ mod tests {
         driver.start_row();
         let mb = driver
             .decode_interlaced_macroblock(&mut br, &vol, VopCodingType::B, 0, 0, plain_anchor())
-            .unwrap();
+            .unwrap()
+            .0;
         assert!(matches!(
             mb,
             BVopInterlacedMb::Field(d) if matches!(d.mode, BVopFieldMode::Forward(_))
@@ -3051,7 +3067,8 @@ mod tests {
         };
         let mb = driver
             .decode_interlaced_macroblock(&mut br, &vol, VopCodingType::B, 0, 0, anchor)
-            .unwrap();
+            .unwrap()
+            .0;
         match mb {
             BVopInterlacedMb::InterlacedDirect(d) => {
                 // δ=(0,0), TRB=2, TRD=4 → mvf top = (3, -3).
@@ -3082,7 +3099,8 @@ mod tests {
         };
         let mb = driver
             .decode_interlaced_macroblock(&mut br, &vol, VopCodingType::B, 0, 0, anchor)
-            .unwrap();
+            .unwrap()
+            .0;
         match mb {
             BVopInterlacedMb::Progressive(d) => {
                 assert_eq!(d.mb_type, BVopMbType::Direct);
@@ -3117,7 +3135,8 @@ mod tests {
         };
         let mb = driver
             .decode_interlaced_macroblock(&mut br, &vol, VopCodingType::B, 0, 0, anchor)
-            .unwrap();
+            .unwrap()
+            .0;
         // §7.6.9.6: modb "1" + skipped → direct, zero delta, from MV (8,0).
         // TRB=1, TRD=2 → MVF.x = (1*8)/2 = 4.
         match mb {

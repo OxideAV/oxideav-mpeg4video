@@ -217,6 +217,20 @@ pub fn reconstruct_inter_macroblock_into(
     }
 }
 
+/// §7.7.1 inverse field-DCT permutation of one 16×16 luminance
+/// residual / texture array: with `dct_type == 1` the upper eight rows
+/// hold the top field and the lower eight the bottom field (Figure
+/// 6-12); the inverse permutation re-interleaves them to frame lines.
+/// Chrominance is unaffected by `dct_type`.
+pub fn inverse_field_dct_luma(luma: &[[i32; 16]; 16]) -> [[i32; 16]; 16] {
+    let mut out = [[0i32; 16]; 16];
+    for k in 0..8 {
+        out[2 * k] = luma[k];
+        out[2 * k + 1] = luma[8 + k];
+    }
+    out
+}
+
 /// §7.3 step-1 + step-3 reconstruction of one 4:2:0 intra macroblock.
 ///
 /// Step-1 sets `d[y][x] = f[y][x]` plane-by-plane; step-3 clips to

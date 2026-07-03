@@ -576,6 +576,81 @@ pub fn assemble_b_vop_frame(
     Ok(frame)
 }
 
+/// Assemble a complete **interlaced B-VOP** frame from per-macroblock
+/// path-tagged textured decodes against the bracketing anchors in
+/// `store`.
+///
+/// The per-entry dispatch is
+/// [`BVopInterlacedTexturedDecode::reconstruct`](crate::bvop_mv::BVopInterlacedTexturedDecode::reconstruct):
+/// progressive macroblocks read the six [`BVopAnchorPlanes`] with
+/// `progressive_mode`, field-predicted and interlaced-direct
+/// macroblocks read the same planes through the
+/// [`BVopFieldReferences`](crate::bvop_field_motion::BVopFieldReferences)
+/// per-field view with `field_mode`. Like its progressive sibling the
+/// frame never enters the reference chain.
+#[allow(clippy::too_many_arguments)]
+pub fn assemble_b_vop_interlaced_frame(
+    store: &FrameStore,
+    mb_width: usize,
+    mb_height: usize,
+    entries: &[crate::bvop_mv::BVopInterlacedTexturedDecode],
+    vop_rounding_type: u8,
+    progressive_mode: BVopSampleMode,
+    field_mode: crate::bvop_field_motion::FieldSampleMode,
+    bits_per_pixel: u32,
+) -> Result<DecodedFrame, FrameDecodeError> {
+    let expected = mb_width * mb_height;
+    if entries.len() != expected {
+        return Err(FrameDecodeError::MacroblockCountMismatch {
+            supplied: entries.len(),
+            expected,
+        });
+    }
+    let (forward, backward) = store
+        .b_vop_references()
+        .ok_or(FrameDecodeError::MissingReference)?;
+    let fwd_luma = forward.luma_reference();
+    let bwd_luma = backward.luma_reference();
+    let fwd_cb = forward.cb_reference();
+    let bwd_cb = backward.cb_reference();
+    let fwd_cr = forward.cr_reference();
+    let bwd_cr = backward.cr_reference();
+    let anchors = BVopAnchorPlanes {
+        forward_luma: &fwd_luma,
+        backward_luma: &bwd_luma,
+        forward_cb: &fwd_cb,
+        backward_cb: &bwd_cb,
+        forward_cr: &fwd_cr,
+        backward_cr: &bwd_cr,
+    };
+    let field_refs = crate::bvop_field_motion::BVopFieldReferences {
+        forward_luma: &fwd_luma,
+        forward_cb: &fwd_cb,
+        forward_cr: &fwd_cr,
+        backward_luma: &bwd_luma,
+        backward_cb: &bwd_cb,
+        backward_cr: &bwd_cr,
+    };
+
+    let mut frame = DecodedFrame::new(mb_width * 16, mb_height * 16, VopCodingType::B)?;
+    for (idx, entry) in entries.iter().enumerate() {
+        let mb_col = idx % mb_width;
+        let mb_row = idx / mb_width;
+        let reconstructed = entry.reconstruct(
+            &anchors,
+            progressive_mode,
+            &field_refs,
+            field_mode,
+            (mb_col * 16) as i32,
+            (mb_row * 16) as i32,
+            vop_rounding_type,
+            bits_per_pixel,
+        );
+        frame.blit_macroblock(mb_col, mb_row, &reconstructed)?;
+    }
+    Ok(frame)
+}
+
 /// Per-macroblock content for an **S(GMC)-VOP** frame assembly.
 ///
 /// §6.3.6 / §7.8.7.1: each inter macroblock of an S(GMC)-VOP carries an

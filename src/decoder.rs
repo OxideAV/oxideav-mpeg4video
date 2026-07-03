@@ -56,8 +56,9 @@ use crate::vop::{
     VopParseError, GROUP_OF_VOP_START_CODE, VOP_START_CODE,
 };
 use crate::vop_decode::{
-    decode_b_vop_macroblocks, decode_i_vop_macroblocks, decode_p_vop_macroblocks,
-    decode_s_gmc_vop_macroblocks, vop_mb_dimensions, VopDecodeError,
+    decode_b_vop_interlaced_macroblocks, decode_b_vop_macroblocks, decode_i_vop_macroblocks,
+    decode_p_vop_macroblocks, decode_s_gmc_vop_macroblocks, vop_mb_dimensions, AnchorMbMotion,
+    VopDecodeError,
 };
 
 /// §6.2.1 `user_data_start_code`.
@@ -154,9 +155,10 @@ pub struct Mpeg4VideoDecoder {
     /// §7.6.1 reference chain + §6.1.3.8 reorder buffer.
     sequence: SequenceDecoder,
     /// The most recent anchor's per-macroblock motion (raster order) —
-    /// the §7.6.9.5.1 co-located source for B-VOP direct mode. `None`
+    /// the §7.6.9.5.1 / §7.7.2.2 co-located source for B-VOP direct
+    /// modes (field-predicted anchors keep their field pairs). `None`
     /// after an intra-only anchor.
-    anchor_motion: Option<Vec<PvopMbMotion>>,
+    anchor_motion: Option<Vec<AnchorMbMotion>>,
     /// §6.3.5: seconds accumulated at the sync point of the most
     /// recently decoded anchor.
     sync_sec: u64,
@@ -374,22 +376,54 @@ impl Mpeg4VideoDecoder {
             }
             VopCodingType::B => {
                 let (trb, trd) = self.b_vop_temporal_refs(&vop, res)?;
-                let entries = decode_b_vop_macroblocks(
-                    &mut br,
-                    &vol,
-                    &vop,
-                    trb,
-                    trd,
-                    self.anchor_motion.as_deref(),
-                )?;
-                out.extend(self.sequence.push_b_vop(
-                    mb_width,
-                    mb_height,
-                    &entries,
-                    vop.rounding_type,
-                    sample_mode,
-                    u32::from(vol.bits_per_pixel),
-                )?);
+                if vol.interlaced {
+                    let entries = decode_b_vop_interlaced_macroblocks(
+                        &mut br,
+                        &vol,
+                        &vop,
+                        trb,
+                        trd,
+                        self.anchor_motion.as_deref(),
+                    )?;
+                    let field_mode = if vol.quarter_sample {
+                        crate::bvop_field_motion::FieldSampleMode::QuarterSample {
+                            bits_per_pixel: u32::from(vol.bits_per_pixel),
+                        }
+                    } else {
+                        crate::bvop_field_motion::FieldSampleMode::HalfSample
+                    };
+                    out.extend(self.sequence.push_b_vop_interlaced(
+                        mb_width,
+                        mb_height,
+                        &entries,
+                        vop.rounding_type,
+                        sample_mode,
+                        field_mode,
+                        u32::from(vol.bits_per_pixel),
+                    )?);
+                } else {
+                    let progressive: Vec<PvopMbMotion> = self
+                        .anchor_motion
+                        .as_deref()
+                        .map(|m| m.iter().map(|a| a.progressive()).collect())
+                        .unwrap_or_default();
+                    let entries = decode_b_vop_macroblocks(
+                        &mut br,
+                        &vol,
+                        &vop,
+                        trb,
+                        trd,
+                        self.anchor_motion.as_deref().map(|_| &progressive[..]),
+                    )?;
+                    out.extend(self.sequence.push_b_vop(
+                        mb_width,
+                        mb_height,
+                        &entries,
+                        vop.rounding_type,
+                        sample_mode,
+                        u32::from(vol.bits_per_pixel),
+                    )?);
+                }
             }
         }
 
@@ -456,7 +490,8 @@ impl Mpeg4VideoDecoder {
                         residual: InterMacroblock::zero(),
                     })
                     .collect();
-                self.anchor_motion = Some(vec![PvopMbMotion::Skipped; mb_count]);
+                self.anchor_motion =
+                    Some(vec![AnchorMbMotion::Frame(PvopMbMotion::Skipped); mb_count]);
                 // All-skipped MBs are integer zero-MV copies, so the
                 // sub-pel mode is immaterial; pass the VOL's anyway.
                 let sample_mode = sample_mode_of(vol);
@@ -526,22 +561,26 @@ fn sample_mode_of(vol: &VolHeader) -> BVopSampleMode {
 
 /// Extract the per-macroblock motion of a decoded P-VOP (co-located
 /// source for the next B-VOPs).
-fn motion_of_p_entries(entries: &[PVopMbContent]) -> Vec<PvopMbMotion> {
+fn motion_of_p_entries(entries: &[PVopMbContent]) -> Vec<AnchorMbMotion> {
     entries
         .iter()
         .map(|e| match e {
-            PVopMbContent::Inter { motion, .. } => *motion,
-            // A field-predicted anchor macroblock collapses to its
-            // Div2Round-averaged vector for the progressive co-located
-            // consumers (the §7.7.2.2 interlaced direct mode is gated
-            // off with the interlaced B walk).
-            PVopMbContent::FieldInter { mvs, .. } => {
-                PvopMbMotion::OneMv(crate::motion::MotionVector {
-                    x: crate::field_motion::div2_round(mvs.top.x + mvs.bottom.x),
-                    y: crate::field_motion::div2_round(mvs.top.y + mvs.bottom.y),
-                })
-            }
-            PVopMbContent::Intra(_) => PvopMbMotion::Intra,
+            PVopMbContent::Inter { motion, .. } => AnchorMbMotion::Frame(*motion),
+            // A field-predicted anchor macroblock keeps its field MV
+            // pair + reference selections — the §7.7.2.2 interlaced
+            // direct mode consumes them; progressive consumers collapse
+            // via AnchorMbMotion::progressive().
+            PVopMbContent::FieldInter {
+                mvs,
+                top_field_ref,
+                bottom_field_ref,
+                ..
+            } => AnchorMbMotion::Field {
+                mvs: *mvs,
+                top_ref: *top_field_ref,
+                bottom_ref: *bottom_field_ref,
+            },
+            PVopMbContent::Intra(_) => AnchorMbMotion::Frame(PvopMbMotion::Intra),
         })
         .collect()
 }
@@ -550,12 +589,14 @@ fn motion_of_p_entries(entries: &[PVopMbContent]) -> Vec<PvopMbMotion> {
 /// macroblocks carry no local vector — they resolve to the §7.6.9.5.1
 /// zero-vector fallback (represented as `Intra` for the co-located
 /// adapter).
-fn motion_of_s_entries(entries: &[SGmcMbContent]) -> Vec<PvopMbMotion> {
+fn motion_of_s_entries(entries: &[SGmcMbContent]) -> Vec<AnchorMbMotion> {
     entries
         .iter()
         .map(|e| match e {
-            SGmcMbContent::Local { motion, .. } => *motion,
-            SGmcMbContent::Gmc { .. } | SGmcMbContent::Intra(_) => PvopMbMotion::Intra,
+            SGmcMbContent::Local { motion, .. } => AnchorMbMotion::Frame(*motion),
+            SGmcMbContent::Gmc { .. } | SGmcMbContent::Intra(_) => {
+                AnchorMbMotion::Frame(PvopMbMotion::Intra)
+            }
         })
         .collect()
 }

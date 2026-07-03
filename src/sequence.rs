@@ -202,6 +202,34 @@ impl SequenceDecoder {
         self.pending_anchor.as_mut()
     }
 
+    /// Decode an **interlaced** B-VOP in coding order against the
+    /// bracketing anchors — the path-dispatching sibling of
+    /// [`SequenceDecoder::push_b_vop`]. Displayed immediately; never
+    /// enters the chain.
+    #[allow(clippy::too_many_arguments)]
+    pub fn push_b_vop_interlaced(
+        &mut self,
+        mb_width: usize,
+        mb_height: usize,
+        entries: &[crate::bvop_mv::BVopInterlacedTexturedDecode],
+        vop_rounding_type: u8,
+        progressive_mode: crate::bvop_prediction::BVopSampleMode,
+        field_mode: crate::bvop_field_motion::FieldSampleMode,
+        bits_per_pixel: u32,
+    ) -> Result<Vec<DecodedFrame>, FrameDecodeError> {
+        let frame = crate::frame_decode::assemble_b_vop_interlaced_frame(
+            &self.store,
+            mb_width,
+            mb_height,
+            entries,
+            vop_rounding_type,
+            progressive_mode,
+            field_mode,
+            bits_per_pixel,
+        )?;
+        Ok(vec![frame])
+    }
+
     /// Release the final held anchor at end-of-sequence. Returns the
     /// held anchor (if any) for display, leaving the decoder empty of a
     /// pending anchor.

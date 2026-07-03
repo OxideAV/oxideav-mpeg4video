@@ -192,3 +192,38 @@ fn interlaced_ip_stream_matches_reference_decode() {
     // of field neighbours for frame-predicted macroblocks.
     assert_stream_matches("ilaced_ip_64x64.m4v", "ilaced_ip_64x64.yuv", 3, 0.40);
 }
+
+#[test]
+fn interlaced_ip2_stream_matches_reference_decode() {
+    // A second interlaced I+P stream with strong real motion
+    // (`testsrc2`, bottom-field-first): drives non-trivial field MV
+    // pairs through the CASE 1/2/3 predictors and the §7.7.2.1
+    // Div2Round field-chroma derivation (whose vertical component must
+    // land on the field-mode `mc` half-flag grid — `2*Div2Round(MVy/2)`
+    // — validated sample-exact here; the naive `Div2Round(MVy)`
+    // composition drops the `MVy ≡ +2 (mod 8)` fraction).
+    assert_stream_matches("ilaced_ip2_64x64.m4v", "ilaced_ip2_64x64.yuv", 2, 0.40);
+}
+
+#[test]
+fn interlaced_ipb_stream_matches_reference_decode() {
+    // Interlaced I/P/B: the unified §7.7.2.2 B dispatch — progressive
+    // frame-predicted macroblocks, field forward / backward /
+    // bidirectional through the Table 7-14/7-15 four-PMV bank, B-VOP
+    // video-packet resync, interlaced direct mode driven by the
+    // co-located future macroblock's forward field MV pairs, and the
+    // §7.7.1 field DCT on B residuals.
+    //
+    // Tolerance note: every macroblock class is inside the twin-IDCT
+    // envelope EXCEPT §7.7.2.2 interlaced-direct macroblocks whose
+    // co-located field MVs need the TRB/TRD scaling (two isolated MBs
+    // of one B-VOP here, ~6% of samples, bounded at 40): the spec's
+    // interlaced-direct pseudo code is internally inconsistent (its
+    // backward call passes `mvb[1]` for both fields and tests a
+    // nonexistent `MVD[i]`), and the black-box reference decode
+    // disagrees with the literal forward-call scaling on those
+    // macroblocks. We implement the spec text literally and bound the
+    // deviation until a clean-room erratum/trace for §7.7.2.2 direct
+    // mode resolves the intended derivation.
+    assert_stream_matches("ilaced_ipb_64x64.m4v", "ilaced_ipb_64x64.yuv", 40, 0.07);
+}

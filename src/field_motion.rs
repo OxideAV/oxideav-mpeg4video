@@ -310,9 +310,9 @@ pub fn field_motion_compensate_one_reference(
     let cx = x / 2;
     let cy = y / 2;
     let top_cx = div2_round(mvs.top.x);
-    let top_cy = div2_round(mvs.top.y);
+    let top_cy = field_chroma_dy(mvs.top.y);
     let bot_cx = div2_round(mvs.bottom.x);
-    let bot_cy = div2_round(mvs.bottom.y);
+    let bot_cy = field_chroma_dy(mvs.bottom.y);
 
     for (plane, reference) in [(&mut cb, cb_ref), (&mut cr, cr_ref)] {
         mc(
@@ -360,6 +360,28 @@ pub fn field_motion_compensate_one_reference(
         }
     }
     out
+}
+
+/// The §7.7.2.1 chrominance **vertical** component for the field-mode
+/// [`mc`] calls, from the luma field MV's vertical component (frame
+/// half-pel units, always even).
+///
+/// The field-mode `mc` encodes the vertical sub-position with **bit 1**
+/// as the same-field half-sample flag (`dy = y_incr * (dy_halfpel >>
+/// y_incr)`, `half = dy_halfpel & y_incr` with `y_incr == 2`), so the
+/// 4:2:0 halving must land on that grid: `2 * Div2Round(MVy / 2)` —
+/// halve to field units (exact — the component is even), then the
+/// §7.7.2.1 `Div2Round` snap of any fractional chroma offset onto the
+/// half-sample position, re-encoded with the half flag on bit 1.
+///
+/// Feeding `Div2Round(MVy)` straight into the field-mode `mc` (a
+/// literal composition of the two §7.7.2.1 pseudo-code fragments)
+/// silently drops bit 0, collapsing the `MVy ≡ +2 (mod 8)` cases to a
+/// pure copy while their negative mirrors keep the interpolation —
+/// the black-box reference decode confirms the symmetric snap.
+#[inline]
+pub const fn field_chroma_dy(luma_field_mvy: i32) -> i32 {
+    2 * div2_round(luma_field_mvy / 2)
 }
 
 /// Half-pel-units equivalent of a quarter-pel luma field motion-vector
@@ -447,9 +469,9 @@ pub fn field_motion_compensate_one_reference_qpel(
 
     // --- Chroma: half-sample field mc with Div2Round(qpel / 2) MVs. ---
     let top_cx = div2_round(half_pel_chroma_mv_from_qpel(mvs.top.x));
-    let top_cy = div2_round(half_pel_chroma_mv_from_qpel(mvs.top.y));
+    let top_cy = field_chroma_dy(half_pel_chroma_mv_from_qpel(mvs.top.y));
     let bot_cx = div2_round(half_pel_chroma_mv_from_qpel(mvs.bottom.x));
-    let bot_cy = div2_round(half_pel_chroma_mv_from_qpel(mvs.bottom.y));
+    let bot_cy = field_chroma_dy(half_pel_chroma_mv_from_qpel(mvs.bottom.y));
     let cx = x / 2;
     let cy = y / 2;
     let mut cb = [0u8; MACROBLOCK_CHROMA_SIDE * MACROBLOCK_CHROMA_SIDE];

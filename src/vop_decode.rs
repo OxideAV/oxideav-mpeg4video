@@ -177,18 +177,7 @@ fn check_progressive(vol: &VolHeader) -> Result<(), VopDecodeError> {
     Ok(())
 }
 
-/// §7.7.1 inverse field-DCT permutation: with `dct_type == 1` the four
-/// luminance blocks hold field lines (Figure 6-12 — the upper half is
-/// the top field, the lower half the bottom field); after the IDCT the
-/// lines interleave back to frame order. Chrominance is unaffected.
-fn inverse_field_dct_luma(luma: &[[i32; 16]; 16]) -> [[i32; 16]; 16] {
-    let mut out = [[0i32; 16]; 16];
-    for k in 0..8 {
-        out[2 * k] = luma[k];
-        out[2 * k + 1] = luma[8 + k];
-    }
-    out
-}
+use crate::reconstruct::inverse_field_dct_luma;
 
 /// The §6.2.6.3 forward reference-field selection bits of a
 /// field-predicted P-/S(GMC)-VOP macroblock (`field_prediction == 1`),
@@ -729,6 +718,201 @@ pub fn decode_b_vop_macroblocks(
                 .map_err(|e| VopDecodeError::BVop(BVopMvDriverError::Texture(e)))?;
 
             out.push(BVopMbTexturedDecode {
+                motion,
+                residual,
+                quantiser_scale,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// One anchor macroblock's motion as recorded for the following
+/// B-VOPs' co-located consultation (§7.6.9.5.1 / §7.7.2.2).
+///
+/// The interlaced direct mode needs the co-located future macroblock's
+/// two forward **field** motion vectors and reference-field selections
+/// — information the progressive [`PvopMbMotion`] cannot carry — so
+/// the anchor record keeps the field shape intact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnchorMbMotion {
+    /// A frame-predicted (or intra / skipped) anchor macroblock.
+    Frame(PvopMbMotion),
+    /// A §7.7.2.1 field-predicted anchor macroblock: its reconstructed
+    /// field MV pair plus the §6.3.7.2 reference-field bits.
+    Field {
+        /// Reconstructed top/bottom field motion vectors.
+        mvs: crate::field_motion::FieldMotionVectors,
+        /// `forward_top_field_reference` raw bit.
+        top_ref: bool,
+        /// `forward_bottom_field_reference` raw bit.
+        bottom_ref: bool,
+    },
+}
+
+impl AnchorMbMotion {
+    /// Collapse to the progressive co-located representation: a field
+    /// pair averages per §7.7.2.1 `Div2Round(MVf1 + MVf2)`.
+    pub fn progressive(self) -> PvopMbMotion {
+        match self {
+            AnchorMbMotion::Frame(m) => m,
+            AnchorMbMotion::Field { mvs, .. } => PvopMbMotion::OneMv(crate::motion::MotionVector {
+                x: crate::field_motion::div2_round(mvs.top.x + mvs.bottom.x),
+                y: crate::field_motion::div2_round(mvs.top.y + mvs.bottom.y),
+            }),
+        }
+    }
+}
+
+/// Resolve the per-macroblock [`BVopInterlacedAnchor`] for the
+/// interlaced B walk.
+fn interlaced_anchor_of(
+    co: Option<AnchorMbMotion>,
+    top_field_first: bool,
+) -> crate::bvop_mv::BVopInterlacedAnchor {
+    use crate::bvop_mv::{BVopInterlacedAnchor, ColocatedFutureFieldMvs};
+    use crate::interlaced_information::FieldReference;
+    match co {
+        None => BVopInterlacedAnchor {
+            progressive: CoLocatedAnchor::default(),
+            future_field_mvs: None,
+            top_field_first,
+        },
+        Some(AnchorMbMotion::Frame(m)) => BVopInterlacedAnchor {
+            progressive: co_located_from_motion(m),
+            future_field_mvs: None,
+            top_field_first,
+        },
+        Some(
+            field @ AnchorMbMotion::Field {
+                mvs,
+                top_ref,
+                bottom_ref,
+            },
+        ) => BVopInterlacedAnchor {
+            progressive: co_located_from_motion(field.progressive()),
+            future_field_mvs: Some(ColocatedFutureFieldMvs::from_field_motion(
+                mvs,
+                FieldReference::from_bit(top_ref),
+                FieldReference::from_bit(bottom_ref),
+            )),
+            top_field_first,
+        },
+    }
+}
+
+/// Decode a complete rectangular **interlaced B-VOP**'s macroblock
+/// layer straight off the bitstream, returning one
+/// [`BVopInterlacedTexturedDecode`](crate::bvop_mv::BVopInterlacedTexturedDecode)
+/// per macroblock in raster order — ready for
+/// [`crate::frame_decode::assemble_b_vop_interlaced_frame`].
+///
+/// The per-macroblock dispatch is
+/// [`BVopMvDriver::decode_interlaced_macroblock`]: progressive
+/// (frame-predicted / progressive-direct), §7.7.2.2 field-predicted
+/// forward / backward / bidirectional (through the Table 7-14/7-15
+/// four-PMV bank), or §7.7.2.2 interlaced direct (when the co-located
+/// future macroblock was field-predicted — `anchor_motion` supplies
+/// the field pairs via [`AnchorMbMotion::Field`]). Residual luminance
+/// coded with `dct_type == 1` is inverse-field-DCT permuted (§7.7.1).
+///
+/// The §6.2.6 `co_located_not_coded` zero-bit rule applies exactly as
+/// in the progressive walk.
+pub fn decode_b_vop_interlaced_macroblocks(
+    br: &mut BitReader<'_>,
+    vol: &VolHeader,
+    vop: &VopHeader,
+    trb: i32,
+    trd: i32,
+    anchor_motion: Option<&[AnchorMbMotion]>,
+) -> Result<Vec<crate::bvop_mv::BVopInterlacedTexturedDecode>, VopDecodeError> {
+    use crate::bvop_mv::BVopInterlacedTexturedDecode;
+
+    check_vol_supported(vol)?;
+    if !vol.interlaced {
+        return Err(VopDecodeError::Unsupported("not an interlaced VOL"));
+    }
+    if !matches!(vop.coding_type, VopCodingType::B) {
+        return Err(VopDecodeError::Unsupported("not a B-VOP"));
+    }
+    if !vop.coded {
+        return Err(VopDecodeError::Unsupported("vop_coded == 0"));
+    }
+
+    let (mb_width, mb_height) = vop_mb_dimensions(vol);
+    let max_qp = max_quantiser_scale(vol);
+    let mut driver = BVopMvDriver::new(mb_height, mb_width, vop.fcode_fwd, vop.fcode_bwd, trb, trd)
+        .with_quarter_sample(vol.quarter_sample);
+    let quant_matrix = nonintra_quant_matrix(vol);
+    let vp_ctx = video_packet_context(vol, vop);
+    let mut quantiser_scale = u32::from(vop.quant).clamp(1, max_qp);
+    let mut out = Vec::with_capacity(mb_width * mb_height);
+    for mb_row in 0..mb_height {
+        driver.start_row();
+        for mb_col in 0..mb_width {
+            let mb_index = mb_row * mb_width + mb_col;
+            // §6.2.5.2 video-packet resync — same rules as the
+            // progressive B walk: a packet may resume ahead of the
+            // raster index across a run of zero-bit
+            // co_located_not_coded macroblocks.
+            if mb_index > 0 && !vol.resync_marker_disable && video_packet_follows(br, &vp_ctx) {
+                let mut probe = br.clone();
+                let packet = parse_video_packet_header(&mut probe, &vp_ctx)?;
+                let resume = packet.macroblock_number as usize;
+                let gap_all_skipped = (mb_index..resume).all(|i| {
+                    anchor_motion
+                        .map(|m| matches!(m[i], AnchorMbMotion::Frame(PvopMbMotion::Skipped)))
+                        .unwrap_or(false)
+                });
+                if resume < mb_index || !gap_all_skipped {
+                    return Err(VopDecodeError::VideoPacketSkip {
+                        packet_mb: resume as u32,
+                        expected_mb: mb_index as u32,
+                    });
+                }
+                let consumed = probe.bit_position() - br.bit_position();
+                br.skip_bits(consumed)
+                    .map_err(|_| VopDecodeError::VideoPacket(VideoPacketParseError::Truncated))?;
+                driver.start_row();
+                quantiser_scale = u32::from(packet.quant_scale).clamp(1, max_qp);
+            }
+            let co = anchor_motion.map(|m| m[mb_index]);
+
+            // §6.2.6 / §7.6.9.6 co_located_not_coded: no bits at all.
+            if matches!(co, Some(AnchorMbMotion::Frame(PvopMbMotion::Skipped))) {
+                let fz = forward_zero_b_mb(quantiser_scale);
+                out.push(BVopInterlacedTexturedDecode {
+                    motion: crate::bvop_mv::BVopInterlacedMb::Progressive(fz.motion),
+                    residual: fz.residual,
+                    quantiser_scale,
+                });
+                continue;
+            }
+
+            let anchor = interlaced_anchor_of(co, vop.top_field_first);
+            let (motion, field_dct) = driver
+                .decode_interlaced_macroblock(br, vol, vop.coding_type, mb_row, mb_col, anchor)
+                .map_err(VopDecodeError::BVop)?;
+
+            if let Some(delta) = motion.dbquant_delta() {
+                let updated = i64::from(quantiser_scale) + i64::from(delta);
+                quantiser_scale = updated.clamp(1, i64::from(max_qp)) as u32;
+            }
+
+            let ctx = MacroblockTextureContext {
+                quantiser_scale,
+                bits_per_pixel: u32::from(vol.bits_per_pixel),
+                quant_type: vol.quant_type,
+                ac_pred_flag: false,
+                alternate_vertical_scan: vop.alternate_vertical_scan,
+            };
+            let mut residual = decode_b_vop_inter_macroblock(br, motion.cbpb(), ctx, &quant_matrix)
+                .map_err(|e| VopDecodeError::BVop(BVopMvDriverError::Texture(e)))?;
+            if field_dct {
+                residual.luma = inverse_field_dct_luma(&residual.luma);
+            }
+
+            out.push(BVopInterlacedTexturedDecode {
                 motion,
                 residual,
                 quantiser_scale,
