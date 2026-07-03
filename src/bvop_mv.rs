@@ -309,9 +309,25 @@ impl BVopMbDecode {
 pub struct CoLocatedAnchor {
     /// §7.6.9.6: whether the co-located anchor macroblock was skipped.
     pub skipped: bool,
-    /// §7.6.9.5.1: the co-located anchor block vector (or the
-    /// transparent / unavailable fallback).
-    pub mv: DirectCoLocatedMv,
+    /// §7.6.9.5.1 / §7.6.9.5.2: the co-located anchor **block**
+    /// vectors `{MV[i], i = 0..3}` in Figure 6-8 order, after the
+    /// §7.6.1.6 vector padding. A 1-MV co-located macroblock
+    /// replicates its single vector into all four slots
+    /// ([`CoLocatedAnchor::uniform`]); a 4-MV (inter4v) macroblock
+    /// supplies its four sub-block vectors, giving direct mode a
+    /// distinct `(MVF[i], MVB[i])` pair per 8×8 block.
+    pub mvs: [DirectCoLocatedMv; MB_SUB_BLOCKS],
+}
+
+impl CoLocatedAnchor {
+    /// A co-located macroblock whose four block vectors are the same
+    /// resolved vector (the 1-MV / skipped / GMC-averaged cases).
+    pub fn uniform(skipped: bool, mv: DirectCoLocatedMv) -> Self {
+        Self {
+            skipped,
+            mvs: [mv; MB_SUB_BLOCKS],
+        }
+    }
 }
 
 impl Default for CoLocatedAnchor {
@@ -320,10 +336,7 @@ impl Default for CoLocatedAnchor {
     /// then derives `MVF` / `MVB` from a zero `MV` per §7.6.9.5.1's
     /// final sentence).
     fn default() -> Self {
-        Self {
-            skipped: false,
-            mv: DirectCoLocatedMv::TransparentOrAbsent,
-        }
+        Self::uniform(false, DirectCoLocatedMv::TransparentOrAbsent)
     }
 }
 
@@ -852,10 +865,11 @@ impl BVopMvDriver {
     ///   co-located macroblock in the most recently decoded anchor was
     ///   *skipped* (`not_coded`). When set, the §7.6.9.6 overrides
     ///   apply before any `mb_type` decode.
-    /// * `co_located_mv` is the §7.6.9.5.1 co-located anchor block
-    ///   vector (after §7.6.1.6 vector padding) used by direct mode;
-    ///   pass [`DirectCoLocatedMv::TransparentOrAbsent`] for a
-    ///   transparent / unavailable slot.
+    /// * `co_located_mvs` are the §7.6.9.5.1 co-located anchor block
+    ///   vectors `{MV[i]}` (after §7.6.1.6 vector padding) used by
+    ///   direct mode — one per Figure 6-8 luminance sub-block;
+    ///   pass [`DirectCoLocatedMv::TransparentOrAbsent`] slots for a
+    ///   transparent / unavailable macroblock.
     // Args map directly to the §6.2.6 / §7.6.9 macroblock-decode inputs;
     // grouping them into a struct would obscure the call site.
     #[allow(clippy::too_many_arguments)]
@@ -867,7 +881,7 @@ impl BVopMvDriver {
         mb_row: usize,
         mb_col: usize,
         co_located_skipped: bool,
-        co_located_mv: DirectCoLocatedMv,
+        co_located_mvs: [DirectCoLocatedMv; MB_SUB_BLOCKS],
     ) -> Result<BVopMbDecode, BVopMvDriverError> {
         if mb_row >= self.mb_rows || mb_col >= self.mb_cols {
             return Err(BVopMvDriverError::OutOfBounds { mb_row, mb_col });
@@ -877,7 +891,7 @@ impl BVopMvDriver {
 
         // §7.6.9.6 skipped co-located macroblock override.
         if co_located_skipped {
-            return self.decode_co_located_skipped(br, &header, co_located_mv);
+            return self.decode_co_located_skipped(br, &header, co_located_mvs);
         }
 
         // Field prediction is out of scope for this progressive frame
@@ -898,7 +912,7 @@ impl BVopMvDriver {
         }
 
         match header.mb_type {
-            BVopMbType::Direct => self.decode_direct(br, &header, co_located_mv),
+            BVopMbType::Direct => self.decode_direct(br, &header, co_located_mvs),
             BVopMbType::Forward => self.decode_forward(br, &header),
             BVopMbType::Backward => self.decode_backward(br, &header),
             BVopMbType::Interpolated => self.decode_bidirectional(br, &header),
@@ -1180,7 +1194,7 @@ impl BVopMvDriver {
         // forward regardless of the decoded type (§7.6.9.6).
         if anchor.progressive.skipped {
             return self
-                .decode_co_located_skipped(br, &header, anchor.progressive.mv)
+                .decode_co_located_skipped(br, &header, anchor.progressive.mvs)
                 .map(BVopInterlacedMb::Progressive);
         }
 
@@ -1207,7 +1221,7 @@ impl BVopMvDriver {
                     .map(BVopInterlacedMb::InterlacedDirect);
             }
             return self
-                .decode_direct(br, &header, anchor.progressive.mv)
+                .decode_direct(br, &header, anchor.progressive.mvs)
                 .map(BVopInterlacedMb::Progressive);
         }
 
@@ -1345,7 +1359,7 @@ impl BVopMvDriver {
                     mb_row,
                     mb_col,
                     anchor.skipped,
-                    anchor.mv,
+                    anchor.mvs,
                 )?;
                 out.push(decode);
             }
@@ -1405,7 +1419,7 @@ impl BVopMvDriver {
                     mb_row,
                     mb_col,
                     anchor.skipped,
-                    anchor.mv,
+                    anchor.mvs,
                 )?;
 
                 // §6.3.6: apply this macroblock's dbquant (Table 6-33
@@ -1447,13 +1461,13 @@ impl BVopMvDriver {
         &mut self,
         br: &mut BitReader<'_>,
         header: &BVopMbHeader,
-        co_located_mv: DirectCoLocatedMv,
+        co_located_mvs: [DirectCoLocatedMv; MB_SUB_BLOCKS],
     ) -> Result<BVopMbDecode, BVopMvDriverError> {
         if !header.mb_type_present {
             // modb == "1" → direct mode with a zero delta vector. No
             // motion bodies are coded.
             let zero_delta = MotionVectorDelta { dx: 0, dy: 0 };
-            let mvs = self.direct_mvs(co_located_mv, zero_delta)?;
+            let mvs = self.direct_mvs(co_located_mvs, zero_delta)?;
             let (fwd_chroma, bwd_chroma) = direct_chroma_mvs(&mvs)?;
             return Ok(BVopMbDecode {
                 mb_type: BVopMbType::Direct,
@@ -1504,7 +1518,7 @@ impl BVopMvDriver {
         &mut self,
         br: &mut BitReader<'_>,
         header: &BVopMbHeader,
-        co_located_mv: DirectCoLocatedMv,
+        co_located_mvs: [DirectCoLocatedMv; MB_SUB_BLOCKS],
     ) -> Result<BVopMbDecode, BVopMvDriverError> {
         // §6.2.6: when `modb == "1"` (no explicit `mb_type`), the whole
         // subtree after `modb` is absent — there is no `motion_vector`
@@ -1523,7 +1537,7 @@ impl BVopMvDriver {
         } else {
             MotionVectorDelta { dx: 0, dy: 0 }
         };
-        let mvs = self.direct_mvs(co_located_mv, delta)?;
+        let mvs = self.direct_mvs(co_located_mvs, delta)?;
         let (fwd_chroma, bwd_chroma) = direct_chroma_mvs(&mvs)?;
         Ok(BVopMbDecode {
             mb_type: BVopMbType::Direct,
@@ -1671,13 +1685,15 @@ impl BVopMvDriver {
         }
     }
 
-    /// §7.6.9.5.2 direct-mode (MVF, MVB) pairs for the four luminance
-    /// sub-blocks, scaling the single co-located anchor MV by the
-    /// §7.6.7 TRB / TRD distances. The progressive (frame) path uses
-    /// the same co-located MV for every sub-block.
+    /// §7.6.9.5.2 direct-mode `(MVF[i], MVB[i])` pairs for the four
+    /// luminance sub-blocks, scaling each co-located block vector
+    /// `MV[i]` by the §7.6.7 TRB / TRD distances (one shared delta
+    /// vector per macroblock). A 1-MV co-located macroblock supplies
+    /// four identical vectors; a 4-MV one gives each 8×8 block its own
+    /// scaled pair.
     fn direct_mvs(
         &self,
-        co_located_mv: DirectCoLocatedMv,
+        co_located_mvs: [DirectCoLocatedMv; MB_SUB_BLOCKS],
         delta: MotionVectorDelta,
     ) -> Result<[BVopMvPair; MB_SUB_BLOCKS], BVopMvDriverError> {
         let units = if self.quarter_sample {
@@ -1689,9 +1705,17 @@ impl BVopMvDriver {
         } else {
             DirectMvUnits::Match
         };
-        let DirectModeMv { forward, backward } =
-            direct_mode_motion_vector(co_located_mv, delta, self.trb, self.trd, units)?;
-        Ok([BVopMvPair { forward, backward }; MB_SUB_BLOCKS])
+        let zero = MotionVector { x: 0, y: 0 };
+        let mut out = [BVopMvPair {
+            forward: zero,
+            backward: zero,
+        }; MB_SUB_BLOCKS];
+        for (pair, co_located) in out.iter_mut().zip(co_located_mvs) {
+            let DirectModeMv { forward, backward } =
+                direct_mode_motion_vector(co_located, delta, self.trb, self.trd, units)?;
+            *pair = BVopMvPair { forward, backward };
+        }
+        Ok(out)
     }
 }
 
@@ -1889,7 +1913,7 @@ mod tests {
                 5,
                 5,
                 false,
-                DirectCoLocatedMv::TransparentOrAbsent,
+                [DirectCoLocatedMv::TransparentOrAbsent; MB_SUB_BLOCKS],
             )
             .unwrap_err();
         assert_eq!(
@@ -1922,7 +1946,7 @@ mod tests {
                 0,
                 0,
                 false,
-                DirectCoLocatedMv::TransparentOrAbsent,
+                [DirectCoLocatedMv::TransparentOrAbsent; MB_SUB_BLOCKS],
             )
             .unwrap();
         assert_eq!(mb.mb_type, BVopMbType::Direct);
@@ -1931,6 +1955,44 @@ mod tests {
             assert_eq!(pair.forward, MotionVector { x: 0, y: 0 });
             assert_eq!(pair.backward, MotionVector { x: 0, y: 0 });
         }
+    }
+
+    #[test]
+    fn direct_mode_scales_each_co_located_block_vector() {
+        // §7.6.9.5.2: a 4-MV co-located macroblock gives each 8x8
+        // sub-block its own scaled (MVF[i], MVB[i]) pair. TRB=1,
+        // TRD=2, zero delta: MVF[i] = MV[i]/2, MVB[i] = -MV[i]/2.
+        let vol = make_vol();
+        let mut w = BitWriter::new();
+        w.write_bits(0b1, 1); // modb "1" → default direct, zero delta
+        w.align();
+        let data = w.buf;
+        let mut br = BitReader::new(&data);
+        let mut driver = BVopMvDriver::new(1, 1, 1, 1, 1, 2);
+        driver.start_row();
+        let co = [
+            DirectCoLocatedMv::Mv(MotionVector { x: 8, y: 0 }),
+            DirectCoLocatedMv::Mv(MotionVector { x: 0, y: 8 }),
+            DirectCoLocatedMv::Mv(MotionVector { x: -8, y: 0 }),
+            DirectCoLocatedMv::Mv(MotionVector { x: 4, y: -4 }),
+        ];
+        let mb = driver
+            .decode_macroblock(&mut br, &vol, VopCodingType::B, 0, 0, false, co)
+            .unwrap();
+        assert_eq!(mb.prediction_mode, BVopPredictionMode::Direct);
+        let expect_f = [(4, 0), (0, 4), (-4, 0), (2, -2)];
+        for (i, (fx, fy)) in expect_f.into_iter().enumerate() {
+            assert_eq!(mb.mvs[i].forward, MotionVector { x: fx, y: fy }, "MVF[{i}]");
+            assert_eq!(
+                mb.mvs[i].backward,
+                MotionVector { x: -fx, y: -fy },
+                "MVB[{i}]"
+            );
+        }
+        // §7.6.9.5.3: chroma from the four per-block forward vectors.
+        // sum = (4+0-4+2, 0+4+0-2) = (2, 2); residue mod 16 = 2 →
+        // Table 7-10[2] = 0 on both axes → (0, 0) half-sample.
+        assert_eq!(mb.forward_chroma_mv, MotionVector { x: 0, y: 0 });
     }
 
     #[test]
@@ -1956,7 +2018,7 @@ mod tests {
                 0,
                 0,
                 false,
-                DirectCoLocatedMv::Mv(MotionVector { x: 10, y: 6 }),
+                [DirectCoLocatedMv::Mv(MotionVector { x: 10, y: 6 }); MB_SUB_BLOCKS],
             )
             .unwrap();
         assert_eq!(mb.prediction_mode, BVopPredictionMode::Direct);
@@ -2017,7 +2079,7 @@ mod tests {
                 0,
                 0,
                 false,
-                DirectCoLocatedMv::TransparentOrAbsent,
+                [DirectCoLocatedMv::TransparentOrAbsent; MB_SUB_BLOCKS],
             )
             .unwrap();
         assert_eq!(mb.mb_type, BVopMbType::Forward);
@@ -2050,7 +2112,7 @@ mod tests {
                 0,
                 0,
                 true,
-                DirectCoLocatedMv::TransparentOrAbsent,
+                [DirectCoLocatedMv::TransparentOrAbsent; MB_SUB_BLOCKS],
             )
             .unwrap();
         assert_eq!(mb.mb_type, BVopMbType::Forward);
@@ -2077,7 +2139,7 @@ mod tests {
                 0,
                 0,
                 true,
-                DirectCoLocatedMv::Mv(MotionVector { x: 6, y: -6 }),
+                [DirectCoLocatedMv::Mv(MotionVector { x: 6, y: -6 }); MB_SUB_BLOCKS],
             )
             .unwrap();
         assert_eq!(mb.mb_type, BVopMbType::Direct);
@@ -2182,10 +2244,10 @@ mod tests {
         let mbs = driver
             .decode_vop_motion(&mut br, &vol, VopCodingType::B, |_, col| {
                 if col == 0 {
-                    CoLocatedAnchor {
-                        skipped: true,
-                        mv: DirectCoLocatedMv::Mv(MotionVector { x: 8, y: 0 }),
-                    }
+                    CoLocatedAnchor::uniform(
+                        true,
+                        DirectCoLocatedMv::Mv(MotionVector { x: 8, y: 0 }),
+                    )
                 } else {
                     CoLocatedAnchor::default()
                 }
@@ -3004,10 +3066,10 @@ mod tests {
         let mut br = BitReader::new(&data);
         let mut driver = BVopMvDriver::new(1, 1, 1, 1, 1, 2);
         let anchor = BVopInterlacedAnchor {
-            progressive: CoLocatedAnchor {
-                skipped: false,
-                mv: DirectCoLocatedMv::Mv(MotionVector { x: 6, y: -6 }),
-            },
+            progressive: CoLocatedAnchor::uniform(
+                false,
+                DirectCoLocatedMv::Mv(MotionVector { x: 6, y: -6 }),
+            ),
             future_field_mvs: None,
             top_field_first: false,
         };
@@ -3036,10 +3098,10 @@ mod tests {
         let mut br = BitReader::new(&data);
         let mut driver = BVopMvDriver::new(1, 1, 1, 1, 1, 2);
         let anchor = BVopInterlacedAnchor {
-            progressive: CoLocatedAnchor {
-                skipped: true,
-                mv: DirectCoLocatedMv::Mv(MotionVector { x: 8, y: 0 }),
-            },
+            progressive: CoLocatedAnchor::uniform(
+                true,
+                DirectCoLocatedMv::Mv(MotionVector { x: 8, y: 0 }),
+            ),
             future_field_mvs: Some(ColocatedFutureFieldMvs {
                 top: future_field(6, -6, FieldReference::Top),
                 bottom: future_field(6, -6, FieldReference::Bottom),

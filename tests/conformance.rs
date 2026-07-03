@@ -150,3 +150,13 @@ fn qpel_ipb_stream_matches_reference_decode() {
     // conversion) and reconstruct with §7.6.2.1 interpolation.
     assert_stream_matches("qpel_ipb_64x64.m4v", "qpel_ipb_64x64.yuv", 3, 0.40);
 }
+
+#[test]
+fn mv4_ipb_stream_matches_reference_decode() {
+    // Four-MV (inter4v) anchors + B-VOPs: the P walk decodes four
+    // §7.6.3 vectors per macroblock (Figure 7-34 in-MB candidate
+    // gathering), and §7.6.9.5.2 direct-mode B macroblocks scale each
+    // co-located block vector separately (per-sub-block MVF[i]/MVB[i],
+    // with the §7.6.9.5.3 K=4 chroma reduction).
+    assert_stream_matches("mv4_ipb_64x64.m4v", "mv4_ipb_64x64.yuv", 3, 0.40);
+}

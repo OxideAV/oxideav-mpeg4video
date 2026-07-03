@@ -493,25 +493,22 @@ pub fn decode_p_vop_macroblocks(
 /// per-macroblock motion.
 ///
 /// * a skipped anchor MB → the §7.6.9.6 override flag,
-/// * a 1-MV inter MB → its vector,
-/// * a 4-MV inter MB → its **first** sub-block vector (the driver's
-///   direct derivation applies one co-located vector per macroblock;
-///   per-sub-block co-located vectors are a later refinement),
+/// * a 1-MV inter MB → its vector replicated into all four block
+///   slots (§7.6.1.6 vector padding of a 1-MV macroblock),
+/// * a 4-MV inter MB → its four sub-block vectors `{MV[i]}` in
+///   Figure 6-8 order (§7.6.9.5.2 gives each 8×8 block its own
+///   scaled `(MVF[i], MVB[i])` pair),
 /// * an intra MB (or a GMC MB, which carries no local vector) → the
 ///   §7.6.9.5.1 final-sentence zero-vector fallback.
 fn co_located_from_motion(motion: PvopMbMotion) -> CoLocatedAnchor {
     match motion {
-        PvopMbMotion::Skipped => CoLocatedAnchor {
-            skipped: true,
-            mv: DirectCoLocatedMv::TransparentOrAbsent,
-        },
-        PvopMbMotion::OneMv(mv) => CoLocatedAnchor {
-            skipped: false,
-            mv: DirectCoLocatedMv::Mv(mv),
-        },
+        PvopMbMotion::Skipped => {
+            CoLocatedAnchor::uniform(true, DirectCoLocatedMv::TransparentOrAbsent)
+        }
+        PvopMbMotion::OneMv(mv) => CoLocatedAnchor::uniform(false, DirectCoLocatedMv::Mv(mv)),
         PvopMbMotion::FourMv(mvs) => CoLocatedAnchor {
             skipped: false,
-            mv: DirectCoLocatedMv::Mv(mvs[0]),
+            mvs: mvs.map(DirectCoLocatedMv::Mv),
         },
         PvopMbMotion::Intra => CoLocatedAnchor::default(),
     }
@@ -624,7 +621,7 @@ pub fn decode_b_vop_macroblocks(
                     mb_row,
                     mb_col,
                     anchor.skipped,
-                    anchor.mv,
+                    anchor.mvs,
                 )
                 .map_err(VopDecodeError::BVop)?;
 
