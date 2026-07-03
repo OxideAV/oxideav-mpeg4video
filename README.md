@@ -1,5 +1,7 @@
 # oxideav-mpeg4video
 
+[![CI](https://github.com/OxideAV/oxideav-mpeg4video/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-mpeg4video/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-mpeg4video.svg)](https://crates.io/crates/oxideav-mpeg4video) [![docs.rs](https://docs.rs/oxideav-mpeg4video/badge.svg)](https://docs.rs/oxideav-mpeg4video) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Pure-Rust clean-room decoder for MPEG-4 Part 2 Video (ISO/IEC 14496-2 /
 MPEG-4 Visual / ASP) for the
 [oxideav](https://github.com/OxideAV/oxideav-workspace) framework. This
