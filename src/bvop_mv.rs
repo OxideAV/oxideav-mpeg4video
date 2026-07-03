@@ -275,6 +275,28 @@ impl BVopMbDecode {
     }
 }
 
+impl BVopMbDecode {
+    /// The sub-pel grid [`Self::mvs`] is expressed on, given the VOL's
+    /// `sample_mode`.
+    ///
+    /// §7.6.9.5.2 fourth paragraph: in a `quarter_sample == 1` VOL the
+    /// direct-mode vectors are derived in **half**-sample units (the
+    /// co-located quarter-pel MV is halved before scaling, the delta
+    /// is coded half-pel), so a direct macroblock — including the
+    /// §7.6.9.6 `modb == "1"` skipped-co-located form — reconstructs
+    /// with §7.6.2.1 interpolation. Every other mode follows the VOL.
+    pub fn luma_sample_mode(
+        &self,
+        vol_mode: crate::bvop_prediction::BVopSampleMode,
+    ) -> crate::bvop_prediction::BVopSampleMode {
+        if matches!(self.prediction_mode, BVopPredictionMode::Direct) {
+            crate::bvop_prediction::BVopSampleMode::HalfPel
+        } else {
+            vol_mode
+        }
+    }
+}
+
 /// The §7.6.9.5.1 / §7.6.9.6 co-located anchor state for one B-VOP
 /// macroblock, supplied by the caller to
 /// [`BVopMvDriver::decode_vop_motion`].
@@ -740,6 +762,11 @@ pub struct BVopMvDriver {
     trb: i32,
     /// §7.6.7 temporal distance next anchor → previous anchor.
     trd: i32,
+    /// §6.3.3 `quarter_sample`: the decoded forward/backward vectors
+    /// are quarter-pel units, the §7.6.5 chroma reduction runs on the
+    /// finer grid, and direct mode converts the co-located MV to
+    /// half-pel per §7.6.9.5.2 fourth paragraph.
+    quarter_sample: bool,
     predictor: DirectionPredictor,
     /// §7.7.2.2 four-PMV bank for the interlaced field-prediction path,
     /// threaded alongside the progressive `predictor` and reset together
@@ -772,9 +799,24 @@ impl BVopMvDriver {
             vop_fcode_backward,
             trb,
             trd,
+            quarter_sample: false,
             predictor: DirectionPredictor::default(),
             field_predictor: FieldPmvBank::new(),
         }
+    }
+
+    /// Select the §6.3.3 `quarter_sample` mode (builder-style; the
+    /// [`BVopMvDriver::new`] default is half-sample). In quarter-sample
+    /// mode the explicit forward / backward / bidirectional vectors are
+    /// quarter-pel units and their §7.6.5 chroma reduction runs on the
+    /// doubled grid; the §7.6.9.5 direct mode instead converts the
+    /// co-located quarter-pel MV to half-pel units (Table 7-13) before
+    /// the TRB/TRD scaling — its delta vector is coded half-pel — so a
+    /// direct macroblock reconstructs on the half-pel grid
+    /// ([`BVopMbDecode::luma_sample_mode`]).
+    pub fn with_quarter_sample(mut self, quarter_sample: bool) -> Self {
+        self.quarter_sample = quarter_sample;
+        self
     }
 
     /// Number of macroblock rows in the VOP.
@@ -1519,7 +1561,7 @@ impl BVopMvDriver {
         .map_err(BVopMbParseError::Motion)?;
         self.predictor.forward = mv;
         let mvs = replicated_pair(mv, MotionVector { x: 0, y: 0 });
-        let fwd_chroma = chroma_mv_from_luma_blocks(&[mv])?;
+        let fwd_chroma = self.chroma_from(&[mv])?;
         Ok(BVopMbDecode {
             mb_type: BVopMbType::Forward,
             prediction_mode: BVopPredictionMode::ForwardOnly,
@@ -1556,7 +1598,7 @@ impl BVopMvDriver {
         .map_err(BVopMbParseError::Motion)?;
         self.predictor.backward = mv;
         let mvs = replicated_pair(MotionVector { x: 0, y: 0 }, mv);
-        let bwd_chroma = chroma_mv_from_luma_blocks(&[mv])?;
+        let bwd_chroma = self.chroma_from(&[mv])?;
         Ok(BVopMbDecode {
             mb_type: BVopMbType::Backward,
             prediction_mode: BVopPredictionMode::BackwardOnly,
@@ -1602,8 +1644,8 @@ impl BVopMvDriver {
         self.predictor.forward = fwd_mv;
         self.predictor.backward = bwd_mv;
         let mvs = replicated_pair(fwd_mv, bwd_mv);
-        let fwd_chroma = chroma_mv_from_luma_blocks(&[fwd_mv])?;
-        let bwd_chroma = chroma_mv_from_luma_blocks(&[bwd_mv])?;
+        let fwd_chroma = self.chroma_from(&[fwd_mv])?;
+        let bwd_chroma = self.chroma_from(&[bwd_mv])?;
         Ok(BVopMbDecode {
             mb_type: BVopMbType::Interpolated,
             prediction_mode: BVopPredictionMode::Bidirectional,
@@ -1615,6 +1657,20 @@ impl BVopMvDriver {
         })
     }
 
+    /// §7.6.5 chroma reduction on the grid the VOL selects: half-pel
+    /// (`sum / 2K` + Tables 7-10..7-13) or quarter-pel (divide by 2
+    /// before summation, one table rounding on the doubled grid).
+    fn chroma_from(
+        &self,
+        mvs: &[MotionVector],
+    ) -> Result<MotionVector, crate::chroma_mv::ChromaMvError> {
+        if self.quarter_sample {
+            crate::chroma_mv::chroma_mv_from_luma_blocks_qpel(mvs)
+        } else {
+            chroma_mv_from_luma_blocks(mvs)
+        }
+    }
+
     /// §7.6.9.5.2 direct-mode (MVF, MVB) pairs for the four luminance
     /// sub-blocks, scaling the single co-located anchor MV by the
     /// §7.6.7 TRB / TRD distances. The progressive (frame) path uses
@@ -1624,13 +1680,17 @@ impl BVopMvDriver {
         co_located_mv: DirectCoLocatedMv,
         delta: MotionVectorDelta,
     ) -> Result<[BVopMvPair; MB_SUB_BLOCKS], BVopMvDriverError> {
-        let DirectModeMv { forward, backward } = direct_mode_motion_vector(
-            co_located_mv,
-            delta,
-            self.trb,
-            self.trd,
-            DirectMvUnits::Match,
-        )?;
+        let units = if self.quarter_sample {
+            // §7.6.9.5.2 fourth paragraph: the co-located MV is
+            // quarter-pel but the direct delta is half-pel; halve the
+            // MV (Table 7-13) before the linear scaling. The derived
+            // MVF/MVB are then half-pel units.
+            DirectMvUnits::QpelMvToHalfPel
+        } else {
+            DirectMvUnits::Match
+        };
+        let DirectModeMv { forward, backward } =
+            direct_mode_motion_vector(co_located_mv, delta, self.trb, self.trd, units)?;
         Ok([BVopMvPair { forward, backward }; MB_SUB_BLOCKS])
     }
 }
@@ -1871,6 +1931,60 @@ mod tests {
             assert_eq!(pair.forward, MotionVector { x: 0, y: 0 });
             assert_eq!(pair.backward, MotionVector { x: 0, y: 0 });
         }
+    }
+
+    #[test]
+    fn quarter_sample_direct_converts_co_located_to_half_pel() {
+        // §7.6.9.5.2 fourth paragraph: quarter-pel co-located MV
+        // (10, 6) halves via Table 7-13 to (5, 3) half-pel before the
+        // TRB/TRD = 1/2 scaling: MVF = (5/2, 3/2) = (2, 1); MVB =
+        // ((1-2)*5/2, (1-2)*3/2) = (-2, -1). The delta is zero
+        // (modb == "1"), and the reconstruct grid is half-pel.
+        let vol = make_vol();
+        let mut w = BitWriter::new();
+        w.write_bits(0b1, 1);
+        w.align();
+        let data = w.buf;
+        let mut br = BitReader::new(&data);
+        let mut driver = BVopMvDriver::new(1, 1, 1, 1, 1, 2).with_quarter_sample(true);
+        driver.start_row();
+        let mb = driver
+            .decode_macroblock(
+                &mut br,
+                &vol,
+                VopCodingType::B,
+                0,
+                0,
+                false,
+                DirectCoLocatedMv::Mv(MotionVector { x: 10, y: 6 }),
+            )
+            .unwrap();
+        assert_eq!(mb.prediction_mode, BVopPredictionMode::Direct);
+        for pair in mb.mvs {
+            assert_eq!(pair.forward, MotionVector { x: 2, y: 1 });
+            assert_eq!(pair.backward, MotionVector { x: -2, y: -1 });
+        }
+        // Direct macroblocks reconstruct half-pel even in a qpel VOL…
+        let qpel = crate::bvop_prediction::BVopSampleMode::QuarterPel { bits_per_pixel: 8 };
+        assert_eq!(
+            mb.luma_sample_mode(qpel),
+            crate::bvop_prediction::BVopSampleMode::HalfPel
+        );
+        // …while an explicit-mode macroblock follows the VOL grid.
+        let zero = MotionVector { x: 0, y: 0 };
+        let fwd = BVopMbDecode {
+            mb_type: BVopMbType::Forward,
+            prediction_mode: BVopPredictionMode::ForwardOnly,
+            cbpb: None,
+            dbquant_delta: None,
+            mvs: [BVopMvPair {
+                forward: zero,
+                backward: zero,
+            }; 4],
+            forward_chroma_mv: zero,
+            backward_chroma_mv: zero,
+        };
+        assert_eq!(fwd.luma_sample_mode(qpel), qpel);
     }
 
     #[test]

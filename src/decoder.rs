@@ -334,7 +334,7 @@ impl Mpeg4VideoDecoder {
                     mb_height,
                     &entries,
                     vop.rounding_type,
-                    BVopSampleMode::HalfPel,
+                    sample_mode,
                     u32::from(vol.bits_per_pixel),
                 )?);
             }

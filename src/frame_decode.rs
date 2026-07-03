@@ -277,13 +277,15 @@ pub fn assemble_b_vop_frame(
     for (idx, entry) in entries.iter().enumerate() {
         let mb_col = idx % mb_width;
         let mb_row = idx / mb_width;
+        // §7.6.9.5.2: direct-mode vectors are half-pel even in a
+        // quarter-sample VOL; every other mode follows the VOL grid.
         let reconstructed = entry.motion.reconstruct(
             &anchors,
             &entry.residual,
             (mb_col * 16) as i32,
             (mb_row * 16) as i32,
             vop_rounding_type,
-            sample_mode,
+            entry.motion.luma_sample_mode(sample_mode),
             bits_per_pixel,
         );
         frame.blit_macroblock(mb_col, mb_row, &reconstructed)?;

@@ -550,13 +550,11 @@ pub fn decode_b_vop_macroblocks(
     if !vop.coded {
         return Err(VopDecodeError::Unsupported("vop_coded == 0"));
     }
-    if vol.quarter_sample {
-        return Err(VopDecodeError::Unsupported("quarter_sample"));
-    }
 
     let (mb_width, mb_height) = vop_mb_dimensions(vol);
     let max_qp = max_quantiser_scale(vol);
-    let mut driver = BVopMvDriver::new(mb_height, mb_width, vop.fcode_fwd, vop.fcode_bwd, trb, trd);
+    let mut driver = BVopMvDriver::new(mb_height, mb_width, vop.fcode_fwd, vop.fcode_bwd, trb, trd)
+        .with_quarter_sample(vol.quarter_sample);
     let texture = BVopTextureParams {
         base_quantiser_scale: u32::from(vop.quant).clamp(1, max_qp),
         max_quantiser_scale: max_qp,

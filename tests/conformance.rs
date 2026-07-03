@@ -140,3 +140,13 @@ fn qpel_ip_stream_matches_reference_decode() {
     // four prediction passes, as in the I/P/B stream.
     assert_stream_matches("qpel_ip_64x64.m4v", "qpel_ip_64x64.yuv", 3, 0.40);
 }
+
+#[test]
+fn qpel_ipb_stream_matches_reference_decode() {
+    // Quarter-sample I/P/B: the explicit B modes (forward / backward /
+    // interpolated) run on the quarter-pel grid while §7.6.9.5 direct
+    // macroblocks derive half-pel vectors from the quarter-pel
+    // co-located MV (§7.6.9.5.2 fourth paragraph, Table 7-13
+    // conversion) and reconstruct with §7.6.2.1 interpolation.
+    assert_stream_matches("qpel_ipb_64x64.m4v", "qpel_ipb_64x64.yuv", 3, 0.40);
+}
