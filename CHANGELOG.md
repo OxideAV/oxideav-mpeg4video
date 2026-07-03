@@ -8,6 +8,75 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Quarter-sample decode path end-to-end** (§7.6.2.2): the P-, S(GMC)-
+  and B-VOP walks accept `quarter_sample == 1` VOLs. The sub-pel
+  cascade now runs on the Figure 7-30 mirrored `(M+1)×(N+1)` reference
+  block (three-sample symmetric extension per block — four 8×8
+  interpolations no longer equal one 16×16, per the §7.6.9.5.3 NOTE);
+  the §7.6.5 chroma reduction gains the quarter-sample derivation
+  (`chroma_mv_from_luma_blocks_qpel`: the divide-by-2-before-summation
+  is algebraic — K=1 on the eighth-sample grid / Table 7-12, K=2 on
+  the sixteenth / Table 7-10 — validated sample-exact against a
+  black-box reference decode); §7.6.9.5 direct mode converts the
+  quarter-pel co-located MV to half-pel (Table 7-13) per the
+  §7.6.9.5.2 fourth paragraph and reconstructs on the half-pel grid
+  (`BVopMbDecode::luma_sample_mode`).
+- **Per-sub-block direct-mode co-located MVs** (§7.6.9.5.2 `MV[i]`):
+  `CoLocatedAnchor` carries the four co-located block vectors, so a
+  4-MV (inter4v) anchor macroblock yields four distinct
+  `(MVF[i], MVB[i])` pairs and the true §7.6.9.5.3 K=4 chroma
+  reduction.
+- **§7.6.6 overlapped motion compensation** wired into the P path:
+  `assemble_p_vop_frame_obmc` blends each 8×8 luminance block's three
+  fetches through the Figure 7-35/7-36/7-37 weights, gathering remote
+  vectors from the frame-wide block motion field with the four
+  substitution rules; skipped macroblocks overlap with the zero
+  vector; chrominance stays on the §7.6.5 path. The decoder dispatches
+  on `obmc_disable == 0`.
+- **Presentation timestamps**: `DecodedFrame::pts` (container packet
+  pts, attached in display order via
+  `Mpeg4VideoDecoder::decode_with_pts` — anchors stamped on the held
+  §6.1.3.8 pending frame so stamps survive the reorder) and
+  `DecodedFrame::pts_ticks` (the §6.3.5 composed VOP time in
+  `1 / vop_time_increment_resolution` ticks). `Mpeg4PacketDecoder`
+  emits `VideoFrame::pts` from the packet stamp with the tick
+  fallback.
+- **Interlaced decode** (`interlaced == 1`): the I- and P-VOP walks
+  decode interlaced VOLs — §6.2.6.3 `dct_type` routes macroblocks
+  through the §7.7.1 inverse field-DCT line permutation (intra
+  texture and inter residuals), the §6.3.5
+  `alternate_vertical_scan_flag` (now surfaced on `VopHeader` with
+  `top_field_first`) selects the Figure 7-4 (b) scan for the whole
+  VOP, and §7.7.2.1 field-predicted macroblocks decode their two
+  field MV pairs against the CASE 1/2/3 shared predictor
+  (`MvDriver::decode_field_macroblock`) and reconstruct via
+  `field_motion_compensate_one_reference`
+  (`PVopMbContent::FieldInter`). Interlaced B-VOPs decode through
+  `decode_b_vop_interlaced_macroblocks`: §7.7.2.2 field forward /
+  backward / bidirectional (Table 7-14/7-15 four-PMV bank),
+  interlaced direct mode from the co-located future macroblock's
+  forward field MV pairs (`AnchorMbMotion` keeps the field shape),
+  video-packet resync, and field-DCT B residuals.
+
+### Fixed
+
+- **§7.7.2.1 field-chroma vertical component**: the field-mode `mc()`
+  encodes the same-field half-sample flag on bit 1, so the 4:2:0
+  chroma vertical MV is `2 * Div2Round(MVy / 2)` — the naive
+  `Div2Round(MVy)` composition of the two pseudo-code fragments
+  silently dropped the `MVy ≡ +2 (mod 8)` interpolation while keeping
+  the negative mirrors (black-box-validated sample-exact).
+
+### Known gaps
+
+- §7.7.2.2 **interlaced direct mode**: the spec's pseudo code is
+  internally inconsistent (the backward call passes `mvb[1]` for both
+  fields and tests a nonexistent `MVD[i]`), and the black-box
+  reference decode disagrees with the literal forward TRB/TRD scaling
+  on isolated macroblocks. The crate implements the spec text
+  literally; `tests/conformance.rs` bounds the deviation until a
+  clean-room erratum/trace resolves the intended derivation.
+
 - **Runtime codec registration + dual-API factory** (`decoder`):
   `register()` installs a real decoder entry (`CodecInfo` id
   `mpeg4video`, implementation `mpeg4video_sw`) claiming the

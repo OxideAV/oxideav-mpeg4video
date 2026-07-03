@@ -25,10 +25,23 @@ into the runtime codec registry** (`mpeg4video`, FourCCs XVID / DIVX /
 DX50 / FMP4 / MP4V / M4S2 + MP4 OTI `0x20`) via a packet decoder that
 supports extradata priming, seeks (`reset`), and the pixel-count DoS
 cap; `decoder::make_decoder` is the direct factory endpoint. The
-bitstream walks cover the rectangular progressive half-sample path —
-quarter-sample, interlaced texture, and data-partitioned streams are
-typed-rejected at the walk level (their per-stage modules exist below).
-There is no encoder.
+bitstream walks cover the rectangular path in **half- and
+quarter-sample** modes (§7.6.2.1 / §7.6.2.2 with the Figure 7-30
+per-block boundary mirroring), with **§7.6.6 overlapped motion
+compensation** (`obmc_disable == 0`), **per-sub-block §7.6.9.5.2
+direct-mode co-located MVs**, **presentation timestamps** (container
+pts through the §6.1.3.8 reorder + §6.3.5 tick times), and
+**interlaced tools**: §7.7.1 field DCT + alternate vertical scan,
+§7.7.2.1 field-predicted P macroblocks (CASE 1/2/3 predictors, field
+MC, Div2Round field chroma), and §7.7.2.2 interlaced B-VOPs (field
+forward / backward / bidirectional via the four-PMV bank + interlaced
+direct mode; the spec's self-inconsistent direct-mode pseudo code
+leaves a bounded, documented deviation vs the reference decode on
+isolated macroblocks). Data-partitioned streams are typed-rejected at
+the walk level (their per-stage modules exist below). Fifteen
+black-box conformance fixtures (intra / IP / IPB / qpel / 4-MV /
+interlaced × {intra, alt-scan, IP, IP-motion, IPB}) match the
+reference decode within the twin-IDCT envelope. There is no encoder.
 
 ## What works today
 
