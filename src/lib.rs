@@ -318,6 +318,7 @@ pub mod bvop_prediction;
 pub mod chroma_mv;
 pub mod chroma_shape;
 pub mod data_partition;
+pub mod decoder;
 pub mod extended_padding;
 pub mod field_motion;
 pub mod frame_decode;
@@ -401,6 +402,8 @@ pub use chroma_shape::{
     decimate_chroma_shape_progressive, decimate_chroma_shape_sample, split_luma_shape_into_fields,
     stack_interlaced_chroma_shape, CHROMA_FIELD_LINES,
 };
+pub use decoder::{Mpeg4VideoDecoder, StreamDecodeError};
+
 pub use data_partition::{
     decode_motion_coding, mb_block_layout, parse_data_partitioned_i_vop,
     parse_data_partitioned_p_vop, use_intra_dc_vlc, DataPartitionError, DataPartitionedIVop,
