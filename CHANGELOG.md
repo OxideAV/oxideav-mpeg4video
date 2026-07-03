@@ -8,6 +8,69 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Runtime codec registration + dual-API factory** (`decoder`):
+  `register()` installs a real decoder entry (`CodecInfo` id
+  `mpeg4video`, implementation `mpeg4video_sw`) claiming the
+  XVID / DIVX / DX50 / FMP4 / MP4V / M4S2 FourCCs and MP4
+  ObjectTypeIndication `0x20`. `Mpeg4PacketDecoder` adapts the
+  elementary-stream decoder to the framework send-packet /
+  receive-frame contract (display-order planar 4:2:0 `VideoFrame`s,
+  extradata priming, `reset()` re-priming after seeks, and the
+  `DecoderLimits::max_pixels_per_frame` DoS cap);
+  `decoder::make_decoder` is the direct factory endpoint.
+- **Top-level elementary-stream decoder** (`decoder::Mpeg4VideoDecoder`):
+  start-code scan (§6.2.1) → §6.2 configuration parsers → §6.2.4 GOV
+  time-code sync → §6.2.5 VOP headers → the per-coding-type macroblock
+  walks → `SequenceDecoder` display-order output. Implements the §6.3.5
+  time model (anchor `modulo_time_base` accumulation; B-VOPs count from
+  the previous display-order anchor) from which the §7.6.7 `TRB`/`TRD`
+  fall out as tick differences, retains the future anchor's per-MB
+  motion as the §7.6.9.5.1 co-located source, and reconstructs
+  `vop_coded == 0` VOPs as forward-reference copies.
+- **Bitstream-driven macroblock walks** (`vop_decode`): raster loops
+  that decode a whole rectangular progressive VOP straight off the
+  bitstream — I-VOP (per-block Figure 7-5 predictor resolution against
+  a running `IntraBlockGrid`, Table 6-25 `use_intra_dc_vlc` from the
+  running quantiser), P-VOP (`MvDriver` motion + §7.4 residuals + intra
+  MBs), S(GMC)-VOP (`mcsel` routing, §7.8.7.3 averaged-MV predictor
+  recording, warp geometry from the VOP trajectory), and B-VOP
+  (`BVopMvDriver` + §6.2.6 `co_located_not_coded` zero-bit macroblocks).
+- **§6.2.5.2 video-packet resync handling** in all four walks:
+  non-destructive stuffing+marker probe, `video_packet_header` decode,
+  and the §E.1.2 "treated like a VOP boundary" state reset (fresh
+  §7.4.3 / §7.6.5 predictor grids, quantiser restart from
+  `quant_scale`, re-stated `intra_dc_vlc_thr`); B-VOP packets may
+  resume ahead of the raster index across runs of zero-bit macroblocks.
+- **Real-stream conformance** (`tests/conformance.rs`): three
+  reference-encoder-produced 64×64 fixtures (intra-only with video
+  packets, I+4P, I/P/B with two consecutive B-VOPs) decode end-to-end
+  and match the reference decode within the twin-IDCT envelope (max ±2
+  per sample, no drift growth across the GOP).
+- **Traced intra-block decode** (`decode_intra_block_full`): returns
+  the §7.4.3 predictor by-products (post-prediction saturated `QF`
+  rows/columns + inverse-quantised `F[0][0]`) and implements the Table
+  6-25 `use_intra_dc_vlc == 0` path (differential DC carried by the AC
+  EVENT stream at scan position 0). `parse_vop_header_body` exposes the
+  reader-based §6.2.5 header parse the walks consume.
+
+### Fixed
+
+- **§7.6.5 chroma-MV derivation** (`chroma_mv`): the reduction
+  decomposed `sum/(2K)` against the half-sample floor and re-added the
+  table offset, double-counting the half step for odd residues (luma
+  `MVx = 3` → chroma `2` instead of `1`). The whole-pel part is
+  `sum div 4K` (two half-samples each) and Table 7-10/11/12/13 is
+  indexed directly by `sum mod 4K`.
+- **§6.3.3 B-VOP `resync_marker` length** (`video_packet`): the
+  `max(15 + fcode, 17)` applies to the **zero count**, so the shortest
+  B marker is 17 zeros + 1 = 18 bits; the old formula floored the total
+  bit count at 17 and mis-probed every B-VOP packet.
+- **§6.2.6 `co_located_not_coded`** (`vop_decode`): a B macroblock
+  whose co-located future-P macroblock was skipped transmits no bits at
+  all (the whole `modb` subtree is gated out) and reconstructs per
+  §7.6.9.6 as a forward zero-MV copy; the walk previously parsed a
+  `modb` and desynced.
+
 - **§7.6.1 decoded-picture buffer / reference-frame chain** (`framestore`):
   `DecodedFrame` owns the three 4:2:0 sample planes of one decoded VOP as
   flat `Vec<u8>` buffers, blits each reconstructed macroblock into place

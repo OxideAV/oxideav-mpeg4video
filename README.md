@@ -9,22 +9,47 @@ MP4V) — *not* the pre-standard Microsoft MPEG-4 family, which lives in
 
 ## Status
 
-Clean-room rebuild in progress. The decode pipeline is implemented as a
-set of composable, per-stage public modules covering configuration- and
-frame-header parsing, motion-vector reconstruction, residual decode and
-pixel reconstruction for I-, P-, B-, and S(GMC)-VOPs. The
-**reference-frame chain is now closed end-to-end**: a [`DecodedFrame`] /
-[`FrameStore`] decoded-picture buffer (§7.6.1) owns each decoded VOP's
-planes, the [`frame_decode`] frame-assembly drivers reconstruct a whole
-I-/P-/B-/S(GMC)-VOP against the correct reference plane(s) and blit it
-into a fresh frame, and the [`sequence::SequenceDecoder`] applies §6.1.3.8
-VOP reordering to emit frames in display order from a coding-order VOP
-stream. It is not yet wired into the runtime codec registry — `register`
-is a no-op placeholder, so the codec is consumed today through its direct
-module APIs (including the new frame-level drivers). There is no encoder.
+Clean-room rebuild: **the decoder is now a working end-to-end codec**.
+`decoder::Mpeg4VideoDecoder` consumes a raw MPEG-4 Visual elementary
+stream (start-code-delimited §6.2.1 units) and emits display-order
+frames: start-code scan → §6.2 configuration headers → §6.2.4 GOV /
+§6.2.5 VOP headers → the `vop_decode` bitstream macroblock walks (I /
+P / B / S(GMC), with §6.2.5.2 video-packet resync handling) → the
+§7.6.1 reference-frame chain → §6.1.3.8 display reorder. The §6.3.5
+time model derives each B-VOP's §7.6.7 `TRB`/`TRD` from the composed
+VOP times. **Real-stream conformance**: reference-encoder-produced
+intra-only, I+P and I/P/B fixtures decode end-to-end and match the
+reference decode within the twin-IDCT envelope (max ±2 per sample, no
+drift across the GOP — `tests/conformance.rs`). The crate **registers
+into the runtime codec registry** (`mpeg4video`, FourCCs XVID / DIVX /
+DX50 / FMP4 / MP4V / M4S2 + MP4 OTI `0x20`) via a packet decoder that
+supports extradata priming, seeks (`reset`), and the pixel-count DoS
+cap; `decoder::make_decoder` is the direct factory endpoint. The
+bitstream walks cover the rectangular progressive half-sample path —
+quarter-sample, interlaced texture, and data-partitioned streams are
+typed-rejected at the walk level (their per-stage modules exist below).
+There is no encoder.
 
 ## What works today
 
+- **End-to-end elementary-stream decode** (`decoder`):
+  [`Mpeg4VideoDecoder`] (start-code scan, §6.3.5 VOP time model,
+  §7.6.7 `TRB`/`TRD` derivation, `vop_coded == 0` forward-reference
+  copies) plus the registry-facing [`Mpeg4PacketDecoder`] /
+  [`make_decoder`] factory and a live `register()` (id `mpeg4video`,
+  the common FourCC tags + MP4 OTI `0x20`).
+- **Bitstream-driven macroblock walks** (`vop_decode`):
+  [`decode_i_vop_macroblocks`] (running quantiser + Table 6-25
+  `use_intra_dc_vlc` + per-block Figure 7-5 predictor resolution),
+  [`decode_p_vop_macroblocks`], [`decode_s_gmc_vop_macroblocks`]
+  (`mcsel` routing + §7.8.7.3 averaged-MV predictor recording), and
+  [`decode_b_vop_macroblocks`] (§6.2.6 `co_located_not_coded`
+  zero-bit macroblocks) — each with §6.2.5.2 video-packet resync
+  handling (probe, header decode, §E.1.2 predictor/quantiser reset).
+- **Real-stream conformance** against a black-box reference decode
+  (`tests/conformance.rs`): intra-only (with video packets), I+4P, and
+  I/P/B (two consecutive B-VOPs) fixtures match within the twin-IDCT
+  envelope.
 - **Configuration headers** (§6.2): Visual Object Sequence
   (`0x000001B0` + profile/level), Visual Object (`0x000001B5`, verid,
   video-signal-type, colour description), and Video Object Layer
@@ -176,96 +201,20 @@ module APIs (including the new frame-level drivers). There is no encoder.
 
 ## Not yet supported
 
-- Runtime registration (`register` is a no-op) and a single top-level
-  frame-decode entry point. The §7.6 **progressive P-VOP
-  motion-vector + luma-prediction subsystem is now wired end-to-end**:
-  [`MvDriver`] walks the macroblocks of a P-VOP in raster order —
-  dispatching skipped / intra / inter / inter4v per Table B.1, gathering
-  the Figure 7-34 candidates from the running [`MvGrid`], applying the
-  §7.6.5 median, decoding the §6.2.6.2 MVD body, and reconstructing the
-  §7.6.3 vector — and [`predict_luma_macroblock`] turns the result into
-  a §7.6.2 half-sample-interpolated 16×16 luma prediction block
-  (1-MV / inter4v / skipped), and [`predict_chroma_macroblock`] derives
-  the §6.1.3.4 / §7.6.5 4:2:0 chroma MV (`sum / 2K`) and produces the
-  8×8 Cb / Cr prediction. The §7.6.2 → §7.3 bridge is now closed at the
-  macroblock level: [`predict_inter_macroblock`] packs the prediction
-  into an `InterPredictionMacroblock`, and
-  [`reconstruct_pvop_macroblock`] runs the full
-  §7.6.2-predict + §7.3 `d = p + f` add + display clip end-to-end,
-  returning a `ReconstructedMacroblock` ready to blit (verified by a
-  frame-level test that drives a four-macroblock motion bitstream
-  through [`MvDriver`] and reassembles a 32×32 luma / 16×16 chroma
-  frame). **Reference-plane selection is now resolved**: the §7.6.1
-  [`FrameStore`] hands the forward reference plane to
-  [`assemble_p_vop_frame`], which reconstructs and blits a whole P-VOP;
-  what remains for a *fully bitstream-driven* P-VOP frame decoder is
-  threading the per-macroblock §7.4 residual-texture decode into the same
-  loop (the residual is currently supplied by the caller as
-  [`PVopMbContent`]). The **B-VOP motion
-  subsystem is now wired one step further**: [`BVopMvDriver::decode_vop`]
-  walks a progressive B-VOP in raster order with the §7.6.8 row-reset
-  predictor threading **and** threads the §6.2.6 / §7.4 residual decode
-  + `dbquant` running-quantiser accumulation into the same loop,
-  returning one [`BVopMbTexturedDecode`] (motion + residual) per
-  macroblock; [`BVopMbDecode::reconstruct`] closes the §7.6.9 → §7.3
-  bridge per macroblock. **Reference-plane selection is now resolved for
-  progressive B-VOPs too**: [`assemble_b_vop_frame`] pulls the bracketing
-  forward+backward anchors from the [`FrameStore`] and reconstructs +
-  blits a whole progressive B-VOP frame.
-  The **interlaced field-prediction B-VOP path is now wired into the
-  frame driver** for the three non-direct field modes:
-  [`BVopMvDriver::decode_field_macroblock`] decodes a field-predicted
-  macroblock (forward `mb_type == "0001"` / backward `"001"` /
-  bidirectional `"01"`), threads the §6.2.6 field motion bodies through
-  the §7.7.2.2 four-PMV bank ([`FieldPmvBank`], reset per row alongside
-  the progressive predictor), and emits a [`BVopFieldMbDecode`];
-  [`BVopFieldMbDecode::reconstruct`] runs the §7.7.2.2 field MC (forward /
-  backward / bidirectional-average) against the six reference planes plus
-  the §7.3 residual add + display clip, so an interlaced B-VOP
-  field-predicted macroblock decodes to real pixels. The §7.7.2.2
-  **interlaced direct** mode is now implemented as a standalone
-  derivation ([`interlaced_direct_mvs`] in the `bvop_field_direct`
-  module): the four derived field MVs `mvf[0..2]` / `mvb[0..2]` from the
-  co-located future macroblock's two forward field MVs, the single
-  transmitted `MVD[0]`, and the field-period `TRB[i]` / `TRD[i]` (the
-  `2*frame_distance + δ` conversion with the Table 7-16 `δ` parity
-  selection), plus [`interlaced_direct_prediction`] which runs the
-  §7.7.2.2 forward + backward (mvb[1]-for-both-fields) field MC and
-  averages them. **Interlaced direct mode is now wired into the frame
-  driver**: [`BVopMvDriver::decode_interlaced_direct_macroblock`] parses
-  the §6.2.6 header (a `modb == "1"` default direct, or an explicit Direct
-  `mb_type`), reads the single `MVD[0]` body (`f_code == 1`, §7.7.2.2;
-  implicitly zero for `modb == "1"`), and threads the caller-supplied
-  co-located *future* P-VOP macroblock's two forward field MVs + reference
-  fields ([`ColocatedFutureFieldMvs`]) and `top_field_first` through
-  [`interlaced_direct_mvs`] with the driver's frame-period `TRB` / `TRD`,
-  returning a [`BVopInterlacedDirectMbDecode`] whose `reconstruct` runs
-  the §7.7.2.2 → §7.3 forward/backward field-MC + average + residual add
-  + display clip. The caller establishes interlaced-direct applicability
-  (future macroblock field-predicted) and supplies the future field MVs
-  from the reference-frame chain via
-  [`ColocatedFutureFieldMvs::from_field_motion`], which builds them from a
-  decoded interlaced P-VOP macroblock's reconstructed forward field MVs
-  ([`FieldMotionVectors`]) and its §6.3.6.3 top/bottom field references.
-  A single **unified dispatch** entry
-  [`BVopMvDriver::decode_interlaced_macroblock`] parses the §6.2.6 header
-  once and routes each macroblock to the progressive / field-prediction /
-  interlaced-direct path automatically (driven by a per-MB
-  [`BVopInterlacedAnchor`] and returning a tagged [`BVopInterlacedMb`]),
-  so an interlaced B-VOP frame loop never has to peek the header to
-  pre-select a decode path. [`BVopMvDriver::decode_interlaced_vop`] then
-  closes the raster loop — the interlaced analogue of `decode_vop`: it
-  walks the interlaced B-VOP in raster order driving each macroblock
-  through the unified dispatch, resets both the progressive and §7.7.2.2
-  four-PMV predictors per row, applies each `dbquant`, and threads the
-  §7.4 residual decode into the same loop, returning one
-  [`BVopInterlacedTexturedDecode`] per macroblock, whose
-  [`BVopInterlacedTexturedDecode::reconstruct`] dispatches on the path
-  variant (progressive `BVopAnchorPlanes` / field & interlaced-direct
-  `BVopFieldReferences`) to close the §7.6.9 / §7.7.2.2 → §7.3 loop to
-  pixels. What remains for a full interlaced B-VOP *frame* decode is the
-  caller supplying each macroblock's co-located future/anchor state from
-  the reference-frame chain and blitting the per-MB reconstruction.
+- Quarter-sample, interlaced-texture (dct_type / alternate vertical
+  scan), and data-partitioned streams in the **bitstream walks** — the
+  per-stage modules below already implement large parts of these
+  (quarter-pel interpolation, field MC/predictors, the §6.2.5.3
+  data-partition layouts + RVLC recovery), but `vop_decode` /
+  `decoder` reject the VOL configurations with typed errors rather
+  than mis-decode. OBMC (`obmc_disable == 0`) is likewise decoded at
+  the module level but not wired into the P-walk prediction.
+- Per-sub-block co-located vectors for B-VOP direct mode over a 4-MV
+  future anchor (the walk applies the first sub-block vector to all
+  four), and the §7.6.9.6 averaged-MV substitution for a skipped
+  co-located S(GMC) macroblock (the walk uses the zero-vector
+  fallback; the AMV is computed in the S walk but not yet retained
+  per-macroblock).
 - Encoder.
 - Blitting the §E.1.4.4 RVLC recovery into a reconstructed *frame*. The
   driver is now assembled — [`recover_video_packet_dct`] detects the
