@@ -8,6 +8,44 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **§6.2.5.3 data-partitioned I-/P-VOP decode** wired into the frame
+  loop: `decode_i_vop_macroblocks_dp` / `decode_p_vop_macroblocks_dp`
+  walk the per-packet partition structure (partition 1 → 19-bit
+  `dc_marker` / 17-bit `motion_marker` → partition 2 → texture
+  partition) with §E.1.2 prediction resets, thread the §7.6.5
+  predictor grid through partition 1 (`DpMbEvent` closure), decode the
+  texture partition against the header-partition intra DC, and select
+  the Table B.23 reversible VLC when `reversible_vlc == 1`. B-VOPs
+  keep the combined syntax (§6.2.5.3 NOTE). Black-box validated
+  (data-partitioned I/P/B conformance fixture inside the twin-IDCT
+  envelope).
+- **Interlaced direct-mode B-frame conformance fixture** (176×144, 30
+  interlaced-direct MBs): classification matches the fixture's
+  independent per-VOP distribution 30/30.
+
+### Fixed
+
+- **§7.6.5 intra neighbour candidates**: an intra macroblock
+  contributes a *valid zero* motion-vector candidate to the median
+  predictor (the four validity rules only invalidate transparent /
+  outside-packet neighbours). Previously recorded as invalid,
+  mis-predicting inter MBs bordering intra MBs next to motion.
+- **Table 7-15 unified four-PMV bank**: frame- and field-predicted
+  interlaced-B macroblocks now share one predictor bank (frame forward
+  uses PMV[0], updates PMV[0,1]; backward PMV[2] → PMV[2,3]);
+  previously two independent banks never saw each other's updates.
+- **§7.7.2.2 field backward reconstruction**: the printed
+  `PMV[3].x = PMV[1].x + MVD[1].x` (a forward slot) is corrected to
+  the same-slot `PMV[3].x`, matching Table 7-15 and the sibling
+  forward listing.
+- **§7.7.2.2 interlaced-direct backward MC (erratum E1)**: `mvb[0]`
+  drives the top field, `mvb[1]` the bottom (printed code passes
+  `mvb[1]` in all four slots).
+- **Direct-mode delta with `vop_fcode > 1`**: the §7.6.9.5.2 /
+  §7.7.2.2 delta is decoded assuming `f_code == 1` — unit
+  reconstruction scale, not just "no residual bits"; previously the
+  reconstruction still scaled by `f`.
+
 - **Quarter-sample decode path end-to-end** (§7.6.2.2): the P-, S(GMC)-
   and B-VOP walks accept `quarter_sample == 1` VOLs. The sub-pel
   cascade now runs on the Figure 7-30 mirrored `(M+1)×(N+1)` reference

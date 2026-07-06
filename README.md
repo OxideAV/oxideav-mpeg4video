@@ -36,14 +36,30 @@ pts through the §6.1.3.8 reorder + §6.3.5 tick times), and
 **interlaced tools**: §7.7.1 field DCT + alternate vertical scan,
 §7.7.2.1 field-predicted P macroblocks (CASE 1/2/3 predictors, field
 MC, Div2Round field chroma), and §7.7.2.2 interlaced B-VOPs (field
-forward / backward / bidirectional via the four-PMV bank + interlaced
-direct mode; the spec's self-inconsistent direct-mode pseudo code
-leaves a bounded, documented deviation vs the reference decode on
-isolated macroblocks). Data-partitioned streams are typed-rejected at
-the walk level (their per-stage modules exist below). Fifteen
-black-box conformance fixtures (intra / IP / IPB / qpel / 4-MV /
-interlaced × {intra, alt-scan, IP, IP-motion, IPB}) match the
-reference decode within the twin-IDCT envelope. There is no encoder.
+forward / backward / bidirectional through the Table 7-15 **unified
+four-PMV bank** shared by frame- and field-predicted macroblocks +
+interlaced direct mode). The §7.7.2.2 printed pseudo code carries
+several defects; this decoder implements the corrected readings
+(erratum E1 backward-call field ordering, E2 `MVD[0]` gate, same-slot
+`PMV[3].x` field-backward reconstruction, §7.6.5 intra neighbours as
+valid zero MV candidates, and the f_code==1 direct-delta rule), each
+**black-box-arbitrated** against a conformant interlaced direct-mode
+B-frame stream (docs fixture, refs #176). One bounded, documented
+deviation remains: the conformant interlaced-*direct* vector
+derivation contradicts both the printed pseudo code and its erratum
+reading on isolated macroblocks (18 of the fixture's 30
+interlaced-direct MBs, ≤5% of a frame's samples) — resolving it needs
+a per-MB derived-vector trace. **§6.2.5.3 data-partitioned I-/P-VOPs
+decode end-to-end** (`decode_i_vop_macroblocks_dp` /
+`decode_p_vop_macroblocks_dp`: per-packet dc_marker / motion_marker
+partition structure, §E.1.2 prediction resets, header-partition intra
+DC feeding the texture partition, Table B.23 RVLC texture when
+`reversible_vlc == 1`), with B-VOPs on the combined syntax per the
+§6.2.5.3 NOTE. Seventeen black-box conformance fixtures (intra / IP /
+IPB / qpel / 4-MV / data-partitioned IPB / interlaced × {intra,
+alt-scan, IP, IP-motion, IPB, direct-B 176×144}) match the reference
+decode within the twin-IDCT envelope (plus the bounded
+interlaced-direct deviation above). There is no encoder.
 
 ## What works today
 
