@@ -138,6 +138,26 @@ impl FieldPmvBank {
         mv
     }
 
+    /// Frame forward-direction update without reconstruction: set both
+    /// forward field PMVs (slots 0, 1) to an already-reconstructed
+    /// frame vector (Table 7-15 "Frame forward → updates 0,1"; §7.7.2.2
+    /// "when a frame macroblock is decoded, the two field PMVs for each
+    /// prediction direction are set to the same frame value"). Used by
+    /// the driver when the frame vector reconstructs through the
+    /// §7.6.3 wrap rather than the bank's plain add.
+    pub fn set_frame_forward(&mut self, mv: MotionVector) {
+        self.pmv[PMV_TOP_FWD] = mv;
+        self.pmv[PMV_BOT_FWD] = mv;
+    }
+
+    /// Frame backward-direction update without reconstruction: set both
+    /// backward field PMVs (slots 2, 3) to an already-reconstructed
+    /// frame vector (Table 7-15 "Frame backward → updates 2,3").
+    pub fn set_frame_backward(&mut self, mv: MotionVector) {
+        self.pmv[PMV_TOP_BWD] = mv;
+        self.pmv[PMV_BOT_BWD] = mv;
+    }
+
     /// Frame bidirectional mode (Table 7-15): uses PMV[0] + PMV[2],
     /// updates all four. `mvd_fwd` / `mvd_bwd` are the two transmitted
     /// differentials. Returns `(forward, backward)` reconstructed MVs.
@@ -170,22 +190,26 @@ impl FieldPmvBank {
     /// Field backward mode (`mb_type == "001"`, `field_prediction == 1`):
     /// uses PMV[2] + PMV[3], updates them.
     ///
-    /// Mirrors the §7.6.8 backward pseudo-code, whose top-field update
-    /// reads PMV[2] but whose bottom-field update reads PMV[1] for its
-    /// `x` (the spec's `PMV[3].x = PMV[1].x + MVD[1].x`) while taking
-    /// PMV[3].y for its `y`. This asymmetry is reproduced faithfully.
+    /// The §7.7.2.2 backward pseudo-code as printed reads
+    /// `PMV[3].x = PMV[1].x + MVD[1].x` — the *forward* bottom slot —
+    /// for the backward bottom-field x while taking `PMV[3].y` for its
+    /// y. That contradicts Table 7-15 ("Field backward: PMVs used 2,3"),
+    /// the sibling forward listing (`PMV[1].x = PMV[1].x + MVD[1].x`,
+    /// same-slot), and its own y component; it is the same class of
+    /// printed defect as the mvb[] slot swap documented in
+    /// `docs/video/mpeg4-visual/mpeg4-visual-errata.md`. The corrected
+    /// same-slot reading (`PMV[3].x = PMV[3].x + MVD[1].x`) is
+    /// arbitrated against a conformant black-box stream
+    /// (tests/conformance.rs, interlaced-direct fixture: field-backward
+    /// macroblocks only reproduce the reference decode with the
+    /// same-slot read).
     pub fn field_backward(
         &mut self,
         mvd_top: MotionVector,
         mvd_bot: MotionVector,
     ) -> FieldMvDirection {
         let top = reconstruct_field_component(self.pmv[PMV_TOP_BWD], mvd_top);
-        // §7.6.8: PMV[3].x = PMV[1].x + MVD[1].x (note PMV[1], not [3]);
-        //          PMV[3].y = 2 * (PMV[3].y / 2 + MVD[1].y).
-        let bottom = MotionVector {
-            x: self.pmv[PMV_BOT_FWD].x + mvd_bot.x,
-            y: 2 * (self.pmv[PMV_BOT_BWD].y / 2 + mvd_bot.y),
-        };
+        let bottom = reconstruct_field_component(self.pmv[PMV_BOT_BWD], mvd_bot);
         self.pmv[PMV_TOP_BWD] = top;
         self.pmv[PMV_BOT_BWD] = bottom;
         FieldMvDirection { top, bottom }
@@ -312,16 +336,19 @@ mod tests {
     }
 
     #[test]
-    fn field_backward_bottom_x_reads_forward_bottom_slot() {
-        // §7.6.8 quirk: field-backward bottom-field x reads PMV[1]
-        // (bottom forward), not PMV[3].
+    fn field_backward_bottom_x_reads_backward_bottom_slot() {
+        // The printed §7.7.2.2 backward listing reads PMV[1].x (a
+        // *forward* slot) for the backward bottom-field x — a printed
+        // defect (see the `field_backward` doc comment); the corrected
+        // same-slot reading uses PMV[3]. A forward decode must
+        // therefore leave the backward reconstruction untouched.
         let mut bank = FieldPmvBank::new();
         bank.field_forward(mv(11, 0), mv(22, 0)); // PMV[1].x = 22
         let out = bank.field_backward(mv(1, 1), mv(2, 1));
         // top.x = PMV[2].x(0) + 1 = 1.
         assert_eq!(out.top.x, 1);
-        // bottom.x = PMV[1].x(22) + 2 = 24.
-        assert_eq!(out.bottom.x, 24);
+        // bottom.x = PMV[3].x(0) + 2 = 2 — NOT the forward slot's 22.
+        assert_eq!(out.bottom.x, 2);
     }
 
     #[test]

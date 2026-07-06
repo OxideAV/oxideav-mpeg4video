@@ -340,25 +340,6 @@ impl Default for CoLocatedAnchor {
     }
 }
 
-/// §7.6.8 running motion-vector predictor pair for one direction.
-///
-/// Reset to `(0, 0)` at the start of every macroblock row; updated only
-/// after a macroblock that decoded a vector in this direction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct DirectionPredictor {
-    forward: MotionVector,
-    backward: MotionVector,
-}
-
-impl Default for DirectionPredictor {
-    fn default() -> Self {
-        Self {
-            forward: MotionVector { x: 0, y: 0 },
-            backward: MotionVector { x: 0, y: 0 },
-        }
-    }
-}
-
 /// Per-VOP texture parameters the residual-threaded B-VOP frame loop
 /// ([`BVopMvDriver::decode_vop`]) needs in addition to the motion state.
 ///
@@ -784,10 +765,10 @@ pub struct BVopMvDriver {
     /// finer grid, and direct mode converts the co-located MV to
     /// half-pel per §7.6.9.5.2 fourth paragraph.
     quarter_sample: bool,
-    predictor: DirectionPredictor,
-    /// §7.7.2.2 four-PMV bank for the interlaced field-prediction path,
-    /// threaded alongside the progressive `predictor` and reset together
-    /// at each row start.
+    /// §7.6.8 / §7.7.2.2 four-PMV predictor bank (Table 7-14), reset at
+    /// each row start. Progressive frame modes read/write slots 0 and 2
+    /// (with the pair-update of Table 7-15, which is invisible to a
+    /// purely progressive VOP); interlaced field modes use all four.
     field_predictor: FieldPmvBank,
 }
 
@@ -817,7 +798,6 @@ impl BVopMvDriver {
             trb,
             trd,
             quarter_sample: false,
-            predictor: DirectionPredictor::default(),
             field_predictor: FieldPmvBank::new(),
         }
     }
@@ -851,7 +831,6 @@ impl BVopMvDriver {
     /// (and after a video-packet `resync_marker`, which §7.6.8 treats
     /// the same as a new row for predictor purposes).
     pub fn start_row(&mut self) {
-        self.predictor = DirectionPredictor::default();
         self.field_predictor.reset_row();
     }
 
@@ -1518,8 +1497,9 @@ impl BVopMvDriver {
             forward: zero,
             backward: zero,
         }; MB_SUB_BLOCKS];
-        // §7.6.8: forward mode updates only the forward predictor.
-        self.predictor.forward = zero;
+        // §7.6.8 / Table 7-15: forward mode updates only the forward
+        // predictor pair.
+        self.field_predictor.set_frame_forward(zero);
         Ok(BVopMbDecode {
             mb_type: BVopMbType::Forward,
             prediction_mode: BVopPredictionMode::ForwardOnly,
@@ -1586,14 +1566,18 @@ impl BVopMvDriver {
             self.vop_fcode_backward,
         )?;
         let delta = frame_delta(bodies.forward)?;
-        let mv = reconstruct_motion_vector(
-            delta,
-            self.predictor.forward.x,
-            self.predictor.forward.y,
-            self.vop_fcode_forward,
-        )
-        .map_err(BVopMbParseError::Motion)?;
-        self.predictor.forward = mv;
+        let pred = self
+            .field_predictor
+            .get(crate::bvop_field_predictor::PMV_TOP_FWD);
+        let mv = reconstruct_motion_vector(delta, pred.x, pred.y, self.vop_fcode_forward)
+            .map_err(BVopMbParseError::Motion)?;
+        // Table 7-15: frame forward uses PMV[0], updates PMV[0] and
+        // PMV[1] (both forward field slots take the frame value). In a
+        // progressive B-VOP only slot 0 is ever read back, so this is
+        // exactly the §7.6.8 running forward predictor; in an
+        // interlaced B-VOP the shared bank is what makes frame- and
+        // field-predicted macroblocks see each other's updates.
+        self.field_predictor.set_frame_forward(mv);
         let mvs = replicated_pair(mv, MotionVector { x: 0, y: 0 });
         let fwd_chroma = self.chroma_from(&[mv])?;
         Ok(BVopMbDecode {
@@ -1623,14 +1607,13 @@ impl BVopMvDriver {
             self.vop_fcode_backward,
         )?;
         let delta = frame_delta(bodies.backward)?;
-        let mv = reconstruct_motion_vector(
-            delta,
-            self.predictor.backward.x,
-            self.predictor.backward.y,
-            self.vop_fcode_backward,
-        )
-        .map_err(BVopMbParseError::Motion)?;
-        self.predictor.backward = mv;
+        let pred = self
+            .field_predictor
+            .get(crate::bvop_field_predictor::PMV_TOP_BWD);
+        let mv = reconstruct_motion_vector(delta, pred.x, pred.y, self.vop_fcode_backward)
+            .map_err(BVopMbParseError::Motion)?;
+        // Table 7-15: frame backward uses PMV[2], updates PMV[2]/PMV[3].
+        self.field_predictor.set_frame_backward(mv);
         let mvs = replicated_pair(MotionVector { x: 0, y: 0 }, mv);
         let bwd_chroma = self.chroma_from(&[mv])?;
         Ok(BVopMbDecode {
@@ -1661,22 +1644,22 @@ impl BVopMvDriver {
         )?;
         let fwd_delta = frame_delta(bodies.forward)?;
         let bwd_delta = frame_delta(bodies.backward)?;
-        let fwd_mv = reconstruct_motion_vector(
-            fwd_delta,
-            self.predictor.forward.x,
-            self.predictor.forward.y,
-            self.vop_fcode_forward,
-        )
-        .map_err(BVopMbParseError::Motion)?;
-        let bwd_mv = reconstruct_motion_vector(
-            bwd_delta,
-            self.predictor.backward.x,
-            self.predictor.backward.y,
-            self.vop_fcode_backward,
-        )
-        .map_err(BVopMbParseError::Motion)?;
-        self.predictor.forward = fwd_mv;
-        self.predictor.backward = bwd_mv;
+        let fwd_pred = self
+            .field_predictor
+            .get(crate::bvop_field_predictor::PMV_TOP_FWD);
+        let bwd_pred = self
+            .field_predictor
+            .get(crate::bvop_field_predictor::PMV_TOP_BWD);
+        let fwd_mv =
+            reconstruct_motion_vector(fwd_delta, fwd_pred.x, fwd_pred.y, self.vop_fcode_forward)
+                .map_err(BVopMbParseError::Motion)?;
+        let bwd_mv =
+            reconstruct_motion_vector(bwd_delta, bwd_pred.x, bwd_pred.y, self.vop_fcode_backward)
+                .map_err(BVopMbParseError::Motion)?;
+        // Table 7-15: frame bidirectional uses PMV[0] + PMV[2], updates
+        // all four slots (each direction pair takes its frame value).
+        self.field_predictor.set_frame_forward(fwd_mv);
+        self.field_predictor.set_frame_backward(bwd_mv);
         let mvs = replicated_pair(fwd_mv, bwd_mv);
         let fwd_chroma = self.chroma_from(&[fwd_mv])?;
         let bwd_chroma = self.chroma_from(&[bwd_mv])?;
@@ -2175,11 +2158,19 @@ mod tests {
     #[test]
     fn start_row_resets_predictors() {
         let mut driver = BVopMvDriver::new(2, 2, 2, 2, 1, 2);
-        driver.predictor.forward = MotionVector { x: 9, y: 9 };
-        driver.predictor.backward = MotionVector { x: -9, y: -9 };
+        driver
+            .field_predictor
+            .set_frame_forward(MotionVector { x: 9, y: 9 });
+        driver
+            .field_predictor
+            .set_frame_backward(MotionVector { x: -9, y: -9 });
         driver.start_row();
-        assert_eq!(driver.predictor.forward, MotionVector { x: 0, y: 0 });
-        assert_eq!(driver.predictor.backward, MotionVector { x: 0, y: 0 });
+        for slot in 0..4 {
+            assert_eq!(
+                driver.field_predictor.get(slot),
+                MotionVector { x: 0, y: 0 }
+            );
+        }
     }
 
     /// Table B.12 codeword for `mv_data == 2` (`0010`, 4 bits). With

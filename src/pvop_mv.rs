@@ -260,9 +260,20 @@ impl MvDriver {
 
         match mb_type {
             Some(DerivedMbType::Intra) | Some(DerivedMbType::IntraQ) | None => {
-                // §7.6.5 — intra (or unspecified) MB is not a valid MV
-                // candidate. Recorded as Absent.
-                self.grid.record_absent(mb_row, mb_col)?;
+                // §7.6.5 — the four validity rules invalidate only
+                // *transparent* neighbours (and those outside the VOP /
+                // video packet / GOB). An intra neighbour is not
+                // transparent; it simply carries no vector of its own,
+                // so its candidate contribution is the zero vector —
+                // mirroring the §7.6.9.5.1 co-located-intra zero
+                // fallback and the §6.3.6 not-coded convention.
+                // Arbitrated against a conformant black-box stream
+                // (tests/conformance.rs interlaced_direct fixture):
+                // recording intra as *invalid* mis-predicts every inter
+                // MB whose left/above/above-right neighbours include an
+                // intra MB next to a moving area.
+                self.grid
+                    .record_one_mv(mb_row, mb_col, MotionVector { x: 0, y: 0 })?;
                 Ok(PvopMbMotion::Intra)
             }
             Some(DerivedMbType::Inter) | Some(DerivedMbType::InterQ) => {
@@ -805,7 +816,7 @@ mod tests {
     }
 
     #[test]
-    fn intra_mb_records_absent() {
+    fn intra_mb_records_zero_candidate() {
         let mut driver = MvDriver::new(2, 2, 1);
         let data = [];
         let mut br = BitReader::new(&data);
@@ -813,10 +824,11 @@ mod tests {
             .decode_macroblock(&mut br, 0, 0, false, Some(DerivedMbType::Intra))
             .unwrap();
         assert_eq!(out, PvopMbMotion::Intra);
-        // Intra MB is an invalid neighbour → MV1 of (0, 1) block 0 is
-        // None.
+        // §7.6.5: only *transparent* / outside-packet neighbours are
+        // "not valid"; an intra neighbour contributes a valid zero
+        // vector (black-box arbitrated — see decode_macroblock).
         let cands = driver.grid().predictor_candidates(0, 1, 0).unwrap();
-        assert_eq!(cands[0], None);
+        assert_eq!(cands[0], Some(MotionVector { x: 0, y: 0 }));
     }
 
     #[test]

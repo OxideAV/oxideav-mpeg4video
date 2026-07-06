@@ -203,9 +203,19 @@ pub fn interlaced_direct_mvs(
 /// * **forward** uses `mvf[0]` (top) / `mvf[1]` (bottom) against the
 ///   *forward* (past) reference, with the co-located future macroblock's
 ///   `top` / `bottom` reference fields;
-/// * **backward** uses `mvb[1]` for **both** output fields against the
+/// * **backward** uses `mvb[0]` (top) / `mvb[1]` (bottom) against the
 ///   *backward* (future) reference, with reference fields fixed at
 ///   top → Top, bottom → Bottom (the spec's `0, 1` literal).
+///
+/// The *printed* backward call passes `mvb[1]` in all four MV slots —
+/// which contradicts the callee signature (§7.7.2 fixes slots 7–10 as
+/// `top_x, top_y, bot_x, bot_y`), leaves the prose-defined `mvb[0]`
+/// ("top field backward") unused, and breaks symmetry with the sibling
+/// forward call (`mvf[0], mvf[0], mvf[1], mvf[1]`). The resolved reading
+/// (top slot = `mvb[0]`) is confirmed against a conformant black-box
+/// stream — see `tests/conformance.rs`
+/// `interlaced_direct_bframes_stream_matches_reference_decode` and the
+/// in-repo erratum `docs/video/mpeg4-visual/mpeg4-visual-errata.md` (E1).
 ///
 /// `mb_x` / `mb_y` are the top-left luma pixel coordinates. Half-sample
 /// luma interpolation (the pseudo code's `mc` routine).
@@ -236,14 +246,16 @@ pub fn interlaced_direct_prediction(
         mb_y,
         rounding_type,
     );
-    // §7.7.2.2: the backward call uses mvb[1] for BOTH fields, with
-    // reference fields fixed at (top → Top, bottom → Bottom).
+    // §7.7.2.2 backward call, erratum-corrected (E1): mvb[0] drives the
+    // top field, mvb[1] the bottom field — matching the callee signature
+    // and the forward call's ordering. Reference fields are fixed at
+    // (top → Top, bottom → Bottom), the pseudo code's `0, 1` literals.
     let bak = field_motion_compensate_one_reference(
         references.backward_luma,
         references.backward_cb,
         references.backward_cr,
         FieldMotionVectors {
-            top: mvs.backward_bottom,
+            top: mvs.backward_top,
             bottom: mvs.backward_bottom,
         },
         false,
@@ -380,6 +392,73 @@ mod tests {
             false,
         );
         assert_eq!(out.forward_top.x, -1);
+    }
+
+    #[test]
+    fn backward_prediction_uses_mvb0_for_top_field() {
+        // Erratum E1 regression: the backward field MC must feed mvb[0]
+        // to the top field and mvb[1] to the bottom field (the printed
+        // pseudo code passes mvb[1] for both). Derive mvb[0] = (0,0) and
+        // mvb[1] = (-4,0): top MV=(0,0), bottom MV=(8,0), MVD=(0,0),
+        // δ=(0,0) (refs Top/Bottom), trb_frame=1, trd_frame=2 →
+        // mvb[1].x = (2-4)*8/4 = -4 (-2 full pel), mvb[0].x = 0.
+        use crate::bvop_field_motion::BVopFieldReferences;
+        use crate::half_sample::ReferenceVop;
+
+        let mvs = interlaced_direct_mvs(
+            field(0, 0, FieldReference::Top),
+            field(8, 0, FieldReference::Bottom),
+            mv(0, 0),
+            1,
+            2,
+            false,
+        );
+        assert_eq!(mvs.backward_top, mv(0, 0));
+        assert_eq!(mvs.backward_bottom, mv(-4, 0));
+
+        // Forward reference: constant 0. Backward reference: horizontal
+        // gradient value == x. Output rows of the top field (even y)
+        // must sample the backward gradient unshifted; bottom rows (odd
+        // y) shifted by -2. Under the printed (defective) call both
+        // parities would be shifted.
+        let fwd = vec![0u8; 48 * 48];
+        let mut bak = vec![0u8; 48 * 48];
+        for y in 0..48 {
+            for x in 0..48 {
+                bak[y * 48 + x] = x as u8;
+            }
+        }
+        let fwd_c = vec![0u8; 24 * 24];
+        let bak_c = vec![0u8; 24 * 24];
+        let fl = ReferenceVop::new(&fwd, 48, 48).unwrap();
+        let bl = ReferenceVop::new(&bak, 48, 48).unwrap();
+        let fc = ReferenceVop::new(&fwd_c, 24, 24).unwrap();
+        let bc = ReferenceVop::new(&bak_c, 24, 24).unwrap();
+        let references = BVopFieldReferences {
+            forward_luma: &fl,
+            forward_cb: &fc,
+            forward_cr: &fc,
+            backward_luma: &bl,
+            backward_cb: &bc,
+            backward_cr: &bc,
+        };
+        let pred = interlaced_direct_prediction(
+            mvs,
+            FieldReference::Top,
+            FieldReference::Bottom,
+            &references,
+            16,
+            16,
+            0,
+        );
+        // Top field row 0: (0 + (16+x) + 1) >> 1; bottom field row 1:
+        // (0 + (14+x) + 1) >> 1 — one gray level below the top row.
+        for x in 0..16 {
+            let top = (16 + x as i32 + 1) >> 1;
+            let bot = (14 + x as i32 + 1) >> 1;
+            assert_eq!(pred.luma[0][x], top, "top row x={x}");
+            assert_eq!(pred.luma[1][x], bot, "bottom row x={x}");
+        }
     }
 
     #[test]

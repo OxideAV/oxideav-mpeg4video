@@ -324,7 +324,12 @@ pub fn decode_motion_vector_delta(
     vop_fcode: u8,
 ) -> Result<MotionVectorDelta, MotionParseError> {
     let (f, _low, _high, _range) = fcode_bounds(vop_fcode)?;
-    let reads_residual = mode != MvMode::Direct && f != 1;
+    // §7.6.9.5.2 / §7.7.2.2: the direct-mode delta "is decoded assuming
+    // f_code == 1 regardless of the number in VOP header" — no residual
+    // bits are read AND the reconstruction scale is 1 (MVD == mv_data),
+    // whatever the VOP's fcode says.
+    let f = if mode == MvMode::Direct { 1 } else { f };
+    let reads_residual = f != 1;
 
     let h_data = decode_mv_data(br)?;
     let h_residual = if reads_residual && h_data != 0 {
@@ -1608,11 +1613,12 @@ mod tests {
 
     #[test]
     fn direct_mode_never_reads_residual() {
-        // Even with vop_fcode != 1, the direct branch reads only the
-        // two mv_data VLCs. h_data = 2 (0010), v_data = -2 (0011). With
-        // no residual the §7.6.3 reconstruction still applies (f != 1),
-        // giving MVDx = (2-1)*2 + 0 + 1 = 3, MVDy = -((2-1)*2 + 0 + 1)
-        // = -3.
+        // §7.6.9.5.2 / §7.7.2.2: the direct delta "is decoded assuming
+        // f_code == 1 regardless of the number in VOP header". Even
+        // with vop_fcode == 2 the direct branch reads only the two
+        // mv_data VLCs *and* reconstructs with f == 1, so MVD equals
+        // mv_data directly: h_data = 2 (0010) → MVDx = 2, v_data = -2
+        // (0011) → MVDy = -2.
         let mut w = BitWriter::new();
         w.write_bits(0b0010, 4); // h_data = 2
         w.write_bits(0b0011, 4); // v_data = -2 — no residuals follow
@@ -1621,8 +1627,8 @@ mod tests {
         let data = w.buf;
         let mut br = BitReader::new(&data);
         let mvd = decode_motion_vector_delta(&mut br, MvMode::Direct, 2).unwrap();
-        assert_eq!(mvd.dx, 3);
-        assert_eq!(mvd.dy, -3);
+        assert_eq!(mvd.dx, 2);
+        assert_eq!(mvd.dy, -2);
         // Confirm the reader stopped right after the two 4-bit VLCs.
         assert_eq!(br.read_bits(8).unwrap(), 0xAA);
     }
