@@ -83,6 +83,10 @@ pub enum VopDecodeError {
     BVop(BVopMvDriverError),
     /// A §6.2.5 `video_packet_header` failed to parse.
     VideoPacket(VideoPacketParseError),
+    /// A §6.2.5.3 data-partitioned partition structure failed to parse
+    /// (missing `dc_marker` / `motion_marker`, truncated partition, or
+    /// a header field inside a partition failed).
+    DataPartition(crate::data_partition::DataPartitionError),
     /// A video packet's `macroblock_number` did not equal the next
     /// macroblock in raster order — the packet skips ahead (an
     /// error-resilience gap this clean-path walk does not conceal).
@@ -105,6 +109,7 @@ impl core::fmt::Display for VopDecodeError {
             VopDecodeError::Texture(e) => write!(f, "vop decode: texture: {e}"),
             VopDecodeError::BVop(e) => write!(f, "vop decode: b-vop macroblock: {e}"),
             VopDecodeError::VideoPacket(e) => write!(f, "vop decode: video_packet_header: {e}"),
+            VopDecodeError::DataPartition(e) => write!(f, "vop decode: data partition: {e}"),
             VopDecodeError::VideoPacketSkip {
                 packet_mb,
                 expected_mb,
@@ -163,6 +168,16 @@ fn check_vol_supported(vol: &VolHeader) -> Result<(), VopDecodeError> {
     if vol.video_object_layer_shape != 0 {
         return Err(VopDecodeError::Unsupported("non-rectangular shape"));
     }
+    Ok(())
+}
+
+/// The combined-syntax I-/P-/S-walk gate: a `data_partitioned` VOL
+/// rearranges the macroblock layer into the §6.2.5.3 partitions, which
+/// the [`decode_i_vop_macroblocks_dp`] / [`decode_p_vop_macroblocks_dp`]
+/// walks decode instead. (B-VOPs always use the combined syntax —
+/// §6.2.5.3 NOTE: data partitioning is not supported in B-VOPs — so the
+/// B walks do not call this.)
+fn check_combined_syntax(vol: &VolHeader) -> Result<(), VopDecodeError> {
     if vol.data_partitioned {
         return Err(VopDecodeError::Unsupported("data_partitioned"));
     }
@@ -355,6 +370,7 @@ pub fn decode_i_vop_macroblocks(
     vop: &VopHeader,
 ) -> Result<Vec<ReconstructedMacroblock>, VopDecodeError> {
     check_vol_supported(vol)?;
+    check_combined_syntax(vol)?;
     if !matches!(vop.coding_type, VopCodingType::I) {
         return Err(VopDecodeError::Unsupported("not an I-VOP"));
     }
@@ -415,6 +431,348 @@ pub fn decode_i_vop_macroblocks(
     Ok(out)
 }
 
+/// Decode the six §6.2.7 `block(i)` bodies of one **intra** macroblock
+/// from a §6.2.5.3 data-partitioned *texture partition*, with per-block
+/// §7.4.3 predictors from `grid`.
+///
+/// The differential intra DC (when the packet used the Table 6-25 DC
+/// VLC) was already decoded from the header partition and arrives in
+/// `supplied_dc` (Figure 6-8 block order); `None` means the DC is coded
+/// as an AC coefficient inside the texture partition. `reversible_vlc`
+/// selects the Table B.23 RVLC Tcoef table for the AC EVENT loops.
+#[allow(clippy::too_many_arguments)]
+fn decode_intra_mb_partitioned(
+    br: &mut BitReader<'_>,
+    grid: &mut IntraBlockGrid,
+    mb_row: usize,
+    mb_col: usize,
+    coded: [bool; 6],
+    supplied_dc: Option<[i32; 6]>,
+    reversible_vlc: bool,
+    ctx: MacroblockTextureContext,
+    quant_matrix: &[[u8; 8]; 8],
+) -> Result<IntraMacroblock, VopDecodeError> {
+    let mut blocks: [[[i32; 8]; 8]; 6] = [[[0i32; 8]; 8]; 6];
+    for (i, block) in blocks.iter_mut().enumerate() {
+        let predictors =
+            grid.predictors_for(mb_row, mb_col, i, ctx.bits_per_pixel, ctx.quantiser_scale);
+        let full = crate::block::decode_intra_block_partitioned(
+            br,
+            i,
+            coded[i],
+            supplied_dc.map(|dc| dc[i]),
+            reversible_vlc,
+            ctx,
+            predictors,
+            quant_matrix,
+        )?;
+        grid.record(
+            mb_row,
+            mb_col,
+            i,
+            Some(BlockNeighbour::from_qf(
+                &full.qf,
+                full.dc,
+                ctx.quantiser_scale,
+            )),
+        );
+        *block = full.spatial;
+    }
+
+    let mut luma = [[0i32; 16]; 16];
+    const LUMA_OFFSETS: [(usize, usize); 4] = [(0, 0), (0, 8), (8, 0), (8, 8)];
+    for (b, &(row_off, col_off)) in LUMA_OFFSETS.iter().enumerate() {
+        for y in 0..8 {
+            for x in 0..8 {
+                luma[row_off + y][col_off + x] = blocks[b][y][x];
+            }
+        }
+    }
+    Ok(IntraMacroblock {
+        luma,
+        cb: blocks[4],
+        cr: blocks[5],
+    })
+}
+
+/// Decode one **inter** macroblock's six residual blocks from a
+/// data-partitioned texture partition and assemble the
+/// [`InterMacroblock`](crate::block::InterMacroblock) residual.
+fn decode_inter_mb_partitioned(
+    br: &mut BitReader<'_>,
+    coded: [bool; 6],
+    reversible_vlc: bool,
+    ctx: MacroblockTextureContext,
+    quant_matrix: &[[u8; 8]; 8],
+) -> Result<crate::block::InterMacroblock, VopDecodeError> {
+    let mut blocks: [[[i32; 8]; 8]; 6] = [[[0i32; 8]; 8]; 6];
+    for (i, block) in blocks.iter_mut().enumerate() {
+        *block = crate::block::decode_inter_block_partitioned(
+            br,
+            i,
+            coded[i],
+            reversible_vlc,
+            ctx,
+            quant_matrix,
+        )?;
+    }
+    let mut luma = [[0i32; 16]; 16];
+    const LUMA_OFFSETS: [(usize, usize); 4] = [(0, 0), (0, 8), (8, 0), (8, 8)];
+    for (b, &(row_off, col_off)) in LUMA_OFFSETS.iter().enumerate() {
+        for y in 0..8 {
+            for x in 0..8 {
+                luma[row_off + y][col_off + x] = blocks[b][y][x];
+            }
+        }
+    }
+    Ok(crate::block::InterMacroblock {
+        luma,
+        cb: blocks[4],
+        cr: blocks[5],
+    })
+}
+
+/// The data-partitioned walks' shared gates (§6.2.5.3 rectangular
+/// progressive layouts only).
+fn check_dp_supported(vol: &VolHeader) -> Result<(), VopDecodeError> {
+    check_vol_supported(vol)?;
+    if !vol.data_partitioned {
+        return Err(VopDecodeError::Unsupported("not a data_partitioned VOL"));
+    }
+    if vol.interlaced {
+        // §6.2.5.3 data partitioning with the interlaced macroblock
+        // tools is outside this walk's scope.
+        return Err(VopDecodeError::Unsupported("data_partitioned + interlaced"));
+    }
+    Ok(())
+}
+
+/// Decode a complete rectangular progressive **I-VOP** coded with
+/// §6.2.5.3 **data partitioning** (`data_partitioned == 1`), returning
+/// the reconstructed macroblocks in raster order.
+///
+/// Each video packet is decoded as `data_partitioned_i_vop()`:
+/// partition 1 (per-MB `mcbpc` + `dquant` + DC-VLC intra DC, up to the
+/// 19-bit `dc_marker`), partition 2 (`ac_pred_flag` + `cbpy`), then the
+/// texture partition holding every macroblock's AC `block()` data —
+/// coded with the Table B.23 reversible VLC when the VOL set
+/// `reversible_vlc == 1`. Prediction state (§7.4.3 grid, running
+/// quantiser, `intra_dc_vlc_thr`) resets at each packet boundary
+/// exactly as in the combined walk (§E.1.2).
+pub fn decode_i_vop_macroblocks_dp(
+    br: &mut BitReader<'_>,
+    vol: &VolHeader,
+    vop: &VopHeader,
+) -> Result<Vec<ReconstructedMacroblock>, VopDecodeError> {
+    check_dp_supported(vol)?;
+    if !matches!(vop.coding_type, VopCodingType::I) {
+        return Err(VopDecodeError::Unsupported("not an I-VOP"));
+    }
+    if !vop.coded {
+        return Err(VopDecodeError::Unsupported("vop_coded == 0"));
+    }
+
+    let (mb_width, mb_height) = vop_mb_dimensions(vol);
+    let total = mb_width * mb_height;
+    let bpp = u32::from(vol.bits_per_pixel);
+    let max_qp = max_quantiser_scale(vol);
+    let quant_matrix = intra_quant_matrix(vol);
+    let vp_ctx = video_packet_context(vol, vop);
+    let mut running_qp = u32::from(vop.quant).clamp(1, max_qp);
+    let mut dc_thr = vop.intra_dc_vlc_thr;
+    let mut out = Vec::with_capacity(total);
+    let mut mb_index = 0usize;
+
+    while mb_index < total {
+        if mb_index > 0 {
+            // Between packets: §5.2.5 stuffing + resync_marker + header.
+            let packet = enter_video_packet(br, &vp_ctx, mb_index as u32)?;
+            running_qp = u32::from(packet.quant_scale).clamp(1, max_qp);
+            if let Some(thr) = packet.intra_dc_vlc_thr {
+                dc_thr = thr;
+            }
+        }
+        // §E.1.2: no prediction crosses a packet boundary.
+        let mut grid = IntraBlockGrid::new(mb_height, mb_width);
+        let parsed = crate::data_partition::parse_data_partitioned_i_vop(
+            br,
+            total - mb_index,
+            dc_thr,
+            running_qp,
+        )
+        .map_err(VopDecodeError::DataPartition)?;
+
+        for (k, (mb, tex)) in parsed.mbs.iter().zip(parsed.tex_headers.iter()).enumerate() {
+            let idx = mb_index + k;
+            let (mb_row, mb_col) = (idx / mb_width, idx % mb_width);
+            running_qp = apply_dquant(running_qp, mb.dquant_delta, max_qp);
+            let ctx = MacroblockTextureContext {
+                quantiser_scale: running_qp,
+                bits_per_pixel: bpp,
+                quant_type: vol.quant_type,
+                ac_pred_flag: tex.ac_pred_flag,
+                alternate_vertical_scan: vop.alternate_vertical_scan,
+            };
+            let coded = pattern_code(tex.cbpy, mb.cbpc);
+            let imb = decode_intra_mb_partitioned(
+                br,
+                &mut grid,
+                mb_row,
+                mb_col,
+                coded,
+                mb.intra_dc,
+                vol.reversible_vlc,
+                ctx,
+                &quant_matrix,
+            )?;
+            out.push(reconstruct_intra_macroblock(&imb, bpp));
+        }
+        mb_index += parsed.mbs.len();
+    }
+    Ok(out)
+}
+
+/// Decode a complete rectangular progressive **P-VOP** coded with
+/// §6.2.5.3 **data partitioning**, returning one [`PVopMbContent`] per
+/// macroblock in raster order (drop-in replacement for
+/// [`decode_p_vop_macroblocks`] on a `data_partitioned` VOL).
+///
+/// Each video packet is decoded as `data_partitioned_p_vop()`:
+/// partition 1 (per-MB `not_coded` + `mcbpc` + `motion_coding()`, up to
+/// the 17-bit `motion_marker`) drives the §7.6.5 [`MvDriver`] in raster
+/// order — a skipped MB records the valid zero vector and an intra MB
+/// the valid zero candidate, exactly as in the combined walk — then
+/// partition 2 (`ac_pred_flag` + `cbpy` + `dquant` + DC-VLC intra DC)
+/// and the texture partition (RVLC when `reversible_vlc == 1`).
+pub fn decode_p_vop_macroblocks_dp(
+    br: &mut BitReader<'_>,
+    vol: &VolHeader,
+    vop: &VopHeader,
+) -> Result<Vec<PVopMbContent>, VopDecodeError> {
+    use crate::data_partition::DpMbEvent;
+    use crate::macroblock::DerivedMbType;
+
+    check_dp_supported(vol)?;
+    if !matches!(vop.coding_type, VopCodingType::P) {
+        return Err(VopDecodeError::Unsupported("not a P-VOP"));
+    }
+    if !vop.coded {
+        return Err(VopDecodeError::Unsupported("vop_coded == 0"));
+    }
+    if !vol.obmc_disable {
+        return Err(VopDecodeError::Unsupported("data_partitioned + obmc"));
+    }
+
+    let (mb_width, mb_height) = vop_mb_dimensions(vol);
+    let total = mb_width * mb_height;
+    let bpp = u32::from(vol.bits_per_pixel);
+    let max_qp = max_quantiser_scale(vol);
+    let intra_matrix = intra_quant_matrix(vol);
+    let inter_matrix = nonintra_quant_matrix(vol);
+    let vp_ctx = video_packet_context(vol, vop);
+    let mut running_qp = u32::from(vop.quant).clamp(1, max_qp);
+    let mut dc_thr = vop.intra_dc_vlc_thr;
+    let mut out: Vec<PVopMbContent> = Vec::with_capacity(total);
+    let mut mb_index = 0usize;
+
+    while mb_index < total {
+        if mb_index > 0 {
+            let packet = enter_video_packet(br, &vp_ctx, mb_index as u32)?;
+            running_qp = u32::from(packet.quant_scale).clamp(1, max_qp);
+            if let Some(thr) = packet.intra_dc_vlc_thr {
+                dc_thr = thr;
+            }
+        }
+        // §E.1.2 packet boundary: fresh §7.6.5 / §7.4.3 state.
+        let mut driver = MvDriver::new(mb_height, mb_width, vop.fcode_fwd);
+        let mut grid = IntraBlockGrid::new(mb_height, mb_width);
+        let base = mb_index;
+        let mut motions: Vec<PvopMbMotion> = Vec::new();
+
+        let parsed = crate::data_partition::parse_data_partitioned_p_vop(
+            br,
+            total - base,
+            false,
+            dc_thr,
+            running_qp,
+            |b, ev| {
+                let idx = base + motions.len();
+                let (row, col) = (idx / mb_width, idx % mb_width);
+                let m = match ev {
+                    DpMbEvent::NotCoded => driver.decode_macroblock(b, row, col, true, None),
+                    DpMbEvent::Intra => {
+                        driver.decode_macroblock(b, row, col, false, Some(DerivedMbType::Intra))
+                    }
+                    DpMbEvent::Motion(ty) => driver.decode_macroblock(b, row, col, false, Some(ty)),
+                    // GMC needs the S(GMC) walk; `is_s_gmc == false`
+                    // keeps this arm unreachable on conforming input.
+                    DpMbEvent::Gmc => {
+                        return Err(crate::data_partition::DataPartitionError::Truncated)
+                    }
+                }
+                .map_err(|_| crate::data_partition::DataPartitionError::Truncated)?;
+                motions.push(m);
+                Ok(())
+            },
+        )
+        .map_err(VopDecodeError::DataPartition)?;
+
+        for (k, (mb, tex)) in parsed.mbs.iter().zip(parsed.tex_headers.iter()).enumerate() {
+            let idx = base + k;
+            let (mb_row, mb_col) = (idx / mb_width, idx % mb_width);
+            if mb.not_coded {
+                out.push(PVopMbContent::Inter {
+                    motion: motions[k],
+                    residual: crate::block::InterMacroblock::zero(),
+                });
+                continue;
+            }
+            running_qp = apply_dquant(running_qp, tex.dquant_delta, max_qp);
+            let coded = pattern_code(tex.cbpy, mb.cbpc);
+            let is_intra = mb.mb_type.map(|t| t.is_intra()).unwrap_or(false);
+            if is_intra {
+                let ctx = MacroblockTextureContext {
+                    quantiser_scale: running_qp,
+                    bits_per_pixel: bpp,
+                    quant_type: vol.quant_type,
+                    ac_pred_flag: tex.ac_pred_flag,
+                    alternate_vertical_scan: vop.alternate_vertical_scan,
+                };
+                let imb = decode_intra_mb_partitioned(
+                    br,
+                    &mut grid,
+                    mb_row,
+                    mb_col,
+                    coded,
+                    tex.intra_dc,
+                    vol.reversible_vlc,
+                    ctx,
+                    &intra_matrix,
+                )?;
+                out.push(PVopMbContent::Intra(reconstruct_intra_macroblock(
+                    &imb, bpp,
+                )));
+            } else {
+                let ctx = MacroblockTextureContext {
+                    quantiser_scale: running_qp,
+                    bits_per_pixel: bpp,
+                    quant_type: vol.quant_type,
+                    ac_pred_flag: false,
+                    alternate_vertical_scan: vop.alternate_vertical_scan,
+                };
+                let residual =
+                    decode_inter_mb_partitioned(br, coded, vol.reversible_vlc, ctx, &inter_matrix)?;
+                out.push(PVopMbContent::Inter {
+                    motion: motions[k],
+                    residual,
+                });
+            }
+        }
+        mb_index += parsed.mbs.len();
+    }
+    Ok(out)
+}
+
 /// Decode a complete rectangular progressive **P-VOP**'s macroblock
 /// layer straight off the bitstream, returning one [`PVopMbContent`]
 /// per macroblock in raster order — ready for
@@ -444,6 +802,7 @@ pub fn decode_p_vop_macroblocks(
     vop: &VopHeader,
 ) -> Result<Vec<PVopMbContent>, VopDecodeError> {
     check_vol_supported(vol)?;
+    check_combined_syntax(vol)?;
     if vol.interlaced && !vol.obmc_disable {
         // §7.7.2.1 defines OBMC-with-field-neighbour semantics, but
         // the combination is outside the supported profiles; keep it
@@ -1005,6 +1364,7 @@ pub fn decode_s_gmc_vop_macroblocks(
     vop: &VopHeader,
 ) -> Result<(Vec<SGmcMbContent>, WarpGeometry), VopDecodeError> {
     check_vol_supported(vol)?;
+    check_combined_syntax(vol)?;
     check_progressive(vol)?;
     if !matches!(vop.coding_type, VopCodingType::S) {
         return Err(VopDecodeError::Unsupported("not an S-VOP"));

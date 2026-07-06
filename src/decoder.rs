@@ -326,7 +326,13 @@ impl Mpeg4VideoDecoder {
 
         match vop.coding_type {
             VopCodingType::I => {
-                let mbs = decode_i_vop_macroblocks(&mut br, &vol, &vop)?;
+                // §6.2.5.3: a data_partitioned VOL rearranges the I-/P-
+                // VOP macroblock layer into marker-separated partitions.
+                let mbs = if vol.data_partitioned {
+                    crate::vop_decode::decode_i_vop_macroblocks_dp(&mut br, &vol, &vop)?
+                } else {
+                    decode_i_vop_macroblocks(&mut br, &vol, &vop)?
+                };
                 out.extend(self.sequence.push_i_vop(mb_width, mb_height, &mbs)?);
                 self.anchor_motion = None;
             }
@@ -334,7 +340,11 @@ impl Mpeg4VideoDecoder {
                 if self.sequence.store().p_vop_reference().is_none() {
                     return Err(StreamDecodeError::MissingAnchor);
                 }
-                let entries = decode_p_vop_macroblocks(&mut br, &vol, &vop)?;
+                let entries = if vol.data_partitioned {
+                    crate::vop_decode::decode_p_vop_macroblocks_dp(&mut br, &vol, &vop)?
+                } else {
+                    decode_p_vop_macroblocks(&mut br, &vol, &vop)?
+                };
                 self.anchor_motion = Some(motion_of_p_entries(&entries));
                 out.extend(if vol.obmc_disable {
                     self.sequence.push_p_vop(

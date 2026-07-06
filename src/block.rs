@@ -490,11 +490,64 @@ pub fn decode_intra_block_full(
         None
     };
 
+    decode_intra_block_tail(br, coded, intra_dc, false, i, ctx, predictors, quant_matrix)
+}
+
+/// §6.2.5.3 data-partitioned sibling of [`decode_intra_block_full`]:
+/// the differential intra DC (when `use_intra_dc_vlc`) was already
+/// decoded from the header partition (I-VOP partition 1 / P-VOP
+/// partition 2) and is passed in as `supplied_dc`; the reader sits
+/// inside the *texture* partition, which carries only the AC EVENT
+/// loop for this block (`supplied_dc == None` reproduces the
+/// DC-coded-as-AC layout, where the EVENT loop fills scan position 0
+/// too). `reversible_vlc` selects the §6.3.3 RVLC Tcoef table
+/// (Table B.23) for the EVENT loop, as coded in the texture partition
+/// of a `reversible_vlc == 1` VOL.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_intra_block_partitioned(
+    br: &mut BitReader<'_>,
+    i: usize,
+    coded: bool,
+    supplied_dc: Option<i32>,
+    reversible_vlc: bool,
+    ctx: MacroblockTextureContext,
+    predictors: BlockPredictors,
+    quant_matrix: &[[u8; 8]; 8],
+) -> Result<IntraBlockDecode, BlockAssemblyError> {
+    decode_intra_block_tail(
+        br,
+        coded,
+        supplied_dc,
+        reversible_vlc,
+        i,
+        ctx,
+        predictors,
+        quant_matrix,
+    )
+}
+
+/// Shared §7.4.x reconstruction tail: AC EVENT loop (standard Tcoef or
+/// Table B.23 RVLC) + inverse scan + §7.4.3 prediction + §7.4.4 / 7.4.5.
+#[allow(clippy::too_many_arguments)]
+fn decode_intra_block_tail(
+    br: &mut BitReader<'_>,
+    coded: bool,
+    intra_dc: Option<i32>,
+    reversible_vlc: bool,
+    i: usize,
+    ctx: MacroblockTextureContext,
+    predictors: BlockPredictors,
+    quant_matrix: &[[u8; 8]; 8],
+) -> Result<IntraBlockDecode, BlockAssemblyError> {
+    let component = block_component(i);
+
     // §6.2.7 — the AC EVENT loop runs only when pattern_code[i] == 1.
-    let events = if coded {
-        decode_ac_events(br, TcoefTable::Intra)?
-    } else {
+    let events = if !coded {
         Vec::new()
+    } else if reversible_vlc {
+        crate::texture::decode_ac_events_rvlc(br, TcoefTable::Intra)?
+    } else {
+        decode_ac_events(br, TcoefTable::Intra)?
     };
 
     // §7.4.1 / §7.4.2 — assemble the one-dimensional QFS[64]. With the
@@ -762,6 +815,39 @@ pub fn decode_inter_block(
 ) -> Result<[[i32; 8]; 8], BlockAssemblyError> {
     let component = block_component(i);
 
+    decode_inter_block_events(br, i, coded, false, ctx, quant_matrix, component)
+}
+
+/// §6.2.5.3 data-partitioned sibling of [`decode_inter_block`]: the
+/// reader sits inside the texture partition and `reversible_vlc`
+/// selects the Table B.23 RVLC Tcoef table for the AC EVENT loop
+/// (`reversible_vlc == 1` VOLs code the texture partition with the
+/// reversible VLC; the combined syntax never does).
+pub fn decode_inter_block_partitioned(
+    br: &mut BitReader<'_>,
+    i: usize,
+    coded: bool,
+    reversible_vlc: bool,
+    ctx: MacroblockTextureContext,
+    quant_matrix: &[[u8; 8]; 8],
+) -> Result<[[i32; 8]; 8], BlockAssemblyError> {
+    let component = block_component(i);
+    decode_inter_block_events(br, i, coded, reversible_vlc, ctx, quant_matrix, component)
+}
+
+/// Shared inter-block tail: AC EVENT loop (standard or RVLC) + inverse
+/// scan + §7.4.4 inverse quantisation + §7.4.5 IDCT.
+#[allow(clippy::too_many_arguments)]
+fn decode_inter_block_events(
+    br: &mut BitReader<'_>,
+    i: usize,
+    coded: bool,
+    reversible_vlc: bool,
+    ctx: MacroblockTextureContext,
+    quant_matrix: &[[u8; 8]; 8],
+    component: crate::texture::DcComponent,
+) -> Result<[[i32; 8]; 8], BlockAssemblyError> {
+    let _ = i;
     if !coded {
         // §6.2.7 — no AC EVENT loop, no DC for inter; the residual is
         // the all-zero block.
@@ -770,7 +856,11 @@ pub fn decode_inter_block(
 
     // §6.2.7 — `while (!last) DCT coefficient` against the inter
     // Tcoef tables.
-    let events = decode_ac_events(br, TcoefTable::Inter)?;
+    let events = if reversible_vlc {
+        crate::texture::decode_ac_events_rvlc(br, TcoefTable::Inter)?
+    } else {
+        decode_ac_events(br, TcoefTable::Inter)?
+    };
 
     // §7.4.2 — expand to QFS[0..=63] (no DC: pass `None` for the
     // §7.4.1.1 intra-DC slot) then 1-D → 2-D under the zigzag scan.
@@ -992,6 +1082,58 @@ mod tests {
     fn write_dc_size1_luma(w: &mut BitWriter, positive: bool) {
         w.write_bits(0b11, 2); // dct_dc_size_luminance = 1
         w.write_bits(if positive { 1 } else { 0 }, 1);
+    }
+
+    /// The §6.2.5.3 partitioned intra path with a header-partition DC
+    /// must reconstruct identically to the combined path that reads
+    /// the same DC from its §6.2.7 prologue: the differential only
+    /// moves *where* it sits in the bitstream.
+    #[test]
+    fn partitioned_intra_block_matches_combined_with_supplied_dc() {
+        let ctx = MacroblockTextureContext {
+            quantiser_scale: 8,
+            bits_per_pixel: 8,
+            quant_type: false,
+            ac_pred_flag: false,
+            alternate_vertical_scan: false,
+        };
+        let predictors = BlockPredictors::outside(8, 8);
+
+        // Combined: DC prologue (size 1, +1) and no AC (coded = false).
+        let mut w = BitWriter::default();
+        write_dc_size1_luma(&mut w, true);
+        let data = w.finish();
+        let mut br = BitReader::new(&data);
+        let combined = decode_intra_block_full(
+            &mut br,
+            0,
+            false,
+            true,
+            ctx,
+            predictors,
+            &DEFAULT_INTRA_QUANT_MATRIX,
+        )
+        .unwrap();
+
+        // Partitioned: no bits at all — the +1 differential arrives
+        // from the header partition.
+        let empty: [u8; 0] = [];
+        let mut br2 = BitReader::new(&empty);
+        let partitioned = decode_intra_block_partitioned(
+            &mut br2,
+            0,
+            false,
+            Some(1),
+            false,
+            ctx,
+            predictors,
+            &DEFAULT_INTRA_QUANT_MATRIX,
+        )
+        .unwrap();
+
+        assert_eq!(combined.spatial, partitioned.spatial);
+        assert_eq!(combined.qf, partitioned.qf);
+        assert_eq!(combined.dc, partitioned.dc);
     }
 
     #[test]

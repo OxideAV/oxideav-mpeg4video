@@ -194,6 +194,28 @@ pub struct DataPartitionedTexHeader {
     pub intra_dc: Option<[i32; 6]>,
 }
 
+/// Per-macroblock partition-1 event handed to the caller's closure by
+/// [`parse_data_partitioned_p_vop`], in raster order. The closure sees
+/// **every** macroblock of the packet — not just the ones carrying
+/// motion — so it can thread the §7.6.5 predictor grid exactly as the
+/// combined-syntax walk does (a skipped MB records a valid zero
+/// vector, an intra MB a valid zero candidate).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DpMbEvent {
+    /// `not_coded == 1` — a skipped macroblock (zero-MV inter copy).
+    /// No motion bits follow.
+    NotCoded,
+    /// An intra / intra+q macroblock — no motion bits.
+    Intra,
+    /// A GMC-selected macroblock (S(GMC) with `mcsel == 1`) — no local
+    /// motion bits.
+    Gmc,
+    /// A coded inter macroblock carrying `motion_coding()`: the
+    /// closure must consume the §6.2.6.2 motion-vector bodies (one for
+    /// types 0/1, four for the inter-4V type 2).
+    Motion(DerivedMbType),
+}
+
 /// The decode of a data-partitioned I-VOP video packet's header
 /// partitions: per-MB partition-1 records, plus per-MB partition-2
 /// (`ac_pred_flag` + `cbpy`) records. The block (texture) partition that
@@ -449,7 +471,7 @@ pub fn parse_data_partitioned_p_vop<F>(
     mut decode_motion: F,
 ) -> Result<DataPartitionedPVop, DataPartitionError>
 where
-    F: FnMut(&mut BitReader<'_>, DerivedMbType) -> Result<(), DataPartitionError>,
+    F: FnMut(&mut BitReader<'_>, DpMbEvent) -> Result<(), DataPartitionError>,
 {
     let dc_vlc = use_intra_dc_vlc(intra_dc_vlc_thr, running_qp);
 
@@ -465,6 +487,7 @@ where
 
         let not_coded = br.read_bool()?;
         if not_coded {
+            decode_motion(br, DpMbEvent::NotCoded)?;
             mbs.push(DataPartitionedMb {
                 not_coded: true,
                 mb_type: None,
@@ -501,7 +524,13 @@ where
         let gmc_selected = mcsel == Some(true);
         let carries_motion = (!gmc_selected && raw < 2) || raw == 2;
         if carries_motion {
-            decode_motion(br, mb_type)?;
+            decode_motion(br, DpMbEvent::Motion(mb_type))?;
+        } else if gmc_selected {
+            decode_motion(br, DpMbEvent::Gmc)?;
+        } else {
+            // Intra / intra+q — no motion bits, but the closure still
+            // sees the macroblock for predictor bookkeeping.
+            decode_motion(br, DpMbEvent::Intra)?;
         }
 
         mbs.push(DataPartitionedMb {
@@ -709,7 +738,10 @@ mod tests {
         ));
         let mut br = BitReader::new(&stream);
         let mut captured = Vec::new();
-        let out = parse_data_partitioned_p_vop(&mut br, 4, false, 7, 31, |b, ty| {
+        let out = parse_data_partitioned_p_vop(&mut br, 4, false, 7, 31, |b, ev| {
+            let DpMbEvent::Motion(ty) = ev else {
+                return Ok(());
+            };
             let deltas = decode_motion_coding(b, ty, 1)
                 .map_err(|_| DataPartitionError::Macroblock(MacroblockParseError::Truncated))?;
             captured = deltas;
@@ -878,7 +910,10 @@ mod tests {
         ));
         let mut br = BitReader::new(&stream);
         let mut motion_calls = 0;
-        let out = parse_data_partitioned_p_vop(&mut br, 4, false, 7, 31, |b, ty| {
+        let out = parse_data_partitioned_p_vop(&mut br, 4, false, 7, 31, |b, ev| {
+            let DpMbEvent::Motion(ty) = ev else {
+                return Ok(());
+            };
             motion_calls += 1;
             assert_eq!(ty, DerivedMbType::Inter);
             b.skip_bits(4)?;

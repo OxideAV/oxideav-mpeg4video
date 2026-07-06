@@ -282,3 +282,22 @@ fn interlaced_direct_bframes_stream_matches_reference_decode() {
         0.05,
     );
 }
+
+#[test]
+fn data_partitioned_ipb_stream_matches_reference_decode() {
+    // §6.2.5.3 data partitioning (`data_partitioned == 1`): 12 VOPs
+    // (I/P/B, GOP 6, two B-VOPs per anchor) of a vertically panning
+    // 64×64 source, RD mode, ~120-byte video packets. Every I-/P-VOP
+    // video packet carries the partitioned layout — partition 1
+    // (`mcbpc` + DC-VLC intra DC, or `not_coded` + `mcbpc` +
+    // `motion_coding()`), the 19-bit `dc_marker` / 17-bit
+    // `motion_marker`, partition 2 (`ac_pred_flag` + `cbpy` + `dquant`
+    // + P-VOP intra DC), then the texture partition — while the B-VOPs
+    // use the combined syntax (§6.2.5.3 NOTE: data partitioning is not
+    // supported in B-VOPs). Exercises the packetised §E.1.2 prediction
+    // resets, the partition-1-threaded §7.6.5 MV predictor walk
+    // (skipped / intra / 1-MV / 4-MV), and the header-partition intra
+    // DC feeding the texture-partition AC decode. Only the twin-IDCT
+    // envelope remains.
+    assert_stream_matches("dp_ipb_64x64.m4v", "dp_ipb_64x64.yuv", 3, 0.40);
+}
