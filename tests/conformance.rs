@@ -19,22 +19,19 @@
 use oxideav_mpeg4video::decoder::Mpeg4VideoDecoder;
 use oxideav_mpeg4video::framestore::DecodedFrame;
 
-const W: usize = 64;
-const H: usize = 64;
-const Y_LEN: usize = W * H;
-const C_LEN: usize = (W / 2) * (H / 2);
-
 fn fixture(name: &str) -> Vec<u8> {
     let path = format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"));
     std::fs::read(&path).unwrap_or_else(|e| panic!("read {path}: {e}"))
 }
 
 /// Split a raw `yuv420p` dump into per-frame (Y, U, V) plane slices.
-fn yuv_frames(data: &[u8]) -> Vec<(&[u8], &[u8], &[u8])> {
-    let frame_len = Y_LEN + 2 * C_LEN;
+fn yuv_frames(data: &[u8], w: usize, h: usize) -> Vec<(&[u8], &[u8], &[u8])> {
+    let y_len = w * h;
+    let c_len = (w / 2) * (h / 2);
+    let frame_len = y_len + 2 * c_len;
     assert_eq!(data.len() % frame_len, 0, "yuv length must be whole frames");
     data.chunks_exact(frame_len)
-        .map(|f| (&f[..Y_LEN], &f[Y_LEN..Y_LEN + C_LEN], &f[Y_LEN + C_LEN..]))
+        .map(|f| (&f[..y_len], &f[y_len..y_len + c_len], &f[y_len + c_len..]))
         .collect()
 }
 
@@ -71,9 +68,20 @@ fn diff_stats(frame: &DecodedFrame, y: &[u8], u: &[u8], v: &[u8]) -> (u32, usize
 }
 
 fn assert_stream_matches(m4v: &str, yuv: &str, max_tol: u32, frac_tol: f64) {
+    assert_stream_matches_dims(m4v, yuv, 64, 64, max_tol, frac_tol);
+}
+
+fn assert_stream_matches_dims(
+    m4v: &str,
+    yuv: &str,
+    w: usize,
+    h: usize,
+    max_tol: u32,
+    frac_tol: f64,
+) {
     let frames = decode_stream(m4v);
     let reference = fixture(yuv);
-    let reference = yuv_frames(&reference);
+    let reference = yuv_frames(&reference, w, h);
     assert_eq!(
         frames.len(),
         reference.len(),
@@ -214,12 +222,63 @@ fn interlaced_ipb_stream_matches_reference_decode() {
     // co-located future macroblock's forward field MV pairs, and the
     // §7.7.1 field DCT on B residuals.
     //
-    // Tolerance note: every macroblock class is inside the twin-IDCT
-    // envelope EXCEPT §7.7.2.2 interlaced-*direct* macroblocks (two
-    // isolated MBs of one B-VOP here): the conformant interlaced-direct
-    // derivation demonstrably differs from both the printed §7.7.2.2
-    // pseudo code and its erratum-corrected reading (E1/E2 per
-    // `docs/video/mpeg4-visual/mpeg4-visual-errata.md`); bounded until
-    // the direct-mode derivation trace lands.
+    // The §7.7.2.2 interlaced B pseudo code is printed with multiple
+    // internal inconsistencies; the readings below are corrected per
+    // `docs/video/mpeg4-visual/mpeg4-visual-errata.md` (E1/E2) plus the
+    // same-slot `PMV[3].x` field-backward reconstruction, all
+    // arbitrated against a conformant black-box stream (see
+    // `interlaced_direct_bframes_stream_matches_reference_decode`
+    // below). Every macroblock class in this stream now sits inside
+    // the twin-IDCT envelope EXCEPT §7.7.2.2 interlaced *direct*
+    // macroblocks (two isolated MBs of one B-VOP here): the conformant
+    // interlaced-direct derivation demonstrably differs from both the
+    // printed pseudo code and the erratum-corrected reading in ways
+    // this fixture cannot pin down uniquely (see the tolerance note on
+    // the 176×144 fixture below). Bounded until the direct-mode
+    // derivation trace lands.
     assert_stream_matches("ilaced_ipb_64x64.m4v", "ilaced_ipb_64x64.yuv", 60, 0.07);
+}
+
+#[test]
+fn interlaced_direct_bframes_stream_matches_reference_decode() {
+    // 176×144, 25 VOPs (3 I / 6 P / 16 B), interlaced VOL with strong
+    // field-differentiated vertical motion: 30 macroblocks across 11
+    // B-VOPs decode in §7.7.2.2 *interlaced direct* mode (co-located
+    // future P macroblock coded + inter + field_prediction == 1); our
+    // classification reproduces the fixture's independent per-VOP
+    // interlaced-direct distribution exactly (30/30). Fixture staged
+    // in docs/video/mpeg4-visual/fixtures/interlaced-direct-bframes/.
+    //
+    // This stream black-box-arbitrated five decoder corrections:
+    // §7.6.5 intra neighbours as valid zero MV candidates, the
+    // Table 7-15 unified four-PMV bank shared by frame- and
+    // field-predicted B macroblocks, the same-slot `PMV[3].x`
+    // field-backward reconstruction, the §7.7.2.2 backward MC field
+    // ordering (erratum E1, `mvb[0]` top / `mvb[1]` bottom), and the
+    // §7.6.9.5.2 / §7.7.2.2 f_code == 1 direct-delta reconstruction.
+    // All I- and P-VOPs and every interlaced B macroblock class except
+    // interlaced direct land inside the twin-IDCT envelope (max ≤ 2).
+    //
+    // Bounded deviation: of the 30 interlaced-direct MBs, 18 still
+    // mismatch (isolated, ≤ 5% of a frame's samples, luma max ≤ 75
+    // with the chroma Div2Round derivation reaching ~110). Solving the
+    // conformant per-field predictions pixel-exactly on the
+    // residual-free ones shows the true derivation contradicts the
+    // *printed* §7.7.2.2 pseudo code AND its erratum-corrected reading
+    // (e.g. one co-located MB with field MVs (0,0)/(0,12), MVD[0].y =
+    // -22, TRB/TRD = 2/3 reconstructs both forward fields at -22
+    // *frame lines* — twice the erratum derivation — while another MB
+    // with MVs (0,-64)/(0,0), MVD[0] = 0 reconstructs its top backward
+    // field at exactly 0). No single consistent reading fits all
+    // constraints; resolving it needs a per-MB derived-vector
+    // (mvf[]/mvb[]) trace from a conformant decoder — the outstanding
+    // half of the §7.7.2.2 erratum's "trace ask".
+    assert_stream_matches_dims(
+        "ilaced_direct_176x144.m4v",
+        "ilaced_direct_176x144.yuv",
+        176,
+        144,
+        120,
+        0.05,
+    );
 }
