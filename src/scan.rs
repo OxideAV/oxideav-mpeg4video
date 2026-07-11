@@ -14,10 +14,11 @@
 //! * Intra blocks with `ac_pred_flag == 0` → [`ScanType::Zigzag`] for
 //!   every block in the macroblock.
 //! * Intra blocks with `ac_pred_flag == 1`: per-block. The §7.4.3.1
-//!   DC-prediction direction picks the scan:
-//!   * Prediction from block C (vertically adjacent, "above") →
-//!     [`ScanType::AlternateVertical`] for the current block.
+//!   DC-prediction direction picks the scan (perpendicular to the
+//!   prediction edge):
 //!   * Prediction from block A (horizontally adjacent, "left") →
+//!     [`ScanType::AlternateVertical`] for the current block.
+//!   * Prediction from block C (vertically adjacent, "above") →
 //!     [`ScanType::AlternateHorizontal`] for the current block.
 //!
 //! See [`select_scan_type`] for the encoded rule. Predictor gathering
@@ -82,12 +83,13 @@ use crate::texture::AcEvent;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanType {
     /// Figure 7-4 (a) — Alternate-Horizontal scan. Used by an intra
-    /// block whose §7.4.3.1 DC prediction is taken from block A
-    /// (the horizontally adjacent / left block).
+    /// block whose §7.4.3.1 DC prediction is taken from block C
+    /// (the vertically adjacent / above block) — §7.4.2: the scan runs
+    /// perpendicular to the predicted first row.
     AlternateHorizontal,
     /// Figure 7-4 (b) — Alternate-Vertical scan. Used by an intra
-    /// block whose §7.4.3.1 DC prediction is taken from block C
-    /// (the vertically adjacent / above block).
+    /// block whose §7.4.3.1 DC prediction is taken from block A
+    /// (the horizontally adjacent / left block).
     AlternateVertical,
     /// Figure 7-4 (c) — Zigzag scan. Used for every non-intra block,
     /// and for every block in an intra macroblock with
@@ -168,15 +170,22 @@ fn scan_grid(scan_type: ScanType) -> &'static [[u8; 8]; 8] {
 ///   only consulted for intra blocks. (Pass `is_intra == false` to get
 ///   the non-intra default of [`ScanType::Zigzag`] for completeness.)
 /// * Intra + `ac_pred_flag == false` → [`ScanType::Zigzag`].
-/// * Intra + `ac_pred_flag == true` + DC predictor from above (C) →
-///   [`ScanType::AlternateVertical`].
-/// * Intra + `ac_pred_flag == true` + DC predictor from left (A) →
-///   [`ScanType::AlternateHorizontal`].
+/// * Intra + `ac_pred_flag == true` + DC predictor from left (A, the
+///   horizontally adjacent block) → [`ScanType::AlternateVertical`].
+/// * Intra + `ac_pred_flag == true` + DC predictor from above (C, the
+///   vertically adjacent block) → [`ScanType::AlternateHorizontal`].
+///
+/// §7.4.2: "if the DC prediction refers to the horizontally adjacent
+/// block, alternate-vertical scan is selected for the current block.
+/// Otherwise (for DC prediction referring to vertically adjacent
+/// block), alternate-horizontal scan is used" — the scan runs
+/// *perpendicular* to the prediction edge, front-loading the
+/// frequencies the §7.4.3.3 predictor row/column does not cover.
 ///
 /// `dc_direction` is ignored when `ac_pred_flag == false` or when
-/// `is_intra == false`. When the predictor gathering pass lands, the
-/// caller resolves the direction per §7.4.3.1 (compare
-/// `|FA - FB|` vs `|FB - FC|`) and threads it in here.
+/// `is_intra == false`. The caller resolves the direction per
+/// §7.4.3.1 (compare `|FA - FB|` vs `|FB - FC|`) and threads it in
+/// here.
 pub fn select_scan_type(
     is_intra: bool,
     ac_pred_flag: bool,
@@ -186,8 +195,8 @@ pub fn select_scan_type(
         return ScanType::Zigzag;
     }
     match dc_direction {
-        DcPredictionDirection::FromAbove => ScanType::AlternateVertical,
-        DcPredictionDirection::FromLeft => ScanType::AlternateHorizontal,
+        DcPredictionDirection::FromLeft => ScanType::AlternateVertical,
+        DcPredictionDirection::FromAbove => ScanType::AlternateHorizontal,
     }
 }
 
@@ -694,18 +703,23 @@ mod tests {
     }
 
     #[test]
-    fn select_scan_intra_acpred_from_above_is_alt_vertical() {
+    fn select_scan_intra_acpred_from_above_is_alt_horizontal() {
+        // §7.4.2: DC prediction from the vertically adjacent block →
+        // alternate-horizontal scan (perpendicular to the predicted
+        // first row).
         assert_eq!(
             select_scan_type(true, true, DcPredictionDirection::FromAbove),
-            ScanType::AlternateVertical
+            ScanType::AlternateHorizontal
         );
     }
 
     #[test]
-    fn select_scan_intra_acpred_from_left_is_alt_horizontal() {
+    fn select_scan_intra_acpred_from_left_is_alt_vertical() {
+        // §7.4.2: DC prediction from the horizontally adjacent block →
+        // alternate-vertical scan.
         assert_eq!(
             select_scan_type(true, true, DcPredictionDirection::FromLeft),
-            ScanType::AlternateHorizontal
+            ScanType::AlternateVertical
         );
     }
 
