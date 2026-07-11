@@ -41,16 +41,18 @@
 //! ## Pre-reduction in quarter-sample mode
 //!
 //! §7.6.5 also says: *"in quarter sample mode the vectors are divided
-//! by 2 before summation."* The division is algebraic — the halved
-//! vectors keep their fractional part through the sum, so the result
-//! lands on a grid twice as fine as the half-sample-mode case for the
-//! same `K` (eighth-sample for `K = 1`, sixteenth for `K = 2`), and
-//! **one** table rounding is applied at the end. This reading is
-//! validated sample-exact against a black-box reference decode of a
-//! `quarter_sample == 1` stream (`tests/conformance.rs`); the earlier
-//! per-vector Table 7-13 pre-rounding produced double-rounded chroma
-//! vectors that drifted visibly. Quarter-sample callers use
-//! [`chroma_mv_from_luma_blocks_qpel`].
+//! by 2 before summation."* The halving is the §4.1 `/` operator
+//! (integer, truncating toward zero) applied per vector — §7.6.5 goes
+//! on to name only the "sixteenth/twelfth/eighth/fourth sample
+//! resolution" grids, which is the half-sample-mode `4K` progression:
+//! an algebraic halving would land on thirty-second / twenty-fourth
+//! grids for `K = 4 / 3`, for which no table exists. After the
+//! per-vector halving the reduction is exactly the half-sample-mode
+//! one. Black-box-validated bit-exact on a quarter-sample four-MV
+//! stream's P-VOP chrominance (`tests/conformance.rs`); a per-vector
+//! Table 7-13 pre-rounding (double rounding) drifts visibly, and an
+//! algebraic fold misses the 4-MV chrominance by tens of grey levels.
+//! Quarter-sample callers use [`chroma_mv_from_luma_blocks_qpel`].
 //!
 //! ## What this module does **not** do
 //!
@@ -246,27 +248,23 @@ pub fn chroma_mv_from_luma_blocks(
 /// (`quarter_sample == 1`).
 ///
 /// §7.6.5: *"in quarter sample mode the vectors are divided by 2
-/// before summation"* — the division is algebraic (the halved vectors
-/// keep their fractional part through the sum), so the resulting
-/// component sits on a `1/(8K)`-pel grid before the toward-nearest-
-/// half-sample modification:
+/// before summation"* — the per-vector halving is the §4.1 `/`
+/// operator (integer division truncating toward zero), so each halved
+/// vector is an integer in half-sample units and the summed result
+/// lands on exactly the same "sixteenth/twelfth/eighth/fourth sample
+/// resolution" grids §7.6.5 names for `K = 4/3/2/1` — the sentence
+/// only lists those four resolutions, which rules out an algebraic
+/// halving (that would produce thirty-second/twenty-fourth grids for
+/// `K = 4/3`, for which §7.6.5 provides no table). After the halving
+/// the reduction is identical to the half-sample-mode case:
+/// `sum / 2K` decomposed into whole chroma pels plus the Table
+/// 7-10/7-11/7-12/7-13 residue rounding.
 ///
-/// * `K = 1` → eighth-sample resolution → [`TABLE_7_12`],
-/// * `K = 2` → sixteenth-sample resolution → [`TABLE_7_10`],
-///
-/// exactly the "sixteenth/twelfth/eighth/fourth" progression §7.6.5
-/// names (each quarter-sample case lands two steps finer than its
-/// half-sample sibling). `K = 1` is validated sample-exact against a
-/// black-box reference decode of a quarter-sample stream
-/// (`tests/conformance.rs`).
-///
-/// For `K ∈ {3, 4}` the algebraic grid would be a twenty-fourth /
-/// thirty-second — finer than any table §7.6.5 provides. The tables'
-/// shared shape (0 for the first quarter of the range, 1 through
-/// ~0.85, then the carry) is applied on the doubled Table 7-11 /
-/// 7-10 index (`residue / 2`), which reproduces every representable
-/// half-sample-grid input exactly and rounds the odd sixteenth
-/// positions with the same toward-half bias.
+/// Black-box validation: a quarter-sample four-MV (`inter4v`) stream's
+/// P-VOP chrominance is bit-exact under this reading and diverges by
+/// tens of grey levels under an algebraic-halving fold
+/// (`tests/fixtures/qpel_mv4_ipb_64x64.m4v`); the `K = 1` streams
+/// (`qpel_ip` / `qpel_ipb`) are bit-exact under both readings.
 pub fn chroma_mv_from_luma_blocks_qpel(
     luma_mvs: &[MotionVector],
 ) -> Result<MotionVector, ChromaMvError> {
@@ -274,35 +272,14 @@ pub fn chroma_mv_from_luma_blocks_qpel(
     if !(1..=4).contains(&k) {
         return Err(ChromaMvError::InvalidBlockCount(k));
     }
-    let sum_x: i32 = luma_mvs.iter().map(|m| m.x).sum();
-    let sum_y: i32 = luma_mvs.iter().map(|m| m.y).sum();
+    // §4.1 truncating halving per vector, then the §7.6.5 half-mode
+    // reduction on the halved (half-sample-unit) sum.
+    let sum_x: i32 = luma_mvs.iter().map(|m| m.x / 2).sum();
+    let sum_y: i32 = luma_mvs.iter().map(|m| m.y / 2).sum();
     Ok(MotionVector {
-        x: reduce_component_half_pel_qpel(sum_x, k),
-        y: reduce_component_half_pel_qpel(sum_y, k),
+        x: reduce_component_half_pel(sum_x, k),
+        y: reduce_component_half_pel(sum_y, k),
     })
-}
-
-/// Per-component §7.6.5 reduction for quarter-sample-unit sums.
-///
-/// `sum` is the component-sum of the `K` luminance MV components in
-/// quarter-sample units. The chroma displacement is
-/// `(sum / 2) / (2K)` half-samples `= sum / (8K)` whole chroma pels;
-/// the residue indexes the table for the `8K`-per-pel grid.
-#[inline]
-fn reduce_component_half_pel_qpel(sum: i32, k: usize) -> i32 {
-    let eight_k = 8 * (k as i32);
-    let whole_pels = sum.div_euclid(eight_k);
-    let residue = sum.rem_euclid(eight_k) as usize;
-    let offset = match k {
-        1 => TABLE_7_12[residue],
-        2 => TABLE_7_10[residue],
-        // 24- / 32-entry grids have no §7.6.5 table; fold each pair of
-        // fine positions onto the twelfth / sixteenth table entry.
-        3 => TABLE_7_11[residue / 2],
-        4 => TABLE_7_10[residue / 2],
-        _ => 0, // Unreachable — K validated by the caller.
-    };
-    2 * whole_pels + i32::from(offset)
 }
 
 #[cfg(test)]
