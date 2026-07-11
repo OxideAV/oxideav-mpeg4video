@@ -806,11 +806,12 @@ impl BVopMvDriver {
     /// [`BVopMvDriver::new`] default is half-sample). In quarter-sample
     /// mode the explicit forward / backward / bidirectional vectors are
     /// quarter-pel units and their §7.6.5 chroma reduction runs on the
-    /// doubled grid; the §7.6.9.5 direct mode instead converts the
-    /// co-located quarter-pel MV to half-pel units (Table 7-13) before
-    /// the TRB/TRD scaling — its delta vector is coded half-pel — so a
-    /// direct macroblock reconstructs on the half-pel grid
-    /// ([`BVopMbDecode::luma_sample_mode`]).
+    /// doubled grid; the §7.6.9.5 direct mode converts the co-located
+    /// quarter-pel MV to half-pel units (Table 7-13) before the TRB/TRD
+    /// scaling — its delta vector is coded half-pel — and the derived
+    /// vectors are then re-expressed ×2 on the quarter grid so the
+    /// §7.6.9.5.3 luminance MC runs through the §7.6.2.2 interpolation
+    /// (see [`BVopMbDecode::luma_sample_mode`]).
     pub fn with_quarter_sample(mut self, quarter_sample: bool) -> Self {
         self.quarter_sample = quarter_sample;
         self
@@ -2758,8 +2759,10 @@ mod tests {
         // modb == "1" → default direct, no MVD[0] body (implicit zero).
         // Future field MVs MV[0]=(6,-6) Top, MV[1]=(6,-6) Bottom →
         // δ = (Top,Bottom) row = (0,0); TRB=2*1=2, TRD=2*2=4.
-        // mvf = 2*6/4 = 3, 2*-6/4 = -3 → (3,-3); mvb (zero delta) =
-        // (2-4)*6/4 = -3, (2-4)*-6/4 = 3 → (-3,3).
+        // x: mvf = 2*6/4 = 3; mvb (zero delta) = (2-4)*6/4 = -3.
+        // y runs on the field grid (§7.7.2 evenness invariant):
+        // MV.y = -6 frame → -3 field; mvf = 2*((2*-3)/4) = 2*-1 = -2;
+        // mvb = 2*(((2-4)*-3)/4) = 2*1 = 2.
         let vol = make_interlaced_vol();
         let mut w = BitWriter::new();
         w.write_bits(0b1, 1); // modb "1"
@@ -2782,10 +2785,10 @@ mod tests {
                 false,
             )
             .unwrap();
-        assert_eq!(decode.mvs.forward_top, MotionVector { x: 3, y: -3 });
-        assert_eq!(decode.mvs.backward_top, MotionVector { x: -3, y: 3 });
-        assert_eq!(decode.mvs.forward_bottom, MotionVector { x: 3, y: -3 });
-        assert_eq!(decode.mvs.backward_bottom, MotionVector { x: -3, y: 3 });
+        assert_eq!(decode.mvs.forward_top, MotionVector { x: 3, y: -2 });
+        assert_eq!(decode.mvs.backward_top, MotionVector { x: -3, y: 2 });
+        assert_eq!(decode.mvs.forward_bottom, MotionVector { x: 3, y: -2 });
+        assert_eq!(decode.mvs.backward_bottom, MotionVector { x: -3, y: 2 });
         assert_eq!(decode.forward_top_ref, FieldReference::Top);
         assert_eq!(decode.forward_bottom_ref, FieldReference::Bottom);
         assert_eq!(decode.cbpb, None);
@@ -3092,8 +3095,10 @@ mod tests {
             .0;
         match mb {
             BVopInterlacedMb::InterlacedDirect(d) => {
-                // δ=(0,0), TRB=2, TRD=4 → mvf top = (3, -3).
-                assert_eq!(d.mvs.forward_top, MotionVector { x: 3, y: -3 });
+                // δ=(0,0), TRB=2, TRD=4 → mvf top x = 2*6/4 = 3; the
+                // vertical runs on the field grid: MV.y = -6 frame →
+                // -3 field, 2*((2*-3)/4) = -2.
+                assert_eq!(d.mvs.forward_top, MotionVector { x: 3, y: -2 });
             }
             other => panic!("expected InterlacedDirect, got {other:?}"),
         }

@@ -26,6 +26,11 @@
 //! the top / bottom backward field MVs. (Note the spec's pseudo code
 //! lists the single bitstream delta as `MVD[0]` for both fields; the
 //! `MVD[i]` index in the `?:` guard refers to that same `MVD[0]`.)
+//! The *vertical* arithmetic runs on the field grid (the co-located
+//! `MV[i].y` halved from its even frame-coordinate form, the sum
+//! doubled back for the frame-coordinate `mc` call) so the §7.7.2
+//! evenness invariant of field motion vectors is preserved — see
+//! [`derive_field`] for the clause-level derivation.
 //!
 //! ## §7.7.2.2 field-period temporal references
 //!
@@ -127,20 +132,52 @@ fn field_temporal(trb_frame: i32, trd_frame: i32, delta_i: i32) -> (i32, i32) {
 /// macroblock's field MV, the transmitted delta, and that field's
 /// `TRB` / `TRD`.
 ///
-/// Returns `(mvf, mvb)`. `/` truncates toward zero (§3.4, Rust `/`).
+/// Returns `(mvf, mvb)` in **frame** half-sample coordinates (the form
+/// [`crate::field_motion::mc`] consumes). `/` truncates toward zero
+/// (§3.4, Rust `/`).
+///
+/// ## Vertical components run on the field grid
+///
+/// §7.7.2 fixes an invariant for every field motion vector: "the
+/// vertical component of field motion vectors [is] always even (in
+/// half- or quarter-pel frame coordinates)" — one field line spans two
+/// frame lines, so a field MV's frame-coordinate vertical is always a
+/// doubled field-grid value, and §7.7.2.1 recovers coded field MVs as
+/// `MVy = 2 * (MVDy + Py / 2)` (the wire delta lives on the field
+/// grid). The four derived vectors here are field motion vectors fed
+/// straight into `field_motion_compensate_one_reference`, and `MVD[0]`
+/// is the §7.7.2.2 "field direct mode" delta (decoded with
+/// `f_code == 1`); were the sum `(TRB*MV)/TRD + MVD[0]` evaluated on
+/// frame coordinates, an odd `MVD[0].y` would produce an odd `mvf.y`,
+/// violating the invariant (and silently losing its low bit in the
+/// §7.6.9.1 `mc` routine, whose field path masks `dy_halfpel` with
+/// `y_incr == 2`). The §7.7.2.2 vertical arithmetic therefore runs in
+/// field-grid units: the co-located `MV[i].y` (frame coordinates, even
+/// by the invariant) is halved exactly, scaled and summed with
+/// `MVD[0].y` on the field grid, and the result is doubled back to the
+/// frame coordinates. Horizontal components have no field/frame split.
+/// This reading is black-box-confirmed: a conformant reference decode
+/// reconstructs a direct macroblock with `MVD[0].y == -21` at exactly
+/// 21 frame lines (= 42 half-sample frame units) of vertical
+/// displacement in both derived fields (see `tests/conformance.rs`).
 fn derive_field(
     mv: MotionVector,
     delta_mv: MotionVector,
     trb: i32,
     trd: i32,
 ) -> (MotionVector, MotionVector) {
-    // mvf = TRB*MV/TRD + MVD[0]
+    // §7.7.2 invariant: field MVs are vertically even in frame coords.
+    debug_assert!(mv.y % 2 == 0, "co-located field MV.y must be even");
+    let mv_y_field = mv.y / 2;
+    // mvf = TRB*MV/TRD + MVD[0]  (y on the field grid, then doubled).
+    let mvf_y_field = (trb * mv_y_field) / trd + delta_mv.y;
     let mvf = MotionVector {
         x: (trb * mv.x) / trd + delta_mv.x,
-        y: (trb * mv.y) / trd + delta_mv.y,
+        y: 2 * mvf_y_field,
     };
     // mvb component: when the delta component is 0, the scaled
-    // (TRB-TRD)*MV/TRD form; otherwise mvf - MV.
+    // (TRB-TRD)*MV/TRD form; otherwise mvf - MV (both identities on the
+    // field grid for y; doubling distributes over the subtraction).
     let mvb = MotionVector {
         x: if delta_mv.x == 0 {
             ((trb - trd) * mv.x) / trd
@@ -148,9 +185,9 @@ fn derive_field(
             mvf.x - mv.x
         },
         y: if delta_mv.y == 0 {
-            ((trb - trd) * mv.y) / trd
+            2 * (((trb - trd) * mv_y_field) / trd)
         } else {
-            mvf.y - mv.y
+            2 * (mvf_y_field - mv_y_field)
         },
     };
     (mvf, mvb)
@@ -377,6 +414,75 @@ mod tests {
         );
         assert_eq!(out.forward_top.x, 5);
         assert_eq!(out.forward_bottom.x, 3);
+    }
+
+    #[test]
+    fn delta_y_lands_on_field_grid_doubled_to_frame() {
+        // §7.7.2 evenness invariant: MVD[0].y = -21 (an odd field-grid
+        // value) must displace both derived fields by 21 *frame* lines
+        // (-42 half-sample frame units), not 10.5. Co-located MVs zero
+        // isolate the delta term; MVD.x stays on the shared
+        // half-sample grid (no doubling).
+        let out = interlaced_direct_mvs(
+            field(0, 0, FieldReference::Top),
+            field(0, 0, FieldReference::Bottom),
+            mv(-1, -21),
+            1,
+            3,
+            true,
+        );
+        assert_eq!(out.forward_top, mv(-1, -42));
+        assert_eq!(out.forward_bottom, mv(-1, -42));
+        // MVD != 0 → mvb = mvf - MV = mvf (co-located MV zero).
+        assert_eq!(out.backward_top, mv(-1, -42));
+        assert_eq!(out.backward_bottom, mv(-1, -42));
+    }
+
+    #[test]
+    fn scaled_vertical_term_truncates_on_the_field_grid() {
+        // δ = (0,0); TRB = 2, TRD = 4. MV.y = 6 (frame, even) → 3 on
+        // the field grid. Field-grid scaling: (2*3)/4 = 1 (truncated),
+        // doubled → 2 frame units. Frame-grid scaling would give
+        // (2*6)/4 = 3 — an odd frame vertical, violating the §7.7.2
+        // invariant. Backward: ((2-4)*3)/4 = -1 → -2 frame units.
+        let out = interlaced_direct_mvs(
+            field(0, 6, FieldReference::Top),
+            field(0, 6, FieldReference::Bottom),
+            mv(0, 0),
+            1,
+            2,
+            false,
+        );
+        assert_eq!(out.forward_top, mv(0, 2));
+        assert_eq!(out.backward_top, mv(0, -2));
+    }
+
+    #[test]
+    fn derived_vertical_components_are_always_even() {
+        // Exhaustive spot-check of the §7.7.2 invariant across
+        // co-located MVs, deltas, and TRB/TRD combinations.
+        for mvy in (-64..=64).step_by(2) {
+            for dy in [-21, -3, 0, 1, 17] {
+                for (trb, trd) in [(1, 3), (2, 3), (1, 2), (3, 4)] {
+                    let out = interlaced_direct_mvs(
+                        field(0, mvy, FieldReference::Top),
+                        field(0, mvy, FieldReference::Bottom),
+                        mv(0, dy),
+                        trb,
+                        trd,
+                        false,
+                    );
+                    for v in [
+                        out.forward_top,
+                        out.forward_bottom,
+                        out.backward_top,
+                        out.backward_bottom,
+                    ] {
+                        assert_eq!(v.y % 2, 0, "mvy={mvy} dy={dy} trb={trb} trd={trd}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
