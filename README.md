@@ -19,10 +19,18 @@ frames: start-code scan → §6.2 configuration headers → §6.2.4 GOV /
 P / B / S(GMC), with §6.2.5.2 video-packet resync handling) → the
 §7.6.1 reference-frame chain → §6.1.3.8 display reorder. The §6.3.5
 time model derives each B-VOP's §7.6.7 `TRB`/`TRD` from the composed
-VOP times. **Real-stream conformance**: reference-encoder-produced
-intra-only, I+P and I/P/B fixtures decode end-to-end and match the
-reference decode within the twin-IDCT envelope (max ±2 per sample, no
-drift across the GOP — `tests/conformance.rs`). The crate **registers
+VOP times. **Real-stream conformance is now bit-exact**: against a
+black-box reference decode using the ideal (floating-point) Annex A.1
+IDCT, eleven reference-encoder-produced streams — intra-only, I+P,
+I/P/B, qpel-IP, qpel-IPB, qpel+4MV-IPB, AC-prediction IPB,
+progressive alternate-scan IPB, data-partitioned IPB, 176×144 IPB
+with video packets, and an interlaced I+P — decode **bit-for-bit
+identically**; four more match up to a documented budget of ±1
+"near-tie" samples (the oracle's single-precision IDCT crossing a
+rounding boundary the ideal value sits within ~1e-5 of), and the
+remaining three carry bounded, root-caused oracle deviations
+(`tests/conformance.rs`, fixture provenance + SHA-256 in
+`tests/fixtures/NOTES.md`). The crate **registers
 into the runtime codec registry** (`mpeg4video`, FourCCs XVID / DIVX /
 DX50 / FMP4 / MP4V / M4S2 + MP4 OTI `0x20`) via a packet decoder that
 supports extradata priming, seeks (`reset`), and the pixel-count DoS
@@ -44,22 +52,30 @@ several defects; this decoder implements the corrected readings
 `PMV[3].x` field-backward reconstruction, §7.6.5 intra neighbours as
 valid zero MV candidates, and the f_code==1 direct-delta rule), each
 **black-box-arbitrated** against a conformant interlaced direct-mode
-B-frame stream (docs fixture, refs #176). One bounded, documented
-deviation remains: the conformant interlaced-*direct* vector
-derivation contradicts both the printed pseudo code and its erratum
-reading on isolated macroblocks (18 of the fixture's 30
-interlaced-direct MBs, ≤5% of a frame's samples) — resolving it needs
-a per-MB derived-vector trace. **§6.2.5.3 data-partitioned I-/P-VOPs
+B-frame stream (docs fixture, refs #176), plus the field-grid
+vertical arithmetic the §7.7.2 evenness invariant requires. The
+long-standing interlaced-direct deviation is now **root-caused**: an
+exhaustive per-macroblock-field pixel search (12 uniquely-determined
+macroblock-fields, all consistent) proves the reference decoder
+evaluates the corrected §7.7.2.2 pseudo code with the co-located
+field motion vectors substituted by zero (its derived vectors reduce
+to `mvf[i] = mvb[i] = MVD[0]` on the field grid, forward reference
+fields still following the co-located selections); §7.7.2.2 derives
+"from the forward field motion vectors of the co-located future
+reference VOP", so this decoder keeps the spec's `MV[i]` term and the
+affected macroblocks carry a bounded, documented envelope instead.
+**§6.2.5.3 data-partitioned I-/P-VOPs
 decode end-to-end** (`decode_i_vop_macroblocks_dp` /
 `decode_p_vop_macroblocks_dp`: per-packet dc_marker / motion_marker
 partition structure, §E.1.2 prediction resets, header-partition intra
 DC feeding the texture partition, Table B.23 RVLC texture when
 `reversible_vlc == 1`), with B-VOPs on the combined syntax per the
-§6.2.5.3 NOTE. Seventeen black-box conformance fixtures (intra / IP /
-IPB / qpel / 4-MV / data-partitioned IPB / interlaced × {intra,
-alt-scan, IP, IP-motion, IPB, direct-B 176×144}) match the reference
-decode within the twin-IDCT envelope (plus the bounded
-interlaced-direct deviation above). There is no encoder.
+§6.2.5.3 NOTE. Nineteen black-box conformance fixtures (intra / IP /
+IPB / qpel {IP, IPB, +4MV} / AC-prediction / alternate-scan /
+mpeg-quant / data-partitioned IPB / QCIF-resync IPB / interlaced ×
+{intra, alt-scan, IP, IP-motion, IPB, qpel-IP, direct-B 176×144})
+are asserted bit-exact, near-exact, or envelope-bounded as described
+above. There is no encoder.
 
 ## What works today
 
@@ -77,10 +93,11 @@ interlaced-direct deviation above). There is no encoder.
   [`decode_b_vop_macroblocks`] (§6.2.6 `co_located_not_coded`
   zero-bit macroblocks) — each with §6.2.5.2 video-packet resync
   handling (probe, header decode, §E.1.2 predictor/quantiser reset).
-- **Real-stream conformance** against a black-box reference decode
-  (`tests/conformance.rs`): intra-only (with video packets), I+4P, and
-  I/P/B (two consecutive B-VOPs) fixtures match within the twin-IDCT
-  envelope.
+- **Bit-exact real-stream conformance** against a black-box reference
+  decode with the ideal floating-point IDCT (`tests/conformance.rs`,
+  provenance in `tests/fixtures/NOTES.md`): eleven streams bit-exact,
+  four near-exact (±1 near-tie IDCT samples), three bounded with
+  root-caused oracle deviations.
 - **Configuration headers** (§6.2): Visual Object Sequence
   (`0x000001B0` + profile/level), Visual Object (`0x000001B5`, verid,
   video-signal-type, colour description), and Video Object Layer
@@ -232,20 +249,17 @@ interlaced-direct deviation above). There is no encoder.
 
 ## Not yet supported
 
-- Quarter-sample, interlaced-texture (dct_type / alternate vertical
-  scan), and data-partitioned streams in the **bitstream walks** — the
-  per-stage modules below already implement large parts of these
-  (quarter-pel interpolation, field MC/predictors, the §6.2.5.3
-  data-partition layouts + RVLC recovery), but `vop_decode` /
-  `decoder` reject the VOL configurations with typed errors rather
-  than mis-decode. OBMC (`obmc_disable == 0`) is likewise decoded at
-  the module level but not wired into the P-walk prediction.
-- Per-sub-block co-located vectors for B-VOP direct mode over a 4-MV
-  future anchor (the walk applies the first sub-block vector to all
-  four), and the §7.6.9.6 averaged-MV substitution for a skipped
-  co-located S(GMC) macroblock (the walk uses the zero-vector
-  fallback; the AMV is computed in the S walk but not yet retained
-  per-macroblock).
+- Pixel-exact conformance for the **interlaced quarter-sample field
+  interpolation** (`ildct + ilme + qpel` streams): isolated
+  field-predicted macroblocks diverge from the reference decode, and
+  an exhaustive (MV, reference-field, rounding) search shows the
+  oracle's quarter-sample *field* FIR cascade itself differs from our
+  §7.6.2.2-per-field reading — the fixture carries a bounded envelope
+  until a dedicated arbitration pass (or a clean-room §7.7.2.1
+  quarter-sample field-interpolation trace) settles the geometry.
+- The §7.6.9.6 averaged-MV substitution for a skipped co-located
+  S(GMC) macroblock (the walk uses the zero-vector fallback; the AMV
+  is computed in the S walk but not yet retained per-macroblock).
 - Encoder.
 - Blitting the §E.1.4.4 RVLC recovery into a reconstructed *frame*. The
   driver is now assembled — [`recover_video_packet_dct`] detects the
