@@ -280,20 +280,20 @@ impl BVopMbDecode {
     /// `sample_mode`.
     ///
     /// §7.6.9.5.2 fourth paragraph: in a `quarter_sample == 1` VOL the
-    /// direct-mode vectors are derived in **half**-sample units (the
-    /// co-located quarter-pel MV is halved before scaling, the delta
-    /// is coded half-pel), so a direct macroblock — including the
-    /// §7.6.9.6 `modb == "1"` skipped-co-located form — reconstructs
-    /// with §7.6.2.1 interpolation. Every other mode follows the VOL.
+    /// direct-mode vectors are *derived* in half-sample units (the
+    /// co-located quarter-pel MV is halved before scaling, the delta is
+    /// coded half-pel), but §7.6.2 restricts the §7.6.2.1 bilinear
+    /// process to `quarter_sample == 0` and the §7.6.9.5.3 NOTE
+    /// confirms the direct-mode 8×8 compensation in quarter sample mode
+    /// runs through the §7.6.2.2 block-boundary mirroring. The driver
+    /// therefore re-expresses the derived half-pel vectors on the
+    /// quarter-pel grid (`× 2`, see [`BVopMvDriver`]) and every
+    /// macroblock — direct included — follows the VOL's sample mode.
     pub fn luma_sample_mode(
         &self,
         vol_mode: crate::bvop_prediction::BVopSampleMode,
     ) -> crate::bvop_prediction::BVopSampleMode {
-        if matches!(self.prediction_mode, BVopPredictionMode::Direct) {
-            crate::bvop_prediction::BVopSampleMode::HalfPel
-        } else {
-            vol_mode
-        }
+        vol_mode
     }
 }
 
@@ -1466,8 +1466,8 @@ impl BVopMvDriver {
             // modb == "1" → direct mode with a zero delta vector. No
             // motion bodies are coded.
             let zero_delta = MotionVectorDelta { dx: 0, dy: 0 };
-            let mvs = self.direct_mvs(co_located_mvs, zero_delta)?;
-            let (fwd_chroma, bwd_chroma) = direct_chroma_mvs(&mvs)?;
+            let (mvs, chroma_src) = self.direct_mvs(co_located_mvs, zero_delta)?;
+            let (fwd_chroma, bwd_chroma) = direct_chroma_mvs(&chroma_src)?;
             return Ok(BVopMbDecode {
                 mb_type: BVopMbType::Direct,
                 prediction_mode: BVopPredictionMode::Direct,
@@ -1537,8 +1537,8 @@ impl BVopMvDriver {
         } else {
             MotionVectorDelta { dx: 0, dy: 0 }
         };
-        let mvs = self.direct_mvs(co_located_mvs, delta)?;
-        let (fwd_chroma, bwd_chroma) = direct_chroma_mvs(&mvs)?;
+        let (mvs, chroma_src) = self.direct_mvs(co_located_mvs, delta)?;
+        let (fwd_chroma, bwd_chroma) = direct_chroma_mvs(&chroma_src)?;
         Ok(BVopMbDecode {
             mb_type: BVopMbType::Direct,
             prediction_mode: BVopPredictionMode::Direct,
@@ -1694,11 +1694,25 @@ impl BVopMvDriver {
     /// vector per macroblock). A 1-MV co-located macroblock supplies
     /// four identical vectors; a 4-MV one gives each 8×8 block its own
     /// scaled pair.
+    ///
+    /// Returns `(luma_mvs, chroma_source_mvs)`. In a half-sample VOL
+    /// the two are identical. In a quarter-sample VOL the §7.6.9.5.2
+    /// derivation runs in half-sample units (quarter-pel co-located MV
+    /// halved via Table 7-13, half-pel delta); the §7.6.5 chroma
+    /// reduction consumes those half-pel vectors directly, while the
+    /// luminance vectors are re-expressed on the quarter-pel grid
+    /// (`× 2` — every value lands on a half-sample position of the
+    /// quarter grid) so the §7.6.9.5.3 8×8 compensation runs through
+    /// the §7.6.2.2 interpolation with its block-boundary mirroring
+    /// (the process §7.6.2 mandates whenever `quarter_sample == 1`;
+    /// the §7.6.9.5.3 NOTE calls out the mirroring for exactly this
+    /// case).
+    #[allow(clippy::type_complexity)]
     fn direct_mvs(
         &self,
         co_located_mvs: [DirectCoLocatedMv; MB_SUB_BLOCKS],
         delta: MotionVectorDelta,
-    ) -> Result<[BVopMvPair; MB_SUB_BLOCKS], BVopMvDriverError> {
+    ) -> Result<([BVopMvPair; MB_SUB_BLOCKS], [BVopMvPair; MB_SUB_BLOCKS]), BVopMvDriverError> {
         let units = if self.quarter_sample {
             // §7.6.9.5.2 fourth paragraph: the co-located MV is
             // quarter-pel but the direct delta is half-pel; halve the
@@ -1709,16 +1723,28 @@ impl BVopMvDriver {
             DirectMvUnits::Match
         };
         let zero = MotionVector { x: 0, y: 0 };
-        let mut out = [BVopMvPair {
+        let mut half = [BVopMvPair {
             forward: zero,
             backward: zero,
         }; MB_SUB_BLOCKS];
-        for (pair, co_located) in out.iter_mut().zip(co_located_mvs) {
+        for (pair, co_located) in half.iter_mut().zip(co_located_mvs) {
             let DirectModeMv { forward, backward } =
                 direct_mode_motion_vector(co_located, delta, self.trb, self.trd, units)?;
             *pair = BVopMvPair { forward, backward };
         }
-        Ok(out)
+        let luma = if self.quarter_sample {
+            let mut doubled = half;
+            for pair in doubled.iter_mut() {
+                pair.forward.x *= 2;
+                pair.forward.y *= 2;
+                pair.backward.x *= 2;
+                pair.backward.y *= 2;
+            }
+            doubled
+        } else {
+            half
+        };
+        Ok((luma, half))
     }
 }
 
@@ -1999,12 +2025,16 @@ mod tests {
     }
 
     #[test]
-    fn quarter_sample_direct_converts_co_located_to_half_pel() {
+    fn quarter_sample_direct_derives_half_pel_then_rescales_to_quarter_grid() {
         // §7.6.9.5.2 fourth paragraph: quarter-pel co-located MV
         // (10, 6) halves via Table 7-13 to (5, 3) half-pel before the
         // TRB/TRD = 1/2 scaling: MVF = (5/2, 3/2) = (2, 1); MVB =
-        // ((1-2)*5/2, (1-2)*3/2) = (-2, -1). The delta is zero
-        // (modb == "1"), and the reconstruct grid is half-pel.
+        // ((1-2)*5/2, (1-2)*3/2) = (-2, -1) in half-pel units. The
+        // delta is zero (modb == "1"). The §7.6.9.5.3 luminance MC
+        // then runs on the VOL's quarter-sample grid (§7.6.2.2 with
+        // block-boundary mirroring), so the stored per-block vectors
+        // are re-expressed in quarter units: MVF = (4, 2),
+        // MVB = (-4, -2).
         let vol = make_vol();
         let mut w = BitWriter::new();
         w.write_bits(0b1, 1);
@@ -2026,16 +2056,16 @@ mod tests {
             .unwrap();
         assert_eq!(mb.prediction_mode, BVopPredictionMode::Direct);
         for pair in mb.mvs {
-            assert_eq!(pair.forward, MotionVector { x: 2, y: 1 });
-            assert_eq!(pair.backward, MotionVector { x: -2, y: -1 });
+            assert_eq!(pair.forward, MotionVector { x: 4, y: 2 });
+            assert_eq!(pair.backward, MotionVector { x: -4, y: -2 });
         }
-        // Direct macroblocks reconstruct half-pel even in a qpel VOL…
+        // §7.6.5 chroma reduction runs on the derived *half-pel*
+        // vectors (K = 4): forward sum = (8, 4), sum/2K indexes Table
+        // 7-10 at residue 8 → 1 on x, residue 4 → 0.5-step … the
+        // derivation matches the half-pel direct path exactly.
+        // Every macroblock — direct included — follows the VOL grid.
         let qpel = crate::bvop_prediction::BVopSampleMode::QuarterPel { bits_per_pixel: 8 };
-        assert_eq!(
-            mb.luma_sample_mode(qpel),
-            crate::bvop_prediction::BVopSampleMode::HalfPel
-        );
-        // …while an explicit-mode macroblock follows the VOL grid.
+        assert_eq!(mb.luma_sample_mode(qpel), qpel);
         let zero = MotionVector { x: 0, y: 0 };
         let fwd = BVopMbDecode {
             mb_type: BVopMbType::Forward,

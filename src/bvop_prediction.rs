@@ -348,52 +348,72 @@ pub fn generate_b_vop_luma_prediction_into(
         MB_LUMA_PIXELS,
     );
 
-    let mut sub_buf_f = [0u8; SUB_BLOCK_SIDE * SUB_BLOCK_SIDE];
-    let mut sub_buf_b = [0u8; SUB_BLOCK_SIDE * SUB_BLOCK_SIDE];
-    let mut sub_buf_avg = [0u8; SUB_BLOCK_SIDE * SUB_BLOCK_SIDE];
-
-    for (i, &(dx, dy)) in SUB_BLOCK_OFFSETS.iter().enumerate() {
-        let origin_x = mb_origin_x + dx;
-        let origin_y = mb_origin_y + dy;
-
-        // ForwardOnly / BackwardOnly / Bidirectional all use mvs[0]
-        // since §7.6.9.2 / §7.6.9.3 / §7.6.9.4 specify one MV per MB
-        // (not per sub-block). Direct mode uses the per-sub-block
-        // entry.
-        let mv_index = match prediction_mode {
-            BVopPredictionMode::Direct => i,
-            BVopPredictionMode::ForwardOnly
-            | BVopPredictionMode::BackwardOnly
-            | BVopPredictionMode::Bidirectional => 0,
-        };
-        let pair = mvs[mv_index];
-
-        let placed: &[u8] = match prediction_mode {
-            BVopPredictionMode::ForwardOnly => {
-                interpolate_sub_block(
-                    forward_ref,
-                    pair.forward,
-                    origin_x,
-                    origin_y,
-                    mode,
-                    vop_rounding_type,
-                    &mut sub_buf_f,
-                );
-                &sub_buf_f
-            }
-            BVopPredictionMode::BackwardOnly => {
-                interpolate_sub_block(
-                    backward_ref,
-                    pair.backward,
-                    origin_x,
-                    origin_y,
-                    mode,
-                    vop_rounding_type,
-                    &mut sub_buf_b,
-                );
-                &sub_buf_b
-            }
-            BVopPredictionMode::Bidirectional | BVopPredictionMode::Direct => {
+    match prediction_mode {
+        // §7.6.9.2 / §7.6.9.3 / §7.6.9.4: forward, backward, and
+        // interpolated modes carry one MV per direction for the whole
+        // macroblock and compensate it as a single 16×16 block. The
+        // distinction matters in quarter-sample mode: the §7.6.2.2
+        // block-boundary mirroring is applied at the edges of the MC
+        // block, so a 16×16 fetch is *not* equivalent to four 8×8
+        // fetches with the same vector (the §7.6.9.5.3 NOTE spells
+        // this out for the direct-mode side of the contrast).
+        BVopPredictionMode::ForwardOnly => {
+            interpolate_mb_block(
+                forward_ref,
+                mvs[0].forward,
+                mb_origin_x,
+                mb_origin_y,
+                mode,
+                vop_rounding_type,
+                &mut out[..MB_LUMA_PIXELS],
+            );
+        }
+        BVopPredictionMode::BackwardOnly => {
+            interpolate_mb_block(
+                backward_ref,
+                mvs[0].backward,
+                mb_origin_x,
+                mb_origin_y,
+                mode,
+                vop_rounding_type,
+                &mut out[..MB_LUMA_PIXELS],
+            );
+        }
+        BVopPredictionMode::Bidirectional => {
+            let mut buf_f = [0u8; MB_LUMA_PIXELS];
+            let mut buf_b = [0u8; MB_LUMA_PIXELS];
+            interpolate_mb_block(
+                forward_ref,
+                mvs[0].forward,
+                mb_origin_x,
+                mb_origin_y,
+                mode,
+                vop_rounding_type,
+                &mut buf_f,
+            );
+            interpolate_mb_block(
+                backward_ref,
+                mvs[0].backward,
+                mb_origin_x,
+                mb_origin_y,
+                mode,
+                vop_rounding_type,
+                &mut buf_b,
+            );
+            average_bidirectional_into(&buf_f, &buf_b, &mut out[..MB_LUMA_PIXELS]);
+        }
+        // §7.6.9.5.3: direct mode compensates the four 8×8 luminance
+        // blocks individually, each with its own (MVF[i], MVB[i]) pair
+        // — and, in quarter-sample mode, with the §7.6.2.2 mirroring at
+        // each 8×8 block boundary.
+        BVopPredictionMode::Direct => {
+            let mut sub_buf_f = [0u8; SUB_BLOCK_SIDE * SUB_BLOCK_SIDE];
+            let mut sub_buf_b = [0u8; SUB_BLOCK_SIDE * SUB_BLOCK_SIDE];
+            let mut sub_buf_avg = [0u8; SUB_BLOCK_SIDE * SUB_BLOCK_SIDE];
+            for (i, &(dx, dy)) in SUB_BLOCK_OFFSETS.iter().enumerate() {
+                let origin_x = mb_origin_x + dx;
+                let origin_y = mb_origin_y + dy;
+                let pair = mvs[i];
                 interpolate_sub_block(
                     forward_ref,
                     pair.forward,
@@ -413,11 +433,56 @@ pub fn generate_b_vop_luma_prediction_into(
                     &mut sub_buf_b,
                 );
                 average_bidirectional_into(&sub_buf_f, &sub_buf_b, &mut sub_buf_avg);
-                &sub_buf_avg
+                place_sub_block(&sub_buf_avg, i, out);
             }
-        };
+        }
+    }
+}
 
-        place_sub_block(placed, i, out);
+/// Interpolate one full 16×16 macroblock at the requested origin —
+/// the single-MC-block form used by the §7.6.9.2 / §7.6.9.3 / §7.6.9.4
+/// (forward / backward / interpolated) B-VOP modes.
+//
+// Inputs map one-for-one to the §7.6.2 interpolation primitives —
+// a struct wrapper would obscure the call site.
+#[allow(clippy::too_many_arguments)]
+fn interpolate_mb_block(
+    reference: &ReferenceVop<'_>,
+    mv: MotionVector,
+    origin_x: i32,
+    origin_y: i32,
+    mode: BVopSampleMode,
+    vop_rounding_type: u8,
+    out: &mut [u8],
+) {
+    match mode {
+        BVopSampleMode::HalfPel => {
+            interpolate_block_into(
+                reference,
+                mv.x,
+                mv.y,
+                origin_x,
+                origin_y,
+                MB_LUMA_SIDE,
+                MB_LUMA_SIDE,
+                vop_rounding_type,
+                out,
+            );
+        }
+        BVopSampleMode::QuarterPel { bits_per_pixel } => {
+            interpolate_block_qpel_into(
+                reference,
+                mv.x,
+                mv.y,
+                origin_x,
+                origin_y,
+                MB_LUMA_SIDE,
+                MB_LUMA_SIDE,
+                vop_rounding_type,
+                bits_per_pixel,
+                out,
+            );
+        }
     }
 }
 
