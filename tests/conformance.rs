@@ -1,20 +1,36 @@
 //! Real-stream conformance: decode reference-encoder-produced MPEG-4
 //! Visual elementary streams and compare every sample against the
-//! reference decode.
+//! reference decode — **bit-exactly** wherever the oracle permits.
 //!
 //! The fixtures under `tests/fixtures/` were produced by a black-box
-//! reference encoder (64×64 `testsrc` pattern, Simple Profile settings)
-//! together with the matching raw `yuv420p` reference decode of each
-//! stream in display order. No external implementation source was
-//! consulted — the binaries were used opaquely as encode/decode oracles.
+//! reference encoder together with the matching raw `yuv420p` reference
+//! decode of each stream in display order (generation commands +
+//! SHA-256 in `tests/fixtures/NOTES.md`). No external implementation
+//! source was consulted — the binaries were used opaquely as
+//! encode/decode oracles.
 //!
-//! Tolerance: ISO/IEC 14496-2 Annex A.1 specifies the IDCT only up to
-//! the IEEE 1180-1990 accuracy envelope, so two conforming decoders may
-//! legitimately differ by ±1 per sample per intra pass, and prediction
-//! drift can accumulate a little further across a P/B chain. The
-//! assertions therefore allow a small per-sample tolerance and a tiny
-//! fraction of differing samples, while requiring exact frame counts
-//! and plane sizes.
+//! The reference decodes were produced with the oracle's
+//! floating-point IDCT, i.e. the mathematical Annex A.1 transform —
+//! the same ideal transform this decoder evaluates in `f64` — so the
+//! two decoders agree bit-for-bit on every stream, with two measured,
+//! bounded exceptions:
+//!
+//! * **Near-tie IDCT samples** (`assert_stream_near_exact`): the
+//!   oracle's transform runs in single precision; on isolated samples
+//!   whose ideal spatial value sits within ~1e-5 of a rounding
+//!   boundary (measured: 12.5000007, 238.4999993) its float error can
+//!   cross the boundary while our `f64` evaluation rounds the ideal
+//!   value correctly. Affected streams carry a per-stream budget of
+//!   ±1-valued differing samples; everything else must match exactly.
+//! * **§7.4.4.5 mismatch control on intra blocks** (`mq_ipb_64x64`):
+//!   the oracle applies the method-1 mismatch toggle to non-intra
+//!   blocks only (verified per-block-class — skipping the intra toggle
+//!   collapses the stream's differences to a handful of near-ties).
+//!   §7.4.4.5 contains no intra exemption, so this decoder keeps the
+//!   spec behaviour and the assertion carries a ±1 envelope.
+//!
+//! Two interlaced tool axes remain outside the exact envelope with
+//! root-caused, documented deviations — see their tests below.
 
 use oxideav_mpeg4video::decoder::Mpeg4VideoDecoder;
 use oxideav_mpeg4video::framestore::DecodedFrame;
@@ -67,18 +83,10 @@ fn diff_stats(frame: &DecodedFrame, y: &[u8], u: &[u8], v: &[u8]) -> (u32, usize
     (max, differing, total)
 }
 
-fn assert_stream_matches(m4v: &str, yuv: &str, max_tol: u32, frac_tol: f64) {
-    assert_stream_matches_dims(m4v, yuv, 64, 64, max_tol, frac_tol);
-}
-
-fn assert_stream_matches_dims(
-    m4v: &str,
-    yuv: &str,
-    w: usize,
-    h: usize,
-    max_tol: u32,
-    frac_tol: f64,
-) {
+/// Whole-stream diff against the reference decode:
+/// `(max_abs_diff, differing_samples, total_samples)` over every frame,
+/// with frame count and plane sizes asserted exact.
+fn stream_diff(m4v: &str, yuv: &str, w: usize, h: usize) -> (u32, usize, usize) {
     let frames = decode_stream(m4v);
     let reference = fixture(yuv);
     let reference = yuv_frames(&reference, w, h);
@@ -87,217 +95,274 @@ fn assert_stream_matches_dims(
         reference.len(),
         "{m4v}: display-order frame count"
     );
-    for (idx, (frame, &(y, u, v))) in frames.iter().zip(reference.iter()).enumerate() {
-        let (max, differing, total) = diff_stats(frame, y, u, v);
-        let frac = differing as f64 / total as f64;
-        assert!(
-            max <= max_tol && frac <= frac_tol,
-            "{m4v} frame {idx}: max abs diff {max} (tol {max_tol}), \
-             {differing}/{total} samples differ ({frac:.4} > {frac_tol})"
-        );
+    let mut max = 0u32;
+    let mut differing = 0usize;
+    let mut total = 0usize;
+    for (frame, &(y, u, v)) in frames.iter().zip(reference.iter()) {
+        let (m, d, t) = diff_stats(frame, y, u, v);
+        max = max.max(m);
+        differing += d;
+        total += t;
     }
+    (max, differing, total)
 }
 
-// Tolerance rationale: our IDCT is the double-precision orthonormal
-// Annex A.1 transform (accurate to the ideal within rounding); the
-// reference decoder uses an integer IDCT approximation that is itself
-// allowed to deviate by ±1 per sample under IEEE 1180. Two conforming
-// decoders can therefore legitimately differ by up to 2 per sample on
-// an intra pass (opposite-direction rounding), with about a third of
-// the busy-texture samples differing by 1. Prediction chains carry the
-// per-pass difference forward, so a long P/B chain may show isolated
-// samples one step further out. Frame counts, display order, and
-// motion/header decode must be exact — any real decode error shows up
-// as a large localized diff, far outside these envelopes.
-
-#[test]
-fn intra_only_stream_matches_reference_decode() {
-    // 3 intra frames (with §6.2.5.2 video packets): the twin-IDCT
-    // envelope only.
-    assert_stream_matches("intra_64x64.m4v", "intra_64x64.yuv", 2, 0.40);
+/// Every sample of every frame must equal the reference decode.
+fn assert_stream_exact(m4v: &str, yuv: &str, w: usize, h: usize) {
+    let (max, differing, total) = stream_diff(m4v, yuv, w, h);
+    assert!(
+        differing == 0,
+        "{m4v}: expected bit-exact decode, got {differing}/{total} \
+         differing samples (max abs diff {max})"
+    );
 }
 
-#[test]
-fn ip_stream_matches_reference_decode() {
-    // I + 4 P frames: half-pel MC and the §7.6.5 chroma-MV derivation
-    // are exact integer math, so only IDCT rounding flows through the
-    // prediction chain (no drift growth across the GOP).
-    assert_stream_matches("ip_64x64.m4v", "ip_64x64.yuv", 2, 0.40);
+/// Bit-exact except for a bounded budget of near-tie samples: at most
+/// `tie_budget` samples may differ, each by exactly 1 (the oracle's
+/// single-precision IDCT crossing a rounding boundary the ideal value
+/// sits within ~1e-5 of — see the module docs).
+fn assert_stream_near_exact(m4v: &str, yuv: &str, w: usize, h: usize, tie_budget: usize) {
+    let (max, differing, total) = stream_diff(m4v, yuv, w, h);
+    assert!(
+        max <= 1 && differing <= tie_budget,
+        "{m4v}: expected <= {tie_budget} near-tie +/-1 samples, got \
+         {differing}/{total} differing (max abs diff {max})"
+    );
 }
 
-#[test]
-fn ipb_stream_matches_reference_decode() {
-    // I/P/B with 2 consecutive B-VOPs: exercises the §6.1.3.8 reorder,
-    // §7.6.7 TRB/TRD derivation, the §6.2.6 co_located_not_coded
-    // zero-bit B macroblocks, B-VOP video packets (18-bit resync
-    // markers + ahead-of-raster resume points), and the §7.6.9
-    // prediction modes. A couple of samples reach 3 after two
-    // prediction passes.
-    assert_stream_matches("ipb_64x64.m4v", "ipb_64x64.yuv", 3, 0.40);
+/// Bounded, root-caused deviation from the oracle (documented at the
+/// call site): max per-sample difference and differing-sample fraction
+/// must stay within the measured envelope.
+fn assert_stream_bounded(m4v: &str, yuv: &str, w: usize, h: usize, max_tol: u32, frac_tol: f64) {
+    let (max, differing, total) = stream_diff(m4v, yuv, w, h);
+    let frac = differing as f64 / total as f64;
+    assert!(
+        max <= max_tol && frac <= frac_tol,
+        "{m4v}: max abs diff {max} (tol {max_tol}), {differing}/{total} \
+         samples differ ({frac:.5} > {frac_tol})"
+    );
 }
 
+// ───────────────────────── bit-exact streams ─────────────────────────
+
 #[test]
-fn qpel_ip_stream_matches_reference_decode() {
-    // §7.6.2.2 quarter-sample mode (VOL `quarter_sample == 1`): I + 4 P
-    // frames encoded with quarter-pel motion. Exercises the 8-tap FIR
-    // half-pel stage, the bilinear quarter positions, the Figure 7-30
-    // per-block boundary mirroring, and the §7.6.5 quarter→half chroma
-    // MV reduction (K = 1 on the eighth-sample grid / Table 7-12). The
-    // FIR is exact integer math, so only the twin-IDCT envelope flows
-    // through the prediction chain — isolated samples reach 3 after
-    // four prediction passes, as in the I/P/B stream.
-    assert_stream_matches("qpel_ip_64x64.m4v", "qpel_ip_64x64.yuv", 3, 0.40);
+fn intra_only_stream_is_bit_exact() {
+    // 3 intra frames with §6.2.5.2 video packets.
+    assert_stream_exact("intra_64x64.m4v", "intra_64x64.yuv", 64, 64);
 }
 
 #[test]
-fn qpel_ipb_stream_matches_reference_decode() {
-    // Quarter-sample I/P/B: the explicit B modes (forward / backward /
-    // interpolated) run on the quarter-pel grid while §7.6.9.5 direct
-    // macroblocks derive half-pel vectors from the quarter-pel
-    // co-located MV (§7.6.9.5.2 fourth paragraph, Table 7-13
-    // conversion) and reconstruct with §7.6.2.1 interpolation.
-    assert_stream_matches("qpel_ipb_64x64.m4v", "qpel_ipb_64x64.yuv", 3, 0.40);
+fn ip_stream_is_bit_exact() {
+    // I + 4 P frames: half-pel MC, §7.6.5 chroma derivation, and the
+    // §7.4.3 DC/AC prediction with the §4.1 `//` rounding.
+    assert_stream_exact("ip_64x64.m4v", "ip_64x64.yuv", 64, 64);
 }
 
 #[test]
-fn mv4_ipb_stream_matches_reference_decode() {
-    // Four-MV (inter4v) anchors + B-VOPs: the P walk decodes four
-    // §7.6.3 vectors per macroblock (Figure 7-34 in-MB candidate
-    // gathering), and §7.6.9.5.2 direct-mode B macroblocks scale each
-    // co-located block vector separately (per-sub-block MVF[i]/MVB[i],
-    // with the §7.6.9.5.3 K=4 chroma reduction).
-    assert_stream_matches("mv4_ipb_64x64.m4v", "mv4_ipb_64x64.yuv", 3, 0.40);
+fn ipb_stream_is_bit_exact() {
+    // I/P/B with 2 consecutive B-VOPs: §6.1.3.8 reorder, §7.6.7
+    // TRB/TRD, §6.2.6 co_located_not_coded zero-bit macroblocks, B-VOP
+    // video packets, and the §7.6.9 modes as single 16×16 MC blocks.
+    assert_stream_exact("ipb_64x64.m4v", "ipb_64x64.yuv", 64, 64);
 }
 
 #[test]
-fn interlaced_intra_stream_matches_reference_decode() {
-    // Interlaced VOL (`interlaced == 1`), intra-only: exercises the
-    // §6.2.6.3 interlaced_information() dct_type bit and the §7.7.1
-    // inverse field-DCT line permutation (top/bottom-field blocks back
-    // to frame lines) on real field-coded macroblocks.
-    assert_stream_matches("ilaced_intra_64x64.m4v", "ilaced_intra_64x64.yuv", 2, 0.40);
+fn qpel_ip_stream_is_bit_exact() {
+    // §7.6.2.2 quarter-sample mode: 8-tap FIR half-pel stage, bilinear
+    // quarter positions, Figure 7-30 block-boundary mirroring, and the
+    // §7.6.5 quarter-mode chroma reduction (K = 1).
+    assert_stream_exact("qpel_ip_64x64.m4v", "qpel_ip_64x64.yuv", 64, 64);
 }
 
 #[test]
-fn interlaced_alternate_scan_intra_stream_matches_reference_decode() {
-    // As above plus the §6.3.5 alternate_vertical_scan_flag: every
-    // block of the VOP inverse-scans with the Figure 7-4 (b) pattern.
-    assert_stream_matches(
-        "ilaced_altscan_intra_64x64.m4v",
-        "ilaced_altscan_intra_64x64.yuv",
-        2,
-        0.40,
+fn qpel_ipb_stream_is_bit_exact() {
+    // Quarter-sample I/P/B: explicit B modes as 16×16 quarter-pel MC
+    // blocks; §7.6.9.5 direct macroblocks derive on the quarter grid
+    // (co-located MV and MVD[0] both quarter-pel) and compensate 8×8
+    // blocks through §7.6.2.2 with its boundary mirroring.
+    assert_stream_exact("qpel_ipb_64x64.m4v", "qpel_ipb_64x64.yuv", 64, 64);
+}
+
+#[test]
+fn qpel_mv4_ipb_stream_is_bit_exact() {
+    // Quarter-sample + four-MV anchors: the §7.6.5 quarter-mode K = 4
+    // chroma reduction (§4.1 truncating per-vector halving onto the
+    // sixteenth grid / Table 7-10) and §7.6.9.5.2 direct mode over
+    // 4-MV co-located macroblocks with per-sub-block quarter-grid
+    // (MVF[i], MVB[i]) pairs.
+    assert_stream_exact("qpel_mv4_ipb_64x64.m4v", "qpel_mv4_ipb_64x64.yuv", 64, 64);
+}
+
+#[test]
+fn aic_ipb_stream_is_bit_exact() {
+    // §7.4.3.3 AC prediction: ac_pred_flag == 1 intra macroblocks with
+    // the §7.4.2 direction-dependent scan (DC-from-left →
+    // alternate-vertical, DC-from-above → alternate-horizontal) and the
+    // §4.1 `//` quantiser rescale of the predicted row/column.
+    assert_stream_exact("aic_ipb_64x64.m4v", "aic_ipb_64x64.yuv", 64, 64);
+}
+
+#[test]
+fn altscan_ipb_stream_is_bit_exact() {
+    // §6.3.5 alternate_vertical_scan_flag on a progressive VOL: every
+    // block of every VOP inverse-scans with the Figure 7-4 (b) pattern.
+    assert_stream_exact("altscan_ipb_64x64.m4v", "altscan_ipb_64x64.yuv", 64, 64);
+}
+
+#[test]
+fn dp_ipb_stream_is_bit_exact() {
+    // §6.2.5.3 data partitioning: per-packet dc_marker / motion_marker
+    // partition walks, §E.1.2 prediction resets, header-partition intra
+    // DC feeding the texture partition; B-VOPs on the combined syntax.
+    assert_stream_exact("dp_ipb_64x64.m4v", "dp_ipb_64x64.yuv", 64, 64);
+}
+
+#[test]
+fn ipb_176x144_stream_is_bit_exact() {
+    // QCIF I/P/B with ~120-byte video packets: resync-marker handling
+    // at a realistic frame size (99 macroblocks per VOP).
+    assert_stream_exact("ipb_176x144.m4v", "ipb_176x144.yuv", 176, 144);
+}
+
+#[test]
+fn interlaced_ip2_stream_is_bit_exact() {
+    // Interlaced I + P with strong real motion (bottom-field-first):
+    // §7.7.2.1 field MC, CASE 1/2/3 predictors, and the
+    // `2*Div2Round(MVy/2)` field-chroma vertical derivation.
+    assert_stream_exact("ilaced_ip2_64x64.m4v", "ilaced_ip2_64x64.yuv", 64, 64);
+}
+
+// ───────────── bit-exact up to near-tie IDCT samples ─────────────
+
+#[test]
+fn mv4_ipb_stream_is_bit_exact_up_to_near_ties() {
+    // Four-MV anchors + B-VOPs (half-sample): per-sub-block §7.6.9.5.2
+    // direct MVs, K = 4 chroma reduction. One near-tie sample (ideal
+    // value 238.4999993) persists across the 7 frames.
+    assert_stream_near_exact("mv4_ipb_64x64.m4v", "mv4_ipb_64x64.yuv", 64, 64, 7);
+}
+
+#[test]
+fn interlaced_intra_stream_is_bit_exact_up_to_near_ties() {
+    // Interlaced VOL, intra-only: §7.7.1 field DCT. One near-tie
+    // sample (ideal value 12.5000007) per frame.
+    assert_stream_near_exact(
+        "ilaced_intra_64x64.m4v",
+        "ilaced_intra_64x64.yuv",
+        64,
+        64,
+        3,
     );
 }
 
 #[test]
-fn interlaced_ip_stream_matches_reference_decode() {
-    // Interlaced I + 4 P frames encoded with field motion estimation:
-    // exercises the §7.7.2.1 field-predicted macroblocks (two field MV
-    // bodies, shared CASE 1/2/3 predictor, Div2Round chroma vectors,
-    // per-field reference selection), the §7.7.1 field DCT on both
-    // intra macroblocks and inter residuals, and the CASE 2 collapse
-    // of field neighbours for frame-predicted macroblocks.
-    assert_stream_matches("ilaced_ip_64x64.m4v", "ilaced_ip_64x64.yuv", 3, 0.40);
+fn interlaced_alternate_scan_intra_stream_is_bit_exact_up_to_near_ties() {
+    // As above plus §6.3.5 alternate_vertical_scan_flag; same near-tie
+    // sample.
+    assert_stream_near_exact(
+        "ilaced_altscan_intra_64x64.m4v",
+        "ilaced_altscan_intra_64x64.yuv",
+        64,
+        64,
+        3,
+    );
 }
 
 #[test]
-fn interlaced_ip2_stream_matches_reference_decode() {
-    // A second interlaced I+P stream with strong real motion
-    // (`testsrc2`, bottom-field-first): drives non-trivial field MV
-    // pairs through the CASE 1/2/3 predictors and the §7.7.2.1
-    // Div2Round field-chroma derivation (whose vertical component must
-    // land on the field-mode `mc` half-flag grid — `2*Div2Round(MVy/2)`
-    // — validated sample-exact here; the naive `Div2Round(MVy)`
-    // composition drops the `MVy ≡ +2 (mod 8)` fraction).
-    assert_stream_matches("ilaced_ip2_64x64.m4v", "ilaced_ip2_64x64.yuv", 2, 0.40);
+fn interlaced_ip_stream_is_bit_exact_up_to_near_ties() {
+    // Interlaced I + 4 P with field motion estimation: §7.7.2.1
+    // field-predicted macroblocks, §7.7.1 field DCT. The intra
+    // near-tie sample propagates through the P chain (5 frames).
+    assert_stream_near_exact("ilaced_ip_64x64.m4v", "ilaced_ip_64x64.yuv", 64, 64, 5);
+}
+
+// ─────────────── bounded, root-caused oracle deviations ───────────────
+
+#[test]
+fn mpeg_quant_ipb_stream_matches_within_intra_mismatch_envelope() {
+    // quant_type == 1 (method-1 inverse quantisation, default matrices)
+    // I/P/B. §7.4.4.5 requires the mismatch toggle on every method-1
+    // block; the oracle applies it to non-intra blocks only (verified
+    // per-block-class — with the intra toggle suppressed this stream
+    // collapses to 4 near-tie samples). The F[7][7] LSB difference on
+    // intra blocks ripples through the IDCT as scattered ±1 samples
+    // (measured 3062/73728 ≈ 4.2%, max 1). This decoder follows the
+    // printed clause.
+    assert_stream_bounded("mq_ipb_64x64.m4v", "mq_ipb_64x64.yuv", 64, 64, 1, 0.05);
 }
 
 #[test]
-fn interlaced_ipb_stream_matches_reference_decode() {
-    // Interlaced I/P/B: the unified §7.7.2.2 B dispatch — progressive
-    // frame-predicted macroblocks, field forward / backward /
-    // bidirectional through the Table 7-14/7-15 four-PMV bank, B-VOP
-    // video-packet resync, interlaced direct mode driven by the
-    // co-located future macroblock's forward field MV pairs, and the
-    // §7.7.1 field DCT on B residuals.
-    //
-    // The §7.7.2.2 interlaced B pseudo code is printed with multiple
-    // internal inconsistencies; the readings below are corrected per
-    // `docs/video/mpeg4-visual/mpeg4-visual-errata.md` (E1/E2) plus the
-    // same-slot `PMV[3].x` field-backward reconstruction, all
-    // arbitrated against a conformant black-box stream (see
-    // `interlaced_direct_bframes_stream_matches_reference_decode`
-    // below). Every macroblock class in this stream now sits inside
-    // the twin-IDCT envelope EXCEPT §7.7.2.2 interlaced *direct*
-    // macroblocks (two isolated MBs of one B-VOP here): the conformant
-    // interlaced-direct derivation demonstrably differs from both the
-    // printed pseudo code and the erratum-corrected reading in ways
-    // this fixture cannot pin down uniquely (see the tolerance note on
-    // the 176×144 fixture below). Bounded until the direct-mode
-    // derivation trace lands.
-    assert_stream_matches("ilaced_ipb_64x64.m4v", "ilaced_ipb_64x64.yuv", 60, 0.07);
+fn interlaced_ipb_stream_matches_within_interlaced_direct_envelope() {
+    // Interlaced I/P/B: every macroblock class is bit-exact EXCEPT the
+    // §7.7.2.2 interlaced-direct macroblocks (two isolated MBs per
+    // B-VOP here) — see the 176×144 fixture below for the root cause —
+    // plus the interlaced-intra near-tie sample. Measured: 650/43008
+    // ≈ 1.5%, max 58.
+    assert_stream_bounded(
+        "ilaced_ipb_64x64.m4v",
+        "ilaced_ipb_64x64.yuv",
+        64,
+        64,
+        60,
+        0.02,
+    );
 }
 
 #[test]
-fn interlaced_direct_bframes_stream_matches_reference_decode() {
-    // 176×144, 25 VOPs (3 I / 6 P / 16 B), interlaced VOL with strong
-    // field-differentiated vertical motion: 30 macroblocks across 11
-    // B-VOPs decode in §7.7.2.2 *interlaced direct* mode (co-located
-    // future P macroblock coded + inter + field_prediction == 1); our
-    // classification reproduces the fixture's independent per-VOP
-    // interlaced-direct distribution exactly (30/30). Fixture staged
-    // in docs/video/mpeg4-visual/fixtures/interlaced-direct-bframes/.
+fn interlaced_direct_bframes_stream_matches_within_interlaced_direct_envelope() {
+    // 176×144, 25 VOPs (3 I / 6 P / 16 B), 30 interlaced-direct MBs
+    // across 11 B-VOPs (fixture staged in
+    // docs/video/mpeg4-visual/fixtures/interlaced-direct-bframes/,
+    // refs #176). Classification matches the fixture's per-VOP
+    // interlaced-direct distribution 30/30; every I-/P-VOP and every
+    // non-direct interlaced-B macroblock class is bit-exact.
     //
-    // This stream black-box-arbitrated five decoder corrections:
-    // §7.6.5 intra neighbours as valid zero MV candidates, the
-    // Table 7-15 unified four-PMV bank shared by frame- and
-    // field-predicted B macroblocks, the same-slot `PMV[3].x`
-    // field-backward reconstruction, the §7.7.2.2 backward MC field
-    // ordering (erratum E1, `mvb[0]` top / `mvb[1]` bottom), and the
-    // §7.6.9.5.2 / §7.7.2.2 f_code == 1 direct-delta reconstruction.
-    // All I- and P-VOPs and every interlaced B macroblock class except
-    // interlaced direct land inside the twin-IDCT envelope (max ≤ 2).
-    //
-    // Bounded deviation: of the 30 interlaced-direct MBs, 18 still
-    // mismatch (isolated, ≤ 5% of a frame's samples, luma max ≤ 75
-    // with the chroma Div2Round derivation reaching ~110). Solving the
-    // conformant per-field predictions pixel-exactly on the
-    // residual-free ones shows the true derivation contradicts the
-    // *printed* §7.7.2.2 pseudo code AND its erratum-corrected reading
-    // (e.g. one co-located MB with field MVs (0,0)/(0,12), MVD[0].y =
-    // -22, TRB/TRD = 2/3 reconstructs both forward fields at -22
-    // *frame lines* — twice the erratum derivation — while another MB
-    // with MVs (0,-64)/(0,0), MVD[0] = 0 reconstructs its top backward
-    // field at exactly 0). No single consistent reading fits all
-    // constraints; resolving it needs a per-MB derived-vector
-    // (mvf[]/mvb[]) trace from a conformant decoder — the outstanding
-    // half of the §7.7.2.2 erratum's "trace ask".
-    assert_stream_matches_dims(
+    // Root cause of the remaining deviation, solved this round by
+    // exhaustive per-macroblock-field search over the field-MC
+    // candidate space (12 uniquely-determined macroblock-fields, all
+    // consistent): the oracle evaluates the E1/E2-corrected §7.7.2.2
+    // pseudo code with the co-located field motion vectors substituted
+    // by ZERO — its derived vectors reduce to mvf[i] = mvb[i] = MVD[0]
+    // on the field grid (e.g. MVD[0].y = -21 → exactly 21 frame lines
+    // in both fields), while the forward reference fields still follow
+    // the co-located macroblock's field selections and the backward
+    // ones the spec's (0, 1) literals. §7.7.2.2 states the vectors are
+    // "calculated from the forward field motion vectors of the
+    // co-located future reference VOP", so this decoder keeps the
+    // spec's MV[i] term (with the field-grid vertical arithmetic the
+    // §7.7.2 evenness invariant requires); macroblocks whose co-located
+    // field MVs are non-zero therefore legitimately differ from this
+    // oracle. Measured: 6202/570240 ≈ 0.65%, max 114 (chroma).
+    assert_stream_bounded(
         "ilaced_direct_176x144.m4v",
         "ilaced_direct_176x144.yuv",
         176,
         144,
         120,
-        0.05,
+        0.01,
     );
 }
 
 #[test]
-fn data_partitioned_ipb_stream_matches_reference_decode() {
-    // §6.2.5.3 data partitioning (`data_partitioned == 1`): 12 VOPs
-    // (I/P/B, GOP 6, two B-VOPs per anchor) of a vertically panning
-    // 64×64 source, RD mode, ~120-byte video packets. Every I-/P-VOP
-    // video packet carries the partitioned layout — partition 1
-    // (`mcbpc` + DC-VLC intra DC, or `not_coded` + `mcbpc` +
-    // `motion_coding()`), the 19-bit `dc_marker` / 17-bit
-    // `motion_marker`, partition 2 (`ac_pred_flag` + `cbpy` + `dquant`
-    // + P-VOP intra DC), then the texture partition — while the B-VOPs
-    // use the combined syntax (§6.2.5.3 NOTE: data partitioning is not
-    // supported in B-VOPs). Exercises the packetised §E.1.2 prediction
-    // resets, the partition-1-threaded §7.6.5 MV predictor walk
-    // (skipped / intra / 1-MV / 4-MV), and the header-partition intra
-    // DC feeding the texture-partition AC decode. Only the twin-IDCT
-    // envelope remains.
-    assert_stream_matches("dp_ipb_64x64.m4v", "dp_ipb_64x64.yuv", 3, 0.40);
+fn interlaced_qpel_ip_stream_matches_within_field_qpel_envelope() {
+    // Interlaced field motion estimation + quarter-sample (ildct +
+    // ilme + qpel), I + P chain. Isolated field-predicted (and
+    // neighbouring) macroblocks diverge from the oracle: an exhaustive
+    // search over (top MV, bottom MV, reference fields, rounding) with
+    // our §7.6.2.2-on-field-grid interpolation reproduces NO candidate
+    // for the failing macroblocks, i.e. the oracle's quarter-sample
+    // *field* interpolation cascade itself differs from our reading of
+    // the §7.6.2.2 process applied per field — not the vectors. The
+    // spec text does not pin the field-grid FIR/mirroring geometry
+    // precisely; resolving it needs a dedicated arbitration pass (or a
+    // clean-room trace of §7.7.2.1 quarter-sample field interpolation).
+    // Measured: 1184/73728 ≈ 1.6%, max 111 (chroma).
+    assert_stream_bounded(
+        "ilaced_qpel_ip_64x64.m4v",
+        "ilaced_qpel_ip_64x64.yuv",
+        64,
+        64,
+        120,
+        0.02,
+    );
 }

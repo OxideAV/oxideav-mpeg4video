@@ -22,8 +22,92 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 - **Interlaced direct-mode B-frame conformance fixture** (176×144, 30
   interlaced-direct MBs): classification matches the fixture's
   independent per-VOP distribution 30/30.
+- **Bit-exact conformance corpus** (`tests/conformance.rs` +
+  `tests/fixtures/NOTES.md` with generation commands and SHA-256):
+  every reference decode regenerated with the oracle's floating-point
+  (ideal Annex A.1) IDCT, and the assertions tightened from the old
+  ±2/±3 "twin-IDCT envelope" to **bit-exact** on eleven streams
+  (intra / I+P / I+P+B / qpel-IP / qpel-IPB / qpel+4MV / AC-prediction
+  / progressive alternate-scan / data-partitioned / QCIF-resync /
+  interlaced-IP2), near-exact (a budget of ±1 near-tie IDCT samples,
+  root-caused to the oracle's single-precision transform) on four
+  more, and bounded with documented root causes on the remaining
+  three (method-1 intra mismatch control; §7.7.2.2 interlaced direct
+  — oracle substitutes zero co-located MVs, solved by exhaustive
+  per-macroblock-field search; interlaced quarter-sample field
+  interpolation — oracle's field FIR cascade differs, no vector
+  candidate reproduces it). Six new fixtures widen the tool axes:
+  `mpeg_quant` I/P/B, progressive alternate scan, AC prediction,
+  quarter-sample + 4-MV, 176×144 I/P/B with ~120-byte video packets,
+  and interlaced quarter-sample I+P.
 
 ### Fixed
+
+- **§4.1 `//` operator in the §7.4.3 DC / AC predictors**: the spec's
+  `//` is integer division with rounding to the *nearest* integer
+  (half-integer values away from zero), not truncation. The §7.4.3.2
+  DC reconstruction (`F[0][0] // dc_scaler`) and both §7.4.3.3 AC
+  quantiser rescales (`(QF · Qp) // QpX`) previously truncated,
+  biasing every predicted intra DC/AC low by up to one quantised step
+  (chroma planes of the reference streams showed a uniform +1..+2
+  pixel offset). With the fix, the intra-only / I+P / I+P+B / qpel-IP
+  / data-partitioned conformance streams decode **bit-exactly**
+  against a floating-point-IDCT reference decode.
+- **§7.6.9.2/.3/.4 B-VOP forward / backward / interpolated MC block
+  size**: these modes carry one MV per direction for the whole
+  macroblock and compensate a single 16×16 luminance block. The walk
+  compensated four 8×8 sub-blocks instead — equivalent on the
+  half-sample grid, but *not* in quarter-sample mode, where the
+  §7.6.2.2 block-boundary mirroring differs at the interior sub-block
+  seams (the §7.6.9.5.3 NOTE spells the distinction out). Interpolated
+  quarter-pel B macroblocks could deviate by up to ±3 near seams.
+- **§7.6.9.5.2 direct mode in quarter-sample VOLs derives on the
+  quarter grid** (and compensates through §7.6.2.2): the co-located MV
+  and `MVD[0]` (decoded with `f_code == 1` like every vector of the
+  VOP) already share the quarter-pel grid, so the derivation formulas
+  apply without unit conversion — the fourth paragraph's Table 7-13
+  halving covers a hypothetical half-pel-delta mismatch that does not
+  arise. The 8×8 compensation runs through the §7.6.2.2 quarter-sample
+  interpolation (FIR half-sample values + Figure 7-30 block-boundary
+  mirroring) instead of the §7.6.2.1 bilinear process, which §7.6.2
+  restricts to `quarter_sample == 0`; the §7.6.9.5.3 chroma reduction
+  applies the quarter-mode per-vector `/ 2` pre-halving. Solved from
+  pixels by exhaustive per-sub-block search: co-located
+  `MV[0] = (1, 1)`, `MVD = (0, 3)`, `TRB/TRD = 1/3` reconstructs at
+  `MVF = (0, 3)` / `MVB = (0, 2)` — the unconverted quarter-grid
+  evaluation. Quarter-sample I/P/B streams (including direct mode over
+  4-MV anchors) now decode bit-exactly against the
+  floating-point-IDCT reference decode.
+- **§7.4.2 scan selection was transposed**: DC prediction from the
+  horizontally adjacent block (A) selects the *alternate-vertical*
+  scan and prediction from the vertically adjacent block (C) the
+  *alternate-horizontal* scan — the scan runs perpendicular to the
+  prediction edge. The mapping was swapped, garbling every AC
+  coefficient of every `ac_pred_flag == 1` intra block; an
+  AC-prediction stream now decodes bit-exactly.
+- **§7.6.5 quarter-sample chroma reduction**: "the vectors are divided
+  by 2 before summation" is the §4.1 truncating integer halving per
+  vector, landing the sum on the same sixteenth/twelfth/eighth/fourth
+  grids as half-sample mode (the only resolutions §7.6.5 names — an
+  algebraic halving would need thirty-second/twenty-fourth tables that
+  do not exist). The previous fold of the doubled grid onto the Table
+  7-11/7-10 entries missed 4-MV quarter-sample P-VOP chrominance by
+  tens of grey levels; now bit-exact.
+
+- **§7.7.2.2 interlaced-direct vertical derivation runs on the field
+  grid**: §7.7.2 fixes the invariant that field motion vectors are
+  vertically even in half-pel frame coordinates (one field line = two
+  frame lines; §7.7.2.1 recovers coded field MVs as
+  `MVy = 2*(MVDy + Py/2)`). The four derived direct-mode field vectors
+  must satisfy the same invariant, so the `(TRB*MV)/TRD + MVD[0]`
+  vertical arithmetic operates on field-grid values (co-located
+  `MV[i].y` halved exactly from its even frame form, the result doubled
+  back for the `mc` call) — a frame-coordinate evaluation would emit
+  odd verticals whose low bit the §7.6.9.1 field `mc` silently masks.
+  Black-box-confirmed: the reference decode displaces a direct
+  macroblock with `MVD[0].y == -21` by exactly 21 frame lines in both
+  derived fields (solved pixel-exactly by exhaustive search over the
+  field-MC candidate space).
 
 - **§7.6.5 intra neighbour candidates**: an intra macroblock
   contributes a *valid zero* motion-vector candidate to the median
