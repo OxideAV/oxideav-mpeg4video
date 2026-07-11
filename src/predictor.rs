@@ -189,9 +189,10 @@ pub fn select_dc_direction(fa: i32, fb: i32, fc: i32) -> DcPredictionDirection {
 /// is unavailable). `dc_scaler_x` is the result of [`dc_scaler`] for
 /// the *current* block `X`.
 ///
-/// The `//` operator in the spec denotes integer division with
-/// truncation toward zero; Rust's `/` on signed integers matches
-/// this.
+/// The `//` operator in the spec (§4.1 arithmetic operators) denotes
+/// integer division with rounding to the *nearest* integer,
+/// half-integer values away from zero (`3//2 == 2`, `-3//2 == -2`) —
+/// see [`div_round_half_away`].
 ///
 /// # Panics
 ///
@@ -208,7 +209,20 @@ pub fn predict_intra_dc(
         DcPredictionDirection::FromAbove => fc_dc,
         DcPredictionDirection::FromLeft => fa_dc,
     };
-    pqfx_dc + chosen / (dc_scaler_x as i32)
+    pqfx_dc + div_round_half_away(chosen, dc_scaler_x as i32)
+}
+
+/// §4.1 `//` operator: integer division with rounding to the nearest
+/// integer, half-integer values rounded away from zero (`3//2 == 2`,
+/// `-3//2 == -2`). `d` must be positive.
+#[inline]
+fn div_round_half_away(n: i32, d: i32) -> i32 {
+    debug_assert!(d > 0);
+    if n >= 0 {
+        (n + d / 2) / d
+    } else {
+        -((-n + d / 2) / d)
+    }
 }
 
 /// Reconstruct the §7.4.3.3 first column of quantised AC coefficients
@@ -239,7 +253,7 @@ pub fn predict_intra_ac_column(
     let qp_x = qp_x as i32;
     let mut out = [0i32; 7];
     for v in 0..7 {
-        out[v] = pqfx_col[v] + (qfa[v] * qp_a) / qp_x;
+        out[v] = pqfx_col[v] + div_round_half_away(qfa[v] * qp_a, qp_x);
     }
     out
 }
@@ -271,7 +285,7 @@ pub fn predict_intra_ac_row(
     let qp_x = qp_x as i32;
     let mut out = [0i32; 7];
     for u in 0..7 {
-        out[u] = pqfx_row[u] + (qfc[u] * qp_c) / qp_x;
+        out[u] = pqfx_row[u] + div_round_half_away(qfc[u] * qp_c, qp_x);
     }
     out
 }
@@ -446,13 +460,31 @@ mod tests {
     }
 
     #[test]
-    fn predict_dc_truncates_toward_zero() {
-        // 5 / 8 == 0 in integer division; -5 / 8 == 0 (Rust truncates
-        // toward zero, matching the spec's `//`).
-        let q1 = predict_intra_dc(0, DcPredictionDirection::FromLeft, 5, 0, 8);
-        assert_eq!(q1, 0);
-        let q2 = predict_intra_dc(0, DcPredictionDirection::FromLeft, -5, 0, 8);
-        assert_eq!(q2, 0);
+    fn predict_dc_rounds_to_nearest_half_away_from_zero() {
+        // §4.1 `//`: 5 // 8 rounds to 1 (0.625 → nearest is 1);
+        // -5 // 8 rounds to -1. 3 // 8 rounds to 0 (0.375 → nearest 0).
+        // The exact half 4 // 8 rounds away from zero to 1 (and -4 // 8
+        // to -1).
+        assert_eq!(
+            predict_intra_dc(0, DcPredictionDirection::FromLeft, 5, 0, 8),
+            1
+        );
+        assert_eq!(
+            predict_intra_dc(0, DcPredictionDirection::FromLeft, -5, 0, 8),
+            -1
+        );
+        assert_eq!(
+            predict_intra_dc(0, DcPredictionDirection::FromLeft, 3, 0, 8),
+            0
+        );
+        assert_eq!(
+            predict_intra_dc(0, DcPredictionDirection::FromLeft, 4, 0, 8),
+            1
+        );
+        assert_eq!(
+            predict_intra_dc(0, DcPredictionDirection::FromLeft, -4, 0, 8),
+            -1
+        );
     }
 
     #[test]
@@ -484,14 +516,28 @@ mod tests {
     }
 
     #[test]
-    fn predict_ac_column_truncates_toward_zero() {
-        // QpA = 3, QpX = 5: (1 * 3) / 5 = 0; (-1 * 3) / 5 = 0.
+    fn predict_ac_column_rounds_to_nearest() {
+        // §4.1 `//` with QpA = 3, QpX = 5:
+        // (1*3)//5  = 3//5   → 1  (0.6 nearest 1);
+        // (-1*3)//5 = -3//5  → -1;
+        // (2*3)//5  = 6//5   → 1  (1.2 nearest 1);
+        // (-2*3)//5 = -6//5  → -1;
+        // (6*3)//5  = 18//5  → 4  (3.6 nearest 4);
+        // (-6*3)//5 = -18//5 → -4.
         let pqfx_col = [0; 7];
         let qfa_col = [1, -1, 2, -2, 6, -6, 0];
         let out = predict_intra_ac_column(pqfx_col, Some(qfa_col), 3, 5);
-        // (1*3)/5=0, (-1*3)/5=0, (2*3)/5=1, (-2*3)/5=-1,
-        // (6*3)/5=3, (-6*3)/5=-3, 0.
-        assert_eq!(out, [0, 0, 1, -1, 3, -3, 0]);
+        assert_eq!(out, [1, -1, 1, -1, 4, -4, 0]);
+    }
+
+    #[test]
+    fn predict_ac_column_rounds_exact_half_away_from_zero() {
+        // QpA = 1, QpX = 2: (1*1)//2 = 0.5 → 1; (-1*1)//2 = -0.5 → -1;
+        // (3*1)//2 = 1.5 → 2; (-3*1)//2 = -1.5 → -2.
+        let pqfx_col = [0; 7];
+        let qfa_col = [1, -1, 3, -3, 0, 2, -2];
+        let out = predict_intra_ac_column(pqfx_col, Some(qfa_col), 1, 2);
+        assert_eq!(out, [1, -1, 2, -2, 0, 1, -1]);
     }
 
     #[test]
