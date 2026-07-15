@@ -27,11 +27,19 @@
 //!   blocks only (verified per-block-class — skipping the intra toggle
 //!   collapses the stream's differences to a handful of near-ties).
 //!   §7.4.4.5 contains no intra exemption, so this decoder keeps the
-//!   spec behaviour and the assertion carries a ±1 envelope.
+//!   spec behaviour **by default** and the assertion carries a ±1
+//!   envelope; the opt-in ecosystem-compat mode
+//!   (`DecodeOptions::ecosystem`, see `oxideav_mpeg4video::compat`)
+//!   reproduces the oracle bit-for-bit up to the near-ties — see the
+//!   `compat_*` tests at the end of this file.
 //!
 //! Two interlaced tool axes remain outside the exact envelope with
-//! root-caused, documented deviations — see their tests below.
+//! root-caused, documented deviations — see their tests below. The
+//! §7.7.2.2 interlaced-direct deviation is likewise covered by the
+//! compat mode (29 of the corpus' 30 interlaced-direct macroblocks go
+//! bit-exact under it).
 
+use oxideav_mpeg4video::compat::DecodeOptions;
 use oxideav_mpeg4video::decoder::Mpeg4VideoDecoder;
 use oxideav_mpeg4video::framestore::DecodedFrame;
 
@@ -51,9 +59,9 @@ fn yuv_frames(data: &[u8], w: usize, h: usize) -> Vec<(&[u8], &[u8], &[u8])> {
         .collect()
 }
 
-fn decode_stream(name: &str) -> Vec<DecodedFrame> {
+fn decode_stream(name: &str, options: DecodeOptions) -> Vec<DecodedFrame> {
     let stream = fixture(name);
-    let mut dec = Mpeg4VideoDecoder::new();
+    let mut dec = Mpeg4VideoDecoder::with_options(options);
     let mut frames = dec
         .decode(&stream)
         .unwrap_or_else(|e| panic!("{name}: {e}"));
@@ -87,7 +95,19 @@ fn diff_stats(frame: &DecodedFrame, y: &[u8], u: &[u8], v: &[u8]) -> (u32, usize
 /// `(max_abs_diff, differing_samples, total_samples)` over every frame,
 /// with frame count and plane sizes asserted exact.
 fn stream_diff(m4v: &str, yuv: &str, w: usize, h: usize) -> (u32, usize, usize) {
-    let frames = decode_stream(m4v);
+    stream_diff_with(m4v, yuv, w, h, DecodeOptions::spec())
+}
+
+/// [`stream_diff`] under an explicit [`crate::compat`] behaviour
+/// selection.
+fn stream_diff_with(
+    m4v: &str,
+    yuv: &str,
+    w: usize,
+    h: usize,
+    options: DecodeOptions,
+) -> (u32, usize, usize) {
+    let frames = decode_stream(m4v, options);
     let reference = fixture(yuv);
     let reference = yuv_frames(&reference, w, h);
     assert_eq!(
@@ -122,10 +142,22 @@ fn assert_stream_exact(m4v: &str, yuv: &str, w: usize, h: usize) {
 /// single-precision IDCT crossing a rounding boundary the ideal value
 /// sits within ~1e-5 of — see the module docs).
 fn assert_stream_near_exact(m4v: &str, yuv: &str, w: usize, h: usize, tie_budget: usize) {
-    let (max, differing, total) = stream_diff(m4v, yuv, w, h);
+    assert_stream_near_exact_with(m4v, yuv, w, h, tie_budget, DecodeOptions::spec());
+}
+
+/// [`assert_stream_near_exact`] under an explicit behaviour selection.
+fn assert_stream_near_exact_with(
+    m4v: &str,
+    yuv: &str,
+    w: usize,
+    h: usize,
+    tie_budget: usize,
+    options: DecodeOptions,
+) {
+    let (max, differing, total) = stream_diff_with(m4v, yuv, w, h, options);
     assert!(
         max <= 1 && differing <= tie_budget,
-        "{m4v}: expected <= {tie_budget} near-tie +/-1 samples, got \
+        "{m4v} ({options:?}): expected <= {tie_budget} near-tie +/-1 samples, got \
          {differing}/{total} differing (max abs diff {max})"
     );
 }
@@ -134,11 +166,25 @@ fn assert_stream_near_exact(m4v: &str, yuv: &str, w: usize, h: usize, tie_budget
 /// call site): max per-sample difference and differing-sample fraction
 /// must stay within the measured envelope.
 fn assert_stream_bounded(m4v: &str, yuv: &str, w: usize, h: usize, max_tol: u32, frac_tol: f64) {
-    let (max, differing, total) = stream_diff(m4v, yuv, w, h);
+    assert_stream_bounded_with(m4v, yuv, w, h, max_tol, frac_tol, DecodeOptions::spec());
+}
+
+/// [`assert_stream_bounded`] under an explicit behaviour selection.
+#[allow(clippy::too_many_arguments)]
+fn assert_stream_bounded_with(
+    m4v: &str,
+    yuv: &str,
+    w: usize,
+    h: usize,
+    max_tol: u32,
+    frac_tol: f64,
+    options: DecodeOptions,
+) {
+    let (max, differing, total) = stream_diff_with(m4v, yuv, w, h, options);
     let frac = differing as f64 / total as f64;
     assert!(
         max <= max_tol && frac <= frac_tol,
-        "{m4v}: max abs diff {max} (tol {max_tol}), {differing}/{total} \
+        "{m4v} ({options:?}): max abs diff {max} (tol {max_tol}), {differing}/{total} \
          samples differ ({frac:.5} > {frac_tol})"
     );
 }
@@ -287,7 +333,8 @@ fn mpeg_quant_ipb_stream_matches_within_intra_mismatch_envelope() {
     // collapses to 4 near-tie samples). The F[7][7] LSB difference on
     // intra blocks ripples through the IDCT as scattered ±1 samples
     // (measured 3062/73728 ≈ 4.2%, max 1). This decoder follows the
-    // printed clause.
+    // printed clause by default; `DecodeOptions::ecosystem` opts into
+    // the oracle's behaviour (see the `compat_*` tests below).
     assert_stream_bounded("mq_ipb_64x64.m4v", "mq_ipb_64x64.yuv", 64, 64, 1, 0.05);
 }
 
@@ -329,10 +376,12 @@ fn interlaced_direct_bframes_stream_matches_within_interlaced_direct_envelope() 
     // ones the spec's (0, 1) literals. §7.7.2.2 states the vectors are
     // "calculated from the forward field motion vectors of the
     // co-located future reference VOP", so this decoder keeps the
-    // spec's MV[i] term (with the field-grid vertical arithmetic the
-    // §7.7.2 evenness invariant requires); macroblocks whose co-located
-    // field MVs are non-zero therefore legitimately differ from this
-    // oracle. Measured: 6202/570240 ≈ 0.65%, max 114 (chroma).
+    // spec's MV[i] term by default (with the field-grid vertical
+    // arithmetic the §7.7.2 evenness invariant requires); macroblocks
+    // whose co-located field MVs are non-zero therefore legitimately
+    // differ from this oracle, and `DecodeOptions::ecosystem` opts
+    // into the zero-co-located derivation (see the `compat_*` tests
+    // below). Measured: 6202/570240 ≈ 0.65%, max 114 (chroma).
     assert_stream_bounded(
         "ilaced_direct_176x144.m4v",
         "ilaced_direct_176x144.yuv",
@@ -365,4 +414,146 @@ fn interlaced_qpel_ip_stream_matches_within_field_qpel_envelope() {
         120,
         0.02,
     );
+}
+
+// ───────────── ecosystem-compat mode (`DecodeOptions::ecosystem`) ─────────────
+//
+// The opt-in compat mode reproduces the black-box-observed ecosystem
+// behaviour on the two documented spec divergences (see `crate::compat`):
+// the §7.4.4.5 method-1 mismatch toggle is skipped on intra blocks, and
+// the §7.7.2.2 interlaced-direct derivation reads the co-located field
+// MVs as zero. The tests below pin what each previously-deviating
+// stream measures under compat, and that compat leaves the spec-exact
+// streams untouched.
+
+#[test]
+fn compat_mpeg_quant_stream_collapses_to_near_ties() {
+    // Spec mode carries a 3062-sample ±1 envelope on this stream (the
+    // intra mismatch toggle, see the spec-mode test above). With the
+    // compat intra exemption the whole difference collapses to the 4
+    // remaining single-precision IDCT near-ties (measured 4/73728,
+    // max 1).
+    assert_stream_near_exact_with(
+        "mq_ipb_64x64.m4v",
+        "mq_ipb_64x64.yuv",
+        64,
+        64,
+        4,
+        DecodeOptions::ecosystem(),
+    );
+}
+
+#[test]
+fn compat_interlaced_ipb_stream_collapses_to_near_ties() {
+    // Spec mode carries a 650-sample max-58 envelope (two isolated
+    // §7.7.2.2 interlaced-direct macroblocks per B-VOP). With the
+    // compat zero-co-located derivation every direct macroblock goes
+    // bit-exact; what remains is the interlaced-intra near-tie sample
+    // and its motion-compensated propagation (measured 7/43008,
+    // max 1).
+    assert_stream_near_exact_with(
+        "ilaced_ipb_64x64.m4v",
+        "ilaced_ipb_64x64.yuv",
+        64,
+        64,
+        7,
+        DecodeOptions::ecosystem(),
+    );
+}
+
+#[test]
+fn compat_interlaced_direct_bframes_stream_tightens_to_one_macroblock() {
+    // Spec mode carries a 6202-sample max-114 envelope across the 30
+    // interlaced-direct macroblocks. With the compat derivation 29 of
+    // the 30 go bit-exact; measured 2777/950400 ≈ 0.29 % (max 64),
+    // of which everything except ONE macroblock is ±1 near-tie
+    // propagation through the last GOP's anchor chain.
+    //
+    // The residual macroblock (display frame 19, mb (6,8)) is
+    // root-caused as far as black-box pixels allow: an exhaustive
+    // per-field search over (MV, reference-field, mode, residual
+    // placement) determines its oracle reconstruction uniquely as
+    // bidirectional field MC with mvb[0] = (-3,36) against the top
+    // backward field and mvb[1] = (-2,20) against the bottom — values
+    // consistent with the *printed* §7.7.2.2 formulas (including the
+    // literal `MVD[i]` gate reading an untransmitted MVD[1] as zero)
+    // evaluated from a co-located field-MV set of ((4,-48), (3..4,-30))
+    // — while the bitstream-reconstructed co-located MVs are
+    // ((8,-48), (1,30)). The co-located anchor region is flat, so the
+    // oracle's internal anchor MV state cannot be determined from
+    // pixels; settling whether the ecosystem derivation is
+    // conditional-zero or real-MV-with-different-anchor-state needs
+    // the staged fixture's parser dump (docs ask filed).
+    assert_stream_bounded_with(
+        "ilaced_direct_176x144.m4v",
+        "ilaced_direct_176x144.yuv",
+        176,
+        144,
+        64,
+        0.005,
+        DecodeOptions::ecosystem(),
+    );
+}
+
+#[test]
+fn compat_is_a_no_op_for_the_interlaced_qpel_stream() {
+    // Neither compat behaviour is exercised here (quant_type == 0, no
+    // interlaced-direct macroblocks): the compat decode must be
+    // sample-identical to the spec decode, and the §7.7.2.1
+    // field-qpel envelope (docs ask #279) is unchanged.
+    let spec = decode_stream("ilaced_qpel_ip_64x64.m4v", DecodeOptions::spec());
+    let compat = decode_stream("ilaced_qpel_ip_64x64.m4v", DecodeOptions::ecosystem());
+    assert_eq!(spec.len(), compat.len());
+    for (i, (a, b)) in spec.iter().zip(compat.iter()).enumerate() {
+        assert_eq!(a.luma_samples(), b.luma_samples(), "frame {i} luma");
+        assert_eq!(a.cb_samples(), b.cb_samples(), "frame {i} cb");
+        assert_eq!(a.cr_samples(), b.cr_samples(), "frame {i} cr");
+    }
+    assert_stream_bounded_with(
+        "ilaced_qpel_ip_64x64.m4v",
+        "ilaced_qpel_ip_64x64.yuv",
+        64,
+        64,
+        120,
+        0.02,
+        DecodeOptions::ecosystem(),
+    );
+}
+
+#[test]
+fn compat_keeps_the_bit_exact_streams_bit_exact() {
+    // Progressive streams without method-1 quantisation exercise
+    // neither compat behaviour — the pinned bit-exact results must
+    // hold identically under compat.
+    for (m4v, yuv, w, h) in [
+        ("ipb_64x64.m4v", "ipb_64x64.yuv", 64, 64),
+        ("qpel_mv4_ipb_64x64.m4v", "qpel_mv4_ipb_64x64.yuv", 64, 64),
+        ("dp_ipb_64x64.m4v", "dp_ipb_64x64.yuv", 64, 64),
+        ("ilaced_ip2_64x64.m4v", "ilaced_ip2_64x64.yuv", 64, 64),
+    ] {
+        let (max, differing, total) = stream_diff_with(m4v, yuv, w, h, DecodeOptions::ecosystem());
+        assert!(
+            differing == 0,
+            "{m4v} under compat: {differing}/{total} differ (max {max})"
+        );
+    }
+}
+
+#[test]
+fn compat_keeps_the_near_exact_streams_within_their_budgets() {
+    // The near-tie streams contain no method-1 blocks and no
+    // interlaced-direct macroblocks: their spec-mode budgets hold
+    // unchanged under compat.
+    for (m4v, yuv, budget) in [
+        ("mv4_ipb_64x64.m4v", "mv4_ipb_64x64.yuv", 7usize),
+        ("ilaced_intra_64x64.m4v", "ilaced_intra_64x64.yuv", 3),
+        (
+            "ilaced_altscan_intra_64x64.m4v",
+            "ilaced_altscan_intra_64x64.yuv",
+            3,
+        ),
+        ("ilaced_ip_64x64.m4v", "ilaced_ip_64x64.yuv", 5),
+    ] {
+        assert_stream_near_exact_with(m4v, yuv, 64, 64, budget, DecodeOptions::ecosystem());
+    }
 }
