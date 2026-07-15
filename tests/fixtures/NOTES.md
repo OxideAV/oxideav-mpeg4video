@@ -32,8 +32,11 @@ for the per-stream consequences):
   mismatch toggle to non-intra blocks only (verified by toggling our
   implementation per block class: intra-skip collapses the
   `mpeg_quant` stream's diffs from 3062 to 4). §7.4.4.5 has no intra
-  exemption, so our decoder keeps the spec behaviour and the
-  `mq_ipb_64x64` assertion carries a ±1 envelope.
+  exemption, so our decoder keeps the spec behaviour by default and
+  the `mq_ipb_64x64` assertion carries a ±1 envelope; the opt-in
+  ecosystem-compat mode (`DecodeOptions::ecosystem`) reproduces the
+  oracle up to the 4 near-ties (`compat_*` pins in
+  `tests/conformance.rs`).
 
 ## Streams (`.m4v`)
 

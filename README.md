@@ -30,7 +30,13 @@ identically**; four more match up to a documented budget of ±1
 rounding boundary the ideal value sits within ~1e-5 of), and the
 remaining three carry bounded, root-caused oracle deviations
 (`tests/conformance.rs`, fixture provenance + SHA-256 in
-`tests/fixtures/NOTES.md`). The crate **registers
+`tests/fixtures/NOTES.md`). Two of those deviations are
+**spec-vs-ecosystem divergences** now covered by the opt-in
+[ecosystem-compat mode](#compatibility-modes): with it enabled the
+method-1 (`mpeg_quant`) stream and the interlaced-I/P/B stream
+collapse to near-tie-only differences, and 29 of the corpus' 30
+§7.7.2.2 interlaced-direct macroblocks decode bit-exact. The crate
+**registers
 into the runtime codec registry** (`mpeg4video`, FourCCs XVID / DIVX /
 DX50 / FMP4 / MP4V / M4S2 + MP4 OTI `0x20`) via a packet decoder that
 supports extradata priming, seeks (`reset`), and the pixel-count DoS
@@ -62,8 +68,10 @@ field motion vectors substituted by zero (its derived vectors reduce
 to `mvf[i] = mvb[i] = MVD[0]` on the field grid, forward reference
 fields still following the co-located selections); §7.7.2.2 derives
 "from the forward field motion vectors of the co-located future
-reference VOP", so this decoder keeps the spec's `MV[i]` term and the
-affected macroblocks carry a bounded, documented envelope instead.
+reference VOP", so this decoder keeps the spec's `MV[i]` term **by
+default** and the affected macroblocks carry a bounded, documented
+envelope; the [ecosystem-compat mode](#compatibility-modes) opts into
+the observed zero-co-located derivation instead.
 **§6.2.5.3 data-partitioned I-/P-VOPs
 decode end-to-end** (`decode_i_vop_macroblocks_dp` /
 `decode_p_vop_macroblocks_dp`: per-packet dc_marker / motion_marker
@@ -75,7 +83,52 @@ IPB / qpel {IP, IPB, +4MV} / AC-prediction / alternate-scan /
 mpeg-quant / data-partitioned IPB / QCIF-resync IPB / interlaced ×
 {intra, alt-scan, IP, IP-motion, IPB, qpel-IP, direct-B 176×144})
 are asserted bit-exact, near-exact, or envelope-bounded as described
-above. There is no encoder.
+above — each also pinned under the compat mode. There is no encoder.
+
+## Compatibility modes
+
+The decoder's default behaviour is always the **literal ISO/IEC
+14496-2 text**. For two clauses, black-box pixel comparison against
+reference decodes of conformant streams shows the deployed decoder
+ecosystem behaves differently (no implementation source was consulted
+— outputs only). The opt-in **ecosystem-compat** mode reproduces the
+observed behaviour bit-for-bit so real-world files can be matched
+exactly; it covers exactly these two divergences (`crate::compat`
+module docs carry the full write-up):
+
+1. **§7.7.2.2 interlaced direct mode** — spec: the four field MVs are
+   derived from the co-located future macroblock's forward field
+   motion vectors (`MV[i]`); observed: the same erratum-corrected
+   derivation with those vectors read as **zero**, i.e.
+   `mvf[i] = mvb[i] = MVD[0]` on the field grid (forward reference
+   fields still follow the co-located selections).
+2. **§7.4.4.5 mismatch control** — spec: the method-1 sum-parity
+   toggle of `F[7][7]` applies to every block; observed: **non-intra
+   blocks only**.
+
+Selection is wired through every decode surface:
+
+* typed: `Mpeg4VideoDecoder::with_options(DecodeOptions::ecosystem())`
+  (default `new()` / `DecodeOptions::spec()` is the literal spec);
+  every `vop_decode` macroblock walk takes the same `DecodeOptions`;
+* registry / options bag: key **`ecosystem-compat`** (bool, default
+  `false`) on `CodecParameters::options`, declared by the
+  `Mpeg4DecoderOptions` schema and parsed in `make_decoder`; the
+  selection survives `Decoder::reset`.
+
+Measured effect (`tests/conformance.rs` `compat_*` pins): the
+`mpeg_quant` I/P/B stream collapses from a 3062-sample envelope to 4
+near-tie samples, the interlaced I/P/B stream from 650 samples to 7
+near-ties, and the 176×144 interlaced-direct stream from 6202 samples
+(max 114) to 2777 (0.29 %, max 64) with 29/30 interlaced-direct
+macroblocks bit-exact — the single residual macroblock's oracle
+reconstruction is uniquely pinned by exhaustive per-field search and
+is consistent with the *printed* §7.7.2.2 formulas evaluated from a
+co-located field-MV state that differs from the bitstream-reconstructed
+one (the co-located anchor region is flat, so that internal state is
+not determinable from pixels; a docs-fixture trace ask is filed).
+Streams exercising neither clause decode sample-identically in both
+modes (asserted).
 
 ## What works today
 
@@ -97,7 +150,9 @@ above. There is no encoder.
   decode with the ideal floating-point IDCT (`tests/conformance.rs`,
   provenance in `tests/fixtures/NOTES.md`): eleven streams bit-exact,
   four near-exact (±1 near-tie IDCT samples), three bounded with
-  root-caused oracle deviations.
+  root-caused oracle deviations — plus the full `compat_*` pin set
+  under the [ecosystem-compat mode](#compatibility-modes) (two of the
+  bounded streams collapse to near-tie-only).
 - **Configuration headers** (§6.2): Visual Object Sequence
   (`0x000001B0` + profile/level), Visual Object (`0x000001B5`, verid,
   video-signal-type, colour description), and Video Object Layer

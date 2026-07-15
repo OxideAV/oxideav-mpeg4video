@@ -8,6 +8,43 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Opt-in ecosystem-compat decode mode** (`compat::DecodeOptions`;
+  default is the literal spec text) covering the two documented
+  spec-vs-ecosystem divergences: the §7.7.2.2 interlaced-direct
+  derivation with the co-located field MVs read as zero
+  (`mvf[i] = mvb[i] = MVD[0]` on the field grid;
+  `BVopMvDriver::with_zero_colocated_direct`), and the §7.4.4.5
+  method-1 mismatch toggle skipped on intra blocks
+  (`inverse_quant_method1_no_mismatch`,
+  `MacroblockTextureContext::intra_mismatch_exempt`). Wired through
+  every decode surface: the `vop_decode` macroblock walks take a
+  `DecodeOptions` argument, `Mpeg4VideoDecoder::with_options` selects
+  it on the elementary-stream decoder, and the registry path parses
+  the `ecosystem-compat` bool from `CodecParameters::options`
+  (`Mpeg4DecoderOptions`, declared via `decoder_options` on the
+  registry entry; preserved across `Decoder::reset`).
+- **Compat-mode conformance pins** (`compat_*` tests): the
+  `mpeg_quant` I/P/B stream collapses from its 3062-sample spec-mode
+  envelope to 4 near-tie samples, the interlaced I/P/B stream from
+  650 samples (max 58) to 7 near-ties, and the 176×144
+  interlaced-direct stream from 6202 samples (max 114) to 2777
+  (0.29 %, max 64) with 29/30 interlaced-direct macroblocks
+  bit-exact — the single residual macroblock's oracle reconstruction
+  is uniquely determined by exhaustive per-field search and traced to
+  a co-located anchor field-MV state that differs from the
+  bitstream-reconstructed one (not pixel-determinable; docs trace
+  ask filed). Streams exercising neither divergence are asserted
+  sample-identical across both modes.
+
+### Changed
+
+- The `vop_decode` walk entry points
+  (`decode_{i,p,s_gmc}_vop_macroblocks`, the `_dp` variants,
+  `decode_b_vop_macroblocks`, `decode_b_vop_interlaced_macroblocks`)
+  take a trailing `compat::DecodeOptions` parameter
+  (`DecodeOptions::spec()` reproduces the previous behaviour
+  exactly).
+
 - **§6.2.5.3 data-partitioned I-/P-VOP decode** wired into the frame
   loop: `decode_i_vop_macroblocks_dp` / `decode_p_vop_macroblocks_dp`
   walk the per-packet partition structure (partition 1 → 19-bit
