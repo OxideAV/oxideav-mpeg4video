@@ -735,7 +735,7 @@ impl From<SpriteTrajectoryError> for Error {
     }
 }
 
-pub use decoder::{make_decoder, Mpeg4PacketDecoder};
+pub use decoder::{make_decoder, Mpeg4DecoderOptions, Mpeg4PacketDecoder};
 
 /// Register the MPEG-4 Part 2 Visual decoder with the runtime codec
 /// registry under the id `mpeg4video`, claiming the common container
@@ -743,8 +743,11 @@ pub use decoder::{make_decoder, Mpeg4PacketDecoder};
 /// `DX50` / `FMP4` / `MP4V` / `M4S2`) and the MP4
 /// ObjectTypeIndication `0x20` (ISO/IEC 14496-2 Visual).
 ///
-/// The direct factory endpoint [`decoder::make_decoder`] remains
-/// available for registry-free consumers.
+/// The decoder factory recognises the [`Mpeg4DecoderOptions`] schema
+/// (`ecosystem-compat`, see [`crate::compat`]) on
+/// `CodecParameters::options`. The direct factory endpoint
+/// [`decoder::make_decoder`] remains available for registry-free
+/// consumers.
 pub fn register(ctx: &mut RuntimeContext) {
     use oxideav_core::{CodecCapabilities, CodecId, CodecInfo, CodecTag};
 
@@ -756,6 +759,7 @@ pub fn register(ctx: &mut RuntimeContext) {
         CodecInfo::new(CodecId::new("mpeg4video"))
             .capabilities(caps)
             .decoder(decoder::make_decoder)
+            .decoder_options::<Mpeg4DecoderOptions>()
             .tags([
                 CodecTag::fourcc(b"XVID"),
                 CodecTag::fourcc(b"DIVX"),

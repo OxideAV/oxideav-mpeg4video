@@ -804,18 +804,71 @@ impl oxideav_core::Decoder for Mpeg4PacketDecoder {
     }
 }
 
+/// Typed options struct for the registry / options-bag construction
+/// path ([`oxideav_core::CodecParameters::options`]).
+///
+/// One key is recognised:
+///
+/// * `ecosystem-compat` (bool, default `false`) — decode with the
+///   ecosystem-compat behaviour on the two documented spec
+///   divergences (see [`crate::compat`]): the §7.7.2.2
+///   interlaced-direct derivation reads the co-located field MVs as
+///   zero, and the §7.4.4.5 method-1 mismatch toggle is skipped on
+///   intra blocks. The default is the literal spec text.
+///
+/// Typed consumers can skip the bag and pass
+/// [`DecodeOptions`](crate::compat::DecodeOptions) to
+/// [`Mpeg4VideoDecoder::with_options`] directly.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Mpeg4DecoderOptions {
+    /// The [`crate::compat`] ecosystem-compat switch.
+    pub ecosystem_compat: bool,
+}
+
+impl From<Mpeg4DecoderOptions> for DecodeOptions {
+    fn from(o: Mpeg4DecoderOptions) -> Self {
+        DecodeOptions {
+            ecosystem_compat: o.ecosystem_compat,
+        }
+    }
+}
+
+impl oxideav_core::CodecOptionsStruct for Mpeg4DecoderOptions {
+    const SCHEMA: &'static [oxideav_core::OptionField] = &[oxideav_core::OptionField {
+        name: "ecosystem-compat",
+        kind: oxideav_core::OptionKind::Bool,
+        default: oxideav_core::OptionValue::Bool(false),
+        help: "match the black-box-observed ecosystem behaviour on the two documented \
+               ISO/IEC 14496-2 divergences (interlaced-direct co-located MVs read as zero; \
+               §7.4.4.5 mismatch control skipped on intra blocks) instead of the literal \
+               spec text",
+    }];
+
+    fn apply(&mut self, key: &str, value: &oxideav_core::OptionValue) -> oxideav_core::Result<()> {
+        match key {
+            "ecosystem-compat" => self.ecosystem_compat = value.as_bool()?,
+            _ => unreachable!("guarded by SCHEMA"),
+        }
+        Ok(())
+    }
+}
+
 /// Direct factory endpoint: build a boxed registry-compatible decoder
 /// from [`oxideav_core::CodecParameters`].
 ///
 /// `params.extradata` (the VOS/VO/VOL configuration run, when the
 /// container carries one) is decoded immediately; data packets follow
-/// via [`oxideav_core::Decoder::send_packet`].
+/// via [`oxideav_core::Decoder::send_packet`]. `params.options` is
+/// parsed against the [`Mpeg4DecoderOptions`] schema (unknown keys and
+/// malformed values are rejected with
+/// [`Error::InvalidData`](oxideav_core::Error::InvalidData)).
 pub fn make_decoder(
     params: &oxideav_core::CodecParameters,
 ) -> oxideav_core::Result<Box<dyn oxideav_core::Decoder>> {
+    let options: Mpeg4DecoderOptions = oxideav_core::parse_options(&params.options)?;
     let mut dec = Mpeg4PacketDecoder {
         codec_id: params.codec_id.clone(),
-        inner: Mpeg4VideoDecoder::new(),
+        inner: Mpeg4VideoDecoder::with_options(options.into()),
         ready: std::collections::VecDeque::new(),
         extradata: params.extradata.clone(),
         max_pixels: params.limits.max_pixels_per_frame,
@@ -1393,5 +1446,70 @@ mod registry_tests {
             make_decoder(&params),
             Err(oxideav_core::Error::ResourceExhausted(_))
         ));
+    }
+
+    #[test]
+    fn decoder_options_bag_parses_ecosystem_compat() {
+        // Empty bag → spec defaults.
+        let d: Mpeg4DecoderOptions =
+            oxideav_core::parse_options(&oxideav_core::CodecOptions::new()).unwrap();
+        assert!(!d.ecosystem_compat);
+        assert_eq!(DecodeOptions::from(d), DecodeOptions::spec());
+        // Bool synonyms coerce.
+        let d: Mpeg4DecoderOptions = oxideav_core::parse_options(
+            &oxideav_core::CodecOptions::new().set("ecosystem-compat", "on"),
+        )
+        .unwrap();
+        assert!(d.ecosystem_compat);
+        assert_eq!(DecodeOptions::from(d), DecodeOptions::ecosystem());
+    }
+
+    #[test]
+    fn make_decoder_accepts_the_ecosystem_compat_option() {
+        let mut params = CodecParameters::video(CodecId::new("mpeg4video"));
+        params.options = oxideav_core::CodecOptions::new().set("ecosystem-compat", "true");
+        assert!(make_decoder(&params).is_ok());
+    }
+
+    #[test]
+    fn make_decoder_rejects_unknown_or_malformed_options() {
+        let mut params = CodecParameters::video(CodecId::new("mpeg4video"));
+        params.options = oxideav_core::CodecOptions::new().set("no-such-option", "1");
+        assert!(matches!(
+            make_decoder(&params),
+            Err(oxideav_core::Error::InvalidData(_))
+        ));
+        let mut params = CodecParameters::video(CodecId::new("mpeg4video"));
+        params.options = oxideav_core::CodecOptions::new().set("ecosystem-compat", "maybe");
+        assert!(matches!(
+            make_decoder(&params),
+            Err(oxideav_core::Error::InvalidData(_))
+        ));
+    }
+
+    #[test]
+    fn with_options_reports_and_survives_reset() {
+        // The typed entry point records the selection…
+        let dec = Mpeg4VideoDecoder::with_options(DecodeOptions::ecosystem());
+        assert_eq!(dec.options(), DecodeOptions::ecosystem());
+        assert_eq!(Mpeg4VideoDecoder::new().options(), DecodeOptions::spec());
+
+        // …and a registry decoder built with the option keeps it across
+        // reset() (the inner decoder is rebuilt with the same options).
+        let mut w = BitWriter::default();
+        write_vos(&mut w);
+        write_vol(&mut w, 16, 16);
+        let mut params = CodecParameters::video(CodecId::new("mpeg4video"));
+        params.extradata = w.finish();
+        params.options = oxideav_core::CodecOptions::new().set("ecosystem-compat", "true");
+        let mut dec = make_decoder(&params).unwrap();
+        let mut w = BitWriter::default();
+        write_i_vop(&mut w, 1, 0);
+        let ivop = w.finish();
+        dec.send_packet(&packet(ivop.clone())).unwrap();
+        dec.reset().unwrap();
+        dec.send_packet(&packet(ivop)).unwrap();
+        dec.flush().unwrap();
+        assert!(dec.receive_frame().is_ok());
     }
 }
