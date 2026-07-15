@@ -41,6 +41,7 @@
 use crate::bitreader::BitReader;
 use crate::block::InterMacroblock;
 use crate::bvop_prediction::BVopSampleMode;
+use crate::compat::DecodeOptions;
 use crate::frame_decode::{FrameDecodeError, PVopMbContent, SGmcMbContent};
 use crate::framestore::DecodedFrame;
 use crate::pvop_mv::PvopMbMotion;
@@ -148,6 +149,9 @@ impl From<FrameDecodeError> for StreamDecodeError {
 /// final held anchor (§6.1.3.8 one-slot reorder delay).
 #[derive(Debug, Default)]
 pub struct Mpeg4VideoDecoder {
+    /// The [`crate::compat`] behaviour selection (default: literal
+    /// spec).
+    options: DecodeOptions,
     /// `profile_and_level_indication` from the VOS header (0 = unseen).
     profile_level: u8,
     /// The active VOL configuration.
@@ -173,9 +177,28 @@ pub struct Mpeg4VideoDecoder {
 }
 
 impl Mpeg4VideoDecoder {
-    /// A fresh decoder with no configuration and an empty chain.
+    /// A fresh decoder with no configuration and an empty chain,
+    /// decoding with the literal-spec behaviour
+    /// ([`DecodeOptions::spec`]).
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A fresh decoder with an explicit [`crate::compat`] behaviour
+    /// selection — pass [`DecodeOptions::ecosystem`] to match the
+    /// black-box-observed ecosystem behaviour on the two documented
+    /// spec divergences bit-for-bit.
+    pub fn with_options(options: DecodeOptions) -> Self {
+        Self {
+            options,
+            ..Self::default()
+        }
+    }
+
+    /// The [`crate::compat`] behaviour selection this decoder was
+    /// built with.
+    pub fn options(&self) -> DecodeOptions {
+        self.options
     }
 
     /// The active VOL header, once one has been decoded.
@@ -329,9 +352,14 @@ impl Mpeg4VideoDecoder {
                 // §6.2.5.3: a data_partitioned VOL rearranges the I-/P-
                 // VOP macroblock layer into marker-separated partitions.
                 let mbs = if vol.data_partitioned {
-                    crate::vop_decode::decode_i_vop_macroblocks_dp(&mut br, &vol, &vop)?
+                    crate::vop_decode::decode_i_vop_macroblocks_dp(
+                        &mut br,
+                        &vol,
+                        &vop,
+                        self.options,
+                    )?
                 } else {
-                    decode_i_vop_macroblocks(&mut br, &vol, &vop)?
+                    decode_i_vop_macroblocks(&mut br, &vol, &vop, self.options)?
                 };
                 out.extend(self.sequence.push_i_vop(mb_width, mb_height, &mbs)?);
                 self.anchor_motion = None;
@@ -341,9 +369,14 @@ impl Mpeg4VideoDecoder {
                     return Err(StreamDecodeError::MissingAnchor);
                 }
                 let entries = if vol.data_partitioned {
-                    crate::vop_decode::decode_p_vop_macroblocks_dp(&mut br, &vol, &vop)?
+                    crate::vop_decode::decode_p_vop_macroblocks_dp(
+                        &mut br,
+                        &vol,
+                        &vop,
+                        self.options,
+                    )?
                 } else {
-                    decode_p_vop_macroblocks(&mut br, &vol, &vop)?
+                    decode_p_vop_macroblocks(&mut br, &vol, &vop, self.options)?
                 };
                 self.anchor_motion = Some(motion_of_p_entries(&entries));
                 out.extend(if vol.obmc_disable {
@@ -372,7 +405,8 @@ impl Mpeg4VideoDecoder {
                 if self.sequence.store().p_vop_reference().is_none() {
                     return Err(StreamDecodeError::MissingAnchor);
                 }
-                let (entries, geometry) = decode_s_gmc_vop_macroblocks(&mut br, &vol, &vop)?;
+                let (entries, geometry) =
+                    decode_s_gmc_vop_macroblocks(&mut br, &vol, &vop, self.options)?;
                 self.anchor_motion = Some(motion_of_s_entries(&entries));
                 out.extend(self.sequence.push_s_gmc_vop(
                     mb_width,
@@ -394,6 +428,7 @@ impl Mpeg4VideoDecoder {
                         trb,
                         trd,
                         self.anchor_motion.as_deref(),
+                        self.options,
                     )?;
                     let field_mode = if vol.quarter_sample {
                         crate::bvop_field_motion::FieldSampleMode::QuarterSample {
@@ -424,6 +459,7 @@ impl Mpeg4VideoDecoder {
                         trb,
                         trd,
                         self.anchor_motion.as_deref().map(|_| &progressive[..]),
+                        self.options,
                     )?;
                     out.extend(self.sequence.push_b_vop(
                         mb_width,
@@ -753,7 +789,8 @@ impl oxideav_core::Decoder for Mpeg4PacketDecoder {
     }
 
     fn reset(&mut self) -> oxideav_core::Result<()> {
-        self.inner = Mpeg4VideoDecoder::new();
+        // Preserve the compat behaviour selection across seeks.
+        self.inner = Mpeg4VideoDecoder::with_options(self.inner.options());
         self.ready.clear();
         self.flushed = false;
         if !self.extradata.is_empty() {

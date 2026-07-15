@@ -763,6 +763,15 @@ pub struct BVopMvDriver {
     /// finer grid, and direct mode converts the co-located MV to
     /// half-pel per §7.6.9.5.2 fourth paragraph.
     quarter_sample: bool,
+    /// Ecosystem-compat switch (see [`crate::compat`]): when `true`,
+    /// the §7.7.2.2 interlaced-direct derivation reads the co-located
+    /// future macroblock's field motion vectors as **zero** — the
+    /// derived vectors reduce to `mvf[i] = mvb[i] = MVD[0]` on the
+    /// field grid while the forward reference fields keep the
+    /// co-located selections (the black-box-observed ecosystem
+    /// behaviour). When `false` (the spec default) the derivation uses
+    /// the co-located `MV[i]` term as printed.
+    zero_colocated_direct: bool,
     /// §7.6.8 / §7.7.2.2 four-PMV predictor bank (Table 7-14), reset at
     /// each row start. Progressive frame modes read/write slots 0 and 2
     /// (with the pair-update of Table 7-15, which is invisible to a
@@ -796,6 +805,7 @@ impl BVopMvDriver {
             trb,
             trd,
             quarter_sample: false,
+            zero_colocated_direct: false,
             field_predictor: FieldPmvBank::new(),
         }
     }
@@ -810,6 +820,20 @@ impl BVopMvDriver {
     /// `/ 2` pre-halving (see [`BVopMbDecode::luma_sample_mode`]).
     pub fn with_quarter_sample(mut self, quarter_sample: bool) -> Self {
         self.quarter_sample = quarter_sample;
+        self
+    }
+
+    /// Select the ecosystem-compat §7.7.2.2 interlaced-direct
+    /// derivation (builder-style; the [`BVopMvDriver::new`] default is
+    /// the literal spec text). When enabled, the co-located future
+    /// macroblock's field motion vectors are read as zero — the four
+    /// derived field MVs reduce to `mvf[i] = mvb[i] = MVD[0]` on the
+    /// field grid — while the forward reference fields still follow
+    /// the co-located macroblock's per-field selections. This is the
+    /// black-box-observed behaviour of widely deployed decoders; see
+    /// [`crate::compat`] for the divergence write-up.
+    pub fn with_zero_colocated_direct(mut self, zero_colocated_direct: bool) -> Self {
+        self.zero_colocated_direct = zero_colocated_direct;
         self
     }
 
@@ -1109,9 +1133,31 @@ impl BVopMvDriver {
             y: delta.dy,
         };
 
+        // Ecosystem-compat (see `crate::compat`): the observed
+        // reference decodes evaluate the §7.7.2.2 derivation with the
+        // co-located field MVs read as zero (the derived vectors
+        // reduce to `mvf[i] = mvb[i] = MVD[0]` on the field grid); the
+        // reference-field selections stay co-located, so only the
+        // `.mv` term is zeroed here.
+        let zero = MotionVector { x: 0, y: 0 };
+        let derive_from = if self.zero_colocated_direct {
+            ColocatedFutureFieldMvs {
+                top: ColocatedFutureField {
+                    mv: zero,
+                    reference_field: future_field_mvs.top.reference_field,
+                },
+                bottom: ColocatedFutureField {
+                    mv: zero,
+                    reference_field: future_field_mvs.bottom.reference_field,
+                },
+            }
+        } else {
+            future_field_mvs
+        };
+
         let mvs = interlaced_direct_mvs(
-            future_field_mvs.top,
-            future_field_mvs.bottom,
+            derive_from.top,
+            derive_from.bottom,
             delta_mv,
             self.trb,
             self.trd,
@@ -1289,6 +1335,9 @@ impl BVopMvDriver {
                     quant_type: texture.quant_type,
                     ac_pred_flag: false,
                     alternate_vertical_scan: texture.alternate_vertical_scan,
+                    // B-VOP residuals are inter blocks only; the intra
+                    // mismatch exemption is never consulted here.
+                    intra_mismatch_exempt: false,
                 };
                 let mut residual =
                     decode_b_vop_inter_macroblock(br, motion.cbpb(), ctx, &quant_matrix)?;
@@ -1434,6 +1483,9 @@ impl BVopMvDriver {
                     quant_type: texture.quant_type,
                     ac_pred_flag: false,
                     alternate_vertical_scan: texture.alternate_vertical_scan,
+                    // B-VOP residuals are inter blocks only; the intra
+                    // mismatch exemption is never consulted here.
+                    intra_mismatch_exempt: false,
                 };
                 let residual = decode_b_vop_inter_macroblock(br, motion.cbpb, ctx, &quant_matrix)?;
 
@@ -2830,6 +2882,84 @@ mod tests {
             .unwrap();
         assert_eq!(decode.mvs.forward_top, MotionVector { x: 5, y: 2 });
         assert_eq!(decode.mvs.backward_top, MotionVector { x: -3, y: -2 });
+    }
+
+    /// Ecosystem-compat (`with_zero_colocated_direct`, see
+    /// `crate::compat`): the §7.7.2.2 derivation reads the co-located
+    /// field MVs as zero, so a `modb == "1"` (implicit zero delta)
+    /// direct macroblock derives all-zero field MVs regardless of the
+    /// non-zero co-located vectors — while the forward reference
+    /// fields keep the co-located selections.
+    #[test]
+    fn zero_colocated_direct_ignores_the_colocated_vectors() {
+        let vol = make_interlaced_vol();
+        let mut w = BitWriter::new();
+        w.write_bits(0b1, 1); // modb "1" → implicit MVD[0] = (0, 0)
+        w.align();
+        let data = w.buf;
+        let mut br = BitReader::new(&data);
+        let mut driver = BVopMvDriver::new(1, 1, 1, 1, 2, 4).with_zero_colocated_direct(true);
+        let future = ColocatedFutureFieldMvs {
+            top: future_field(6, -6, FieldReference::Bottom),
+            bottom: future_field(4, 2, FieldReference::Top),
+        };
+        let decode = driver
+            .decode_interlaced_direct_macroblock(
+                &mut br,
+                &vol,
+                VopCodingType::B,
+                0,
+                0,
+                future,
+                false,
+            )
+            .unwrap();
+        let zero = MotionVector { x: 0, y: 0 };
+        assert_eq!(decode.mvs.forward_top, zero);
+        assert_eq!(decode.mvs.forward_bottom, zero);
+        assert_eq!(decode.mvs.backward_top, zero);
+        assert_eq!(decode.mvs.backward_bottom, zero);
+        // Reference-field selections stay co-located.
+        assert_eq!(decode.forward_top_ref, FieldReference::Bottom);
+        assert_eq!(decode.forward_bottom_ref, FieldReference::Top);
+    }
+
+    /// Compat with an explicit delta: the same bitstream as
+    /// [`interlaced_direct_explicit_mvd_applied`] (MVD[0] = (1, 0))
+    /// now derives `mvf[i] = mvb[i] = MVD[0]` in both fields — the
+    /// co-located (8, 4) vectors contribute nothing.
+    #[test]
+    fn zero_colocated_direct_reduces_derived_mvs_to_the_delta() {
+        let vol = make_interlaced_vol();
+        let mut w = BitWriter::new();
+        w.write_bits(0b01, 2); // modb "01"
+        w.write_bits(0b1, 1); // mb_type "1" → direct
+        w.write_bits(0b010, 3); // mv_data == 1
+        w.write_zero_mv_data(); // mv_data == 0
+        w.align();
+        let data = w.buf;
+        let mut br = BitReader::new(&data);
+        let mut driver = BVopMvDriver::new(1, 1, 1, 1, 1, 2).with_zero_colocated_direct(true);
+        let future = ColocatedFutureFieldMvs {
+            top: future_field(8, 4, FieldReference::Top),
+            bottom: future_field(8, 4, FieldReference::Bottom),
+        };
+        let decode = driver
+            .decode_interlaced_direct_macroblock(
+                &mut br,
+                &vol,
+                VopCodingType::B,
+                0,
+                0,
+                future,
+                false,
+            )
+            .unwrap();
+        let delta = MotionVector { x: 1, y: 0 };
+        assert_eq!(decode.mvs.forward_top, delta);
+        assert_eq!(decode.mvs.forward_bottom, delta);
+        assert_eq!(decode.mvs.backward_top, delta);
+        assert_eq!(decode.mvs.backward_bottom, delta);
     }
 
     #[test]

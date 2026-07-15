@@ -49,6 +49,7 @@ use crate::block::{
 use crate::bvop_mv::{
     BVopMbTexturedDecode, BVopMvDriver, BVopMvDriverError, BVopTextureParams, CoLocatedAnchor,
 };
+use crate::compat::DecodeOptions;
 use crate::data_partition::use_intra_dc_vlc;
 use crate::frame_decode::{PVopMbContent, SGmcMbContent};
 use crate::macroblock::{parse_macroblock_header, MacroblockParseError};
@@ -364,10 +365,14 @@ fn decode_intra_mb_with_grid(
 /// quantiser (`vop_quant` + per-MB `dquant`), the per-MB Table 6-25
 /// `use_intra_dc_vlc` decision, and the §7.4.3 intra predictor grid
 /// with per-block Figure 7-5 neighbour resolution.
+///
+/// `opts` selects the [`crate::compat`] behaviour
+/// ([`DecodeOptions::spec()`] for the literal clauses).
 pub fn decode_i_vop_macroblocks(
     br: &mut BitReader<'_>,
     vol: &VolHeader,
     vop: &VopHeader,
+    opts: DecodeOptions,
 ) -> Result<Vec<ReconstructedMacroblock>, VopDecodeError> {
     check_vol_supported(vol)?;
     check_combined_syntax(vol)?;
@@ -412,6 +417,7 @@ pub fn decode_i_vop_macroblocks(
                 quant_type: vol.quant_type,
                 ac_pred_flag: header.ac_pred_flag,
                 alternate_vertical_scan: vop.alternate_vertical_scan,
+                intra_mismatch_exempt: opts.ecosystem_compat,
             };
             let coded = pattern_code(header.cbpy, header.cbpc);
             let mb = decode_intra_mb_with_grid(
@@ -563,6 +569,7 @@ pub fn decode_i_vop_macroblocks_dp(
     br: &mut BitReader<'_>,
     vol: &VolHeader,
     vop: &VopHeader,
+    opts: DecodeOptions,
 ) -> Result<Vec<ReconstructedMacroblock>, VopDecodeError> {
     check_dp_supported(vol)?;
     if !matches!(vop.coding_type, VopCodingType::I) {
@@ -612,6 +619,7 @@ pub fn decode_i_vop_macroblocks_dp(
                 quant_type: vol.quant_type,
                 ac_pred_flag: tex.ac_pred_flag,
                 alternate_vertical_scan: vop.alternate_vertical_scan,
+                intra_mismatch_exempt: opts.ecosystem_compat,
             };
             let coded = pattern_code(tex.cbpy, mb.cbpc);
             let imb = decode_intra_mb_partitioned(
@@ -648,6 +656,7 @@ pub fn decode_p_vop_macroblocks_dp(
     br: &mut BitReader<'_>,
     vol: &VolHeader,
     vop: &VopHeader,
+    opts: DecodeOptions,
 ) -> Result<Vec<PVopMbContent>, VopDecodeError> {
     use crate::data_partition::DpMbEvent;
     use crate::macroblock::DerivedMbType;
@@ -737,6 +746,7 @@ pub fn decode_p_vop_macroblocks_dp(
                     quant_type: vol.quant_type,
                     ac_pred_flag: tex.ac_pred_flag,
                     alternate_vertical_scan: vop.alternate_vertical_scan,
+                    intra_mismatch_exempt: opts.ecosystem_compat,
                 };
                 let imb = decode_intra_mb_partitioned(
                     br,
@@ -759,6 +769,7 @@ pub fn decode_p_vop_macroblocks_dp(
                     quant_type: vol.quant_type,
                     ac_pred_flag: false,
                     alternate_vertical_scan: vop.alternate_vertical_scan,
+                    intra_mismatch_exempt: opts.ecosystem_compat,
                 };
                 let residual =
                     decode_inter_mb_partitioned(br, coded, vol.reversible_vlc, ctx, &inter_matrix)?;
@@ -800,6 +811,7 @@ pub fn decode_p_vop_macroblocks(
     br: &mut BitReader<'_>,
     vol: &VolHeader,
     vop: &VopHeader,
+    opts: DecodeOptions,
 ) -> Result<Vec<PVopMbContent>, VopDecodeError> {
     check_vol_supported(vol)?;
     check_combined_syntax(vol)?;
@@ -869,6 +881,7 @@ pub fn decode_p_vop_macroblocks(
                 quant_type: vol.quant_type,
                 ac_pred_flag: header.ac_pred_flag,
                 alternate_vertical_scan: vop.alternate_vertical_scan,
+                intra_mismatch_exempt: opts.ecosystem_compat,
             };
 
             let is_intra = header.mb_type.map(|t| t.is_intra()).unwrap_or(false);
@@ -971,6 +984,7 @@ pub fn decode_b_vop_macroblocks(
     trb: i32,
     trd: i32,
     anchor_motion: Option<&[PvopMbMotion]>,
+    opts: DecodeOptions,
 ) -> Result<Vec<BVopMbTexturedDecode>, VopDecodeError> {
     check_vol_supported(vol)?;
     check_progressive(vol)?;
@@ -1072,6 +1086,7 @@ pub fn decode_b_vop_macroblocks(
                 quant_type: texture.quant_type,
                 ac_pred_flag: false,
                 alternate_vertical_scan: vop.alternate_vertical_scan,
+                intra_mismatch_exempt: opts.ecosystem_compat,
             };
             let residual = decode_b_vop_inter_macroblock(br, motion.cbpb, ctx, &quant_matrix)
                 .map_err(|e| VopDecodeError::BVop(BVopMvDriverError::Texture(e)))?;
@@ -1184,6 +1199,7 @@ pub fn decode_b_vop_interlaced_macroblocks(
     trb: i32,
     trd: i32,
     anchor_motion: Option<&[AnchorMbMotion]>,
+    opts: DecodeOptions,
 ) -> Result<Vec<crate::bvop_mv::BVopInterlacedTexturedDecode>, VopDecodeError> {
     use crate::bvop_mv::BVopInterlacedTexturedDecode;
 
@@ -1201,7 +1217,8 @@ pub fn decode_b_vop_interlaced_macroblocks(
     let (mb_width, mb_height) = vop_mb_dimensions(vol);
     let max_qp = max_quantiser_scale(vol);
     let mut driver = BVopMvDriver::new(mb_height, mb_width, vop.fcode_fwd, vop.fcode_bwd, trb, trd)
-        .with_quarter_sample(vol.quarter_sample);
+        .with_quarter_sample(vol.quarter_sample)
+        .with_zero_colocated_direct(opts.ecosystem_compat);
     let quant_matrix = nonintra_quant_matrix(vol);
     let vp_ctx = video_packet_context(vol, vop);
     let mut quantiser_scale = u32::from(vop.quant).clamp(1, max_qp);
@@ -1264,6 +1281,7 @@ pub fn decode_b_vop_interlaced_macroblocks(
                 quant_type: vol.quant_type,
                 ac_pred_flag: false,
                 alternate_vertical_scan: vop.alternate_vertical_scan,
+                intra_mismatch_exempt: opts.ecosystem_compat,
             };
             let mut residual = decode_b_vop_inter_macroblock(br, motion.cbpb(), ctx, &quant_matrix)
                 .map_err(|e| VopDecodeError::BVop(BVopMvDriverError::Texture(e)))?;
@@ -1362,6 +1380,7 @@ pub fn decode_s_gmc_vop_macroblocks(
     br: &mut BitReader<'_>,
     vol: &VolHeader,
     vop: &VopHeader,
+    opts: DecodeOptions,
 ) -> Result<(Vec<SGmcMbContent>, WarpGeometry), VopDecodeError> {
     check_vol_supported(vol)?;
     check_combined_syntax(vol)?;
@@ -1439,6 +1458,7 @@ pub fn decode_s_gmc_vop_macroblocks(
                 quant_type: vol.quant_type,
                 ac_pred_flag: header.ac_pred_flag,
                 alternate_vertical_scan: vop.alternate_vertical_scan,
+                intra_mismatch_exempt: opts.ecosystem_compat,
             };
 
             let is_intra = header.mb_type.map(|t| t.is_intra()).unwrap_or(false);
@@ -1646,7 +1666,7 @@ mod tests {
         write_dc_only_intra_mb(&mut w);
         let data = w.finish();
         let mut br = BitReader::new(&data);
-        let mbs = decode_i_vop_macroblocks(&mut br, &vol, &vop).unwrap();
+        let mbs = decode_i_vop_macroblocks(&mut br, &vol, &vop, DecodeOptions::default()).unwrap();
         assert_eq!(mbs.len(), 2);
         for mb in &mbs {
             for row in mb.luma.iter() {
@@ -1673,7 +1693,7 @@ mod tests {
         write_dc_only_intra_mb(&mut w);
         let data = w.finish();
         let mut br = BitReader::new(&data);
-        let mbs = decode_i_vop_macroblocks(&mut br, &vol, &vop).unwrap();
+        let mbs = decode_i_vop_macroblocks(&mut br, &vol, &vop, DecodeOptions::default()).unwrap();
         // MB0 block 0 (top-left 8×8): flat 130. Blocks 1..3: their DC
         // predictor resolves inside the MB; block 1 predicts from block
         // 0's QF (65) — direction: FA=1040, FB=1024, FC=1024 →
@@ -1721,7 +1741,7 @@ mod tests {
         write_dc_only_intra_mb(&mut w);
         let data = w.finish();
         let mut br = BitReader::new(&data);
-        let mbs = decode_i_vop_macroblocks(&mut br, &vol, &vop).unwrap();
+        let mbs = decode_i_vop_macroblocks(&mut br, &vol, &vop, DecodeOptions::default()).unwrap();
         assert_eq!(mbs.len(), 2);
         assert_eq!(mbs[0].luma[0][0], 130);
         // The packet boundary blocked the §7.4.3 prediction: MB1 falls
@@ -1749,7 +1769,7 @@ mod tests {
         let data = w.finish();
         let mut br = BitReader::new(&data);
         assert_eq!(
-            decode_i_vop_macroblocks(&mut br, &vol, &vop),
+            decode_i_vop_macroblocks(&mut br, &vol, &vop, DecodeOptions::default()),
             Err(VopDecodeError::VideoPacketSkip {
                 packet_mb: 2,
                 expected_mb: 1
@@ -1792,7 +1812,8 @@ mod tests {
         w.write_bits(1, 1);
         let data = w.finish();
         let mut br = BitReader::new(&data);
-        let entries = decode_p_vop_macroblocks(&mut br, &vol, &vop).unwrap();
+        let entries =
+            decode_p_vop_macroblocks(&mut br, &vol, &vop, DecodeOptions::default()).unwrap();
         assert_eq!(entries.len(), 2);
         for e in &entries {
             match e {
@@ -1810,7 +1831,7 @@ mod tests {
         let vop = test_p_vop(&vol, 8);
         let mut br = BitReader::new(&[0u8; 4]);
         assert_eq!(
-            decode_i_vop_macroblocks(&mut br, &vol, &vop),
+            decode_i_vop_macroblocks(&mut br, &vol, &vop, DecodeOptions::default()),
             Err(VopDecodeError::Unsupported("not an I-VOP"))
         );
     }
@@ -1826,7 +1847,8 @@ mod tests {
         write_dc_only_intra_mb(&mut w);
         let data = w.finish();
         let mut br = BitReader::new(&data);
-        let imbs = decode_i_vop_macroblocks(&mut br, &vol, &ivop).unwrap();
+        let imbs =
+            decode_i_vop_macroblocks(&mut br, &vol, &ivop, DecodeOptions::default()).unwrap();
 
         let mut store = FrameStore::new();
         decode_i_vop(&mut store, 2, 1, &imbs).unwrap();
@@ -1837,7 +1859,8 @@ mod tests {
         w.write_bits(1, 1); // MB1 not_coded
         let data = w.finish();
         let mut br = BitReader::new(&data);
-        let entries = decode_p_vop_macroblocks(&mut br, &vol, &pvop).unwrap();
+        let entries =
+            decode_p_vop_macroblocks(&mut br, &vol, &pvop, DecodeOptions::default()).unwrap();
         assert_eq!(entries.len(), 2);
         let frame = assemble_p_vop_frame(
             &store,
@@ -1868,7 +1891,8 @@ mod tests {
         write_intra_mb_first_block_dc_plus1(&mut w);
         let data = w.finish();
         let mut br = BitReader::new(&data);
-        let imbs = decode_i_vop_macroblocks(&mut br, &vol, &ivop).unwrap();
+        let imbs =
+            decode_i_vop_macroblocks(&mut br, &vol, &ivop, DecodeOptions::default()).unwrap();
         let mut store = FrameStore::new();
         decode_i_vop(&mut store, 1, 1, &imbs).unwrap();
         let anchor_00 = store.backward().unwrap().luma_at(0, 0).unwrap();
@@ -1883,7 +1907,8 @@ mod tests {
         w.write_bits(1, 1); // MVDy: 0
         let data = w.finish();
         let mut br = BitReader::new(&data);
-        let entries = decode_p_vop_macroblocks(&mut br, &vol, &pvop).unwrap();
+        let entries =
+            decode_p_vop_macroblocks(&mut br, &vol, &pvop, DecodeOptions::default()).unwrap();
         assert_eq!(entries.len(), 1);
         let frame = assemble_p_vop_frame(
             &store,
@@ -1914,7 +1939,8 @@ mod tests {
         write_intra_mb_first_block_dc_plus1(&mut w); // anchor luma 130
         let data = w.finish();
         let mut br = BitReader::new(&data);
-        let imbs = decode_i_vop_macroblocks(&mut br, &vol, &ivop).unwrap();
+        let imbs =
+            decode_i_vop_macroblocks(&mut br, &vol, &ivop, DecodeOptions::default()).unwrap();
         let mut store = FrameStore::new();
         decode_i_vop(&mut store, 1, 1, &imbs).unwrap();
 
@@ -1932,7 +1958,8 @@ mod tests {
         }
         let data = w.finish();
         let mut br = BitReader::new(&data);
-        let entries = decode_p_vop_macroblocks(&mut br, &vol, &pvop).unwrap();
+        let entries =
+            decode_p_vop_macroblocks(&mut br, &vol, &pvop, DecodeOptions::default()).unwrap();
         let frame = assemble_p_vop_frame(
             &store,
             1,
@@ -2035,7 +2062,7 @@ mod tests {
         }
         let data = w.finish();
         let mut br = BitReader::new(&data);
-        let imbs = decode_i_vop_macroblocks(&mut br, vol, &ivop).unwrap();
+        let imbs = decode_i_vop_macroblocks(&mut br, vol, &ivop, DecodeOptions::default()).unwrap();
         let mut store = FrameStore::new();
         decode_i_vop(&mut store, mbw, mbh, &imbs).unwrap();
         store
@@ -2053,7 +2080,8 @@ mod tests {
         w.write_bits(1, 1); // not_coded
         let data = w.finish();
         let mut br = BitReader::new(&data);
-        let (entries, geometry) = decode_s_gmc_vop_macroblocks(&mut br, &vol, &svop).unwrap();
+        let (entries, geometry) =
+            decode_s_gmc_vop_macroblocks(&mut br, &vol, &svop, DecodeOptions::default()).unwrap();
         assert_eq!(entries.len(), 1);
         assert!(matches!(entries[0], SGmcMbContent::Gmc { .. }));
         let frame = crate::frame_decode::assemble_s_gmc_vop_frame(
@@ -2087,7 +2115,8 @@ mod tests {
         w.write_bits(0b11, 2); // cbpy: inter pattern 0
         let data = w.finish();
         let mut br = BitReader::new(&data);
-        let (entries, geometry) = decode_s_gmc_vop_macroblocks(&mut br, &vol, &svop).unwrap();
+        let (entries, geometry) =
+            decode_s_gmc_vop_macroblocks(&mut br, &vol, &svop, DecodeOptions::default()).unwrap();
         assert_eq!(br.bit_position(), 5, "no motion/texture bits consumed");
         let frame = crate::frame_decode::assemble_s_gmc_vop_frame(
             &store,
@@ -2119,7 +2148,8 @@ mod tests {
         w.write_bits(1, 1); // MVDy = 0
         let data = w.finish();
         let mut br = BitReader::new(&data);
-        let (entries, geometry) = decode_s_gmc_vop_macroblocks(&mut br, &vol, &svop).unwrap();
+        let (entries, geometry) =
+            decode_s_gmc_vop_macroblocks(&mut br, &vol, &svop, DecodeOptions::default()).unwrap();
         assert!(matches!(entries[0], SGmcMbContent::Local { .. }));
         let frame = crate::frame_decode::assemble_s_gmc_vop_frame(
             &store,
@@ -2149,7 +2179,8 @@ mod tests {
         w.write_bits(1, 1); // not_coded
         let data = w.finish();
         let mut br = BitReader::new(&data);
-        let (entries, geometry) = decode_s_gmc_vop_macroblocks(&mut br, &vol, &svop).unwrap();
+        let (entries, geometry) =
+            decode_s_gmc_vop_macroblocks(&mut br, &vol, &svop, DecodeOptions::default()).unwrap();
         let frame = crate::frame_decode::assemble_s_gmc_vop_frame(
             &store,
             1,
@@ -2231,7 +2262,16 @@ mod tests {
         let data = w.finish();
         let mut br = BitReader::new(&data);
         let anchor = [PvopMbMotion::Intra];
-        let entries = decode_b_vop_macroblocks(&mut br, &vol, &bvop, 1, 2, Some(&anchor)).unwrap();
+        let entries = decode_b_vop_macroblocks(
+            &mut br,
+            &vol,
+            &bvop,
+            1,
+            2,
+            Some(&anchor),
+            DecodeOptions::default(),
+        )
+        .unwrap();
         assert_eq!(entries.len(), 1);
         let frame = crate::frame_decode::assemble_b_vop_frame(
             &store,
@@ -2260,7 +2300,16 @@ mod tests {
         let data = w.finish();
         let mut br = BitReader::new(&data);
         let anchor = [PvopMbMotion::OneMv(MotionVector { x: 0, y: 0 })];
-        let entries = decode_b_vop_macroblocks(&mut br, &vol, &bvop, 1, 2, Some(&anchor)).unwrap();
+        let entries = decode_b_vop_macroblocks(
+            &mut br,
+            &vol,
+            &bvop,
+            1,
+            2,
+            Some(&anchor),
+            DecodeOptions::default(),
+        )
+        .unwrap();
         assert_eq!(br.bit_position(), 1, "modb '1' consumes exactly one bit");
         let frame = crate::frame_decode::assemble_b_vop_frame(
             &store,
@@ -2289,7 +2338,16 @@ mod tests {
         let data = [0xFFu8; 2]; // arbitrary — must remain unread
         let mut br = BitReader::new(&data);
         let anchor = [PvopMbMotion::Skipped];
-        let entries = decode_b_vop_macroblocks(&mut br, &vol, &bvop, 1, 2, Some(&anchor)).unwrap();
+        let entries = decode_b_vop_macroblocks(
+            &mut br,
+            &vol,
+            &bvop,
+            1,
+            2,
+            Some(&anchor),
+            DecodeOptions::default(),
+        )
+        .unwrap();
         assert_eq!(br.bit_position(), 0, "no bits may be consumed");
         let frame = crate::frame_decode::assemble_b_vop_frame(
             &store,
@@ -2311,7 +2369,7 @@ mod tests {
         let svop = test_i_vop(&vol, 8); // wrong type on purpose
         let mut br = BitReader::new(&[0u8; 2]);
         assert!(matches!(
-            decode_s_gmc_vop_macroblocks(&mut br, &vol, &svop),
+            decode_s_gmc_vop_macroblocks(&mut br, &vol, &svop, DecodeOptions::default()),
             Err(VopDecodeError::Unsupported("not an S-VOP"))
         ));
     }
@@ -2333,7 +2391,8 @@ mod tests {
         w.write_bits(1, 1); // MVDy = 0
         let data = w.finish();
         let mut br = BitReader::new(&data);
-        let entries = decode_p_vop_macroblocks(&mut br, &vol, &pvop).unwrap();
+        let entries =
+            decode_p_vop_macroblocks(&mut br, &vol, &pvop, DecodeOptions::default()).unwrap();
         assert_eq!(entries.len(), 1);
         assert!(matches!(
             entries[0],

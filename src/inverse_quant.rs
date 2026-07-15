@@ -269,6 +269,39 @@ pub fn inverse_quant_method1(
     w: &[[u8; 8]; 8],
     ctx: InverseQuantContext,
 ) -> [[i32; 8]; 8] {
+    inverse_quant_method1_impl(qf, w, ctx, true)
+}
+
+/// [`inverse_quant_method1`] **without** the §7.4.4.5 mismatch toggle
+/// (steps 1–2 of the §7.4.4.6 pseudo-code only, so `F = F'`).
+///
+/// This is the ecosystem-compat intra path (see [`crate::compat`]):
+/// black-box-observed reference decodes apply the method-1 mismatch
+/// control to non-intra blocks only, so a compat-mode decode
+/// reconstructs intra blocks through this entry while non-intra blocks
+/// keep [`inverse_quant_method1`]. The spec text itself contains no
+/// intra exemption — spec-mode decodes never call this function.
+///
+/// # Panics
+///
+/// Panics on `ctx.quantiser_scale == 0`.
+pub fn inverse_quant_method1_no_mismatch(
+    qf: &[[i32; 8]; 8],
+    w: &[[u8; 8]; 8],
+    ctx: InverseQuantContext,
+) -> [[i32; 8]; 8] {
+    inverse_quant_method1_impl(qf, w, ctx, false)
+}
+
+/// Shared §7.4.4.6 body: per-coefficient reconstruction + §7.4.4.4
+/// saturation, with the §7.4.4.5 mismatch toggle gated by
+/// `mismatch_control`.
+fn inverse_quant_method1_impl(
+    qf: &[[i32; 8]; 8],
+    w: &[[u8; 8]; 8],
+    ctx: InverseQuantContext,
+    mismatch_control: bool,
+) -> [[i32; 8]; 8] {
     assert!(ctx.quantiser_scale > 0, "quantiser_scale must be > 0");
     let (lo, hi) = saturation_bounds(ctx.bits_per_pixel);
     let mut f_prime = [[0i32; 8]; 8];
@@ -296,7 +329,7 @@ pub fn inverse_quant_method1(
         }
     }
     // §7.4.4.5 mismatch control: if sum is even, toggle LSB of F[7][7].
-    if sum & 1 == 0 {
+    if mismatch_control && sum & 1 == 0 {
         // The spec's "if F'[7][7] is odd -> F[7][7] = F'[7][7] - 1;
         // else F[7][7] = F'[7][7] + 1" is equivalent to flipping the
         // LSB via XOR (NOTE 1 of §7.4.4.5).
@@ -540,6 +573,49 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn method1_no_mismatch_variant_skips_the_even_sum_toggle() {
+        // Same input as `method1_block_intra_only_dc_then_mismatch`
+        // (sum = 70, even → the spec entry toggles F[7][7]), but via
+        // the ecosystem-compat entry: F = F', so F[7][7] stays 0 and
+        // every other cell matches the spec entry exactly.
+        let mut qf = [[0i32; 8]; 8];
+        qf[0][0] = 7;
+        let w = [[16u8; 8]; 8];
+        let spec = inverse_quant_method1(&qf, &w, ctx(true, 5, 8));
+        let compat = inverse_quant_method1_no_mismatch(&qf, &w, ctx(true, 5, 8));
+        assert_eq!(compat[0][0], 70);
+        assert_eq!(compat[7][7], 0, "no toggle in the no-mismatch entry");
+        assert_eq!(spec[7][7], 1);
+        for v in 0..8 {
+            for u in 0..8 {
+                if (v, u) != (7, 7) {
+                    assert_eq!(compat[v][u], spec[v][u], "({v},{u})");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn method1_no_mismatch_variant_matches_on_odd_sums() {
+        // Odd post-saturation sum → the spec entry applies no toggle
+        // either, so the two entries agree on every cell.
+        let mut qf = [[0i32; 8]; 8];
+        qf[0][0] = 3; // chroma qs=9 → dc_scaler 11 → F[0][0] = 33 (odd)
+        let w = [[16u8; 8]; 8];
+        let c = InverseQuantContext {
+            macroblock_intra: true,
+            component: DcComponent::Chrominance,
+            quantiser_scale: 9,
+            bits_per_pixel: 8,
+            short_video_header: false,
+        };
+        assert_eq!(
+            inverse_quant_method1(&qf, &w, c),
+            inverse_quant_method1_no_mismatch(&qf, &w, c)
+        );
     }
 
     #[test]

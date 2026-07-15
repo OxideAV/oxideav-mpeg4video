@@ -312,6 +312,13 @@ pub struct MacroblockTextureContext {
     /// §7.4.2 per-block selection. Always `false` for progressive
     /// VOLs.
     pub alternate_vertical_scan: bool,
+    /// Ecosystem-compat switch (see [`crate::compat`]): when `true`,
+    /// **intra** blocks skip the §7.4.4.5 method-1 mismatch toggle
+    /// (the black-box-observed ecosystem behaviour); when `false` (the
+    /// spec default) every method-1 block applies it. Never consulted
+    /// on the non-intra decode paths or under method 2
+    /// (`quant_type == false`).
+    pub intra_mismatch_exempt: bool,
 }
 
 /// A reconstructed intra 4:2:0 macroblock: a 16×16 luminance plane plus
@@ -637,7 +644,14 @@ fn decode_intra_block_tail(
         short_video_header: false,
     };
     let f = if ctx.quant_type {
-        inverse_quant_method1(&qf, quant_matrix, iq_ctx)
+        if ctx.intra_mismatch_exempt {
+            // Ecosystem-compat (see `crate::compat`): observed
+            // reference decodes skip the §7.4.4.5 toggle on intra
+            // blocks.
+            crate::inverse_quant::inverse_quant_method1_no_mismatch(&qf, quant_matrix, iq_ctx)
+        } else {
+            inverse_quant_method1(&qf, quant_matrix, iq_ctx)
+        }
     } else {
         inverse_quant_method2(&qf, iq_ctx)
     };
@@ -1096,6 +1110,7 @@ mod tests {
             quant_type: false,
             ac_pred_flag: false,
             alternate_vertical_scan: false,
+            intra_mismatch_exempt: false,
         };
         let predictors = BlockPredictors::outside(8, 8);
 
@@ -1179,6 +1194,7 @@ mod tests {
             quant_type: false,
             ac_pred_flag: false,
             alternate_vertical_scan: false,
+            intra_mismatch_exempt: false,
         };
         let predictors = BlockPredictors::outside(8, 8);
 
@@ -1225,6 +1241,7 @@ mod tests {
             quant_type: false,
             ac_pred_flag: false,
             alternate_vertical_scan: false,
+            intra_mismatch_exempt: false,
         };
         let predictors = BlockPredictors::outside(8, 8);
 
@@ -1268,6 +1285,7 @@ mod tests {
             quant_type: false,
             ac_pred_flag: false,
             alternate_vertical_scan: false,
+            intra_mismatch_exempt: false,
         };
         let predictors = BlockPredictors::outside(8, 8);
         let data = [0xAAu8; 4]; // arbitrary — must remain unread
@@ -1309,6 +1327,7 @@ mod tests {
             quant_type: false,
             ac_pred_flag: false,
             alternate_vertical_scan: false,
+            intra_mismatch_exempt: false,
         };
         let predictors = BlockPredictors::outside(8, 8);
         let mut w = BitWriter::default();
@@ -1346,6 +1365,7 @@ mod tests {
             quant_type: false,
             ac_pred_flag: false,
             alternate_vertical_scan: false,
+            intra_mismatch_exempt: false,
         };
         let predictors = BlockPredictors::outside(8, 8);
         let mut w = BitWriter::default();
@@ -1397,6 +1417,7 @@ mod tests {
             quant_type: false,
             ac_pred_flag: false,
             alternate_vertical_scan: false,
+            intra_mismatch_exempt: false,
         };
         let predictors = BlockPredictors::outside(8, 8);
 
@@ -1457,6 +1478,7 @@ mod tests {
             quant_type: false,
             ac_pred_flag: false,
             alternate_vertical_scan: false,
+            intra_mismatch_exempt: false,
         };
         let predictors = BlockPredictors::outside(8, 8);
 
@@ -1507,6 +1529,7 @@ mod tests {
             quant_type: false,
             ac_pred_flag: false,
             alternate_vertical_scan: false,
+            intra_mismatch_exempt: false,
         };
         let data = [0u8; 4];
         let mut br = BitReader::new(&data);
@@ -1539,6 +1562,7 @@ mod tests {
             quant_type: false,
             ac_pred_flag: false,
             alternate_vertical_scan: false,
+            intra_mismatch_exempt: false,
         };
         let data = [0u8; 4];
         let mut br = BitReader::new(&data);
@@ -1564,6 +1588,7 @@ mod tests {
             quant_type: false,
             ac_pred_flag: false,
             alternate_vertical_scan: false,
+            intra_mismatch_exempt: false,
         };
         // Two bytes of garbage — none of it should be consumed because
         // `coded == false` short-circuits before the bit reader is touched.
@@ -1596,6 +1621,7 @@ mod tests {
             quant_type: false,
             ac_pred_flag: false,
             alternate_vertical_scan: false,
+            intra_mismatch_exempt: false,
         };
 
         let mut w = BitWriter::default();
@@ -1633,6 +1659,7 @@ mod tests {
             quant_type: false,
             ac_pred_flag: false,
             alternate_vertical_scan: false,
+            intra_mismatch_exempt: false,
         };
 
         let mut w = BitWriter::default();
@@ -1675,6 +1702,7 @@ mod tests {
             quant_type: false,
             ac_pred_flag: false,
             alternate_vertical_scan: false,
+            intra_mismatch_exempt: false,
         };
         let data = [0u8; 4];
         let mut br = BitReader::new(&data);
@@ -1719,6 +1747,7 @@ mod tests {
             quant_type: false,
             ac_pred_flag: false,
             alternate_vertical_scan: false,
+            intra_mismatch_exempt: false,
         };
 
         let mut w = BitWriter::default();
@@ -1784,6 +1813,7 @@ mod tests {
             quant_type: false,
             ac_pred_flag: false,
             alternate_vertical_scan: false,
+            intra_mismatch_exempt: false,
         };
         let data = [0u8; 4];
         let mut br = BitReader::new(&data);
@@ -1821,6 +1851,7 @@ mod tests {
             quant_type: false,
             ac_pred_flag: false,
             alternate_vertical_scan: false,
+            intra_mismatch_exempt: false,
         };
         let data = [0u8; 4];
         let mut br = BitReader::new(&data);
@@ -1852,6 +1883,7 @@ mod tests {
             quant_type: false,
             ac_pred_flag: false,
             alternate_vertical_scan: false,
+            intra_mismatch_exempt: false,
         };
         let mut w = BitWriter::default();
         // Block 0 — one positive (LAST=1, RUN=0, LEVEL=1) inter EVENT.
@@ -1912,6 +1944,7 @@ mod tests {
             quant_type: false,
             ac_pred_flag: false,
             alternate_vertical_scan: false,
+            intra_mismatch_exempt: false,
         };
         let data = [0u8; 4];
         let mut br = BitReader::new(&data);
@@ -1949,6 +1982,7 @@ mod tests {
             quant_type: true,
             ac_pred_flag: false,
             alternate_vertical_scan: false,
+            intra_mismatch_exempt: false,
         };
 
         let mut w = BitWriter::default();
@@ -1988,6 +2022,7 @@ mod tests {
             quant_type: true,
             ac_pred_flag: false,
             alternate_vertical_scan: false,
+            intra_mismatch_exempt: false,
         };
         let predictors = BlockPredictors::outside(8, 8);
 
@@ -2015,6 +2050,46 @@ mod tests {
         for row in block.iter() {
             for &px in row.iter() {
                 assert!((px - 128).abs() <= 1, "method-1 DC block: {px} not ~128");
+            }
+        }
+    }
+
+    /// The ecosystem-compat intra exemption (`intra_mismatch_exempt`,
+    /// see `crate::compat`) suppresses the §7.4.4.5 toggle on the
+    /// intra path: the same DC-only method-1 block as
+    /// [`method1_dc_only_block`] reconstructs **exactly** flat —
+    /// F[0][0] = 1024 stays the only non-zero coefficient (no F[7][7]
+    /// perturbation for the IDCT to spread), where the spec-mode
+    /// decode above only guarantees the ±1 envelope. The
+    /// coefficient-level toggle difference itself is pinned by the
+    /// `inverse_quant` unit tests.
+    #[test]
+    fn method1_dc_only_block_intra_mismatch_exempt_is_exactly_flat() {
+        let ctx = MacroblockTextureContext {
+            quantiser_scale: 8,
+            bits_per_pixel: 8,
+            quant_type: true,
+            ac_pred_flag: false,
+            alternate_vertical_scan: false,
+            intra_mismatch_exempt: true,
+        };
+        let predictors = BlockPredictors::outside(8, 8);
+        let mut w = BitWriter::default();
+        write_dc_zero_luma(&mut w);
+        let data = w.finish();
+        let mut br = BitReader::new(&data);
+        let compat = decode_intra_block(
+            &mut br,
+            0,
+            false,
+            ctx,
+            predictors,
+            &DEFAULT_INTRA_QUANT_MATRIX,
+        )
+        .unwrap();
+        for row in compat.iter() {
+            for &px in row.iter() {
+                assert_eq!(px, 128, "compat intra block must be exactly flat");
             }
         }
     }

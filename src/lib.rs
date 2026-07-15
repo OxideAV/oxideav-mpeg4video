@@ -317,6 +317,7 @@ pub mod bvop_mv;
 pub mod bvop_prediction;
 pub mod chroma_mv;
 pub mod chroma_shape;
+pub mod compat;
 pub mod data_partition;
 pub mod decoder;
 pub mod extended_padding;
@@ -404,6 +405,7 @@ pub use chroma_shape::{
 };
 pub use decoder::{Mpeg4VideoDecoder, StreamDecodeError};
 
+pub use compat::DecodeOptions;
 pub use data_partition::{
     decode_motion_coding, mb_block_layout, parse_data_partitioned_i_vop,
     parse_data_partitioned_p_vop, use_intra_dc_vlc, DataPartitionError, DataPartitionedIVop,
@@ -443,8 +445,8 @@ pub use interlaced_padding::{
 };
 pub use inverse_quant::{
     inverse_quant_intra_dc, inverse_quant_method1, inverse_quant_method1_coef,
-    inverse_quant_method2, inverse_quant_method2_coef, saturate_fprime, saturation_bounds,
-    InverseQuantContext,
+    inverse_quant_method1_no_mismatch, inverse_quant_method2, inverse_quant_method2_coef,
+    saturate_fprime, saturation_bounds, InverseQuantContext,
 };
 pub use macroblock::{
     dquant_value, parse_macroblock_header, DerivedMbType, MacroblockHeader, MacroblockParseError,
