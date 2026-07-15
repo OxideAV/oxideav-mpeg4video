@@ -70,6 +70,25 @@ ffmpeg -f lavfi -i "testsrc2=size=176x144:rate=25:duration=0.6" \
 ffmpeg -f lavfi -i "testsrc2=size=64x64:rate=25:duration=0.48" \
   -c:v mpeg4 -qscale:v 4 -g 6 -bf 0 -flags +ildct+ilme+qpel -top 1 \
   -f m4v ilaced_qpel_ip_64x64.m4v
+
+# method-1 quantisation crossed with the other axes (added once the
+# ecosystem-compat mode made the mpeg_quant streams exact-verifiable):
+# mpeg_quant + quarter-sample + 4MV, I/P/B
+ffmpeg -f lavfi -i "testsrc2=size=64x64:rate=25:duration=0.48" \
+  -c:v mpeg4 -qscale:v 4 -g 6 -bf 2 -mpeg_quant 1 -flags +qpel+mv4 \
+  -f m4v mq_qpel_mv4_ipb_64x64.m4v
+
+# mpeg_quant + interlaced field DCT/ME + B-VOPs (both compat
+# divergences in one stream)
+ffmpeg -f lavfi -i "testsrc2=size=64x64:rate=25:duration=0.48" \
+  -c:v mpeg4 -qscale:v 4 -g 6 -bf 2 -mpeg_quant 1 -flags +ildct+ilme \
+  -top 1 -f m4v mq_ilaced_ipb_64x64.m4v
+
+# mpeg_quant + §6.2.5.3 data partitioning, I/P/B (the reference decode
+# is byte-identical to mq_ipb_64x64.yuv — same encoder decisions)
+ffmpeg -f lavfi -i "testsrc2=size=64x64:rate=25:duration=0.48" \
+  -c:v mpeg4 -qscale:v 4 -g 6 -bf 2 -mpeg_quant 1 -data_partitioning 1 \
+  -f m4v mq_dp_ipb_64x64.m4v
 ```
 
 ### From earlier rounds
@@ -125,6 +144,12 @@ db1725c277485611ffb7e8604b9109cdd6df61a7d0609f2ee682e64ea0a85b52  ipb_176x144.m4
 97a9d06708982cbacf8cb974798af8cc5bd4f2e23c96d703287cd14df6736b4a  ipb_176x144.yuv
 9600630769ff16bc829bd5cbf25a0ea61113e7ce852d4ddf79868ef99663340a  ilaced_qpel_ip_64x64.m4v
 67c5323154a8a80b02c1d12d2834bac0c1f3ab9c905d00b0ebceff4c5e577d83  ilaced_qpel_ip_64x64.yuv
+c6c38a7b94714432027886065c6f4f6bd0044cb81bba99ecaaec2d265e66defd  mq_qpel_mv4_ipb_64x64.m4v
+98bb74ca9189a0c47dd06c51c11654919fc0643b1a74bb5d889d4f7600995fb0  mq_qpel_mv4_ipb_64x64.yuv
+4bfce1cee6f977c82c5746960394a2435e9ba3e9bffb92aef05a6d695100e674  mq_ilaced_ipb_64x64.m4v
+6507284607652f4bb09805cf997683729a6e1d04c327e2d86b8a4e93d6882bf6  mq_ilaced_ipb_64x64.yuv
+7a34ef255a41ededc5a3a8090a80a69a3899a7fbecbf84ff03e9ad38589b11d5  mq_dp_ipb_64x64.m4v
+ca2cb8b3cbb12801ede055f71d101004a65e13707f514bf7a8084a2feb74839d  mq_dp_ipb_64x64.yuv
 ```
 
 (Note: `aic_ipb_64x64.yuv` and `altscan_ipb_64x64.yuv` are

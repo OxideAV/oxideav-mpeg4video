@@ -557,3 +557,102 @@ fn compat_keeps_the_near_exact_streams_within_their_budgets() {
         assert_stream_near_exact_with(m4v, yuv, 64, 64, budget, DecodeOptions::ecosystem());
     }
 }
+
+// ────────── method-1 quantisation crossed with the other tool axes ──────────
+//
+// Three fixtures added once the compat mode made the method-1 streams
+// exact-verifiable: `mpeg_quant` crossed with quarter-sample + 4MV,
+// with the interlaced B tools (exercising BOTH compat divergences in
+// one stream), and with data partitioning. Each is pinned in both
+// modes: a bounded intra-mismatch envelope under the spec default, 4
+// near-tie samples under compat.
+
+#[test]
+fn mq_qpel_mv4_stream_matches_within_intra_mismatch_envelope() {
+    // Method-1 quantisation + quarter-sample + 4MV anchors: the intra
+    // F[7][7] toggle difference propagates through the qpel prediction
+    // chain (measured 3413/73728 ≈ 4.6%, max 2).
+    assert_stream_bounded(
+        "mq_qpel_mv4_ipb_64x64.m4v",
+        "mq_qpel_mv4_ipb_64x64.yuv",
+        64,
+        64,
+        2,
+        0.06,
+    );
+}
+
+#[test]
+fn compat_mq_qpel_mv4_stream_collapses_to_near_ties() {
+    // Measured 4/73728, max 1 — the same near-tie set as mq_ipb.
+    assert_stream_near_exact_with(
+        "mq_qpel_mv4_ipb_64x64.m4v",
+        "mq_qpel_mv4_ipb_64x64.yuv",
+        64,
+        64,
+        4,
+        DecodeOptions::ecosystem(),
+    );
+}
+
+#[test]
+fn mq_interlaced_ipb_stream_matches_within_combined_envelope() {
+    // Method-1 quantisation + interlaced field DCT/ME + B-VOPs: BOTH
+    // documented divergences are active (intra mismatch toggle and
+    // §7.7.2.2 interlaced-direct macroblocks). Measured 3393/73728
+    // ≈ 4.6%, max 36.
+    assert_stream_bounded(
+        "mq_ilaced_ipb_64x64.m4v",
+        "mq_ilaced_ipb_64x64.yuv",
+        64,
+        64,
+        40,
+        0.06,
+    );
+}
+
+#[test]
+fn compat_mq_interlaced_ipb_stream_collapses_to_near_ties() {
+    // With both compat behaviours applied the combined stream drops to
+    // 4 near-tie samples (measured 4/73728, max 1) — the strongest
+    // single-stream validation of the compat pairing.
+    assert_stream_near_exact_with(
+        "mq_ilaced_ipb_64x64.m4v",
+        "mq_ilaced_ipb_64x64.yuv",
+        64,
+        64,
+        4,
+        DecodeOptions::ecosystem(),
+    );
+}
+
+#[test]
+fn mq_dp_stream_matches_within_intra_mismatch_envelope() {
+    // Method-1 quantisation + §6.2.5.3 data partitioning: the
+    // partitioned intra path routes through the same §7.4.4 methods
+    // (the encoder makes the same decisions as mq_ipb — the reference
+    // decode is byte-identical to mq_ipb_64x64.yuv). Measured
+    // 3062/73728 ≈ 4.2%, max 1.
+    assert_stream_bounded(
+        "mq_dp_ipb_64x64.m4v",
+        "mq_dp_ipb_64x64.yuv",
+        64,
+        64,
+        1,
+        0.05,
+    );
+}
+
+#[test]
+fn compat_mq_dp_stream_collapses_to_near_ties() {
+    // The data-partitioned intra path honours the exemption too:
+    // measured 4/73728, max 1.
+    assert_stream_near_exact_with(
+        "mq_dp_ipb_64x64.m4v",
+        "mq_dp_ipb_64x64.yuv",
+        64,
+        64,
+        4,
+        DecodeOptions::ecosystem(),
+    );
+}
