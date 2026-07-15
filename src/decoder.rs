@@ -1512,4 +1512,53 @@ mod registry_tests {
         dec.flush().unwrap();
         assert!(dec.receive_frame().is_ok());
     }
+    /// End-to-end proof that the registry options bag reaches the
+    /// decode behaviour: the method-1 conformance stream decodes
+    /// differently with `ecosystem-compat` on vs off (the §7.4.4.5
+    /// intra exemption), and the differences are the expected ±1
+    /// F[7][7]-toggle ripple.
+    #[test]
+    fn registry_option_changes_method1_decode_output() {
+        let stream = std::fs::read(format!(
+            "{}/tests/fixtures/mq_ipb_64x64.m4v",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap();
+        let run = |compat: bool| {
+            let mut params = CodecParameters::video(CodecId::new("mpeg4video"));
+            if compat {
+                params.options = oxideav_core::CodecOptions::new().set("ecosystem-compat", "true");
+            }
+            let mut dec = make_decoder(&params).unwrap();
+            dec.send_packet(&packet(stream.clone())).unwrap();
+            dec.flush().unwrap();
+            let mut planes = Vec::new();
+            while let Ok(oxideav_core::Frame::Video(v)) = dec.receive_frame() {
+                for p in v.planes {
+                    planes.extend(p.data);
+                }
+            }
+            planes
+        };
+        let spec = run(false);
+        let compat = run(true);
+        assert_eq!(spec.len(), compat.len());
+        assert!(!spec.is_empty());
+        let differing = spec
+            .iter()
+            .zip(compat.iter())
+            .filter(|(a, b)| a != b)
+            .count();
+        let max = spec
+            .iter()
+            .zip(compat.iter())
+            .map(|(&a, &b)| (i32::from(a) - i32::from(b)).unsigned_abs())
+            .max()
+            .unwrap();
+        assert!(
+            differing > 1000,
+            "expected the intra-mismatch exemption to alter the decode, got {differing}"
+        );
+        assert!(max <= 2, "toggle ripple must stay small, got max {max}");
+    }
 }

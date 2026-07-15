@@ -4,7 +4,9 @@
 //! ISO/IEC 14496-2:2004 §7.4.4 except for the §7.4.4.5 mismatch
 //! control (which is fused into [`inverse_quant_method1`] because its
 //! per-coefficient sum has to be computed in the same pass as the
-//! per-coefficient arithmetic + saturation):
+//! per-coefficient arithmetic + saturation;
+//! [`inverse_quant_method1_no_mismatch`] is the toggle-free sibling
+//! the ecosystem-compat intra path uses — see [`crate::compat`]):
 //!
 //! * §7.4.4.1.1 — intra DC reconstruction `F''[0][0] = dc_scaler *
 //!   QF[0][0]`.
