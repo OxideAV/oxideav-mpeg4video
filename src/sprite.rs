@@ -38,11 +38,13 @@ use crate::bitreader::BitReader;
 /// (§6.3.3), so the GMC trajectory holds at most 3 points. Static
 /// sprites can use 4 (the §7.8.5 perspective transform); see
 /// [`decode_sprite_trajectory_static`].
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub const MAX_GMC_WARPING_POINTS: usize = 3;
 
 /// Maximum warping points a static-sprite stream may carry: the §7.8.5
 /// perspective transform uses 4 (`no_of_sprite_warping_points == 4`,
 /// Table 6-88).
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub const MAX_STATIC_WARPING_POINTS: usize = 4;
 
 /// Errors raised while decoding a `sprite_trajectory()`.
@@ -95,6 +97,7 @@ const MAX_SSS: u32 = 14;
 /// Layout: VLC `dmv_length` (a unary run of `SSS` `1`-bits then a `0`),
 /// then — when `SSS != 0` — an `SSS`-bit FLC `dmv_code`, then a
 /// `marker_bit` (`1`).
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn decode_warping_mv_code(br: &mut BitReader<'_>) -> Result<i32, SpriteTrajectoryError> {
     // Read the unary `dmv_length` (SSS): count leading 1s, stop at the 0.
     let mut sss: u32 = 0;
@@ -152,6 +155,7 @@ pub fn decode_warping_mv_code(br: &mut BitReader<'_>) -> Result<i32, SpriteTraje
 /// `Copy` so it can ride inside the `Copy` [`crate::vop::VopHeader`].
 /// Only `count` entries are valid; the rest are `0`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub struct SpriteTrajectory {
     /// Number of warping points actually decoded (`==
     /// no_of_sprite_warping_points`).
@@ -178,6 +182,7 @@ impl SpriteTrajectory {
 /// value of `0` is the stationary case and produces an empty trajectory
 /// without consuming any bits (the §6.2.5 syntax guards
 /// `sprite_trajectory()` behind `no_of_sprite_warping_points > 0`).
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn decode_sprite_trajectory(
     br: &mut BitReader<'_>,
     no_of_sprite_warping_points: u8,
@@ -207,6 +212,7 @@ pub fn decode_sprite_trajectory(
 /// [`crate::perspective_warp::PerspectiveWarp::decode`]; counts 0..=3 feed
 /// [`crate::warp::WarpGeometry::decode`] after taking the leading three
 /// pairs.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn decode_sprite_trajectory_static(
     br: &mut BitReader<'_>,
     no_of_sprite_warping_points: u8,

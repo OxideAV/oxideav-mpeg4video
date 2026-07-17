@@ -77,6 +77,7 @@ impl From<FrameStoreError> for FrameDecodeError {
 /// the §7.4 intra texture path). The §7.6.1 reference plane is supplied
 /// by the frame loop, not the caller.
 #[derive(Debug, Clone)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub enum PVopMbContent {
     /// An inter macroblock: the [`PvopMbMotion`] the
     /// [`MvDriver`](crate::pvop_mv::MvDriver) decoded plus the §7.4 inter
@@ -126,6 +127,7 @@ pub enum PVopMbContent {
 /// `sample_mode` the VOL-level `quarter_sample` selection (§7.6.2.1 vs
 /// §7.6.2.2 luminance interpolation); `bits_per_pixel` the §6.3.3
 /// sample depth for the §7.3 clip.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn assemble_p_vop_frame(
     store: &FrameStore,
     mb_width: usize,
@@ -305,6 +307,7 @@ fn obmc_remote_kind(
 ///
 /// OBMC is a half-sample-mode tool; motion vectors are taken in
 /// half-sample units.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn assemble_p_vop_frame_obmc(
     store: &FrameStore,
     mb_width: usize,
@@ -449,6 +452,7 @@ pub fn assemble_p_vop_frame_obmc(
 /// ([`assemble_p_vop_frame`]) then [`FrameStore::push_anchor`] it so the
 /// next VOP sees it as the new forward reference. Returns a borrow of the
 /// freshly-installed anchor.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn decode_p_vop<'a>(
     store: &'a mut FrameStore,
     mb_width: usize,
@@ -479,6 +483,7 @@ pub fn decode_p_vop<'a>(
 /// An I-VOP is intra-only: every macroblock is supplied already
 /// reconstructed to pixels. The assembled frame is pushed into the store
 /// as the new anchor. Returns a borrow of the installed frame.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn decode_i_vop<'a>(
     store: &'a mut FrameStore,
     mb_width: usize,
@@ -522,6 +527,7 @@ pub fn decode_i_vop<'a>(
 ///
 /// Returns [`FrameDecodeError::MissingReference`] if either anchor is
 /// absent (a B-VOP before two anchors have been decoded).
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn assemble_b_vop_frame(
     store: &FrameStore,
     mb_width: usize,
@@ -589,6 +595,7 @@ pub fn assemble_b_vop_frame(
 /// per-field view with `field_mode`. Like its progressive sibling the
 /// frame never enters the reference chain.
 #[allow(clippy::too_many_arguments)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn assemble_b_vop_interlaced_frame(
     store: &FrameStore,
     mb_width: usize,
@@ -657,6 +664,7 @@ pub fn assemble_b_vop_interlaced_frame(
 /// `mcsel` flag selecting global-motion (warp) vs. local-MC prediction.
 /// Intra macroblocks are supplied already reconstructed.
 #[derive(Debug, Clone)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub enum SGmcMbContent {
     /// `mcsel == 1`: global-motion-compensated. The §7.8 warp is applied
     /// to the forward reference plane; only the §7.4 residual is carried.
@@ -695,6 +703,7 @@ pub enum SGmcMbContent {
 /// macroblocks (the GMC warp path has its own
 /// `sprite_warping_accuracy` sub-pel handling).
 #[allow(clippy::too_many_arguments)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn assemble_s_gmc_vop_frame(
     store: &FrameStore,
     mb_width: usize,

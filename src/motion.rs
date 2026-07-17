@@ -69,6 +69,7 @@ use crate::bitreader::{BitReader, BitReaderError};
 /// Prediction mode passed to [`decode_motion_vector`], matching the
 /// `mode` argument of the §6.2.6.2 `motion_vector(mode)` syntax.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub enum MvMode {
     /// `"direct"` — both components are a bare `mv_data` VLC with no
     /// residual (the §6.2.6.2 `if (mode == "direct")` branch).
@@ -139,6 +140,7 @@ impl From<BitReaderError> for MotionParseError {
 /// `MVDy`), in half-sample units when `quarter_sample == 0` or
 /// quarter-sample units when `quarter_sample == 1`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub struct MotionVectorDelta {
     /// Reconstructed horizontal differential component (`MVDx`).
     pub dx: i32,
@@ -149,6 +151,7 @@ pub struct MotionVectorDelta {
 /// A reconstructed (final) motion vector — the §7.6.3 `MVx`, `MVy`
 /// after the predictor add and the modulo wrap into `[low:high]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub struct MotionVector {
     /// Reconstructed horizontal component (`MVx`).
     pub x: i32,
@@ -318,6 +321,7 @@ fn fcode_bounds(vop_fcode: u8) -> Result<(i32, i32, i32, i32), MotionParseError>
 ///
 /// On return the bit reader is positioned immediately after the
 /// (last) component's residual / `mv_data`.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn decode_motion_vector_delta(
     br: &mut BitReader<'_>,
     mode: MvMode,
@@ -362,6 +366,7 @@ fn r_size_bits(vop_fcode: u8) -> usize {
 /// `vop_fcode` selects the wrap range. The predictor itself is the
 /// caller's responsibility (median of neighbouring block vectors,
 /// §7.6.5) and is out of scope for this module.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn reconstruct_motion_vector(
     delta: MotionVectorDelta,
     px: i32,
@@ -466,6 +471,7 @@ fn resolve_candidates(candidates: [Option<MotionVector>; 3]) -> [MotionVector; 3
 /// [`reconstruct_motion_vector`] adds to the decoded differential MV.
 /// Gather the candidates from the spatial neighbourhood via
 /// [`crate::mv_predictor_grid::MvGrid::predictor_candidates`].
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn predict_motion_vector(candidates: [Option<MotionVector>; 3]) -> MotionVector {
     let [mv1, mv2, mv3] = resolve_candidates(candidates);
     MotionVector {
@@ -530,6 +536,7 @@ const fn div2_round(x: i32) -> i32 {
 ///   out-of-video-packet neighbour ("treated as transparent" per §7.6.5),
 ///   equivalent to `None` in [`predict_motion_vector`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub enum FieldPredCandidate {
     /// Frame-predicted neighbour — frame MV used directly.
     Frame(MotionVector),
@@ -583,6 +590,7 @@ impl FieldPredCandidate {
 /// [`crate::field_motion::reconstruct_field_motion_vectors`] (CASE 1 /
 /// CASE 3), or that a frame-predicted current macroblock adds once via
 /// [`reconstruct_motion_vector`] (CASE 2).
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn predict_field_motion_vector(candidates: [FieldPredCandidate; 3]) -> MotionVector {
     let mapped = [
         candidates[0].to_candidate_vector(),
@@ -617,6 +625,7 @@ pub fn predict_field_motion_vector(candidates: [FieldPredCandidate; 3]) -> Motio
 
 /// The §7.8.7.3 luminance-block pixel count (`Nb = 256`, all 16×16 pixels
 /// of one macroblock).
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub const AMV_PIXEL_COUNT: usize = 256;
 
 /// Integer division with rounding to the nearest integer, ties **away
@@ -655,6 +664,7 @@ fn rdiv_away(num: i64, denom: i64) -> i64 {
 /// Returns [`MotionParseError::InvalidFcode`] when `vop_fcode` is
 /// outside `1..=7` and [`MotionParseError::Truncated`] (re-used as a
 /// generic "bad-input" sentinel) when `pel_denominator` is zero.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn averaged_motion_vector(
     pel_mvs_x: &[i64; AMV_PIXEL_COUNT],
     pel_mvs_y: &[i64; AMV_PIXEL_COUNT],
@@ -752,6 +762,7 @@ pub fn averaged_motion_vector(
 /// `MV` is divided by 2 and rounded via Table 7-13 before the linear
 /// scaling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub enum DirectMvUnits {
     /// The co-located MV and the delta MV share the same sub-pel grid;
     /// no pre-scaling conversion is needed.
@@ -778,6 +789,7 @@ pub enum DirectMvUnits {
 /// the derivation then runs with `MV = (0, 0)`, the delta MVD passing
 /// through unchanged into both `MVF` and `MVB`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub enum DirectCoLocatedMv {
     /// A resolved (and §7.6.1.6-padded) reference-block motion vector.
     Mv(MotionVector),
@@ -835,6 +847,7 @@ impl std::error::Error for DirectMvError {}
 /// next anchor). Units match the input delta MV's units (half-pel when
 /// `quarter_sample == 0`, quarter-pel when `quarter_sample == 1`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub struct DirectModeMv {
     /// The forward motion vector `MVF` per §7.6.9.5.2.
     pub forward: MotionVector,
@@ -852,6 +865,7 @@ pub struct DirectModeMv {
 /// when the reference is four block-vectors and the delta `MVD` is
 /// half-pel) and pass an already-converted `MV` directly into
 /// [`direct_mode_motion_vector`] with [`DirectMvUnits::Match`].
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn direct_mode_reduce_qpel_to_half_pel(mv: MotionVector) -> MotionVector {
     use crate::quarter_sample::reduce_qpel_to_half_pel_chroma;
     MotionVector {
@@ -882,6 +896,7 @@ pub fn direct_mode_reduce_qpel_to_half_pel(mv: MotionVector) -> MotionVector {
 /// linear-scaling factor `TRB / TRD ∈ [0, 1]` to keep the magnitude
 /// bounded relative to `MV`; the prediction-block-generator step that
 /// follows (§7.6.9.5.3) consumes the algebraic value directly.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn direct_mode_motion_vector(
     co_located: DirectCoLocatedMv,
     mvd: MotionVectorDelta,
@@ -989,6 +1004,7 @@ pub fn direct_mode_motion_vector(
 /// (`derived_mb_type == 0 / 1`), four for the `inter4v` case
 /// (`derived_mb_type == 2`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub enum MotionCodingDeltas {
     /// `type_of_mb == 1` — the per-macroblock single `MotionVectorDelta`.
     OneMv(MotionVectorDelta),
@@ -1015,6 +1031,7 @@ impl MotionCodingDeltas {
 /// motion_vector(mode)` (the unconditional opening call counts as the
 /// first, the loop adds three more for a total of four).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub enum TypeOfMb {
     /// `type_of_mb == 1` — one `motion_vector(mode)` invocation.
     One,
@@ -1037,6 +1054,7 @@ pub enum TypeOfMb {
 ///
 /// On return the bit reader is positioned immediately after the last
 /// component's residual / `mv_data`.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn motion_coding(
     br: &mut BitReader<'_>,
     mode: MvMode,
@@ -1087,6 +1105,7 @@ pub fn motion_coding(
 /// * Binary-shape `transparent_block(j)` elision — rectangular shape
 ///   guarantees every sub-block is opaque (§6.1.3.4 NOTE 2 / §6.2.6
 ///   rectangular branch).
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn decode_p_macroblock_motion_vectors(
     br: &mut BitReader<'_>,
     derived_mb_type: crate::macroblock::DerivedMbType,
@@ -1149,6 +1168,7 @@ pub fn decode_p_macroblock_motion_vectors(
 /// shape (one entry per 8x8 luma quadrant — opaque if any of the 64
 /// shape samples is opaque).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub struct BinaryShapeBlockOpacity {
     /// Figure 6-8 raster-order opacity flags (`!transparent_block(j)`).
     pub opaque: [bool; 4],
@@ -1202,6 +1222,7 @@ impl BinaryShapeBlockOpacity {
 /// [`MotionCodingDeltas::FourMv`] — converted via
 /// [`BinaryShapeFourMv::to_motion_coding_deltas`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub struct BinaryShapeFourMv {
     /// Optional per-sub-block delta in Figure 6-8 raster order.
     pub deltas: [Option<MotionVectorDelta>; 4],
@@ -1278,6 +1299,7 @@ impl BinaryShapeFourMv {
 ///   later-round work; [`crate::chroma_shape`] handles the related
 ///   luma-to-chroma shape decimation but not the luma-to-block
 ///   `transparent_block(j)` derivation.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn decode_p_macroblock_motion_vectors_with_shape(
     br: &mut BitReader<'_>,
     derived_mb_type: crate::macroblock::DerivedMbType,
@@ -1345,6 +1367,7 @@ pub fn decode_p_macroblock_motion_vectors_with_shape(
 /// in bitstream order — §7.7.2.1: first body = top-field differential
 /// (`MVD f1`), second body = bottom-field differential (`MVD f2`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub struct FieldMvPair {
     /// Top-field differential (`MVDx f1`, `MVDy f1`) — the first body.
     pub top: MotionVectorDelta,
@@ -1363,6 +1386,7 @@ pub struct FieldMvPair {
 /// coded for a direct macroblock, so [`MvMode::Direct`] yields
 /// [`MotionParseError::InvalidFieldPredictionContext`] without
 /// consuming bits.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn decode_field_motion_vector_pair(
     br: &mut BitReader<'_>,
     mode: MvMode,
@@ -1378,6 +1402,7 @@ pub fn decode_field_motion_vector_pair(
 
 /// A P-VOP macroblock's decoded MV bodies, frame- or field-predicted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub enum PMbMotionVectors {
     /// Frame prediction (`field_prediction == 0`, or a progressive
     /// VOL) — the one-or-four delta view of [`MotionCodingDeltas`].
@@ -1401,6 +1426,7 @@ pub enum PMbMotionVectors {
 /// `inter4v` or intra `derived_mb_type` is rejected with
 /// [`MotionParseError::InvalidFieldPredictionContext`] before any bit
 /// is consumed.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn decode_p_macroblock_motion_vectors_interlaced(
     br: &mut BitReader<'_>,
     derived_mb_type: crate::macroblock::DerivedMbType,

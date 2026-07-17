@@ -105,6 +105,7 @@ use crate::motion::MotionVector;
 
 /// Number of 8×8 luminance blocks per macroblock (Figure 6-8 / §6.1.3.4
 /// 4:2:0 chroma format).
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub const LUMA_BLOCKS_PER_MB: usize = 4;
 
 /// Per-block transparency flag (§7.6.1.6 `Transp[i]`).
@@ -114,6 +115,7 @@ pub const LUMA_BLOCKS_PER_MB: usize = 4;
 /// individual blocks may still be `Transparent` (the §7.6.1.6 vector
 /// padding is what fills their MVs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub enum BlockTransparency {
     /// The block is fully inside the VOP shape — its decoded MV is
     /// used as-is.
@@ -131,6 +133,7 @@ pub enum BlockTransparency {
 /// with `(0, 0)`; the [`MacroblockPaddingMode::PerBlock`] branch runs
 /// the per-block transparency fallback chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub enum MacroblockPaddingMode {
     /// The macroblock is INTRA-coded, or is a P-VOP `skipped` (`COD ==
     /// 1`) macroblock. All four block MVs are forced to `(0, 0)`.
@@ -208,6 +211,7 @@ const FALLBACK_CHAIN: [[usize; 3]; LUMA_BLOCKS_PER_MB] = [
 /// // MV propagates into block 1.
 /// assert_eq!(mvs[1], MotionVector { x: 10, y: 4 });
 /// ```
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn pad_macroblock_vectors(
     vectors: &mut [MotionVector; LUMA_BLOCKS_PER_MB],
     transparencies: &[BlockTransparency; LUMA_BLOCKS_PER_MB],

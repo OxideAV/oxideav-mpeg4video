@@ -80,6 +80,7 @@ use crate::motion::MotionVector;
 ///
 /// Verbatim transcription from ISO/IEC 14496-2:2004 §7.6.5 Table
 /// 7-13.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub const TABLE_7_13: [u8; 4] = [0, 1, 1, 1];
 
 /// Table 7-12 — Modification of eighth sample resolution chrominance
@@ -92,6 +93,7 @@ pub const TABLE_7_13: [u8; 4] = [0, 1, 1, 1];
 ///
 /// Verbatim transcription from ISO/IEC 14496-2:2004 §7.6.5 Table
 /// 7-12.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub const TABLE_7_12: [u8; 8] = [0, 0, 1, 1, 1, 1, 1, 2];
 
 /// Table 7-11 — Modification of twelfth sample resolution chrominance
@@ -103,6 +105,7 @@ pub const TABLE_7_12: [u8; 8] = [0, 0, 1, 1, 1, 1, 1, 2];
 ///
 /// Verbatim transcription from ISO/IEC 14496-2:2004 §7.6.5 Table
 /// 7-11.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub const TABLE_7_11: [u8; 12] = [0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 2, 2];
 
 /// Table 7-10 — Modification of sixteenth sample resolution
@@ -114,6 +117,7 @@ pub const TABLE_7_11: [u8; 12] = [0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 2, 2];
 ///
 /// Verbatim transcription from ISO/IEC 14496-2:2004 §7.6.5 Table
 /// 7-10.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub const TABLE_7_10: [u8; 16] = [0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2];
 
 /// Errors raised by [`chroma_mv_from_luma_blocks`].
@@ -228,6 +232,7 @@ fn lookup_table(k: usize, index: usize) -> u8 {
 /// ]).unwrap();
 /// assert_eq!(chroma, MotionVector { x: 2, y: 2 });
 /// ```
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn chroma_mv_from_luma_blocks(
     luma_mvs: &[MotionVector],
 ) -> Result<MotionVector, ChromaMvError> {
@@ -265,6 +270,7 @@ pub fn chroma_mv_from_luma_blocks(
 /// tens of grey levels under an algebraic-halving fold
 /// (`tests/fixtures/qpel_mv4_ipb_64x64.m4v`); the `K = 1` streams
 /// (`qpel_ip` / `qpel_ipb`) are bit-exact under both readings.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn chroma_mv_from_luma_blocks_qpel(
     luma_mvs: &[MotionVector],
 ) -> Result<MotionVector, ChromaMvError> {

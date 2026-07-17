@@ -81,6 +81,7 @@ use crate::vop::VopCodingType;
 /// transparently skipped by [`parse_macroblock_header`]; callers
 /// therefore never see a `Stuffing` variant in the returned header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub enum DerivedMbType {
     /// Type 0 (P-VOP only): inter-coded, one motion vector.
     Inter,
@@ -136,6 +137,7 @@ impl DerivedMbType {
 /// The 2-bit `dquant` field encodes a signed delta against the
 /// running quantiser scale: `00 → -1`, `01 → -2`, `10 → +1`,
 /// `11 → +2`.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn dquant_value(code: u8) -> i8 {
     match code & 0b11 {
         0b00 => -1,
@@ -152,6 +154,7 @@ pub fn dquant_value(code: u8) -> i8 {
 /// coefficients, motion vectors, and the various interlaced /
 /// sprite / scalability bodies stay unparsed here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub struct MacroblockHeader {
     /// 1-bit `not_coded` flag. Always `false` for I-VOP macroblocks
     /// (per Table B.1 — `not_coded` is absent on I-VOP) and `false`
@@ -540,6 +543,7 @@ pub(crate) fn decode_cbpy4(br: &mut BitReader<'_>) -> Result<(u8, u8, u8), Macro
 /// [`MacroblockHeader::mcsel`]. B-VOPs (`modb` / `mb_type` Tables B.3 /
 /// B.4 / B.5) and `Static`-sprite S-VOPs are still rejected with
 /// [`MacroblockParseError::UnsupportedVopKind`].
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn parse_macroblock_header(
     br: &mut BitReader<'_>,
     vop_coding_type: VopCodingType,

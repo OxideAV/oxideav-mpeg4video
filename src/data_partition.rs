@@ -44,14 +44,18 @@ use crate::texture::{decode_intra_dc, DcComponent, TextureParseError};
 
 /// §6.3.5 `dc_marker` — `110 1011 0000 0000 0001`, 19 bits. Inserted
 /// after the §6.2.5.3 first partition of a data-partitioned I-VOP.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub const DC_MARKER: u32 = 0b110_1011_0000_0000_0001;
 /// Length of [`DC_MARKER`] in bits.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub const DC_MARKER_BITS: usize = 19;
 
 /// §6.3.5 `motion_marker` — `1 1111 0000 0000 0001`, 17 bits. Inserted
 /// after the §6.2.5.3 first partition of a data-partitioned P-VOP.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub const MOTION_MARKER: u32 = 0b1_1111_0000_0000_0001;
 /// Length of [`MOTION_MARKER`] in bits.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub const MOTION_MARKER_BITS: usize = 17;
 
 /// Errors emitted while parsing a data-partitioned macroblock layer.
@@ -141,6 +145,7 @@ impl From<TextureParseError> for DataPartitionError {
 ///
 /// `use_intra_dc_vlc` is `true` when the running quantiser scale is
 /// *below* that threshold (so the DC VLC is still in force).
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn use_intra_dc_vlc(intra_dc_vlc_thr: u8, running_qp: u32) -> bool {
     let threshold: u32 = match intra_dc_vlc_thr & 0b111 {
         0 => u32::MAX, // DC VLC for the entire VOP
@@ -158,6 +163,7 @@ pub fn use_intra_dc_vlc(intra_dc_vlc_thr: u8, running_qp: u32) -> bool {
 /// One macroblock's worth of partition-1 header fields gathered from the
 /// motion / shape partition of a data-partitioned VOP.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub struct DataPartitionedMb {
     /// `not_coded` (P-VOP only; always `false` for I-VOP).
     pub not_coded: bool,
@@ -182,6 +188,7 @@ pub struct DataPartitionedMb {
 /// `cbpy` (plus `dquant` + intra-DC for the P-VOP, which the I-VOP
 /// carries in partition 1).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub struct DataPartitionedTexHeader {
     /// `ac_pred_flag` (intra MBs only; `false` for inter MBs).
     pub ac_pred_flag: bool,
@@ -201,6 +208,7 @@ pub struct DataPartitionedTexHeader {
 /// combined-syntax walk does (a skipped MB records a valid zero
 /// vector, an intra MB a valid zero candidate).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub enum DpMbEvent {
     /// `not_coded == 1` — a skipped macroblock (zero-MV inter copy).
     /// No motion bits follow.
@@ -221,6 +229,7 @@ pub enum DpMbEvent {
 /// (`ac_pred_flag` + `cbpy`) records. The block (texture) partition that
 /// follows is left for the caller to decode from `texture_start_bit`.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub struct DataPartitionedIVop {
     /// One [`DataPartitionedMb`] per macroblock, in raster order.
     pub mbs: Vec<DataPartitionedMb>,
@@ -234,6 +243,7 @@ pub struct DataPartitionedIVop {
 /// The decode of a data-partitioned P-VOP video packet's header
 /// partitions.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub struct DataPartitionedPVop {
     /// One [`DataPartitionedMb`] per macroblock (partition 1: not_coded,
     /// mcbpc, mcsel — motion vectors are skipped over but their bit
@@ -292,6 +302,7 @@ fn decode_intra_dc_six(br: &mut BitReader<'_>) -> Result<[i32; 6], DataPartition
 /// matching how the combined path separates delta decode from
 /// reconstruction. This is a ready-made `decode_motion` closure body for
 /// [`parse_data_partitioned_p_vop`].
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn decode_motion_coding(
     br: &mut BitReader<'_>,
     mb_type: DerivedMbType,
@@ -332,6 +343,7 @@ pub fn decode_motion_coding(
 /// partition 1 / 2 (not the texture partition), so the texture-partition
 /// EVENT run of an intra block is its AC coefficients only — but the
 /// Tcoef table selection (intra vs. inter) is unchanged.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn mb_block_layout(
     mb: &DataPartitionedMb,
     tex: &DataPartitionedTexHeader,
@@ -366,6 +378,7 @@ pub fn mb_block_layout(
 /// `intra_dc_vlc_thr` + `running_qp` derive `use_intra_dc_vlc`
 /// (Table 6-25) which gates whether partition 1 also carries the six
 /// intra-DC differentials per macroblock.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn parse_data_partitioned_i_vop(
     br: &mut BitReader<'_>,
     mb_in_video_packet: usize,
@@ -462,6 +475,7 @@ pub fn parse_data_partitioned_i_vop(
 /// `is_s_gmc` selects the §6.3.6 `mcsel` syntax (`sprite_enable ==
 /// "GMC"` S-VOP). `intra_dc_vlc_thr` + `running_qp` derive
 /// `use_intra_dc_vlc` for the partition-2 intra-DC of intra MBs.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn parse_data_partitioned_p_vop<F>(
     br: &mut BitReader<'_>,
     mb_in_video_packet: usize,

@@ -38,6 +38,13 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- The internal decode plumbing (the `vop_decode` bitstream walks and the
+  macroblock / texture / motion-vector / predictor machinery) is now
+  `#[doc(hidden)]`; the documented API is the decoder surface
+  (`Mpeg4VideoDecoder`, `Mpeg4PacketDecoder`, `make_decoder`,
+  `Mpeg4DecoderOptions`, `compat::DecodeOptions`, `register`) plus the
+  frame / parse-error types it exposes.
+
 - The `vop_decode` walk entry points
   (`decode_{i,p,s_gmc}_vop_macroblocks`, the `_dp` variants,
   `decode_b_vop_macroblocks`, `decode_b_vop_interlaced_macroblocks`)

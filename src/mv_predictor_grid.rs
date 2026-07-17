@@ -105,6 +105,7 @@ const fn div2_round(x: i32) -> i32 {
 /// The motion-vector content of one macroblock recorded in
 /// [`MvGrid`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub enum MbMv {
     /// The macroblock is outside the current VOP / video packet / GOB
     /// or is wholly transparent / not-yet-decoded. Every sub-block
@@ -139,6 +140,7 @@ pub enum MbMv {
 /// 1-MV vs 4-MV mode plus the per-luma-block transparency mask of a
 /// macroblock — what [`MvGrid::record`] needs from the caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub struct MbMvRecord {
     /// The macroblock-level motion-vector content.
     pub content: MbMv,
@@ -200,6 +202,7 @@ impl MbMvRecord {
 /// `[Option<MotionVector>; 3]` ready to feed into
 /// [`crate::motion::predict_motion_vector`].
 #[derive(Debug, Clone)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub struct MvGrid {
     mb_rows: usize,
     mb_cols: usize,
@@ -211,6 +214,7 @@ pub struct MvGrid {
 }
 
 /// The four §6.1.3.4 / Figure 6-8 luminance sub-blocks per macroblock.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub const LUMA_BLOCKS_PER_MB: usize = 4;
 
 /// `MvGrid` errors.
@@ -626,6 +630,7 @@ impl MvGrid {
 /// // to zero, and the median over {(5, 6), (3, 4), (0, 0)} → (3, 4).
 /// assert_eq!(predictor, MotionVector { x: 3, y: 4 });
 /// ```
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn gather_mv_predictor_candidates(
     grid: &MvGrid,
     mb_row: usize,
@@ -669,6 +674,7 @@ pub fn gather_mv_predictor_candidates(
 /// let px_py = predict_field_motion_vector(cands);
 /// assert_eq!(px_py, MotionVector { x: 4, y: 0 });
 /// ```
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn gather_field_mv_predictor_candidates(
     grid: &MvGrid,
     mb_row: usize,

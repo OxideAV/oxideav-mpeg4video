@@ -60,9 +60,11 @@ use crate::vol::{SpriteEnable, VolHeader, VolParseError};
 
 /// Start code for a `Group_of_VideoObjectPlane()` (§6.2.4 / §6.3.4 —
 /// `0x000001B3`).
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub const GROUP_OF_VOP_START_CODE: u32 = 0x0000_01B3;
 /// Start code for a `VideoObjectPlane()` (§6.2.5 / §6.3.5 —
 /// `0x000001B6`).
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub const VOP_START_CODE: u32 = 0x0000_01B6;
 
 /// VOP coding type (§6.3.5 Table 6-24).
@@ -93,6 +95,7 @@ impl VopCodingType {
 
 /// Decoded `time_code` field (§6.2.4, Table 6-23).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub struct TimeCode {
     /// `time_code_hours`. Range 0..=23 per the table.
     pub hours: u8,
@@ -104,6 +107,7 @@ pub struct TimeCode {
 
 /// Typed view of a §6.2.4 `Group_of_VideoObjectPlane` header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub struct GovHeader {
     /// Decoded `time_code`.
     pub time_code: TimeCode,
@@ -122,6 +126,7 @@ pub struct GovHeader {
 /// round 1's `VolHeader` exposes the missing bits should populate these
 /// from there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub struct VopContext {
     /// `quant_precision` (§6.3.3 — number of bits used to transmit
     /// `vop_quant`). Default `5`. Valid range 3..=9 per §6.3.3.
@@ -197,6 +202,7 @@ impl VopContext {
 
 /// Decoded §6.2.5 Video Object Plane header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub struct VopHeader {
     /// `vop_coding_type`.
     pub coding_type: VopCodingType,
@@ -359,6 +365,7 @@ fn read_marker(br: &mut BitReader<'_>) -> Result<(), VopParseError> {
 /// minimum number of unsigned integer bits required to represent
 /// `[0, resolution)`, with a special case of one zero bit when
 /// `resolution == 1`.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn vop_time_increment_bits(resolution: u16) -> u8 {
     if resolution <= 1 {
         return 1;
@@ -369,6 +376,7 @@ pub fn vop_time_increment_bits(resolution: u16) -> u8 {
 
 /// Parse a §6.2.4 `Group_of_VideoObjectPlane` header starting at the
 /// `group_of_vop_start_code` (`0x000001B3`).
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn parse_group_of_vop_header(data: &[u8]) -> Result<GovHeader, VopParseError> {
     let mut br = BitReader::new(data);
     let sc = br.read_bits(32)?;
@@ -425,6 +433,7 @@ impl VopHeader {
 /// VOL header and is needed to determine the bit-width of
 /// `vop_time_increment`. `ctx` carries the few additional VOL bits the
 /// VOP syntax depends on; see [`VopContext`] for defaults.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn parse_video_object_plane_header(
     data: &[u8],
     resolution: u16,
@@ -451,6 +460,7 @@ pub fn parse_video_object_plane_header(
 /// directly). This is the entry point the frame-level bitstream
 /// drivers use; [`parse_video_object_plane_header`] wraps it for
 /// callers holding a byte slice that starts at the start code.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn parse_vop_header_body(
     br: &mut BitReader<'_>,
     resolution: u16,

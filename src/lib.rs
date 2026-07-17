@@ -307,97 +307,152 @@
 
 use oxideav_core::RuntimeContext;
 
+// Stable, documented surface: the elementary-stream / registry decoder
+// (`decoder`: `Mpeg4VideoDecoder`, `Mpeg4PacketDecoder`, `make_decoder`,
+// `Mpeg4DecoderOptions`), the compat switch (`compat::DecodeOptions`),
+// `register`, and the frame / parse-error types those signatures expose
+// (`DecodedFrame`, `VolHeader`, `VopCodingType`, `Error` + the error
+// enums it wraps). Everything marked `#[doc(hidden)]` below is internal
+// decode plumbing — the `vop_decode` bitstream walks and the
+// macroblock / texture / motion-vector / predictor machinery they drive
+// — kept `pub` for the test / bench / fuzz harnesses but not part of
+// the crate's semver-stable API.
+#[doc(hidden)]
 pub mod bitreader;
-pub mod block;
-pub mod bvop;
+pub mod block; // mixed: `BlockAssemblyError` stays visible
+pub mod bvop; // mixed: `BVopMbParseError` stays visible
+#[doc(hidden)]
 pub mod bvop_field_direct;
+#[doc(hidden)]
 pub mod bvop_field_motion;
+#[doc(hidden)]
 pub mod bvop_field_predictor;
-pub mod bvop_mv;
+pub mod bvop_mv; // mixed: `BVopMvDriverError` stays visible
+#[doc(hidden)]
 pub mod bvop_prediction;
-pub mod chroma_mv;
+pub mod chroma_mv; // mixed: `ChromaMvError` stays visible
+#[doc(hidden)]
 pub mod chroma_shape;
 pub mod compat;
-pub mod data_partition;
+pub mod data_partition; // mixed: `DataPartitionError` stays visible
 pub mod decoder;
+#[doc(hidden)]
 pub mod extended_padding;
+#[doc(hidden)]
 pub mod field_motion;
-pub mod frame_decode;
-pub mod framestore;
+pub mod frame_decode; // mixed: `FrameDecodeError` stays visible
+pub mod framestore; // mixed: `DecodedFrame` / `FrameStoreError` stay visible
+#[doc(hidden)]
 pub mod gmc;
+#[doc(hidden)]
 pub mod half_sample;
+#[doc(hidden)]
 pub mod idct;
+#[doc(hidden)]
 pub mod interlaced_information;
+#[doc(hidden)]
 pub mod interlaced_padding;
+#[doc(hidden)]
 pub mod inverse_quant;
+#[doc(hidden)]
 pub mod inverse_sadct;
-pub mod macroblock;
-pub mod motion;
-pub mod mv_predictor_grid;
+pub mod macroblock; // mixed: `MacroblockParseError` stays visible
+pub mod motion; // mixed: `MotionParseError` / `DirectMvError` stay visible
+pub mod mv_predictor_grid; // mixed: `MvGridError` stays visible
+#[doc(hidden)]
 pub mod neighbour;
+#[doc(hidden)]
 pub mod obmc;
+#[doc(hidden)]
 pub mod perspective_warp;
+#[doc(hidden)]
 pub mod predictor;
-pub mod pvop_mv;
+pub mod pvop_mv; // mixed: `PvopMvError` stays visible
+#[doc(hidden)]
 pub mod quarter_sample;
+#[doc(hidden)]
 pub mod reconstruct;
+#[doc(hidden)]
 pub mod rvlc_arbitration;
+#[doc(hidden)]
 pub mod rvlc_recovery;
+#[doc(hidden)]
 pub mod s_gmc_recon;
+#[doc(hidden)]
 pub mod sample_padding;
-pub mod scan;
+pub mod scan; // mixed: `InverseScanError` stays visible
+#[doc(hidden)]
 pub mod sequence;
-pub mod sprite;
+pub mod sprite; // mixed: `SpriteTrajectoryError` stays visible
+#[doc(hidden)]
 pub mod sprite_piece;
+#[doc(hidden)]
 pub mod static_sprite;
-pub mod texture;
+pub mod texture; // mixed: `TextureParseError` stays visible
+#[doc(hidden)]
 pub mod transform_select;
-pub mod vector_padding;
+pub mod vector_padding; // mixed: `VectorPaddingError` stays visible
+#[doc(hidden)]
 pub mod vertical_padding;
-pub mod video_packet;
-pub mod vol;
-pub mod vop;
-pub mod vop_decode;
+pub mod video_packet; // mixed: `VideoPacketParseError` stays visible
+pub mod vol; // mixed: `VolHeader` + parse-error / field types stay visible
+pub mod vop; // mixed: `VopCodingType` / `VopParseError` stay visible
+pub mod vop_decode; // mixed: `VopDecodeError` stays visible
+#[doc(hidden)]
 pub mod warp;
 
+// Crate-root re-exports of internal plumbing are hidden alongside their
+// modules; the visible re-exports below them are the stable surface.
+#[doc(hidden)]
 pub use bitreader::{BitReader, BitReaderError};
+pub use block::BlockAssemblyError;
+#[doc(hidden)]
 pub use block::{
     cbpb_pattern_code, de_zigzag, decode_b_vop_inter_macroblock, decode_inter_block,
     decode_inter_macroblock, decode_intra_block, decode_intra_block_full, decode_intra_macroblock,
-    intra_quant_matrix, nonintra_quant_matrix, pattern_code, BlockAssemblyError, BlockPredictors,
-    InterMacroblock, IntraBlockDecode, IntraMacroblock, MacroblockTextureContext,
-    DEFAULT_INTRA_QUANT_MATRIX, DEFAULT_NONINTRA_QUANT_MATRIX,
+    intra_quant_matrix, nonintra_quant_matrix, pattern_code, BlockPredictors, InterMacroblock,
+    IntraBlockDecode, IntraMacroblock, MacroblockTextureContext, DEFAULT_INTRA_QUANT_MATRIX,
+    DEFAULT_NONINTRA_QUANT_MATRIX,
 };
+pub use bvop::BVopMbParseError;
+#[doc(hidden)]
 pub use bvop::{
     decode_b_vop_mb_motion_vectors, default_b_mb_type, parse_b_vop_mb_header, parse_dbquant,
-    BMbTypeTable, BVopMbHeader, BVopMbParseError, BVopMbType, BVopMotionVectors, BVopMvBody,
+    BMbTypeTable, BVopMbHeader, BVopMbType, BVopMotionVectors, BVopMvBody,
 };
+#[doc(hidden)]
 pub use bvop_field_direct::{
     delta as interlaced_direct_delta, interlaced_direct_mvs, interlaced_direct_prediction,
     ColocatedFutureField, InterlacedDirectMvs,
 };
+#[doc(hidden)]
 pub use bvop_field_motion::{
     field_backward_prediction, field_bidirectional_prediction, field_forward_prediction,
     BVopFieldReferences, FieldMvDeltas, FieldReferenceFlags, FieldSampleMode,
 };
+#[doc(hidden)]
 pub use bvop_field_predictor::{
     FieldMvDirection, FieldPmvBank, PMV_BOT_BWD, PMV_BOT_FWD, PMV_TOP_BWD, PMV_TOP_FWD,
 };
+pub use bvop_mv::BVopMvDriverError;
+#[doc(hidden)]
 pub use bvop_mv::{
     BVopAnchorPlanes, BVopFieldMbDecode, BVopFieldMode, BVopInterlacedAnchor,
     BVopInterlacedDirectMbDecode, BVopInterlacedMb, BVopInterlacedTexturedDecode, BVopMbDecode,
-    BVopMbTexturedDecode, BVopMvDriver, BVopMvDriverError, BVopTextureParams, CoLocatedAnchor,
+    BVopMbTexturedDecode, BVopMvDriver, BVopTextureParams, CoLocatedAnchor,
     ColocatedFutureFieldMvs,
 };
+#[doc(hidden)]
 pub use bvop_prediction::{
     average_bidirectional, average_bidirectional_into, generate_b_vop_luma_prediction,
     generate_b_vop_luma_prediction_into, predict_b_vop_macroblock, reconstruct_b_vop_macroblock,
     BVopMvPair, BVopPredictionMode, BVopSampleMode, MB_LUMA_PIXELS, MB_LUMA_SIDE, MB_SUB_BLOCKS,
     SUB_BLOCK_OFFSETS, SUB_BLOCK_SIDE,
 };
-pub use chroma_mv::{
-    chroma_mv_from_luma_blocks, ChromaMvError, TABLE_7_10, TABLE_7_11, TABLE_7_12, TABLE_7_13,
-};
+pub use chroma_mv::ChromaMvError;
+#[doc(hidden)]
+pub use chroma_mv::{chroma_mv_from_luma_blocks, TABLE_7_10, TABLE_7_11, TABLE_7_12, TABLE_7_13};
+#[doc(hidden)]
 pub use chroma_shape::{
     decimate_chroma_shape, decimate_chroma_shape_interlaced_field,
     decimate_chroma_shape_progressive, decimate_chroma_shape_sample, split_luma_shape_into_fields,
@@ -406,153 +461,199 @@ pub use chroma_shape::{
 pub use decoder::{Mpeg4VideoDecoder, StreamDecodeError};
 
 pub use compat::DecodeOptions;
+pub use data_partition::DataPartitionError;
+#[doc(hidden)]
 pub use data_partition::{
     decode_motion_coding, mb_block_layout, parse_data_partitioned_i_vop,
-    parse_data_partitioned_p_vop, use_intra_dc_vlc, DataPartitionError, DataPartitionedIVop,
-    DataPartitionedMb, DataPartitionedPVop, DataPartitionedTexHeader, DC_MARKER, DC_MARKER_BITS,
-    MOTION_MARKER, MOTION_MARKER_BITS,
+    parse_data_partitioned_p_vop, use_intra_dc_vlc, DataPartitionedIVop, DataPartitionedMb,
+    DataPartitionedPVop, DataPartitionedTexHeader, DC_MARKER, DC_MARKER_BITS, MOTION_MARKER,
+    MOTION_MARKER_BITS,
 };
+#[doc(hidden)]
 pub use extended_padding::{
     extended_padding_chroma, extended_padding_luma, extended_padding_macroblock, mid_grey_value,
     BoundaryNeighbours, ExteriorNeighbourPosition, ExteriorPaddingOutcome,
 };
+#[doc(hidden)]
 pub use field_motion::{
     div2_round, field_motion_compensate_one_reference, field_motion_compensate_one_reference_qpel,
     half_pel_chroma_mv_from_qpel, mc, reconstruct_field_motion_vectors, FieldMotionVectors,
 };
+pub use frame_decode::FrameDecodeError;
+#[doc(hidden)]
 pub use frame_decode::{
     assemble_b_vop_frame, assemble_p_vop_frame, assemble_s_gmc_vop_frame, decode_i_vop,
-    decode_p_vop, FrameDecodeError, PVopMbContent, SGmcMbContent,
+    decode_p_vop, PVopMbContent, SGmcMbContent,
 };
-pub use framestore::{DecodedFrame, FrameStore, FrameStoreError};
+#[doc(hidden)]
+pub use framestore::FrameStore;
+pub use framestore::{DecodedFrame, FrameStoreError};
+#[doc(hidden)]
 pub use gmc::{
     gmc_chroma_prediction, gmc_luma_prediction, MB_CHROMA_SIDE as GMC_MB_CHROMA_SIDE,
     MB_LUMA_SIDE as GMC_MB_LUMA_SIDE,
 };
+#[doc(hidden)]
 pub use half_sample::{
     fetch_clamped_sample, interpolate_block, interpolate_block_into, interpolate_pixel,
     split_half_pel, ReferenceVop,
 };
+#[doc(hidden)]
 pub use idct::{idct_8x8, idct_saturation_bounds, saturate_idct_sample};
+#[doc(hidden)]
 pub use interlaced_information::{
     dct_type_present, field_prediction_present, parse_interlaced_information, DctType,
     FieldPrediction, FieldReference, InterlacedInfoContext, InterlacedInfoContextError,
     InterlacedInformation, McSel,
 };
+#[doc(hidden)]
 pub use interlaced_padding::{
     interlaced_boundary_padding_luma, per_field_vertical_padding_luma, InterlacedBoundaryOutcome,
     PerFieldVerticalPaddingResult, LUMA_FIELD_LINES,
 };
+#[doc(hidden)]
 pub use inverse_quant::{
     inverse_quant_intra_dc, inverse_quant_method1, inverse_quant_method1_coef,
     inverse_quant_method1_no_mismatch, inverse_quant_method2, inverse_quant_method2_coef,
     saturate_fprime, saturation_bounds, InverseQuantContext,
 };
-pub use macroblock::{
-    dquant_value, parse_macroblock_header, DerivedMbType, MacroblockHeader, MacroblockParseError,
-};
+pub use macroblock::MacroblockParseError;
+#[doc(hidden)]
+pub use macroblock::{dquant_value, parse_macroblock_header, DerivedMbType, MacroblockHeader};
+#[doc(hidden)]
 pub use motion::{
     averaged_motion_vector, decode_field_motion_vector_pair, decode_motion_vector_delta,
     decode_p_macroblock_motion_vectors, decode_p_macroblock_motion_vectors_interlaced,
     decode_p_macroblock_motion_vectors_with_shape, direct_mode_motion_vector,
     direct_mode_reduce_qpel_to_half_pel, motion_coding, predict_field_motion_vector,
     predict_motion_vector, reconstruct_motion_vector, BinaryShapeBlockOpacity, BinaryShapeFourMv,
-    DirectCoLocatedMv, DirectModeMv, DirectMvError, DirectMvUnits, FieldMvPair, FieldPredCandidate,
-    MotionCodingDeltas, MotionParseError, MotionVector, MotionVectorDelta, MvMode,
-    PMbMotionVectors, TypeOfMb, AMV_PIXEL_COUNT,
+    DirectCoLocatedMv, DirectModeMv, DirectMvUnits, FieldMvPair, FieldPredCandidate,
+    MotionCodingDeltas, MotionVector, MotionVectorDelta, MvMode, PMbMotionVectors, TypeOfMb,
+    AMV_PIXEL_COUNT,
 };
+pub use motion::{DirectMvError, MotionParseError};
+pub use mv_predictor_grid::MvGridError;
+#[doc(hidden)]
 pub use mv_predictor_grid::{
     gather_field_mv_predictor_candidates, gather_mv_predictor_candidates, MbMv, MbMvRecord, MvGrid,
-    MvGridError,
 };
+#[doc(hidden)]
 pub use neighbour::{
     block_grid_position, BlockGridPosition, BlockNeighbour, ChromaPlane, IntraBlockGrid,
 };
+#[doc(hidden)]
 pub use obmc::{
     obmc_predict_block, ObmcConfig, ObmcMv, ObmcNeighbourhood, RemoteBlockKind, OBMC_H0, OBMC_H1,
     OBMC_H2,
 };
+#[doc(hidden)]
 pub use predictor::{
     dc_scaler, default_neighbour_dc, predict_intra_ac_column, predict_intra_ac_row,
     predict_intra_dc, saturate_block, saturate_qf, select_dc_direction, NeighbourBlock,
     NeighbourPosition,
 };
+pub use pvop_mv::PvopMvError;
+#[doc(hidden)]
 pub use pvop_mv::{
     chroma_mv_for_macroblock, predict_chroma_macroblock, predict_inter_macroblock,
-    predict_luma_macroblock, reconstruct_pvop_macroblock, MvDriver, PvopMbMotion, PvopMvError,
+    predict_luma_macroblock, reconstruct_pvop_macroblock, MvDriver, PvopMbMotion,
 };
+#[doc(hidden)]
 pub use quarter_sample::{
     field_mvy_to_field_grid, fir_8tap_clip, half_pel_b, half_pel_c, half_pel_d,
     interpolate_block_qpel, interpolate_block_qpel_field, interpolate_block_qpel_field_into,
     interpolate_block_qpel_into, interpolate_quarter_pixel, reduce_qpel_to_half_pel_chroma,
     split_quarter_pel, FieldRefView, QPEL_FIR_C,
 };
+#[doc(hidden)]
 pub use reconstruct::{
     clip_display_sample, reconstruct_inter_block_8x8, reconstruct_inter_block_8x8_into,
     reconstruct_inter_macroblock, reconstruct_inter_macroblock_into, reconstruct_intra_block_8x8,
     reconstruct_intra_macroblock, InterPredictionMacroblock, ReconstructedMacroblock, BLOCK_SIDE,
     MACROBLOCK_CHROMA_SIDE, MACROBLOCK_LUMA_SIDE,
 };
+#[doc(hidden)]
 pub use rvlc_arbitration::{RvlcArbitration, RvlcArbitrationInput, RvlcStrategy, RVLC_THRESHOLD};
+#[doc(hidden)]
 pub use rvlc_recovery::{recover_video_packet_dct, MbBlockLayout, RecoveredMb, RvlcRecovery};
+#[doc(hidden)]
 pub use s_gmc_recon::{gmc_prediction_macroblock, s_gmc_prediction_macroblock, GmcReferencePlanes};
+#[doc(hidden)]
 pub use sample_padding::{
     horizontal_repetitive_padding_chroma, horizontal_repetitive_padding_luma,
     horizontal_repetitive_padding_row, SamplePresence, ShapeRowState,
     CHROMA_SIDE as PADDING_CHROMA_SIDE, LUMA_SIDE as PADDING_LUMA_SIDE,
 };
+pub use scan::InverseScanError;
+#[doc(hidden)]
 pub use scan::{
-    events_to_pqf, events_to_qfs, inverse_scan, select_scan_type, DcPredictionDirection,
-    InverseScanError, ScanType,
+    events_to_pqf, events_to_qfs, inverse_scan, select_scan_type, DcPredictionDirection, ScanType,
 };
+#[doc(hidden)]
 pub use sequence::SequenceDecoder;
+pub use sprite::SpriteTrajectoryError;
+#[doc(hidden)]
 pub use sprite::{
-    decode_sprite_trajectory, decode_warping_mv_code, SpriteTrajectory, SpriteTrajectoryError,
-    MAX_GMC_WARPING_POINTS,
+    decode_sprite_trajectory, decode_warping_mv_code, SpriteTrajectory, MAX_GMC_WARPING_POINTS,
 };
+#[doc(hidden)]
 pub use static_sprite::{
     static_sprite_chroma, static_sprite_luma, static_sprite_luma_macroblock, SpriteMemory,
     StaticSpriteParams,
 };
+pub use texture::TextureParseError;
+#[doc(hidden)]
 pub use texture::{
     decode_ac_event, decode_ac_event_rvlc, decode_ac_event_short_video_header, decode_ac_events,
     decode_ac_events_rvlc, decode_ac_events_short_video_header, decode_intra_dc, AcEvent,
-    DcComponent, IntraDcDifferential, TcoefTable, TextureParseError,
+    DcComponent, IntraDcDifferential, TcoefTable,
 };
+#[doc(hidden)]
 pub use transform_select::{
     inverse_transform_block, select_and_inverse_transform, select_transform, InverseTransform,
     TransformSelection, SHAPE_RECTANGULAR,
 };
+pub use vector_padding::VectorPaddingError;
+#[doc(hidden)]
 pub use vector_padding::{
-    pad_macroblock_vectors, BlockTransparency, MacroblockPaddingMode, VectorPaddingError,
-    LUMA_BLOCKS_PER_MB,
+    pad_macroblock_vectors, BlockTransparency, MacroblockPaddingMode, LUMA_BLOCKS_PER_MB,
 };
+#[doc(hidden)]
 pub use vertical_padding::{
     vertical_repetitive_padding_chroma, vertical_repetitive_padding_column,
     vertical_repetitive_padding_luma, ColumnState,
 };
+pub use video_packet::VideoPacketParseError;
+#[doc(hidden)]
 pub use video_packet::{
     consume_next_resync_marker, macroblock_number_bit_width, parse_video_packet_header,
     probe_resync_marker, resync_marker_length, total_macroblocks, VideoPacketContext,
-    VideoPacketHeader, VideoPacketParseError,
+    VideoPacketHeader,
 };
+#[doc(hidden)]
 pub use vol::{
     parse_video_object_layer, parse_visual_object_header, parse_visual_object_sequence_header,
-    AspectRatio, ColourDescription, SpriteEnable, SpriteGeometry, SpriteWarpingAccuracy,
-    VbvParameters, VideoSignalType, VisualObjectHeader, VolControlParameters, VolHeader,
-    VolParseError, VIDEO_OBJECT_LAYER_START_CODE_MAX, VIDEO_OBJECT_LAYER_START_CODE_MIN,
-    VIDEO_OBJECT_START_CODE_MAX, VIDEO_OBJECT_START_CODE_MIN, VISUAL_OBJECT_SEQUENCE_END_CODE,
-    VISUAL_OBJECT_SEQUENCE_START_CODE, VISUAL_OBJECT_START_CODE,
+    ColourDescription, VideoSignalType, VisualObjectHeader, VIDEO_OBJECT_LAYER_START_CODE_MAX,
+    VIDEO_OBJECT_LAYER_START_CODE_MIN, VIDEO_OBJECT_START_CODE_MAX, VIDEO_OBJECT_START_CODE_MIN,
+    VISUAL_OBJECT_SEQUENCE_END_CODE, VISUAL_OBJECT_SEQUENCE_START_CODE, VISUAL_OBJECT_START_CODE,
 };
+pub use vol::{
+    AspectRatio, SpriteEnable, SpriteGeometry, SpriteWarpingAccuracy, VbvParameters,
+    VolControlParameters, VolHeader, VolParseError,
+};
+#[doc(hidden)]
 pub use vop::{
     parse_group_of_vop_header, parse_video_object_plane_header, parse_vop_header_body, GovHeader,
-    TimeCode, VopCodingType, VopContext, VopHeader, VopParseError, GROUP_OF_VOP_START_CODE,
-    VOP_START_CODE,
+    TimeCode, VopContext, VopHeader, GROUP_OF_VOP_START_CODE, VOP_START_CODE,
 };
+pub use vop::{VopCodingType, VopParseError};
+pub use vop_decode::VopDecodeError;
+#[doc(hidden)]
 pub use vop_decode::{
     decode_b_vop_macroblocks, decode_i_vop_macroblocks, decode_p_vop_macroblocks,
-    decode_s_gmc_vop_macroblocks, vop_mb_dimensions, VopDecodeError,
+    decode_s_gmc_vop_macroblocks, vop_mb_dimensions,
 };
+#[doc(hidden)]
 pub use warp::{div_sdr, WarpGeometry};
 
 /// Crate-level error surface. Decoding entry points map their internal

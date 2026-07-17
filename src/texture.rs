@@ -106,6 +106,7 @@ use crate::bitreader::{BitReader, BitReaderError};
 /// `block(i)` index per §6.2.7: luminance for `i < 4`, chrominance for
 /// `i >= 4` (the two chroma blocks in 4:2:0).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub enum DcComponent {
     /// Luminance block (`i < 4`) — `dct_dc_size_luminance`, Table B.13.
     Luminance,
@@ -130,6 +131,7 @@ impl DcComponent {
 /// The decoded intra-DC differential of one block, before the §7.4.3
 /// spatial predictor is added.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub struct IntraDcDifferential {
     /// `dct_dc_size` — the decoded size category (0..=12). `0` means the
     /// differential is exactly zero and no additional code follows.
@@ -331,6 +333,7 @@ fn decode_differential(size: u8, additional: u32) -> i32 {
 /// coefficient is differentially VLC-coded. The 8-bit fixed
 /// `intra_dc_coefficient` of the short-video-header branch is not
 /// handled here.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn decode_intra_dc(
     br: &mut BitReader<'_>,
     component: DcComponent,
@@ -378,6 +381,7 @@ pub fn decode_intra_dc(
 /// matching LMAX (Table B.19/B.20) and RMAX (Table B.21/B.22) escape
 /// tables.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub enum TcoefTable {
     /// Intra block — Table B.16, LMAX = Table B.19, RMAX = Table B.21.
     Intra,
@@ -390,6 +394,7 @@ pub enum TcoefTable {
 /// applied); `RUN` is the count of zero coefficients preceding it; `last`
 /// marks the final non-zero coefficient of the block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub struct AcEvent {
     /// `LAST` flag: `true` if this is the last non-zero coefficient of the
     /// block (no further EVENTs follow), `false` if more follow.
@@ -554,6 +559,7 @@ fn decode_tcoef_vlc(
 /// * Type 3 (`ESC 11`) — fixed-length `LAST(1) RUN(6) marker LEVEL(12)
 ///   marker`; the 12-bit LEVEL is signed two's-complement (`0` and
 ///   `-2048` reserved).
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn decode_ac_event(
     br: &mut BitReader<'_>,
     table_kind: TcoefTable,
@@ -638,6 +644,7 @@ pub fn decode_ac_event(
 /// until (and including) the one whose `LAST` flag is set, returning them
 /// in scan order. An empty stream that never reaches `LAST == 1` returns
 /// [`TextureParseError::Truncated`].
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn decode_ac_events(
     br: &mut BitReader<'_>,
     table_kind: TcoefTable,
@@ -674,6 +681,7 @@ pub fn decode_ac_events(
 /// payload — the short-video-header bitstream uses a different
 /// resynchronisation discipline (Annex K) that does not require
 /// per-coefficient marker bits.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn decode_ac_event_short_video_header(
     br: &mut BitReader<'_>,
     table_kind: TcoefTable,
@@ -718,6 +726,7 @@ pub fn decode_ac_event_short_video_header(
 /// Run the §6.2.7 `while (!last) DCT coefficient` loop for the
 /// `short_video_header == 1` path. See
 /// [`decode_ac_event_short_video_header`] for the per-EVENT semantics.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn decode_ac_events_short_video_header(
     br: &mut BitReader<'_>,
     table_kind: TcoefTable,
@@ -778,6 +787,7 @@ fn match_rvlc_tcoef(
 /// The escape opener `00001` is prefix-disjoint from every Table B.23
 /// code (no code begins with `0000`), so an ordinary reversible VLC is
 /// distinguished from the escape by inspecting the leading five bits.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn decode_ac_event_rvlc(
     br: &mut BitReader<'_>,
     table_kind: TcoefTable,
@@ -848,6 +858,7 @@ pub fn decode_ac_event_rvlc(
 /// `short_video_header == 0`, `reversible_vlc == 1` path. See
 /// [`decode_ac_event_rvlc`] for the per-EVENT semantics. An empty stream
 /// that never reaches `LAST == 1` returns [`TextureParseError::Truncated`].
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn decode_ac_events_rvlc(
     br: &mut BitReader<'_>,
     table_kind: TcoefTable,
@@ -930,6 +941,7 @@ fn match_rvlc_tcoef_reverse(
 /// bit are the closing `0000` delimiter iff this is an escape. Because no
 /// non-escape Table B.23 code, reversed, begins with `0000` (no forward
 /// code *ends* with `0000`), the escape is distinguished unambiguously.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn decode_ac_event_rvlc_reverse(
     br: &mut crate::bitreader::BackwardBitReader<'_>,
     table_kind: TcoefTable,
@@ -1047,6 +1059,7 @@ pub fn decode_ac_event_rvlc_reverse(
 /// happens after at least one EVENT was recovered, the recovered tail is
 /// returned (the whole point of the two-way decode); if the very first
 /// (trailing) EVENT is already illegal, the error is propagated.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn decode_ac_events_rvlc_reverse(
     data: &[u8],
     start_bit: usize,

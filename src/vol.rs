@@ -43,19 +43,26 @@
 use crate::bitreader::{BitReader, BitReaderError};
 
 /// Start code for a `VisualObjectSequence` (§6.2.1, Table 6-3).
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub const VISUAL_OBJECT_SEQUENCE_START_CODE: u32 = 0x0000_01B0;
 /// Start code that terminates a `VisualObjectSequence`.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub const VISUAL_OBJECT_SEQUENCE_END_CODE: u32 = 0x0000_01B1;
 /// Start code that introduces a `VisualObject` (§6.2.2).
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub const VISUAL_OBJECT_START_CODE: u32 = 0x0000_01B5;
 /// Lower bound of the `video_object_layer_start_code` range
 /// (Table 6-3 lists `0x20`..=`0x2F` for the trailing byte).
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub const VIDEO_OBJECT_LAYER_START_CODE_MIN: u32 = 0x0000_0120;
 /// Upper bound of the `video_object_layer_start_code` range.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub const VIDEO_OBJECT_LAYER_START_CODE_MAX: u32 = 0x0000_012F;
 /// Lower bound of `video_object_start_code` (`00`..=`1F`).
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub const VIDEO_OBJECT_START_CODE_MIN: u32 = 0x0000_0100;
 /// Upper bound of `video_object_start_code`.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub const VIDEO_OBJECT_START_CODE_MAX: u32 = 0x0000_011F;
 
 /// Errors produced by the structural VOL header parser.
@@ -288,6 +295,7 @@ pub struct SpriteGeometry {
 /// (ITU-R BT.709 primaries, BT.709 transfer, BT.709 matrix); we expose
 /// that default via [`ColourDescription::default_when_absent`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub struct ColourDescription {
     /// `colour_primaries` (Table 6-8). Value `0` is forbidden.
     pub colour_primaries: u8,
@@ -319,6 +327,7 @@ impl ColourDescription {
 /// the case where the flag was `1`; surface the whole thing as
 /// `Option<VideoSignalType>` on the parent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub struct VideoSignalType {
     /// `video_format` (Table 6-7). 0..=7; the spec assigns enumerations
     /// to 0..=5 and reserves 6 / 7.
@@ -339,6 +348,7 @@ pub struct VideoSignalType {
 /// (Table 6-6), and — when the selector is `video ID` — the optional
 /// `video_signal_type()` block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub struct VisualObjectHeader {
     /// `visual_object_verid` (Table 6-5). Defaults to `1` ("object
     /// type listed in Table 9-1") when `is_visual_object_identifier ==
@@ -702,6 +712,7 @@ fn parse_vol_control(br: &mut BitReader<'_>) -> Result<VolControlParameters, Vol
 /// `profile_and_level_indication` byte lives in the parent
 /// `VisualObjectSequence`, so a standalone VOL slice will not know it
 /// and must pass in `0`.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn parse_video_object_layer(
     data: &[u8],
     profile_level: u8,
@@ -991,6 +1002,7 @@ fn parse_video_object_layer_body(
 /// `profile_and_level_indication`. The four-byte start code MUST be
 /// `0x000001B0`. Studio profiles (`0xE1`..=`0xE8` per §6.2.2) return
 /// [`VolParseError::UnsupportedProfile`].
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn parse_visual_object_sequence_header(data: &[u8]) -> Result<u8, VolParseError> {
     let mut br = BitReader::new(data);
     let sc = br.read_bits(32)?;
@@ -1063,6 +1075,7 @@ fn parse_video_signal_type(
 /// `matrix_coefficients` (8 bits each) are all surfaced. When the
 /// flag is clear, [`VisualObjectHeader::video_signal_type`] is `None`
 /// and the §6.3.2.4 defaults (BT.709 colour, studio swing) apply.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn parse_visual_object_header(data: &[u8]) -> Result<VisualObjectHeader, VolParseError> {
     let mut br = BitReader::new(data);
     let sc = br.read_bits(32)?;

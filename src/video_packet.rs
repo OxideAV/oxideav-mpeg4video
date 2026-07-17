@@ -149,6 +149,7 @@ impl From<BitReaderError> for VideoPacketParseError {
 /// the enclosing VOP header (or from the previous video packet) before
 /// invoking `video_packet_header()`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub struct VideoPacketContext {
     /// Current `vop_coding_type` (per the most recent VOP header or
     /// preceding `video_packet_header()` extension body).
@@ -200,6 +201,7 @@ pub struct VideoPacketContext {
 /// state from the extension fields when present; otherwise it
 /// inherits the values from the enclosing VOP header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub struct VideoPacketHeader {
     /// `macroblock_number` — the macroblock index where decoding
     /// resumes. Always present.
@@ -257,6 +259,7 @@ pub struct VideoPacketHeader {
 /// function returns `1` for that degenerate input so callers can
 /// proceed without panicking and the malformed bitstream will fail
 /// later through `MacroblockNumberOutOfRange`.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn macroblock_number_bit_width(total_macroblocks: u32) -> u8 {
     if total_macroblocks <= 2 {
         return 1;
@@ -267,6 +270,7 @@ pub fn macroblock_number_bit_width(total_macroblocks: u32) -> u8 {
 
 /// `((width + 15) / 16) * ((height + 15) / 16)` — Table 6-27's input
 /// expression in plain integer arithmetic.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn total_macroblocks(video_object_layer_width: u32, video_object_layer_height: u32) -> u32 {
     let mb_cols = video_object_layer_width.div_ceil(16);
     let mb_rows = video_object_layer_height.div_ceil(16);
@@ -286,6 +290,7 @@ pub fn total_macroblocks(video_object_layer_width: u32, video_object_layer_heigh
 /// Returns the total marker length in bits (the leading-zeros count
 /// plus the trailing `1`). The minimum is 17 and the maximum is `15 +
 /// 7 + 1 = 23` bits (`fcode = 7`).
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn resync_marker_length(coding_type: VopCodingType, fcode_fwd: u8, fcode_bwd: u8) -> u8 {
     match coding_type {
         VopCodingType::I => 17,
@@ -315,6 +320,7 @@ pub fn resync_marker_length(coding_type: VopCodingType, fcode_fwd: u8, fcode_bwd
 /// [`VideoPacketParseError::MissingResyncMarker`] (with
 /// `expected_bits = 0`, since we cannot peek a meaningful marker yet)
 /// if the first stuffing bit is not `0`.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn consume_next_resync_marker(br: &mut BitReader<'_>) -> Result<(), VideoPacketParseError> {
     // The first stuffing bit must be `0`. `next_start_code()` and
     // `next_resync_marker()` share the convention.
@@ -346,6 +352,7 @@ pub fn consume_next_resync_marker(br: &mut BitReader<'_>) -> Result<(), VideoPac
 /// macroblock and aligned with a byte." Callers chain
 /// [`consume_next_resync_marker`] before this peek if the encoder
 /// inserted stuffing.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn probe_resync_marker(
     br: &BitReader<'_>,
     coding_type: VopCodingType,
@@ -439,6 +446,7 @@ fn read_marker(br: &mut BitReader<'_>) -> Result<(), VideoPacketParseError> {
 /// bodies, newpred, and reduced-resolution VOP are rejected with
 /// [`VideoPacketParseError::UnsupportedBranch`]. Non-rectangular
 /// shape returns `UnsupportedBranch("non-rectangular shape")`.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn parse_video_packet_header(
     br: &mut BitReader<'_>,
     ctx: &VideoPacketContext,

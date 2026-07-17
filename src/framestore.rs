@@ -209,6 +209,7 @@ impl DecodedFrame {
     /// A [`ReferenceVop`] view over the luma plane for motion
     /// compensation of the next VOP.
     #[inline]
+    #[doc(hidden)] // internal decode plumbing, not the crate's stable public API
     pub fn luma_reference(&self) -> ReferenceVop<'_> {
         // dimensions validated in `new`, so the view is always Some.
         ReferenceVop::new(&self.luma, self.width, self.height)
@@ -217,6 +218,7 @@ impl DecodedFrame {
 
     /// A [`ReferenceVop`] view over the Cb plane.
     #[inline]
+    #[doc(hidden)] // internal decode plumbing, not the crate's stable public API
     pub fn cb_reference(&self) -> ReferenceVop<'_> {
         ReferenceVop::new(&self.cb, self.width / 2, self.height / 2)
             .expect("chroma dimensions validated at construction")
@@ -224,6 +226,7 @@ impl DecodedFrame {
 
     /// A [`ReferenceVop`] view over the Cr plane.
     #[inline]
+    #[doc(hidden)] // internal decode plumbing, not the crate's stable public API
     pub fn cr_reference(&self) -> ReferenceVop<'_> {
         ReferenceVop::new(&self.cr, self.width / 2, self.height / 2)
             .expect("chroma dimensions validated at construction")
@@ -238,6 +241,7 @@ impl DecodedFrame {
     /// `[0, 255]` defensively before storing — [`ReconstructedMacroblock`]
     /// already guarantees the §7.3 display range for `bits_per_pixel ==
     /// 8`, so the clamp is a no-op on valid input.
+    #[doc(hidden)] // internal decode plumbing, not the crate's stable public API
     pub fn blit_macroblock(
         &mut self,
         mb_col: usize,
@@ -309,6 +313,7 @@ impl DecodedFrame {
 /// backward slot with the forward slot still empty (a leading I-VOP has
 /// no past reference, which is correct — it is intra-only).
 #[derive(Debug, Clone, Default)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub struct FrameStore {
     /// Most recently decoded I/P/S-VOP in the *past* (forward reference).
     forward: Option<DecodedFrame>,

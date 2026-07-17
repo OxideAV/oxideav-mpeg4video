@@ -179,6 +179,7 @@ impl From<ChromaMvError> for BVopMvDriverError {
 /// `forward_chroma_mv` / `backward_chroma_mv` are the §7.6.5-reduced
 /// chroma vectors the generator consumes directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub struct BVopMbDecode {
     /// The decoded §6.2.6 macroblock type.
     pub mb_type: BVopMbType,
@@ -208,6 +209,7 @@ pub struct BVopMbDecode {
 /// avoids a 16-argument signature. `forward_*` are the previous anchor
 /// VOP's planes, `backward_*` the temporally next anchor's.
 #[derive(Debug, Clone, Copy)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub struct BVopAnchorPlanes<'a> {
     /// Forward (previous anchor) luma plane.
     pub forward_luma: &'a crate::half_sample::ReferenceVop<'a>,
@@ -304,6 +306,7 @@ impl BVopMbDecode {
 /// §7.6.9.5.1 co-located block vector (after §7.6.1.6 vector padding)
 /// consulted by direct mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub struct CoLocatedAnchor {
     /// §7.6.9.6: whether the co-located anchor macroblock was skipped.
     pub skipped: bool,
@@ -348,6 +351,7 @@ impl Default for CoLocatedAnchor {
 /// `bits_per_pixel` and `quant_type` come from the §6.3.3 / §6.3.2 VOL
 /// header and map straight onto [`MacroblockTextureContext`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub struct BVopTextureParams {
     /// §6.3.5 `vop_quant` — the B-VOP base quantiser scale.
     pub base_quantiser_scale: u32,
@@ -373,6 +377,7 @@ pub struct BVopTextureParams {
 /// Produced by [`BVopMvDriver::decode_vop`]; ready to feed
 /// [`BVopMbDecode::reconstruct`] (the residual is in `residual`).
 #[derive(Debug, Clone)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub struct BVopMbTexturedDecode {
     /// The §7.6.8 motion state (type, prediction mode, MVs, chroma MVs).
     pub motion: BVopMbDecode,
@@ -387,6 +392,7 @@ pub struct BVopMbTexturedDecode {
 /// The §7.7.2.2 prediction mode of an interlaced field-predicted B-VOP
 /// macroblock, carrying its already-bank-updated motion state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub enum BVopFieldMode {
     /// Field forward (`mb_type == "0001"`): forward top/bottom field
     /// deltas, compensated from the forward (past) anchor.
@@ -411,6 +417,7 @@ pub enum BVopFieldMode {
 /// supplied reference planes. (The bank state at decode time is captured
 /// so reconstruction is independent of subsequent macroblocks.)
 #[derive(Debug, Clone)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub struct BVopFieldMbDecode {
     /// The §7.7.2.2 field prediction mode + decoded differentials.
     pub mode: BVopFieldMode,
@@ -498,6 +505,7 @@ impl BVopFieldMbDecode {
 /// transmitted `MVD[0]` and the frame-period `TRB` / `TRD` it already
 /// owns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub struct ColocatedFutureFieldMvs {
     /// `MV[0]` — the future macroblock's top-field forward MV + reference
     /// field.
@@ -549,6 +557,7 @@ impl ColocatedFutureFieldMvs {
 /// the future macroblock's forward reference fields are captured here so
 /// reconstruction is self-contained.
 #[derive(Debug, Clone, Copy)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub struct BVopInterlacedDirectMbDecode {
     /// The four derived field MVs (`mvf[0..2]` forward, `mvb[0..2]`
     /// backward).
@@ -614,6 +623,7 @@ impl BVopInterlacedDirectMbDecode {
 /// progressive direct mode (§7.7.2.2: the future MB is skipped / GMC /
 /// intra / frame-predicted).
 #[derive(Debug, Clone, Copy)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub struct BVopInterlacedAnchor {
     /// The §7.6.9.5.1 / §7.6.9.6 progressive co-located anchor (skipped
     /// flag + co-located block MV) for the progressive paths.
@@ -633,6 +643,7 @@ pub struct BVopInterlacedAnchor {
 /// Each variant carries the same per-MB decode the dedicated entry point
 /// produces, so the caller reconstructs via the matching `reconstruct`.
 #[derive(Debug, Clone)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub enum BVopInterlacedMb {
     /// A progressive (frame-predicted, or progressive-direct) macroblock —
     /// reconstruct with [`BVopMbDecode::reconstruct`] + anchor planes.
@@ -671,6 +682,7 @@ impl BVopInterlacedMb {
 /// state plus its §7.4 inter residual and the running quantiser scale that
 /// decoded it. Produced by [`BVopMvDriver::decode_interlaced_vop`].
 #[derive(Debug, Clone)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub struct BVopInterlacedTexturedDecode {
     /// The path-tagged motion state.
     pub motion: BVopInterlacedMb,
@@ -749,6 +761,7 @@ impl BVopInterlacedTexturedDecode {
 /// honour the §7.6.8 "reset to zero only at the beginning of each
 /// macroblock row" rule.
 #[derive(Debug, Clone)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub struct BVopMvDriver {
     mb_rows: usize,
     mb_cols: usize,

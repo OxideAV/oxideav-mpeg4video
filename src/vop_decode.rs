@@ -153,6 +153,7 @@ impl From<BlockAssemblyError> for VopDecodeError {
 /// (height + 15) / 16)` — §6.3.3 `video_object_layer_width` /
 /// `_height` cover the visible samples; a partial right / bottom
 /// macroblock is still a whole coded macroblock.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn vop_mb_dimensions(vol: &VolHeader) -> (usize, usize) {
     (
         (vol.width as usize).div_ceil(16),
@@ -368,6 +369,7 @@ fn decode_intra_mb_with_grid(
 ///
 /// `opts` selects the [`crate::compat`] behaviour
 /// ([`DecodeOptions::spec()`] for the literal clauses).
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn decode_i_vop_macroblocks(
     br: &mut BitReader<'_>,
     vol: &VolHeader,
@@ -565,6 +567,7 @@ fn check_dp_supported(vol: &VolHeader) -> Result<(), VopDecodeError> {
 /// `reversible_vlc == 1`. Prediction state (§7.4.3 grid, running
 /// quantiser, `intra_dc_vlc_thr`) resets at each packet boundary
 /// exactly as in the combined walk (§E.1.2).
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn decode_i_vop_macroblocks_dp(
     br: &mut BitReader<'_>,
     vol: &VolHeader,
@@ -652,6 +655,7 @@ pub fn decode_i_vop_macroblocks_dp(
 /// the valid zero candidate, exactly as in the combined walk — then
 /// partition 2 (`ac_pred_flag` + `cbpy` + `dquant` + DC-VLC intra DC)
 /// and the texture partition (RVLC when `reversible_vlc == 1`).
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn decode_p_vop_macroblocks_dp(
     br: &mut BitReader<'_>,
     vol: &VolHeader,
@@ -807,6 +811,7 @@ pub fn decode_p_vop_macroblocks_dp(
 /// interpolation at frame assembly (and the §7.6.6 OBMC assembly when
 /// the VOL coded `obmc_disable == 0` — the macroblock syntax itself is
 /// unaffected by OBMC).
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn decode_p_vop_macroblocks(
     br: &mut BitReader<'_>,
     vol: &VolHeader,
@@ -977,6 +982,7 @@ fn co_located_from_motion(motion: PvopMbMotion) -> CoLocatedAnchor {
 /// `trb` / `trd` are the §7.6.7 temporal references in
 /// `vop_time_increment_resolution` ticks (`trb`: this B-VOP minus the
 /// past anchor; `trd`: future anchor minus past anchor).
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn decode_b_vop_macroblocks(
     br: &mut BitReader<'_>,
     vol: &VolHeader,
@@ -1109,6 +1115,7 @@ pub fn decode_b_vop_macroblocks(
 /// — information the progressive [`PvopMbMotion`] cannot carry — so
 /// the anchor record keeps the field shape intact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub enum AnchorMbMotion {
     /// A frame-predicted (or intra / skipped) anchor macroblock.
     Frame(PvopMbMotion),
@@ -1192,6 +1199,7 @@ fn interlaced_anchor_of(
 ///
 /// The §6.2.6 `co_located_not_coded` zero-bit rule applies exactly as
 /// in the progressive walk.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn decode_b_vop_interlaced_macroblocks(
     br: &mut BitReader<'_>,
     vol: &VolHeader,
@@ -1376,6 +1384,7 @@ fn gmc_averaged_mv(
 /// * coded inter with `mcsel == 0` (and every inter4v MB — `mcsel` is
 ///   only coded for 1-MV inter types) → the plain P-VOP local-MC path.
 /// * intra / intra+q → the grid-threaded §7.4 intra path.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn decode_s_gmc_vop_macroblocks(
     br: &mut BitReader<'_>,
     vol: &VolHeader,

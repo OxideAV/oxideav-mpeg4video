@@ -81,6 +81,7 @@ use crate::texture::AcEvent;
 
 /// One of the three §7.4.2 scan patterns of Figure 7-4.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub enum ScanType {
     /// Figure 7-4 (a) — Alternate-Horizontal scan. Used by an intra
     /// block whose §7.4.3.1 DC prediction is taken from block C
@@ -101,6 +102,7 @@ pub enum ScanType {
 /// Captured here as an opaque enum so [`select_scan_type`] doesn't
 /// require the predictor implementation (which lands later) to exist.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub enum DcPredictionDirection {
     /// "Predict from block A" — the horizontally adjacent (left) block.
     FromLeft,
@@ -186,6 +188,7 @@ fn scan_grid(scan_type: ScanType) -> &'static [[u8; 8]; 8] {
 /// `is_intra == false`. The caller resolves the direction per
 /// §7.4.3.1 (compare `|FA - FB|` vs `|FB - FC|`) and threads it in
 /// here.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn select_scan_type(
     is_intra: bool,
     ac_pred_flag: bool,
@@ -216,6 +219,7 @@ pub fn select_scan_type(
 /// position keeps a malformed EVENT stream from writing past
 /// `QFS[63]`; the function returns [`InverseScanError::Overflow`] in
 /// that case rather than panicking.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn events_to_qfs(
     events: &[AcEvent],
     intra_dc: Option<i32>,
@@ -253,6 +257,7 @@ pub fn events_to_qfs(
 /// for (n = 0; n < 64; n++)
 ///     PQF[inv_scan_v[scan_type][n]][inv_scan_u[scan_type][n]] = QFS[n];
 /// ```
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn inverse_scan(qfs: &[i32; 64], scan_type: ScanType) -> [[i32; 8]; 8] {
     let grid = scan_grid(scan_type);
     let mut pqf = [[0i32; 8]; 8];
@@ -275,6 +280,7 @@ pub fn inverse_scan(qfs: &[i32; 64], scan_type: ScanType) -> [[i32; 8]; 8] {
 /// opaque samples in the block (which equals the number of SA-DCT
 /// coefficients, per §7.4.2 NOTE 1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub struct ShapeParams {
     /// `coeff_width[v]` — coefficients available in each of the eight
     /// rows of `PQF[v][u]`. Each element lies in `0..=8`.
@@ -344,6 +350,7 @@ impl ShapeParams {
 /// coefficients for a conformant block); every `PQF[v][u]` outside the
 /// `u < coeff_width[v]` region is forced to zero so that subsequent AC
 /// prediction is not confused (§7.4.2 NOTE 1).
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn modified_inverse_scan(
     qfs: &[i32; 64],
     scan_type: ScanType,
@@ -380,6 +387,7 @@ pub fn modified_inverse_scan(
 /// coefficients packed at `QFS[0..opaque_pels]`; the modified scan
 /// distributes them across the in-shape `PQF[v][u]` positions and
 /// zero-fills the rest.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn events_to_pqf_sadct(
     events: &[AcEvent],
     intra_dc: Option<i32>,
@@ -392,6 +400,7 @@ pub fn events_to_pqf_sadct(
 
 /// One-shot: expand AC EVENTs (+ optional intra-DC) into a
 /// scanned 8×8 `PQF[v][u]` block in a single call.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn events_to_pqf(
     events: &[AcEvent],
     intra_dc: Option<i32>,

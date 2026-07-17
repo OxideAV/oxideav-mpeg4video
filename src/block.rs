@@ -158,6 +158,7 @@ use crate::vol::VolHeader;
 /// §6.3.3. Used when `quant_type == 1` and no `intra_quant_mat` was
 /// loaded.
 #[rustfmt::skip]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub const DEFAULT_INTRA_QUANT_MATRIX: [[u8; 8]; 8] = [
     [ 8, 17, 18, 19, 21, 23, 25, 27],
     [17, 18, 19, 21, 23, 25, 27, 28],
@@ -173,6 +174,7 @@ pub const DEFAULT_INTRA_QUANT_MATRIX: [[u8; 8]; 8] = [
 /// raster (`[row][col]`) order, transcribed verbatim from the table in
 /// §6.3.3.
 #[rustfmt::skip]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub const DEFAULT_NONINTRA_QUANT_MATRIX: [[u8; 8]; 8] = [
     [16, 17, 18, 19, 20, 21, 22, 23],
     [17, 18, 19, 20, 21, 22, 23, 24],
@@ -252,6 +254,7 @@ impl From<crate::scan::InverseScanError> for BlockAssemblyError {
 /// matching the §7.4.3.3 "all the prediction coefficients of that block
 /// are assumed to be zero" rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub struct BlockPredictors {
     /// `FA[0][0]` — inverse-quantised DC of the left (A) neighbour.
     pub fa_dc: i32,
@@ -294,6 +297,7 @@ impl BlockPredictors {
 /// Per-macroblock decode parameters threaded into the `block(i)` driver,
 /// resolved from the VOL / VOP headers and the macroblock header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub struct MacroblockTextureContext {
     /// `quantiser_scale` after `dquant`, the §6.2.5 `vop_quant` adjusted
     /// by the macroblock's `dquant_delta`. Range `1..=2^precision - 1`.
@@ -324,6 +328,7 @@ pub struct MacroblockTextureContext {
 /// A reconstructed intra 4:2:0 macroblock: a 16×16 luminance plane plus
 /// two 8×8 chrominance planes, all in pixel-space `[0, 2^bpp - 1]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub struct IntraMacroblock {
     /// Reconstructed luminance samples, `luma[row][col]`, 16×16.
     pub luma: [[i32; 16]; 16],
@@ -340,6 +345,7 @@ pub struct IntraMacroblock {
 /// prediction `p[y][x]` and the §7.3 step-3 `[0, 2^bpp - 1]` clip happen
 /// in the caller's motion-compensation stage.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub struct InterMacroblock {
     /// Residual luminance samples, `luma[row][col]`, 16×16.
     pub luma: [[i32; 16]; 16],
@@ -369,6 +375,7 @@ impl InterMacroblock {
 ///
 /// Index `i` follows Figure 6-8: 0..=3 luminance, 4 = Cb, 5 = Cr. See
 /// the module docs for the bit-to-block mapping.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn pattern_code(cbpy: u8, cbpc: u8) -> [bool; 6] {
     [
         cbpy & 0b1000 != 0, // block 0 — luma top-left
@@ -390,6 +397,7 @@ pub fn pattern_code(cbpy: u8, cbpc: u8) -> [bool; 6] {
 /// LSB→block 5 (block 4 = Cb, block 5 = Cr), matching the §6.2.6
 /// `NOTE` `block_count == 6`. `cbpb == None` (the `modb` indicated no
 /// `cbpb`) means no block is coded.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn cbpb_pattern_code(cbpb: Option<u8>) -> [bool; 6] {
     let bits = cbpb.unwrap_or(0);
     [
@@ -422,6 +430,7 @@ fn block_component(i: usize) -> DcComponent {
 /// * `dc` — the inverse-quantised DC `F[0][0]` (§7.4.4.1.1), the value
 ///   the §7.4.3.1 `|FA − FB| < |FB − FC|` direction rule compares.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub struct IntraBlockDecode {
     /// Reconstructed spatial samples, clipped to `[0, 2^bpp - 1]`.
     pub spatial: [[i32; 8]; 8],
@@ -448,6 +457,7 @@ pub struct IntraBlockDecode {
 /// 6-25 `use_intra_dc_vlc == 0` path (DC coded as an AC coefficient)
 /// use [`decode_intra_block_full`].
 #[allow(clippy::too_many_arguments)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn decode_intra_block(
     br: &mut BitReader<'_>,
     i: usize,
@@ -478,6 +488,7 @@ pub fn decode_intra_block(
 /// quantisation, and §7.4.5 IDCT run identically — the threshold only
 /// moves *where* the differential DC sits in the bitstream.
 #[allow(clippy::too_many_arguments)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn decode_intra_block_full(
     br: &mut BitReader<'_>,
     i: usize,
@@ -511,6 +522,7 @@ pub fn decode_intra_block_full(
 /// (Table B.23) for the EVENT loop, as coded in the texture partition
 /// of a `reversible_vlc == 1` VOL.
 #[allow(clippy::too_many_arguments)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn decode_intra_block_partitioned(
     br: &mut BitReader<'_>,
     i: usize,
@@ -680,6 +692,7 @@ fn decode_intra_block_tail(
 /// Resolve the raster-order `W[0]` intra quantisation matrix for the
 /// given VOL header: the loaded `intra_quant_mat` (de-zigzagged) when
 /// present, else the §6.3.3 default intra matrix.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn intra_quant_matrix(vol: &VolHeader) -> [[u8; 8]; 8] {
     match vol.intra_quant_mat {
         Some(zigzag) => de_zigzag(&zigzag),
@@ -690,6 +703,7 @@ pub fn intra_quant_matrix(vol: &VolHeader) -> [[u8; 8]; 8] {
 /// Resolve the raster-order `W[1]` non-intra quantisation matrix for
 /// the given VOL header: the loaded `nonintra_quant_mat` (de-zigzagged)
 /// when present, else the §6.3.3 default non-intra matrix.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn nonintra_quant_matrix(vol: &VolHeader) -> [[u8; 8]; 8] {
     match vol.nonintra_quant_mat {
         Some(zigzag) => de_zigzag(&zigzag),
@@ -701,6 +715,7 @@ pub fn nonintra_quant_matrix(vol: &VolHeader) -> [[u8; 8]; 8] {
 /// raster-order `[row][col]` matrix the §7.4.4 method-1 reconstruction
 /// reads. The §6.3.3 list is in the same zigzag order as the
 /// Figure 7-4 (c) scan; we re-use that table to place each value.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn de_zigzag(zigzag: &[u8; 64]) -> [[u8; 8]; 8] {
     // The Figure 7-4 (c) zigzag grid maps (row, col) → scan index n;
     // inverse: raster[row][col] = zigzag[ scan_index(row, col) ].
@@ -743,6 +758,7 @@ pub fn de_zigzag(zigzag: &[u8; 64]) -> [[u8; 8]; 8] {
 ///   luma[8..16][0..8]  ← block 2     luma[8..16][8..16] ← block 3
 ///   cb                 ← block 4     cr                 ← block 5
 /// ```
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn decode_intra_macroblock(
     br: &mut BitReader<'_>,
     header: &MacroblockHeader,
@@ -820,6 +836,7 @@ pub fn decode_intra_macroblock(
 /// Per §7.3 step-2 the caller adds `p[y][x]` from motion compensation
 /// and clips the resulting `d[y][x]` to `[0, 2^bpp - 1]` (the §7.3
 /// step-3 display saturation). That happens outside this driver.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn decode_inter_block(
     br: &mut BitReader<'_>,
     i: usize,
@@ -837,6 +854,7 @@ pub fn decode_inter_block(
 /// selects the Table B.23 RVLC Tcoef table for the AC EVENT loop
 /// (`reversible_vlc == 1` VOLs code the texture partition with the
 /// reversible VLC; the combined syntax never does).
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn decode_inter_block_partitioned(
     br: &mut BitReader<'_>,
     i: usize,
@@ -945,6 +963,7 @@ fn decode_inter_block_events(
 ///   luma[8..16][0..8]  ← block 2     luma[8..16][8..16] ← block 3
 ///   cb                 ← block 4     cr                 ← block 5
 /// ```
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn decode_inter_macroblock(
     br: &mut BitReader<'_>,
     header: &MacroblockHeader,
@@ -1009,6 +1028,7 @@ pub fn decode_inter_macroblock(
 /// decoded in Figure 6-8 order (0,1 / 2,3 luminance; 4 Cb; 5 Cr), gated
 /// by [`cbpb_pattern_code`], and assembled into the [`InterMacroblock`]
 /// with the same plane layout as [`decode_inter_macroblock`].
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn decode_b_vop_inter_macroblock(
     br: &mut BitReader<'_>,
     cbpb: Option<u8>,

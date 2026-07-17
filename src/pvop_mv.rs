@@ -91,6 +91,7 @@ use crate::mv_predictor_grid::{MbMv, MbMvRecord, MvGrid, MvGridError, LUMA_BLOCK
 /// One decoded P-VOP macroblock's motion-vector outcome, as recorded
 /// into the [`MvGrid`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub enum PvopMbMotion {
     /// Skipped (`not_coded == 1`) — zero motion vector, no bits read.
     Skipped,
@@ -164,6 +165,7 @@ impl From<MvGridError> for PvopMvError {
 /// header is fixed for the lifetime of the driver (it does not change
 /// within a P-VOP). See the [module docs](self) for the dispatch rules.
 #[derive(Debug, Clone)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub struct MvDriver {
     grid: MvGrid,
     vop_fcode_forward: u8,
@@ -475,6 +477,7 @@ fn interpolate_luma_block_into(
 /// (half-sample units when `quarter_sample == 0`, quarter-sample units
 /// when `quarter_sample == 1`). Returns a row-major `[u8; 256]` 16×16
 /// block (length 256), laid out `block[16*j + i]`.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn predict_luma_macroblock(
     motion: PvopMbMotion,
     reference: &crate::half_sample::ReferenceVop<'_>,
@@ -567,6 +570,7 @@ pub fn predict_luma_macroblock(
 /// returned chroma MV is **always** in half-sample units, ready for
 /// the §7.6.2.1 chroma interpolation (§7.6.2.2 applies to luminance
 /// only). Returns `None` for an intra macroblock.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn chroma_mv_for_macroblock(
     motion: PvopMbMotion,
     mode: crate::bvop_prediction::BVopSampleMode,
@@ -597,6 +601,7 @@ pub fn chroma_mv_for_macroblock(
 /// are the macroblock's top-left **chroma** pixel coordinates (`8 *
 /// mb_col`, `8 * mb_row` for 4:2:0). Returns a row-major `[u8; 64]`
 /// block, or `None` for an intra macroblock (no §7.6.2 prediction).
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn predict_chroma_macroblock(
     motion: PvopMbMotion,
     reference: &crate::half_sample::ReferenceVop<'_>,
@@ -646,6 +651,7 @@ pub fn predict_chroma_macroblock(
 /// prediction — its samples come from the §7.4 intra texture path).
 // The §7.6.2 / §7.3 inputs map one-for-one; see reconstruct_pvop_macroblock.
 #[allow(clippy::too_many_arguments)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn predict_inter_macroblock(
     motion: PvopMbMotion,
     luma_ref: &crate::half_sample::ReferenceVop<'_>,
@@ -719,6 +725,7 @@ pub fn predict_inter_macroblock(
 // VOP-level rounding-control bit and bit-depth). Bundling them into a
 // struct would add a shim layer without simplifying the call site.
 #[allow(clippy::too_many_arguments)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn reconstruct_pvop_macroblock(
     motion: PvopMbMotion,
     luma_ref: &crate::half_sample::ReferenceVop<'_>,

@@ -73,6 +73,7 @@ use crate::vop::VopCodingType;
 /// row (spec §7.9.2.8.3: "the direct mode shall not be used" in
 /// enhancement layers of spatial scalability).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub enum BVopMbType {
     /// Table B.4 row `1`. No `dbquant`, no `mvdf`, no `mvdb`. The MV
     /// itself is reconstructed from the co-located P-VOP forward MV
@@ -122,6 +123,7 @@ impl BVopMbType {
 /// > macroblock type is "direct"."
 ///
 /// See also §7.9.2.8.3.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn default_b_mb_type(scalable: bool) -> BVopMbType {
     if scalable {
         BVopMbType::Forward
@@ -139,6 +141,7 @@ pub fn default_b_mb_type(scalable: bool) -> BVopMbType {
 ///
 /// Returns the consumed bit count alongside the signed delta so the
 /// caller can advance the bit reader the right amount.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn parse_dbquant(br: &mut BitReader<'_>) -> Result<(u8, i8), BVopMbParseError> {
     if br.read_bool()? {
         // 1x — read one more bit to discriminate `10` (-2) vs `11` (+2).
@@ -159,6 +162,7 @@ pub fn parse_dbquant(br: &mut BitReader<'_>) -> Result<(u8, i8), BVopMbParseErro
 /// out of scope this round and the bit reader is left positioned at
 /// their start.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub struct BVopMbHeader {
     /// Raw `modb` code from Table B.3:
     ///   * `0b1` (`1`)  — mb_type absent (default type) + no cbpb.
@@ -307,6 +311,7 @@ impl From<MotionParseError> for BVopMbParseError {
 /// Non-scalable streams (the round-94 default path) read Table B.4;
 /// the spatially-scalable enhancement-layer path reads Table B.5.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub enum BMbTypeTable {
     /// Table B.4 — ref_select_code != '00' || scalability == 0.
     B4,
@@ -404,6 +409,7 @@ fn decode_mb_type(
 /// `interlaced_information()` body (when reached), after `dbquant`
 /// (when present), or immediately after the final preceding field.
 /// The caller continues with `motion_vector("…")` in a later round.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn parse_b_vop_mb_header(
     br: &mut BitReader<'_>,
     vol: &VolHeader,
@@ -541,6 +547,7 @@ pub fn parse_b_vop_mb_header(
 /// frame differential, or the top/bottom field pair when
 /// `field_prediction == 1`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub enum BVopMvBody {
     /// Frame prediction — one §6.2.6.2 body.
     Frame(MotionVectorDelta),
@@ -556,6 +563,7 @@ pub enum BVopMvBody {
 /// forward only (`mb_type == '0001'`), backward only (`'001'`), forward
 /// + backward (`'01'`, interpolated), or direct only (`'1'`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub struct BVopMotionVectors {
     /// `mvdf` — present for Forward and Interpolated macroblocks.
     pub forward: Option<BVopMvBody>,
@@ -586,6 +594,7 @@ pub struct BVopMotionVectors {
 /// skip this walker entirely for `modb == '1'` macroblocks — the
 /// whole `if (modb != '1')` subtree, motion vectors included, is
 /// absent from the bitstream.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn decode_b_vop_mb_motion_vectors(
     br: &mut BitReader<'_>,
     mb_type: BVopMbType,
