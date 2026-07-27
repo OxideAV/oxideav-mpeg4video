@@ -730,61 +730,215 @@ pub fn decode_p_vop_macroblocks_dp(
         )
         .map_err(VopDecodeError::DataPartition)?;
 
-        for (k, (mb, tex)) in parsed.mbs.iter().zip(parsed.tex_headers.iter()).enumerate() {
-            let idx = base + k;
-            let (mb_row, mb_col) = (idx / mb_width, idx % mb_width);
-            if mb.not_coded {
-                out.push(PVopMbContent::Inter {
-                    motion: motions[k],
-                    residual: crate::block::InterMacroblock::zero(),
-                });
-                continue;
+        // ---- Texture partition: forward decode, with the §E.1.4.4
+        // two-way RVLC recovery as the error path on a
+        // `reversible_vlc == 1` VOL. ----
+        let qp_at_texture_start = running_qp;
+        let texture_result: Result<Vec<PVopMbContent>, VopDecodeError> = (|| {
+            let mut packet_out = Vec::with_capacity(parsed.mbs.len());
+            for (k, (mb, tex)) in parsed.mbs.iter().zip(parsed.tex_headers.iter()).enumerate() {
+                let idx = base + k;
+                let (mb_row, mb_col) = (idx / mb_width, idx % mb_width);
+                if mb.not_coded {
+                    packet_out.push(PVopMbContent::Inter {
+                        motion: motions[k],
+                        residual: crate::block::InterMacroblock::zero(),
+                    });
+                    continue;
+                }
+                running_qp = apply_dquant(running_qp, tex.dquant_delta, max_qp);
+                let coded = pattern_code(tex.cbpy, mb.cbpc);
+                let is_intra = mb.mb_type.map(|t| t.is_intra()).unwrap_or(false);
+                if is_intra {
+                    let ctx = MacroblockTextureContext {
+                        quantiser_scale: running_qp,
+                        bits_per_pixel: bpp,
+                        quant_type: vol.quant_type,
+                        ac_pred_flag: tex.ac_pred_flag,
+                        alternate_vertical_scan: vop.alternate_vertical_scan,
+                        intra_mismatch_exempt: opts.ecosystem_compat,
+                    };
+                    let imb = decode_intra_mb_partitioned(
+                        br,
+                        &mut grid,
+                        mb_row,
+                        mb_col,
+                        coded,
+                        tex.intra_dc,
+                        vol.reversible_vlc,
+                        ctx,
+                        &intra_matrix,
+                    )?;
+                    packet_out.push(PVopMbContent::Intra(reconstruct_intra_macroblock(
+                        &imb, bpp,
+                    )));
+                } else {
+                    let ctx = MacroblockTextureContext {
+                        quantiser_scale: running_qp,
+                        bits_per_pixel: bpp,
+                        quant_type: vol.quant_type,
+                        ac_pred_flag: false,
+                        alternate_vertical_scan: vop.alternate_vertical_scan,
+                        intra_mismatch_exempt: opts.ecosystem_compat,
+                    };
+                    let residual = decode_inter_mb_partitioned(
+                        br,
+                        coded,
+                        vol.reversible_vlc,
+                        ctx,
+                        &inter_matrix,
+                    )?;
+                    packet_out.push(PVopMbContent::Inter {
+                        motion: motions[k],
+                        residual,
+                    });
+                }
             }
-            running_qp = apply_dquant(running_qp, tex.dquant_delta, max_qp);
-            let coded = pattern_code(tex.cbpy, mb.cbpc);
-            let is_intra = mb.mb_type.map(|t| t.is_intra()).unwrap_or(false);
-            if is_intra {
-                let ctx = MacroblockTextureContext {
-                    quantiser_scale: running_qp,
-                    bits_per_pixel: bpp,
-                    quant_type: vol.quant_type,
-                    ac_pred_flag: tex.ac_pred_flag,
-                    alternate_vertical_scan: vop.alternate_vertical_scan,
-                    intra_mismatch_exempt: opts.ecosystem_compat,
-                };
-                let imb = decode_intra_mb_partitioned(
+            Ok(packet_out)
+        })();
+
+        match texture_result {
+            Ok(packet_out) => out.extend(packet_out),
+            Err(e) if vol.reversible_vlc => {
+                // §E.1.4.4: the DCT-coefficient region of an RVLC packet
+                // errored — run the two-way recovery + §E.1.4.4.2
+                // stitch and reconstruct/conceal per macroblock (the
+                // motion and header partitions are already trusted).
+                out.extend(recover_dp_p_packet_texture(
                     br,
-                    &mut grid,
-                    mb_row,
-                    mb_col,
-                    coded,
-                    tex.intra_dc,
-                    vol.reversible_vlc,
-                    ctx,
-                    &intra_matrix,
-                )?;
-                out.push(PVopMbContent::Intra(reconstruct_intra_macroblock(
-                    &imb, bpp,
-                )));
-            } else {
-                let ctx = MacroblockTextureContext {
-                    quantiser_scale: running_qp,
-                    bits_per_pixel: bpp,
-                    quant_type: vol.quant_type,
-                    ac_pred_flag: false,
-                    alternate_vertical_scan: vop.alternate_vertical_scan,
-                    intra_mismatch_exempt: opts.ecosystem_compat,
-                };
-                let residual =
-                    decode_inter_mb_partitioned(br, coded, vol.reversible_vlc, ctx, &inter_matrix)?;
-                out.push(PVopMbContent::Inter {
-                    motion: motions[k],
-                    residual,
-                });
+                    &parsed,
+                    &motions,
+                    vol,
+                    vop,
+                    opts,
+                    qp_at_texture_start,
+                    max_qp,
+                    &inter_matrix,
+                    &vp_ctx,
+                )?);
+                running_qp = qp_at_texture_start;
+                let _ = e;
             }
+            Err(e) => return Err(e),
         }
         mb_index += parsed.mbs.len();
     }
+    Ok(out)
+}
+
+/// §E.1.4.4 error path for one data-partitioned P-VOP video packet: run
+/// [`recover_video_packet_dct`](crate::rvlc_recovery::recover_video_packet_dct)
+/// over the packet's DCT-coefficient region, stitch the keep decision +
+/// §E.1.4.4.2.2 INTRA concealment, reconstruct every kept inter
+/// macroblock from its recovered EVENT runs, and conceal the rest:
+///
+/// * a discarded (errored-middle) or malformed **inter** macroblock
+///   keeps its trusted partition-1 motion with a zero residual
+///   (motion-compensated concealment);
+/// * a concealed **intra** macroblock (§E.1.4.4.2.2 conceals every
+///   INTRA MB of an errored packet) is emitted as a skipped-style
+///   zero-MV / zero-residual copy of the co-located reference
+///   macroblock;
+/// * when even the backward decode fails, every macroblock of the
+///   packet falls back to the same concealment.
+///
+/// The reader is repositioned at the end of the packet's texture
+/// region (the start of the stuffing preceding the next
+/// `resync_marker`, found by
+/// [`texture_region_end`](crate::rvlc_recovery::texture_region_end)),
+/// so the caller's packet loop resumes cleanly at the next packet.
+#[allow(clippy::too_many_arguments)]
+fn recover_dp_p_packet_texture(
+    br: &mut BitReader<'_>,
+    parsed: &crate::data_partition::DataPartitionedPVop,
+    motions: &[PvopMbMotion],
+    vol: &VolHeader,
+    vop: &VopHeader,
+    opts: DecodeOptions,
+    qp_at_texture_start: u32,
+    max_qp: u32,
+    inter_matrix: &[[u8; 8]; 8],
+    vp_ctx: &VideoPacketContext,
+) -> Result<Vec<PVopMbContent>, VopDecodeError> {
+    use crate::data_partition::mb_block_layout;
+    use crate::rvlc_recovery::{
+        recover_video_packet_dct, recovered_inter_macroblock, texture_region_end,
+    };
+
+    let data = br.data();
+    let bpp = u32::from(vol.bits_per_pixel);
+    let marker_zeros = usize::from(crate::video_packet::resync_marker_length(
+        vp_ctx.coding_type,
+        vp_ctx.fcode_fwd,
+        vp_ctx.fcode_bwd,
+    )) - 1;
+    let end_bit = texture_region_end(data, parsed.texture_start_bit, marker_zeros);
+
+    let layouts: Vec<_> = parsed
+        .mbs
+        .iter()
+        .zip(parsed.tex_headers.iter())
+        .map(|(mb, tex)| mb_block_layout(mb, tex))
+        .collect();
+    let total = layouts.len();
+    let is_intra =
+        |i: usize| -> bool { parsed.mbs[i].mb_type.map(|t| t.is_intra()).unwrap_or(false) };
+
+    // A backward decode that itself fails (both directions corrupt)
+    // degrades to whole-packet concealment.
+    let stitched: Vec<Option<crate::rvlc_recovery::RecoveredMb>> =
+        match recover_video_packet_dct(data, parsed.texture_start_bit, end_bit, &layouts) {
+            Ok(recovery) => recovery.stitch(total, is_intra),
+            Err(_) => vec![None; total],
+        };
+
+    let mut running_qp = qp_at_texture_start;
+    let mut out = Vec::with_capacity(total);
+    for (k, (mb, tex)) in parsed.mbs.iter().zip(parsed.tex_headers.iter()).enumerate() {
+        if mb.not_coded {
+            out.push(PVopMbContent::Inter {
+                motion: motions[k],
+                residual: crate::block::InterMacroblock::zero(),
+            });
+            continue;
+        }
+        running_qp = apply_dquant(running_qp, tex.dquant_delta, max_qp);
+        if is_intra(k) {
+            // §E.1.4.4.2.2 INTRA concealment: zero-MV / zero-residual
+            // copy of the co-located reference macroblock. (Marking the
+            // MB skipped also gives any following B-VOP the §7.6.9.6
+            // co_located_not_coded treatment — the concealed MB carries
+            // no trustworthy vector.)
+            out.push(PVopMbContent::Inter {
+                motion: PvopMbMotion::Skipped,
+                residual: crate::block::InterMacroblock::zero(),
+            });
+            continue;
+        }
+        let coded = pattern_code(tex.cbpy, mb.cbpc);
+        let ctx = MacroblockTextureContext {
+            quantiser_scale: running_qp,
+            bits_per_pixel: bpp,
+            quant_type: vol.quant_type,
+            ac_pred_flag: false,
+            alternate_vertical_scan: vop.alternate_vertical_scan,
+            intra_mismatch_exempt: opts.ecosystem_compat,
+        };
+        let residual = stitched[k]
+            .as_ref()
+            .and_then(|rec| recovered_inter_macroblock(rec, coded, ctx, inter_matrix))
+            .unwrap_or_else(crate::block::InterMacroblock::zero);
+        out.push(PVopMbContent::Inter {
+            motion: motions[k],
+            residual,
+        });
+    }
+
+    // Reposition the reader at the region end so the packet loop
+    // resumes at the stuffing + resync_marker of the next packet.
+    *br = BitReader::new(data);
+    br.skip_bits(end_bit)
+        .map_err(|_| VopDecodeError::Unsupported("recovery region end out of range"))?;
     Ok(out)
 }
 

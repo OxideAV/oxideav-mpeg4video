@@ -76,7 +76,7 @@ impl From<FrameStoreError> for FrameDecodeError {
 /// or an intra macroblock (already reconstructed to `d[y][x]` samples by
 /// the §7.4 intra texture path). The §7.6.1 reference plane is supplied
 /// by the frame loop, not the caller.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 #[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub enum PVopMbContent {
     /// An inter macroblock: the [`PvopMbMotion`] the

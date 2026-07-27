@@ -314,7 +314,17 @@ both modes' envelopes are pinned).
   arbitration, and returns a `RvlcRecovery::Recovered`.
   [`RvlcRecovery::stitch`] then collapses the recovery into the final
   per-macroblock decode set — applying the keep decision (errored middle
-  discarded) and the §E.1.4.4.2.2 INTRA concealment.
+  discarded) and the §E.1.4.4.2.2 INTRA concealment. **The recovery now
+  reaches pixels**: the data-partitioned P-VOP walk catches a texture
+  (partition-3) error on a `reversible_vlc == 1` VOL, locates the
+  packet's DCT-region end (`texture_region_end`), runs the two-way
+  recovery, reconstructs every kept inter macroblock from its recovered
+  EVENT runs (`recovered_inter_macroblock` → the shared §7.4
+  inter-block tail), conceals discarded/INTRA macroblocks (trusted
+  partition-1 motion + zero residual; skipped-style zero-MV copy for a
+  concealed intra), and resumes bit-exactly at the next video packet
+  (`tests/rvlc_recovery_frame.rs` drives a truncated-texture packet
+  end-to-end through the walk).
 - **§6.2.5.3 data partitioning**: [`parse_data_partitioned_i_vop`] /
   [`parse_data_partitioned_p_vop`] walk the rectangular data-partitioned
   I-/P-VOP layouts — partition 1 (`mcbpc` + `dquant` + intra-DC, or
@@ -333,15 +343,11 @@ both modes' envelopes are pinned).
   S(GMC) macroblock (the walk uses the zero-vector fallback; the AMV
   is computed in the S walk but not yet retained per-macroblock).
 - Encoder.
-- Blitting the §E.1.4.4 RVLC recovery into a reconstructed *frame*. The
-  driver is now assembled — [`recover_video_packet_dct`] detects the
-  forward-decode error, runs both directions, gathers the
-  `L/N/L1/L2/N1/N2` inputs, and [`RvlcRecovery::stitch`] applies the
-  kept-MB decision + §E.1.4.4.2.2 INTRA concealment to produce the final
-  per-macroblock EVENT set. What remains is the caller feeding the kept
-  EVENT runs through the §7.4 reconstruction and writing the resulting
-  pixels into the output VOP (the same per-MB residual blit the
-  non-partitioned path already uses).
+- §E.1.4.4 recovery on **I-VOP** texture partitions (an I-VOP texture
+  error still propagates: §E.1.4.4.2.2 conceals every INTRA macroblock
+  of an errored packet, and an I-VOP has no inter macroblocks to
+  recover — a concealment source for that case needs a policy
+  decision). The **P-VOP** path is wired end-to-end (see above).
 - The final routing of the §7.3.5 / Table 7-2 per-block transform
   selection from a *live decoded shape* inside the macroblock
   reconstruction loop. The decision rule itself is now implemented

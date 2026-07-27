@@ -412,7 +412,8 @@ pub fn cbpb_pattern_code(cbpb: Option<u8>) -> [bool; 6] {
 
 /// The §6.1.3 / Figure 6-8 component of block `i` in a 4:2:0 macroblock.
 #[inline]
-fn block_component(i: usize) -> DcComponent {
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
+pub fn block_component(i: usize) -> DcComponent {
     DcComponent::from_block_index(i)
 }
 
@@ -893,10 +894,26 @@ fn decode_inter_block_events(
     } else {
         decode_ac_events(br, TcoefTable::Inter)?
     };
+    inter_block_from_events(&events, ctx, quant_matrix, component)
+}
 
+/// §7.4 reconstruction of one **inter** block from an already-decoded
+/// AC EVENT run: §7.4.2 expansion + inverse scan, §7.4.3.4 saturation,
+/// §7.4.4 inverse quantisation, and the §7.4.5 IDCT. This is the tail
+/// shared by the bit-reading inter decoders and the §E.1.4.4 RVLC
+/// recovery path (whose EVENTs come from
+/// [`crate::rvlc_recovery::recover_video_packet_dct`] rather than a
+/// live reader).
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
+pub fn inter_block_from_events(
+    events: &[crate::texture::AcEvent],
+    ctx: MacroblockTextureContext,
+    quant_matrix: &[[u8; 8]; 8],
+    component: crate::texture::DcComponent,
+) -> Result<[[i32; 8]; 8], BlockAssemblyError> {
     // §7.4.2 — expand to QFS[0..=63] (no DC: pass `None` for the
     // §7.4.1.1 intra-DC slot) then 1-D → 2-D under the zigzag scan.
-    let qfs = events_to_qfs(&events, None)?;
+    let qfs = events_to_qfs(events, None)?;
     let inter_scan = if ctx.alternate_vertical_scan {
         // §6.3.5 alternate_vertical_scan_flag: the interlaced VOP's
         // blocks use the Figure 7-4 (b) scan.

@@ -52,6 +52,26 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **§E.1.4.4 RVLC recovery now reaches pixels** — the data-partitioned
+  P-VOP walk (`decode_p_vop_macroblocks_dp`) catches a
+  texture-partition error on a `reversible_vlc == 1` VOL and, instead
+  of aborting, locates the packet's DCT-region end
+  (`rvlc_recovery::texture_region_end` — next byte-aligned
+  `resync_marker`, stuffing stripped), runs
+  `recover_video_packet_dct` + `RvlcRecovery::stitch`, reconstructs
+  every kept inter macroblock from its recovered EVENT runs
+  (`rvlc_recovery::recovered_inter_macroblock` over the new shared
+  §7.4 inter-block tail `block::inter_block_from_events`), conceals
+  discarded and §E.1.4.4.2.2-INTRA macroblocks (trusted partition-1
+  motion + zero residual; skipped-style zero-MV copy for concealed
+  intras; whole-packet concealment when both decode directions fail),
+  and repositions the reader so the walk resumes bit-exactly at the
+  next video packet. `tests/rvlc_recovery_frame.rs` drives a
+  hand-written two-packet RVLC stream with a truncated texture
+  partition end-to-end: the recovery keeps front/back spans, conceals
+  the errored middle, and leaves packet 2 bit-identical to the clean
+  decode. (`BitReader` gains a `data()` accessor; `PVopMbContent` now
+  derives `PartialEq`.)
 - **Interlaced-direct probe pins** (`tests/direct_mode_probes.rs` +
   `tests/fixtures/dm_probe_*.yuv`): constructed P+B probe streams
   with provably non-zero co-located field MVs over textured anchors

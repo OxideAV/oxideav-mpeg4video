@@ -354,6 +354,110 @@ pub fn recover_video_packet_dct(
     })
 }
 
+/// §7.4 reconstruction of one recovered **inter** macroblock: expand
+/// each kept EVENT run through the shared inter-block tail
+/// ([`crate::block::inter_block_from_events`]) and assemble the
+/// signed-residual [`InterMacroblock`](crate::block::InterMacroblock).
+///
+/// `coded` is the §6.3.5 `cbpy` / `cbpc` pattern the macroblock's
+/// (trusted) header partitions coded — `rec.blocks` holds one EVENT run
+/// per **coded** block in Figure 6-8 order, exactly parallel to the
+/// [`MbBlockLayout`] the recovery walk consumed. `ctx` carries the
+/// per-macroblock texture parameters (quantiser scale after `dquant`,
+/// `bits_per_pixel`, `quant_type`, scan selection); `quant_matrix` is
+/// the non-intra `W[1]` matrix for method-1 VOLs.
+///
+/// Returns `None` when `rec.blocks` does not line up with `coded` (a
+/// malformed recovery — the caller should fall back to concealment).
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
+pub fn recovered_inter_macroblock(
+    rec: &RecoveredMb,
+    coded: [bool; 6],
+    ctx: crate::block::MacroblockTextureContext,
+    quant_matrix: &[[u8; 8]; 8],
+) -> Option<crate::block::InterMacroblock> {
+    use crate::block::{block_component, inter_block_from_events, InterMacroblock};
+
+    if rec.blocks.len() != coded.iter().filter(|&&c| c).count() {
+        return None;
+    }
+    let mut blocks: [[[i32; 8]; 8]; 6] = [[[0i32; 8]; 8]; 6];
+    let mut next_run = 0usize;
+    for (i, block) in blocks.iter_mut().enumerate() {
+        if !coded[i] {
+            continue; // uncoded → all-zero residual block
+        }
+        let events = &rec.blocks[next_run];
+        next_run += 1;
+        *block = inter_block_from_events(events, ctx, quant_matrix, block_component(i)).ok()?;
+    }
+
+    let mut luma = [[0i32; 16]; 16];
+    const LUMA_OFFSETS: [(usize, usize); 4] = [(0, 0), (0, 8), (8, 0), (8, 8)];
+    for (b, &(row_off, col_off)) in LUMA_OFFSETS.iter().enumerate() {
+        for y in 0..8 {
+            for x in 0..8 {
+                luma[row_off + y][col_off + x] = blocks[b][y][x];
+            }
+        }
+    }
+    Some(InterMacroblock {
+        luma,
+        cb: blocks[4],
+        cr: blocks[5],
+    })
+}
+
+/// Locate the end of the current video packet's DCT-coefficient region:
+/// the bit position where the §5.2.3-style stuffing (`'0'` then `'1'`s
+/// to the byte boundary) that precedes the next byte-aligned
+/// `resync_marker` — or the end of the VOP data — begins.
+///
+/// `data` is the full VOP payload, `from_bit` any position inside the
+/// texture region, and `marker_zeros` the number of leading zero bits
+/// of the applicable `resync_marker`
+/// ([`crate::video_packet::resync_marker_length`]` - 1`). The scan
+/// looks for the next byte-aligned marker pattern (`marker_zeros`
+/// zeros then a `1`) and then walks the stuffing backward (trailing
+/// `'1'`s, then the single `'0'`). When no further marker exists the
+/// region runs to the end of `data`, minus the same trailing stuffing.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
+pub fn texture_region_end(data: &[u8], from_bit: usize, marker_zeros: usize) -> usize {
+    let bit_at = |pos: usize| -> u8 { (data[pos / 8] >> (7 - (pos % 8))) & 1 };
+    let total_bits = data.len() * 8;
+
+    // Scan byte-aligned positions after `from_bit` for the marker: a
+    // run of `marker_zeros` zero bits followed by a one bit.
+    let mut marker_bit = total_bits;
+    let first_byte = from_bit.div_ceil(8);
+    'bytes: for byte in first_byte..data.len() {
+        let start = byte * 8;
+        if start + marker_zeros + 1 > total_bits {
+            break;
+        }
+        for k in 0..marker_zeros {
+            if bit_at(start + k) != 0 {
+                continue 'bytes;
+            }
+        }
+        if bit_at(start + marker_zeros) == 1 {
+            marker_bit = start;
+            break;
+        }
+    }
+
+    // Strip the stuffing that precedes the marker (or the data end):
+    // trailing '1's, then one '0'.
+    let mut end = marker_bit;
+    while end > from_bit && bit_at(end - 1) == 1 {
+        end -= 1;
+    }
+    if end > from_bit && bit_at(end - 1) == 0 {
+        end -= 1;
+    }
+    end
+}
+
 /// Pick the Tcoef table for the next coded block within a macroblock,
 /// given the blocks already decoded backward in this MB. Backward block
 /// order is the reverse of forward order, so the next block to decode is

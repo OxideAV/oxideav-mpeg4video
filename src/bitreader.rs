@@ -45,6 +45,15 @@ impl<'a> BitReader<'a> {
         Self { data, bit_pos: 0 }
     }
 
+    /// The wrapped byte slice (the full buffer, independent of the
+    /// current position). Lets a caller that only holds the reader
+    /// re-derive absolute bit spans over the same data — e.g. the
+    /// §E.1.4.4 recovery, which re-reads a video packet's
+    /// DCT-coefficient region both forward and backward.
+    pub fn data(&self) -> &'a [u8] {
+        self.data
+    }
+
     /// Total number of bits available in the wrapped slice.
     pub fn len_bits(&self) -> usize {
         self.data.len() * 8
