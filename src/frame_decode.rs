@@ -667,9 +667,21 @@ pub fn assemble_b_vop_interlaced_frame(
 #[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub enum SGmcMbContent {
     /// `mcsel == 1`: global-motion-compensated. The §7.8 warp is applied
-    /// to the forward reference plane; only the §7.4 residual is carried.
+    /// to the forward reference plane; the §7.4 residual is carried
+    /// together with the macroblock's §7.8.7.3 **averaged motion
+    /// vector** and its skip status, which the §7.6.9.6 co-located
+    /// substitution for a following B-VOP consumes (a *skipped*
+    /// co-located S(GMC) macroblock is treated as non-skipped with the
+    /// AMV; a coded GMC macroblock keeps the §7.6.9.5.1 zero-vector
+    /// fallback).
     Gmc {
-        /// §7.4 inter residual.
+        /// The §7.8.7.3 averaged pel-wise warping vector for this
+        /// macroblock (VOL-grid units: half-pel, or quarter-pel when
+        /// `quarter_sample == 1`).
+        amv: crate::motion::MotionVector,
+        /// `not_coded == 1` (skipped, implied `mcsel == 1`).
+        not_coded: bool,
+        /// §7.4 inter residual (zero for a skipped macroblock).
         residual: InterMacroblock,
     },
     /// `mcsel == 0`: local-motion-compensated exactly as in a P-VOP.
@@ -741,7 +753,7 @@ pub fn assemble_s_gmc_vop_frame(
         let mb_y = (mb_row * 16) as i32;
         let reconstructed = match entry {
             SGmcMbContent::Intra(mb) => mb.clone(),
-            SGmcMbContent::Gmc { residual } => {
+            SGmcMbContent::Gmc { residual, .. } => {
                 let prediction = gmc_prediction_macroblock(
                     geometry,
                     &gmc_planes,
@@ -1154,6 +1166,8 @@ mod tests {
         let store = FrameStore::new();
         let geo = stationary_geometry(16, 16);
         let entries = vec![SGmcMbContent::Gmc {
+            amv: crate::motion::MotionVector { x: 0, y: 0 },
+            not_coded: false,
             residual: InterMacroblock::zero(),
         }];
         let r =
@@ -1169,6 +1183,8 @@ mod tests {
         decode_i_vop(&mut store, 1, 1, &[flat_recon(70, 21, 31)]).unwrap();
         let geo = stationary_geometry(16, 16);
         let entries = vec![SGmcMbContent::Gmc {
+            amv: crate::motion::MotionVector { x: 0, y: 0 },
+            not_coded: false,
             residual: InterMacroblock::zero(),
         }];
         let frame =
@@ -1236,6 +1252,8 @@ mod tests {
         decode_i_vop(&mut store, 1, 1, &[flat_recon(70, 70, 70)]).unwrap();
         let geo = stationary_geometry(16, 16);
         let entries = vec![SGmcMbContent::Gmc {
+            amv: crate::motion::MotionVector { x: 0, y: 0 },
+            not_coded: false,
             residual: InterMacroblock::zero(),
         }];
         let frame =

@@ -52,6 +52,15 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **§7.6.9.6 averaged-MV substitution for skipped co-located S(GMC)
+  macroblocks** — `SGmcMbContent::Gmc` now retains the macroblock's
+  §7.8.7.3 averaged motion vector and skip status; the decoder's
+  anchor-motion extraction surfaces a *skipped* GMC macroblock as a
+  non-skipped 1-MV macroblock carrying the AMV (per §7.6.9.6: "treated
+  as a non-skipped macroblock with the averaged motion vector"), so a
+  direct-mode B macroblock over it scales the AMV instead of taking
+  the skipped-co-located forward-zero path. Coded GMC and intra
+  macroblocks keep the §7.6.9.5.1 zero-vector fallback.
 - **§E.1.4.4 RVLC recovery now reaches pixels** — the data-partitioned
   P-VOP walk (`decode_p_vop_macroblocks_dp`) catches a
   texture-partition error on a `reversible_vlc == 1` VOL and, instead

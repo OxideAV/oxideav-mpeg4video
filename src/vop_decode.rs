@@ -1609,6 +1609,8 @@ pub fn decode_s_gmc_vop_macroblocks(
                     gmc_averaged_mv(&geometry, mb_x, mb_y, vol.quarter_sample, vop.fcode_fwd)?;
                 driver.record_gmc_macroblock(mb_row, mb_col, amv)?;
                 out.push(SGmcMbContent::Gmc {
+                    amv,
+                    not_coded: true,
                     residual: crate::block::InterMacroblock::zero(),
                 });
                 continue;
@@ -1648,7 +1650,11 @@ pub fn decode_s_gmc_vop_macroblocks(
                     gmc_averaged_mv(&geometry, mb_x, mb_y, vol.quarter_sample, vop.fcode_fwd)?;
                 driver.record_gmc_macroblock(mb_row, mb_col, amv)?;
                 let residual = decode_inter_macroblock(br, &header, ctx, &inter_matrix)?;
-                out.push(SGmcMbContent::Gmc { residual });
+                out.push(SGmcMbContent::Gmc {
+                    amv,
+                    not_coded: false,
+                    residual,
+                });
             } else {
                 // mcsel == 0 (or inter4v): the plain P-VOP local path.
                 let motion = driver.decode_macroblock(br, mb_row, mb_col, false, header.mb_type)?;

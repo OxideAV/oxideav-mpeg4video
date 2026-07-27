@@ -339,9 +339,6 @@ both modes' envelopes are pinned).
 
 ## Not yet supported
 
-- The §7.6.9.6 averaged-MV substitution for a skipped co-located
-  S(GMC) macroblock (the walk uses the zero-vector fallback; the AMV
-  is computed in the S walk but not yet retained per-macroblock).
 - Encoder.
 - §E.1.4.4 recovery on **I-VOP** texture partitions (an I-VOP texture
   error still propagates: §E.1.4.4.2.2 conceals every INTRA macroblock

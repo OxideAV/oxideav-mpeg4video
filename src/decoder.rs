@@ -631,18 +631,33 @@ fn motion_of_p_entries(entries: &[PVopMbContent]) -> Vec<AnchorMbMotion> {
         .collect()
 }
 
-/// Extract the per-macroblock motion of a decoded S(GMC)-VOP. GMC
-/// macroblocks carry no local vector — they resolve to the §7.6.9.5.1
-/// zero-vector fallback (represented as `Intra` for the co-located
-/// adapter).
+/// Extract the per-macroblock motion of a decoded S(GMC)-VOP.
+///
+/// * A **skipped** GMC macroblock applies the §7.6.9.6 substitution:
+///   "If the co-located macroblock in the most recently decoded
+///   S(GMC)-VOP is skipped, this co-located macroblock is treated as a
+///   non-skipped macroblock with the averaged motion vector defined in
+///   subclause 7.8.7.3 for the current B-macroblock" — surfaced as a
+///   1-MV macroblock carrying the AMV, so a direct-mode B macroblock
+///   scales the AMV instead of taking the skipped-co-located forward
+///   zero-MV path.
+/// * A **coded** GMC macroblock and an intra macroblock carry no local
+///   vector — they resolve to the §7.6.9.5.1 zero-vector fallback
+///   (represented as `Intra` for the co-located adapter).
 fn motion_of_s_entries(entries: &[SGmcMbContent]) -> Vec<AnchorMbMotion> {
     entries
         .iter()
         .map(|e| match e {
             SGmcMbContent::Local { motion, .. } => AnchorMbMotion::Frame(*motion),
-            SGmcMbContent::Gmc { .. } | SGmcMbContent::Intra(_) => {
-                AnchorMbMotion::Frame(PvopMbMotion::Intra)
+            SGmcMbContent::Gmc {
+                amv,
+                not_coded: true,
+                ..
+            } => AnchorMbMotion::Frame(PvopMbMotion::OneMv(*amv)),
+            SGmcMbContent::Gmc {
+                not_coded: false, ..
             }
+            | SGmcMbContent::Intra(_) => AnchorMbMotion::Frame(PvopMbMotion::Intra),
         })
         .collect()
 }
@@ -1560,5 +1575,46 @@ mod registry_tests {
             "expected the intra-mismatch exemption to alter the decode, got {differing}"
         );
         assert!(max <= 2, "toggle ripple must stay small, got max {max}");
+    }
+    #[test]
+    fn skipped_s_gmc_colocated_maps_to_the_averaged_motion_vector() {
+        // §7.6.9.6: a skipped co-located S(GMC) macroblock is treated as
+        // a NON-skipped macroblock carrying the §7.8.7.3 averaged motion
+        // vector; a coded GMC macroblock (and an intra one) keeps the
+        // §7.6.9.5.1 zero-vector fallback.
+        use crate::block::InterMacroblock;
+        use crate::motion::MotionVector;
+        use crate::reconstruct::ReconstructedMacroblock;
+
+        let amv = MotionVector { x: 6, y: -2 };
+        let entries = vec![
+            SGmcMbContent::Gmc {
+                amv,
+                not_coded: true,
+                residual: InterMacroblock::zero(),
+            },
+            SGmcMbContent::Gmc {
+                amv,
+                not_coded: false,
+                residual: InterMacroblock::zero(),
+            },
+            SGmcMbContent::Local {
+                motion: PvopMbMotion::OneMv(MotionVector { x: 1, y: 2 }),
+                residual: InterMacroblock::zero(),
+            },
+            SGmcMbContent::Intra(ReconstructedMacroblock {
+                luma: [[0; 16]; 16],
+                cb: [[0; 8]; 8],
+                cr: [[0; 8]; 8],
+            }),
+        ];
+        let motion = motion_of_s_entries(&entries);
+        assert_eq!(motion[0], AnchorMbMotion::Frame(PvopMbMotion::OneMv(amv)));
+        assert_eq!(motion[1], AnchorMbMotion::Frame(PvopMbMotion::Intra));
+        assert_eq!(
+            motion[2],
+            AnchorMbMotion::Frame(PvopMbMotion::OneMv(MotionVector { x: 1, y: 2 }))
+        );
+        assert_eq!(motion[3], AnchorMbMotion::Frame(PvopMbMotion::Intra));
     }
 }
