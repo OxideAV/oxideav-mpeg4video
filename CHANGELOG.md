@@ -6,6 +6,32 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **§7.7.2.1 quarter-sample field motion compensation is now
+  bit-exact** — the interlaced+qpel conformance stream
+  (`ilaced_qpel_ip_64x64`) drops its 1184-sample (max 111) bounded
+  envelope and asserts `assert_stream_exact` in both behaviour modes.
+  Two geometry facts the printed spec text leaves open were
+  arbitrated by black-box pixel comparison over constructed
+  single-macroblock field-prediction probe streams
+  (`tests/field_qpel_probes.rs` + `tests/fixtures/fq_probe_*.yuv`):
+  - each 16-wide luma field block interpolates as **two 8×8
+    §7.6.2.2 blocks**, each with its own Figure 7-30 `(M+1)×(N+1)`
+    read + boundary mirroring (a single 16-wide interpolation
+    mispredicts isolated samples in the columns whose FIR taps span
+    the centre seam; the progressive 16×16 1-MV macroblock keeps its
+    single-block interpolation, pinned by the bit-exact progressive
+    qpel streams);
+  - the chroma field MV's **vertical** quarter → half halving floors
+    on the field grid — new helper
+    `field_motion::field_chroma_dy_qpel` (`2 * Div2Round(mv_y >> 2)`)
+    replaces the truncating
+    `field_chroma_dy(half_pel_chroma_mv_from_qpel(..))` composition,
+    which mispredicted every probe with a negative odd field-grid
+    component; the horizontal component keeps the truncating
+    §7.6.5-style derivation (probe-confirmed for both signs).
+
 ### Added
 
 - **Opt-in ecosystem-compat decode mode** (`compat::DecodeOptions`;

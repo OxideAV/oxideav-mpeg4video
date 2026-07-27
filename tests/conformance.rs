@@ -33,11 +33,14 @@
 //!   reproduces the oracle bit-for-bit up to the near-ties — see the
 //!   `compat_*` tests at the end of this file.
 //!
-//! Two interlaced tool axes remain outside the exact envelope with
-//! root-caused, documented deviations — see their tests below. The
-//! §7.7.2.2 interlaced-direct deviation is likewise covered by the
-//! compat mode (29 of the corpus' 30 interlaced-direct macroblocks go
-//! bit-exact under it).
+//! One interlaced tool axis remains outside the exact envelope with a
+//! root-caused, documented deviation — the §7.7.2.2 interlaced-direct
+//! derivation, covered by the compat mode (29 of the corpus' 30
+//! interlaced-direct macroblocks go bit-exact under it). The
+//! §7.7.2.1 quarter-sample field-interpolation geometry was
+//! arbitrated by constructed probe streams
+//! (`tests/field_qpel_probes.rs`) and the interlaced+qpel stream is
+//! now fully bit-exact.
 
 use oxideav_mpeg4video::compat::DecodeOptions;
 use oxideav_mpeg4video::decoder::Mpeg4VideoDecoder;
@@ -278,6 +281,25 @@ fn interlaced_ip2_stream_is_bit_exact() {
     assert_stream_exact("ilaced_ip2_64x64.m4v", "ilaced_ip2_64x64.yuv", 64, 64);
 }
 
+#[test]
+fn interlaced_qpel_ip_stream_is_bit_exact() {
+    // Interlaced field motion estimation + quarter-sample (ildct +
+    // ilme + qpel), I + P chain. Closed by the constructed-probe
+    // arbitration of the §7.7.2.1 quarter-sample field-interpolation
+    // geometry (`tests/field_qpel_probes.rs`): each 16-wide luma field
+    // block interpolates as two 8×8 §7.6.2.2 blocks with per-sub-block
+    // Figure 7-30 mirroring, and the chroma field MV's vertical
+    // quarter → half halving floors on the field grid
+    // (`field_chroma_dy_qpel`). Previously carried a 1184-sample
+    // envelope (max 111); now bit-exact.
+    assert_stream_exact(
+        "ilaced_qpel_ip_64x64.m4v",
+        "ilaced_qpel_ip_64x64.yuv",
+        64,
+        64,
+    );
+}
+
 // ───────────── bit-exact up to near-tie IDCT samples ─────────────
 
 #[test]
@@ -392,30 +414,6 @@ fn interlaced_direct_bframes_stream_matches_within_interlaced_direct_envelope() 
     );
 }
 
-#[test]
-fn interlaced_qpel_ip_stream_matches_within_field_qpel_envelope() {
-    // Interlaced field motion estimation + quarter-sample (ildct +
-    // ilme + qpel), I + P chain. Isolated field-predicted (and
-    // neighbouring) macroblocks diverge from the oracle: an exhaustive
-    // search over (top MV, bottom MV, reference fields, rounding) with
-    // our §7.6.2.2-on-field-grid interpolation reproduces NO candidate
-    // for the failing macroblocks, i.e. the oracle's quarter-sample
-    // *field* interpolation cascade itself differs from our reading of
-    // the §7.6.2.2 process applied per field — not the vectors. The
-    // spec text does not pin the field-grid FIR/mirroring geometry
-    // precisely; resolving it needs a dedicated arbitration pass (or a
-    // clean-room trace of §7.7.2.1 quarter-sample field interpolation).
-    // Measured: 1184/73728 ≈ 1.6%, max 111 (chroma).
-    assert_stream_bounded(
-        "ilaced_qpel_ip_64x64.m4v",
-        "ilaced_qpel_ip_64x64.yuv",
-        64,
-        64,
-        120,
-        0.02,
-    );
-}
-
 // ───────────── ecosystem-compat mode (`DecodeOptions::ecosystem`) ─────────────
 //
 // The opt-in compat mode reproduces the black-box-observed ecosystem
@@ -499,8 +497,9 @@ fn compat_interlaced_direct_bframes_stream_tightens_to_one_macroblock() {
 fn compat_is_a_no_op_for_the_interlaced_qpel_stream() {
     // Neither compat behaviour is exercised here (quant_type == 0, no
     // interlaced-direct macroblocks): the compat decode must be
-    // sample-identical to the spec decode, and the §7.7.2.1
-    // field-qpel envelope (docs ask #279) is unchanged.
+    // sample-identical to the spec decode, and the stream stays
+    // bit-exact under compat (the §7.7.2.1 field-qpel geometry is an
+    // arbitrated default reading, not a compat behaviour).
     let spec = decode_stream("ilaced_qpel_ip_64x64.m4v", DecodeOptions::spec());
     let compat = decode_stream("ilaced_qpel_ip_64x64.m4v", DecodeOptions::ecosystem());
     assert_eq!(spec.len(), compat.len());
@@ -509,14 +508,16 @@ fn compat_is_a_no_op_for_the_interlaced_qpel_stream() {
         assert_eq!(a.cb_samples(), b.cb_samples(), "frame {i} cb");
         assert_eq!(a.cr_samples(), b.cr_samples(), "frame {i} cr");
     }
-    assert_stream_bounded_with(
+    let (max, differing, total) = stream_diff_with(
         "ilaced_qpel_ip_64x64.m4v",
         "ilaced_qpel_ip_64x64.yuv",
         64,
         64,
-        120,
-        0.02,
         DecodeOptions::ecosystem(),
+    );
+    assert!(
+        differing == 0,
+        "ilaced_qpel_ip under compat: {differing}/{total} differ (max {max})"
     );
 }
 

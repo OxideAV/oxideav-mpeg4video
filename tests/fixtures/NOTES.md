@@ -91,6 +91,31 @@ ffmpeg -f lavfi -i "testsrc2=size=64x64:rate=25:duration=0.48" \
   -f m4v mq_dp_ipb_64x64.m4v
 ```
 
+### Field-qpel probe pins (`fq_probe_*.yuv`)
+
+The seven `fq_probe_*.yuv` files are reference decodes of
+**constructed** probe streams that arbitrated the §7.7.2.1
+quarter-sample field-interpolation geometry (see
+`tests/field_qpel_probes.rs`, which rebuilds each probe bitstream
+deterministically — the streams themselves are therefore not stored).
+Each probe is the `ilaced_qpel_ip_64x64.m4v` configuration headers +
+I-VOP followed by one hand-written P-VOP: every macroblock skipped
+except macroblock (1, 1), which is field-predicted
+(`field_prediction == 1`) with chosen field reference selections and
+field MVDs and no residual. Each expected output was produced by the
+same black-box command as every other reference decode:
+
+```
+ffmpeg -idct faani -i fq_probe_<name>.m4v -f rawvideo -pix_fmt yuv420p fq_probe_<name>.yuv
+```
+
+These probes pinned two geometry facts the printed spec text leaves
+open (both now the decoder's default reading, asserted bit-exact in
+both behaviour modes): the 16-wide luma field block interpolates as
+two 8×8 §7.6.2.2 blocks with per-sub-block Figure 7-30 mirroring, and
+the chroma field MV's vertical quarter → half halving floors on the
+field grid (`Div2Round(mv_y >> 2)`).
+
 ### From earlier rounds
 
 The remaining thirteen `.m4v` streams predate this notes file; they
@@ -150,6 +175,13 @@ c6c38a7b94714432027886065c6f4f6bd0044cb81bba99ecaaec2d265e66defd  mq_qpel_mv4_ip
 6507284607652f4bb09805cf997683729a6e1d04c327e2d86b8a4e93d6882bf6  mq_ilaced_ipb_64x64.yuv
 7a34ef255a41ededc5a3a8090a80a69a3899a7fbecbf84ff03e9ad38589b11d5  mq_dp_ipb_64x64.m4v
 ca2cb8b3cbb12801ede055f71d101004a65e13707f514bf7a8084a2feb74839d  mq_dp_ipb_64x64.yuv
+750f917ee35f593d5766bf33309aa6659b39884ed56af3cf9d785a2a609f2c1d  fq_probe_diag.yuv
+b29588dfd261fe8f4e04a4f8cba31df8150a7b77bb10b2714af5f1ab0c9d46ab  fq_probe_half_seam.yuv
+133f043fbdb383ef5721aaf501a7a183efe840fba8a4a255f7e98bdc26006235  fq_probe_mixed.yuv
+7bd25b9b4dec547be35ade5a29bc4145fb28001aa6467dd0dfd48225925cfe44  fq_probe_neg.yuv
+1b754a60781267ac0f8cea8ff94608283f7c3240ef04976e11e9564965de19dc  fq_probe_odd_a.yuv
+60918961e4ead055d11d56659173eef8b78a87f82a5c43b2160b69bb673ca9fd  fq_probe_odd_c.yuv
+53e56fede4435ec365f4498832930c976414d7a52efe2d489e7ee275fb1ad6d7  fq_probe_odd_d.yuv
 ```
 
 (Note: `aic_ipb_64x64.yuv` and `altscan_ipb_64x64.yuv` are

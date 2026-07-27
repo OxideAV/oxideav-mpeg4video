@@ -63,14 +63,17 @@
 //! calls with the §7.6.2.2 quarter-pel interpolation "accordingly"
 //! (§7.7.2.1, `field_motion_compensate_one_reference`), still on the
 //! field reference grid (vertical neighbours are same-field lines).
-//! [`field_motion_compensate_one_reference_qpel`] issues two
-//! [`crate::quarter_sample::interpolate_block_qpel_field_into`] luma
-//! field-block calls (top then bottom output field) and keeps the four
-//! [`mc`] chroma calls. Per §7.7.2.2 the quarter-sample chroma vectors
-//! are `Div2Round` of the luma field MV **divided by 2** (quarter →
-//! half), i.e. [`div2_round`]`(`[`half_pel_chroma_mv_from_qpel`]`)`,
-//! and chroma is interpolated in half-sample mode exactly as in the
-//! half-sample driver.
+//! [`field_motion_compensate_one_reference_qpel`] interpolates each
+//! 16-wide field block as **two 8×8 blocks** (per-sub-block Figure
+//! 7-30 mirroring — black-box-arbitrated, see the function docs) via
+//! [`crate::quarter_sample::interpolate_block_qpel_field_into`] and
+//! keeps the four [`mc`] chroma calls. Per §7.7.2.2 the quarter-sample
+//! chroma vectors are `Div2Round` of the luma field MV **divided by
+//! 2** (quarter → half): truncating on the horizontal component
+//! ([`div2_round`]`(`[`half_pel_chroma_mv_from_qpel`]`)`), flooring on
+//! the field-grid vertical component ([`field_chroma_dy_qpel`] —
+//! probe-arbitrated), with chroma interpolated in half-sample mode
+//! exactly as in the half-sample driver.
 //!
 //! ## Scope
 //!
@@ -398,6 +401,35 @@ pub const fn half_pel_chroma_mv_from_qpel(qpel_component: i32) -> i32 {
     qpel_component / 2
 }
 
+/// Chroma **vertical** field motion-vector derivation in
+/// quarter-sample mode: `2 * Div2Round(mv_y >> 2)`, where `mv_y` is
+/// the luma field MV's vertical component in quarter-pel frame
+/// coordinates (always even, §7.7.2.1) and the result is the chroma
+/// field MV in the same frame-half-pel representation the [`mc`]
+/// chroma calls consume (4 units per field line, bit 1 = half sample).
+///
+/// §7.7.2.2 prints the derivation as "applying Div2Round to the
+/// luminance motion vectors, divided by 2 in case of quarter_sample
+/// mode", which pins neither the order of the two halvings on the
+/// field grid nor the rounding direction of the quarter → half step
+/// (the printed `field_motion_compensate_one_reference` chroma calls
+/// are already defective in half-sample mode — see [`field_chroma_dy`]'s
+/// symmetric-snap correction). Black-box pixel arbitration over
+/// constructed single-macroblock field-prediction probe streams
+/// (`tests/fixtures/NOTES.md`, field-qpel probe set) uniquely
+/// determines the reference behaviour: the field-grid quarter-pel
+/// value `mv_y / 2` is halved **toward minus infinity** (`>> 1`, i.e.
+/// `mv_y >> 2` overall) and the result `Div2Round`-snapped — the
+/// truncating alternative `Div2Round((mv_y / 2) / 2)` mispredicts
+/// every probe with a negative odd field-grid component while this
+/// form reproduces all of them bit-exactly. The horizontal component
+/// keeps the truncating §7.6.5 quarter-mode derivation
+/// (`Div2Round(mv_x / 2)`), likewise probe-confirmed for both signs.
+#[inline]
+pub const fn field_chroma_dy_qpel(luma_field_mvy_qpel: i32) -> i32 {
+    2 * div2_round(luma_field_mvy_qpel >> 2)
+}
+
 /// §7.7.2.1 `field_motion_compensate_one_reference` in **quarter-sample
 /// mode** (`quarter_sample == 1`).
 ///
@@ -409,11 +441,32 @@ pub const fn half_pel_chroma_mv_from_qpel(qpel_component: i32) -> i32 {
 /// quarter-pel frame coordinates with even vertical components
 /// (§7.7.2.1).
 ///
-/// Chrominance is unchanged from the half-sample path: the four [`mc`]
-/// calls run in half-sample field mode with the §7.7.2.2 chroma MV
-/// `div2_round(half_pel_chroma_mv_from_qpel(component))` — the luma
-/// quarter-pel value divided by 2 (quarter → half) then `Div2Round`
-/// (the 4:2:0 sub-sampling halve).
+/// ## Luma sub-block granularity (black-box-arbitrated)
+///
+/// Each 16-wide field block is interpolated as **two 8×8 blocks**
+/// (8 columns × 8 field lines), each with its own §7.6.2.2 /
+/// Figure 7-30 `(M+1)×(N+1)` read + boundary mirroring. §7.6.2.2
+/// defines the process "for each block of size MxN" without pinning
+/// M×N for a field-predicted macroblock (the §7.7.2.1 pseudo code
+/// compensates a field per [`mc`] call, but the quarter-sample text
+/// only says the macroblock is calculated "as described in subclause
+/// 7.6.2.2, accordingly"); the spec's block-level unit is the 8×8
+/// block (§3). Probe-stream arbitration (constructed field-prediction
+/// P-VOPs over a conformant interlaced+qpel anchor, see
+/// `tests/fixtures/NOTES.md`) determines the 8×8 reading uniquely: a
+/// single 16-wide interpolation mispredicts isolated samples in the
+/// columns whose FIR taps span the centre seam, while the two-8×8
+/// split reproduces every probe bit-exactly (the progressive 16×16
+/// 1-MV macroblock keeps its single-block interpolation, pinned by
+/// the bit-exact progressive qpel conformance streams).
+///
+/// ## Chroma
+///
+/// The four [`mc`] calls run in half-sample field mode; the horizontal
+/// chroma MV is `Div2Round(mv_x / 2)` (truncating quarter → half, then
+/// the 4:2:0 halve) and the vertical is [`field_chroma_dy_qpel`]
+/// (floor-halving on the field grid — see its docs for the
+/// arbitration).
 ///
 /// `bits_per_pixel` is the VOL `bits_per_pixel` (8 for `not_8_bit ==
 /// 0`); it drives the §7.6.2.2.1 FIR clip.
@@ -433,45 +486,49 @@ pub fn field_motion_compensate_one_reference_qpel(
     let top_ref_y0 = top_field_ref as i32;
     let bot_ref_y0 = bottom_field_ref as i32;
 
-    // --- Luma: two 16×8 field blocks via §7.6.2.2 quarter-pel. ---
-    // The field interpolator returns the 8 lines of one field; the top
-    // field's lines land on even destination rows, the bottom field's
-    // on odd rows.
+    // --- Luma: each 16-wide field block as two 8×8 §7.6.2.2 blocks
+    // (per-sub-block Figure 7-30 mirroring — see the function docs for
+    // the probe arbitration). The field interpolator returns the 8
+    // lines of one field; the top field's lines land on even
+    // destination rows, the bottom field's on odd rows.
     let half_h = MACROBLOCK_LUMA_SIDE / 2;
+    let sub_w = MACROBLOCK_LUMA_SIDE / 2;
     let mut top_field = [0u8; MACROBLOCK_LUMA_SIDE * (MACROBLOCK_LUMA_SIDE / 2)];
     let mut bot_field = [0u8; MACROBLOCK_LUMA_SIDE * (MACROBLOCK_LUMA_SIDE / 2)];
-    interpolate_block_qpel_field_into(
-        luma_ref,
-        mvs.top.x,
-        mvs.top.y,
-        x,
-        y,
-        MACROBLOCK_LUMA_SIDE,
-        half_h,
-        top_ref_y0,
-        rounding_type,
-        bits_per_pixel,
-        &mut top_field,
-    );
-    interpolate_block_qpel_field_into(
-        luma_ref,
-        mvs.bottom.x,
-        mvs.bottom.y,
-        x,
-        y,
-        MACROBLOCK_LUMA_SIDE,
-        half_h,
-        bot_ref_y0,
-        rounding_type,
-        bits_per_pixel,
-        &mut bot_field,
-    );
+    for (field_buf, mv, ref_y0) in [
+        (&mut top_field, mvs.top, top_ref_y0),
+        (&mut bot_field, mvs.bottom, bot_ref_y0),
+    ] {
+        for sub in 0..2 {
+            let x_off = sub * sub_w;
+            let mut sub_buf = [0u8; (MACROBLOCK_LUMA_SIDE / 2) * (MACROBLOCK_LUMA_SIDE / 2)];
+            interpolate_block_qpel_field_into(
+                luma_ref,
+                mv.x,
+                mv.y,
+                x + x_off as i32,
+                y,
+                sub_w,
+                half_h,
+                ref_y0,
+                rounding_type,
+                bits_per_pixel,
+                &mut sub_buf,
+            );
+            for (line, sub_line) in sub_buf.chunks_exact(sub_w).enumerate() {
+                let dst = line * MACROBLOCK_LUMA_SIDE + x_off;
+                field_buf[dst..dst + sub_w].copy_from_slice(sub_line);
+            }
+        }
+    }
 
-    // --- Chroma: half-sample field mc with Div2Round(qpel / 2) MVs. ---
+    // --- Chroma: half-sample field mc. Horizontal Div2Round(qpel / 2)
+    // (truncating), vertical `field_chroma_dy_qpel` (floor on the
+    // field grid — black-box-arbitrated, see its docs). ---
     let top_cx = div2_round(half_pel_chroma_mv_from_qpel(mvs.top.x));
-    let top_cy = field_chroma_dy(half_pel_chroma_mv_from_qpel(mvs.top.y));
+    let top_cy = field_chroma_dy_qpel(mvs.top.y);
     let bot_cx = div2_round(half_pel_chroma_mv_from_qpel(mvs.bottom.x));
-    let bot_cy = field_chroma_dy(half_pel_chroma_mv_from_qpel(mvs.bottom.y));
+    let bot_cy = field_chroma_dy_qpel(mvs.bottom.y);
     let cx = x / 2;
     let cy = y / 2;
     let mut cb = [0u8; MACROBLOCK_CHROMA_SIDE * MACROBLOCK_CHROMA_SIDE];

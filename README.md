@@ -21,10 +21,11 @@ P / B / S(GMC), with §6.2.5.2 video-packet resync handling) → the
 time model derives each B-VOP's §7.6.7 `TRB`/`TRD` from the composed
 VOP times. **Real-stream conformance is now bit-exact**: against a
 black-box reference decode using the ideal (floating-point) Annex A.1
-IDCT, eleven reference-encoder-produced streams — intra-only, I+P,
+IDCT, twelve reference-encoder-produced streams — intra-only, I+P,
 I/P/B, qpel-IP, qpel-IPB, qpel+4MV-IPB, AC-prediction IPB,
 progressive alternate-scan IPB, data-partitioned IPB, 176×144 IPB
-with video packets, and an interlaced I+P — decode **bit-for-bit
+with video packets, an interlaced I+P, and an interlaced qpel-IP
+(field motion + quarter-sample) — decode **bit-for-bit
 identically**; four more match up to a documented budget of ±1
 "near-tie" samples (the oracle's single-precision IDCT crossing a
 rounding boundary the ideal value sits within ~1e-5 of), and the
@@ -84,7 +85,14 @@ data-partitioned IPB / QCIF-resync IPB / interlaced × {intra,
 alt-scan, IP, IP-motion, IPB, qpel-IP, direct-B 176×144} / mpeg-quant
 × {plain, qpel+4MV, interlaced-B, data-partitioned}) are asserted
 bit-exact, near-exact, or envelope-bounded as described above — each
-also pinned under the compat mode. There is no encoder.
+also pinned under the compat mode. The **interlaced quarter-sample
+field interpolation** (`ildct + ilme + qpel`) is bit-exact: its
+geometry — two 8×8 §7.6.2.2 blocks per 16-wide luma field block with
+per-sub-block Figure 7-30 mirroring, and floor-halving of the chroma
+field MV's vertical quarter → half step — was black-box-arbitrated
+over seven constructed single-macroblock field-prediction probe
+streams, now committed as regression pins
+(`tests/field_qpel_probes.rs`). There is no encoder.
 
 ## Compatibility modes
 
@@ -149,11 +157,15 @@ modes (asserted).
   handling (probe, header decode, §E.1.2 predictor/quantiser reset).
 - **Bit-exact real-stream conformance** against a black-box reference
   decode with the ideal floating-point IDCT (`tests/conformance.rs`,
-  provenance in `tests/fixtures/NOTES.md`): eleven streams bit-exact,
-  four near-exact (±1 near-tie IDCT samples), three bounded with
-  root-caused oracle deviations — plus the full `compat_*` pin set
-  under the [ecosystem-compat mode](#compatibility-modes) (two of the
-  bounded streams collapse to near-tie-only).
+  provenance in `tests/fixtures/NOTES.md`): twelve streams bit-exact
+  (including interlaced field-MC + quarter-sample), four near-exact
+  (±1 near-tie IDCT samples), three bounded with root-caused oracle
+  deviations — plus the full `compat_*` pin set under the
+  [ecosystem-compat mode](#compatibility-modes) (two of the bounded
+  streams collapse to near-tie-only under it), and seven constructed
+  field-prediction **probe pins** (`tests/field_qpel_probes.rs`) that
+  arbitrated and now lock the §7.7.2.1 quarter-sample
+  field-interpolation geometry.
 - **Configuration headers** (§6.2): Visual Object Sequence
   (`0x000001B0` + profile/level), Visual Object (`0x000001B5`, verid,
   video-signal-type, colour description), and Video Object Layer
@@ -305,14 +317,6 @@ modes (asserted).
 
 ## Not yet supported
 
-- Pixel-exact conformance for the **interlaced quarter-sample field
-  interpolation** (`ildct + ilme + qpel` streams): isolated
-  field-predicted macroblocks diverge from the reference decode, and
-  an exhaustive (MV, reference-field, rounding) search shows the
-  oracle's quarter-sample *field* FIR cascade itself differs from our
-  §7.6.2.2-per-field reading — the fixture carries a bounded envelope
-  until a dedicated arbitration pass (or a clean-room §7.7.2.1
-  quarter-sample field-interpolation trace) settles the geometry.
 - The §7.6.9.6 averaged-MV substitution for a skipped co-located
   S(GMC) macroblock (the walk uses the zero-vector fallback; the AMV
   is computed in the S walk but not yet retained per-macroblock).
