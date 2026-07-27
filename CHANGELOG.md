@@ -52,6 +52,14 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Triple-axis conformance stream** `mq_ilaced_qpel_ipb_64x64`
+  (method-1 quantisation + interlaced field DCT/ME + quarter-sample +
+  B-VOPs): the spec default carries the combined intra-mismatch +
+  interlaced-direct envelope (3858/73728 ≈ 5.2 %, max 54); under
+  ecosystem-compat the stream collapses to the 4 IDCT near-ties —
+  the method-1 intra exemption, the zero-co-located interlaced-direct
+  derivation, and the arbitrated field-qpel geometry compose to a
+  near-tie-exact decode.
 - **§7.6.9.6 averaged-MV substitution for skipped co-located S(GMC)
   macroblocks** — `SGmcMbContent::Gmc` now retains the macroblock's
   §7.8.7.3 averaged motion vector and skip status; the decoder's

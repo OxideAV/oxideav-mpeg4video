@@ -699,3 +699,37 @@ fn compat_interlaced_qpel_ipb_stream_is_bit_exact() {
         "ilaced_qpel_ipb under compat: {differing}/{total} differ (max {max})"
     );
 }
+
+#[test]
+fn mq_interlaced_qpel_ipb_stream_matches_within_combined_envelope() {
+    // Method-1 quantisation + interlaced field DCT/ME + quarter-sample
+    // + B-VOPs: every divergence axis in one stream — the §7.4.4.5
+    // intra mismatch toggle, §7.7.2.2 interlaced-direct macroblocks,
+    // and the probe-arbitrated §7.7.2.1 field-qpel geometry (exact in
+    // both modes). Measured: 3858/73728 ~= 5.2%, max 54.
+    assert_stream_bounded(
+        "mq_ilaced_qpel_ipb_64x64.m4v",
+        "mq_ilaced_qpel_ipb_64x64.yuv",
+        64,
+        64,
+        60,
+        0.06,
+    );
+}
+
+#[test]
+fn compat_mq_interlaced_qpel_ipb_stream_collapses_to_near_ties() {
+    // With both compat behaviours applied, the triple-axis stream
+    // drops to the 4 single-precision IDCT near-ties (measured
+    // 4/73728, max 1) — method-1 intra exemption + zero-co-located
+    // interlaced direct + the arbitrated field-qpel geometry compose
+    // to a near-tie-exact decode.
+    assert_stream_near_exact_with(
+        "mq_ilaced_qpel_ipb_64x64.m4v",
+        "mq_ilaced_qpel_ipb_64x64.yuv",
+        64,
+        64,
+        4,
+        DecodeOptions::ecosystem(),
+    );
+}

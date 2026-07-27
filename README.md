@@ -79,12 +79,12 @@ decode end-to-end** (`decode_i_vop_macroblocks_dp` /
 partition structure, §E.1.2 prediction resets, header-partition intra
 DC feeding the texture partition, Table B.23 RVLC texture when
 `reversible_vlc == 1`), with B-VOPs on the combined syntax per the
-§6.2.5.3 NOTE. Twenty-three black-box conformance fixtures (intra /
+§6.2.5.3 NOTE. Twenty-four black-box conformance fixtures (intra /
 IP / IPB / qpel {IP, IPB, +4MV} / AC-prediction / alternate-scan /
 data-partitioned IPB / QCIF-resync IPB / interlaced × {intra,
 alt-scan, IP, IP-motion, IPB, qpel-IP, qpel-IPB, direct-B 176×144} /
-mpeg-quant
-× {plain, qpel+4MV, interlaced-B, data-partitioned}) are asserted
+mpeg-quant × {plain, qpel+4MV, interlaced-B, interlaced-qpel-B,
+data-partitioned}) are asserted
 bit-exact, near-exact, or envelope-bounded as described above — each
 also pinned under the compat mode. The **interlaced quarter-sample
 field interpolation** (`ildct + ilme + qpel`) is bit-exact: its
