@@ -89,6 +89,12 @@ ffmpeg -f lavfi -i "testsrc2=size=64x64:rate=25:duration=0.48" \
 ffmpeg -f lavfi -i "testsrc2=size=64x64:rate=25:duration=0.48" \
   -c:v mpeg4 -qscale:v 4 -g 6 -bf 2 -mpeg_quant 1 -data_partitioning 1 \
   -f m4v mq_dp_ipb_64x64.m4v
+
+# interlaced field DCT/ME + quarter-sample + B-VOPs (field-qpel through
+# the §7.7.2.2 B modes and the interlaced-direct path)
+ffmpeg -f lavfi -i "testsrc2=size=64x64:rate=25:duration=0.48" \
+  -c:v mpeg4 -qscale:v 4 -g 6 -bf 2 -flags +ildct+ilme+qpel -top 1 \
+  -f m4v ilaced_qpel_ipb_64x64.m4v
 ```
 
 ### Field-qpel probe pins (`fq_probe_*.yuv`)
@@ -175,6 +181,8 @@ c6c38a7b94714432027886065c6f4f6bd0044cb81bba99ecaaec2d265e66defd  mq_qpel_mv4_ip
 6507284607652f4bb09805cf997683729a6e1d04c327e2d86b8a4e93d6882bf6  mq_ilaced_ipb_64x64.yuv
 7a34ef255a41ededc5a3a8090a80a69a3899a7fbecbf84ff03e9ad38589b11d5  mq_dp_ipb_64x64.m4v
 ca2cb8b3cbb12801ede055f71d101004a65e13707f514bf7a8084a2feb74839d  mq_dp_ipb_64x64.yuv
+7f3af441a9b0f41f5d8bbf689339388607581fc842be1b3c467c291d33bd9a8b  ilaced_qpel_ipb_64x64.m4v
+ce464e80c84845d59f2a674d98ce37bedae4cd828c8429e26876d5725cc21df9  ilaced_qpel_ipb_64x64.yuv
 750f917ee35f593d5766bf33309aa6659b39884ed56af3cf9d785a2a609f2c1d  fq_probe_diag.yuv
 b29588dfd261fe8f4e04a4f8cba31df8150a7b77bb10b2714af5f1ab0c9d46ab  fq_probe_half_seam.yuv
 133f043fbdb383ef5721aaf501a7a183efe840fba8a4a255f7e98bdc26006235  fq_probe_mixed.yuv

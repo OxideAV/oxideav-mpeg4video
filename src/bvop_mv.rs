@@ -583,17 +583,22 @@ impl BVopInterlacedDirectMbDecode {
     /// * `references` — the six forward/backward reference planes.
     /// * `residual` — the already-decoded §7.4 inter residual.
     /// * `mb_origin_x` / `mb_origin_y` — top-left luma pixel position.
+    /// * `field_mode` — half- vs quarter-sample luma field
+    ///   interpolation (the VOL `quarter_sample` selection; unlike
+    ///   *progressive* direct mode, whose vectors convert to the
+    ///   half-pel grid per §7.6.9.5.2, the §7.7.2.2 interlaced-direct
+    ///   vectors stay on the VOL grid and compensate accordingly).
     /// * `bits_per_pixel` — §6.3.3 sample depth for the §7.3 clip.
     ///
-    /// Direct-mode B-VOP MC always uses half-sample luma interpolation
-    /// with rounding control `0` (§7.7.2.2 pseudo code's final `mc`
-    /// argument).
+    /// Direct-mode B-VOP MC always uses rounding control `0`
+    /// (§7.7.2.2 pseudo code's final `mc` argument).
     pub fn reconstruct(
         &self,
         references: &BVopFieldReferences<'_>,
         residual: &InterMacroblock,
         mb_origin_x: i32,
         mb_origin_y: i32,
+        field_mode: FieldSampleMode,
         bits_per_pixel: u32,
     ) -> crate::reconstruct::ReconstructedMacroblock {
         let prediction = interlaced_direct_prediction(
@@ -604,6 +609,7 @@ impl BVopInterlacedDirectMbDecode {
             mb_origin_x,
             mb_origin_y,
             0,
+            field_mode,
         );
         crate::reconstruct::reconstruct_inter_macroblock(&prediction, residual, bits_per_pixel)
     }
@@ -745,6 +751,7 @@ impl BVopInterlacedTexturedDecode {
                 &self.residual,
                 mb_origin_x,
                 mb_origin_y,
+                field_mode,
                 bits_per_pixel,
             ),
         }
@@ -3090,7 +3097,7 @@ mod tests {
             cb: [[0i32; 8]; 8],
             cr: [[0i32; 8]; 8],
         };
-        let recon = decode.reconstruct(&refs, &residual, 16, 16, 8);
+        let recon = decode.reconstruct(&refs, &residual, 16, 16, FieldSampleMode::HalfSample, 8);
         for row in recon.luma {
             for px in row {
                 assert_eq!(px, 120);

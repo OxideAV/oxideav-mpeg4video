@@ -254,8 +254,14 @@ pub fn interlaced_direct_mvs(
 /// `interlaced_direct_bframes_stream_matches_reference_decode` and the
 /// in-repo erratum `docs/video/mpeg4-visual/mpeg4-visual-errata.md` (E1).
 ///
-/// `mb_x` / `mb_y` are the top-left luma pixel coordinates. Half-sample
-/// luma interpolation (the pseudo code's `mc` routine).
+/// `mb_x` / `mb_y` are the top-left luma pixel coordinates.
+/// `sample_mode` selects the half- or quarter-sample luma field
+/// interpolation: the printed pseudo code's `mc` routine is
+/// half-sample, but in a `quarter_sample == 1` VOL the §7.7.2.1
+/// blanket rule applies ("In quarter_sample mode the macroblock is
+/// calculated as described in subclause 7.6.2.2, accordingly"), so
+/// the derived quarter-pel field MVs compensate through the §7.6.2.2
+/// field cascade exactly like the explicit field-prediction modes.
 #[allow(clippy::too_many_arguments)]
 pub fn interlaced_direct_prediction(
     mvs: InterlacedDirectMvs,
@@ -265,11 +271,49 @@ pub fn interlaced_direct_prediction(
     mb_x: i32,
     mb_y: i32,
     rounding_type: u8,
+    sample_mode: crate::bvop_field_motion::FieldSampleMode,
 ) -> crate::reconstruct::InterPredictionMacroblock {
-    use crate::field_motion::{field_motion_compensate_one_reference, FieldMotionVectors};
+    use crate::bvop_field_motion::FieldSampleMode;
+    use crate::field_motion::{
+        field_motion_compensate_one_reference, field_motion_compensate_one_reference_qpel,
+        FieldMotionVectors,
+    };
     use crate::reconstruct::{MACROBLOCK_CHROMA_SIDE, MACROBLOCK_LUMA_SIDE};
 
-    let fwd = field_motion_compensate_one_reference(
+    let compensate = |luma: &crate::half_sample::ReferenceVop<'_>,
+                      cb: &crate::half_sample::ReferenceVop<'_>,
+                      cr: &crate::half_sample::ReferenceVop<'_>,
+                      mvs: FieldMotionVectors,
+                      top_ref: bool,
+                      bottom_ref: bool| match sample_mode {
+        FieldSampleMode::HalfSample => field_motion_compensate_one_reference(
+            luma,
+            cb,
+            cr,
+            mvs,
+            top_ref,
+            bottom_ref,
+            mb_x,
+            mb_y,
+            rounding_type,
+        ),
+        FieldSampleMode::QuarterSample { bits_per_pixel } => {
+            field_motion_compensate_one_reference_qpel(
+                luma,
+                cb,
+                cr,
+                mvs,
+                top_ref,
+                bottom_ref,
+                mb_x,
+                mb_y,
+                rounding_type,
+                bits_per_pixel,
+            )
+        }
+    };
+
+    let fwd = compensate(
         references.forward_luma,
         references.forward_cb,
         references.forward_cr,
@@ -279,15 +323,12 @@ pub fn interlaced_direct_prediction(
         },
         forward_top_ref.as_bit(),
         forward_bottom_ref.as_bit(),
-        mb_x,
-        mb_y,
-        rounding_type,
     );
     // §7.7.2.2 backward call, erratum-corrected (E1): mvb[0] drives the
     // top field, mvb[1] the bottom field — matching the callee signature
     // and the forward call's ordering. Reference fields are fixed at
     // (top → Top, bottom → Bottom), the pseudo code's `0, 1` literals.
-    let bak = field_motion_compensate_one_reference(
+    let bak = compensate(
         references.backward_luma,
         references.backward_cb,
         references.backward_cr,
@@ -297,9 +338,6 @@ pub fn interlaced_direct_prediction(
         },
         false,
         true,
-        mb_x,
-        mb_y,
-        rounding_type,
     );
 
     let mut out = crate::reconstruct::InterPredictionMacroblock::zero();
@@ -556,6 +594,7 @@ mod tests {
             16,
             16,
             0,
+            crate::bvop_field_motion::FieldSampleMode::HalfSample,
         );
         // Top field row 0: (0 + (16+x) + 1) >> 1; bottom field row 1:
         // (0 + (14+x) + 1) >> 1 — one gray level below the top row.
@@ -610,6 +649,7 @@ mod tests {
             16,
             16,
             0,
+            crate::bvop_field_motion::FieldSampleMode::HalfSample,
         );
         for row in pred.luma {
             for px in row {

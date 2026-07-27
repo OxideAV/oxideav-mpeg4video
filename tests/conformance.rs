@@ -657,3 +657,45 @@ fn compat_mq_dp_stream_collapses_to_near_ties() {
         DecodeOptions::ecosystem(),
     );
 }
+
+#[test]
+fn interlaced_qpel_ipb_stream_matches_within_interlaced_direct_envelope() {
+    // Interlaced field DCT/ME + quarter-sample + B-VOPs (ildct + ilme
+    // + qpel + bf 2): the arbitrated §7.7.2.1 field-qpel geometry
+    // exercised through the §7.7.2.2 B-VOP field modes AND the
+    // interlaced-direct path (whose derived quarter-pel field MVs
+    // compensate through the §7.6.2.2 field cascade). Every
+    // macroblock class is bit-exact EXCEPT the §7.7.2.2
+    // interlaced-direct macroblocks with non-zero co-located field
+    // MVs — the same documented spec-vs-ecosystem divergence as the
+    // other interlaced-B streams. Measured: 582/73728 ~= 0.79 %,
+    // max 49.
+    assert_stream_bounded(
+        "ilaced_qpel_ipb_64x64.m4v",
+        "ilaced_qpel_ipb_64x64.yuv",
+        64,
+        64,
+        50,
+        0.01,
+    );
+}
+
+#[test]
+fn compat_interlaced_qpel_ipb_stream_is_bit_exact() {
+    // Under the compat zero-co-located derivation every
+    // interlaced-direct macroblock of this stream goes bit-exact —
+    // the first stream in the corpus that is FULLY bit-exact under
+    // compat while exercising the interlaced-direct clause (measured
+    // 0/73728).
+    let (max, differing, total) = stream_diff_with(
+        "ilaced_qpel_ipb_64x64.m4v",
+        "ilaced_qpel_ipb_64x64.yuv",
+        64,
+        64,
+        DecodeOptions::ecosystem(),
+    );
+    assert!(
+        differing == 0,
+        "ilaced_qpel_ipb under compat: {differing}/{total} differ (max {max})"
+    );
+}

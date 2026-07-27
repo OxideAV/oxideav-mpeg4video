@@ -79,10 +79,11 @@ decode end-to-end** (`decode_i_vop_macroblocks_dp` /
 partition structure, §E.1.2 prediction resets, header-partition intra
 DC feeding the texture partition, Table B.23 RVLC texture when
 `reversible_vlc == 1`), with B-VOPs on the combined syntax per the
-§6.2.5.3 NOTE. Twenty-two black-box conformance fixtures (intra / IP /
-IPB / qpel {IP, IPB, +4MV} / AC-prediction / alternate-scan /
+§6.2.5.3 NOTE. Twenty-three black-box conformance fixtures (intra /
+IP / IPB / qpel {IP, IPB, +4MV} / AC-prediction / alternate-scan /
 data-partitioned IPB / QCIF-resync IPB / interlaced × {intra,
-alt-scan, IP, IP-motion, IPB, qpel-IP, direct-B 176×144} / mpeg-quant
+alt-scan, IP, IP-motion, IPB, qpel-IP, qpel-IPB, direct-B 176×144} /
+mpeg-quant
 × {plain, qpel+4MV, interlaced-B, data-partitioned}) are asserted
 bit-exact, near-exact, or envelope-bounded as described above — each
 also pinned under the compat mode. The **interlaced quarter-sample
@@ -130,7 +131,10 @@ Measured effect (`tests/conformance.rs` `compat_*` pins): the
 near-tie samples, the interlaced I/P/B stream from 650 samples to 7
 near-ties, and the 176×144 interlaced-direct stream from 6202 samples
 (max 114) to 2777 (0.29 %, max 64) with 29/30 interlaced-direct
-macroblocks bit-exact — the single residual macroblock's oracle
+macroblocks bit-exact, and the interlaced qpel-IPB stream (whose
+direct macroblocks compensate through the §7.6.2.2 field cascade)
+from 582 samples to **fully bit-exact** — the single 176×144 residual
+macroblock's oracle
 reconstruction is uniquely pinned by exhaustive per-field search and
 is consistent with the *printed* §7.7.2.2 formulas evaluated from a
 co-located field-MV state that differs from the bitstream-reconstructed

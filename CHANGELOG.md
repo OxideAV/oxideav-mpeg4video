@@ -8,6 +8,24 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Interlaced-direct macroblocks in a quarter-sample VOL now
+  compensate through the §7.6.2.2 field cascade** —
+  `interlaced_direct_prediction` /
+  `BVopInterlacedDirectMbDecode::reconstruct` take a
+  `FieldSampleMode` and route the derived quarter-pel field MVs
+  through the quarter-sample field interpolator (the printed
+  §7.7.2.2 pseudo code's `mc` call is half-sample only, but the
+  §7.7.2.1 blanket rule — "In quarter_sample mode the macroblock is
+  calculated as described in subclause 7.6.2.2, accordingly" —
+  applies; unlike *progressive* direct mode the interlaced-direct
+  vectors stay on the VOL grid). Validated by a new
+  `ildct+ilme+qpel+bf 2` conformance stream
+  (`ilaced_qpel_ipb_64x64`): spec mode carries only the documented
+  §7.7.2.2 interlaced-direct co-located envelope (582/73728 ≈
+  0.79 %, max 49) and under the ecosystem-compat zero-co-located
+  derivation the stream is **fully bit-exact** — the corpus' first
+  stream exercising the interlaced-direct clause with a 0-sample
+  compat decode.
 - **§7.7.2.1 quarter-sample field motion compensation is now
   bit-exact** — the interlaced+qpel conformance stream
   (`ilaced_qpel_ip_64x64`) drops its 1184-sample (max 111) bounded
