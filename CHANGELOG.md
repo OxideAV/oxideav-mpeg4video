@@ -52,6 +52,20 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Interlaced-direct probe pins** (`tests/direct_mode_probes.rs` +
+  `tests/fixtures/dm_probe_*.yuv`): constructed P+B probe streams
+  with provably non-zero co-located field MVs over textured anchors
+  arbitrate the §7.7.2.2 ecosystem derivation directly — the compat
+  zero-co-located model is **confirmed unconditionally** for a
+  transmitted non-zero `MVD[0]` and for the zero-bit `modb "1"` form
+  (compat decodes bit-exact up to near-ties), while a *transmitted*
+  `MVD[0] == (0, 0)` observes **progressive** direct mode over the
+  co-located frame vector `Div2Round(MVf1 + MVf2)` — a newly
+  characterised sub-behaviour reproduced by neither mode (no
+  conformance-corpus stream contains such a macroblock; the compat
+  decision is deferred to a project ruling and both modes' envelopes
+  are pinned).
+
 - **Opt-in ecosystem-compat decode mode** (`compat::DecodeOptions`;
   default is the literal spec text) covering the two documented
   spec-vs-ecosystem divergences: the §7.7.2.2 interlaced-direct

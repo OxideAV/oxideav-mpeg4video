@@ -141,7 +141,15 @@ co-located field-MV state that differs from the bitstream-reconstructed
 one (the co-located anchor region is flat, so that internal state is
 not determinable from pixels; a docs-fixture trace ask is filed).
 Streams exercising neither clause decode sample-identically in both
-modes (asserted).
+modes (asserted). Constructed-probe arbitration with provably
+**non-zero co-located field MVs** over textured anchors
+(`tests/direct_mode_probes.rs`) confirms the zero-co-located model
+unconditionally for transmitted non-zero and absent `MVD[0]`; the
+same probes found that a *transmitted* `MVD[0] == (0, 0)` observes
+**progressive** direct mode over `Div2Round(MVf1 + MVf2)` instead —
+a sub-behaviour reproduced by neither mode today (no corpus stream
+contains such a macroblock; the compat decision awaits a ruling and
+both modes' envelopes are pinned).
 
 ## What works today
 

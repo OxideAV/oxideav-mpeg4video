@@ -122,6 +122,30 @@ two 8×8 §7.6.2.2 blocks with per-sub-block Figure 7-30 mirroring, and
 the chroma field MV's vertical quarter → half halving floors on the
 field grid (`Div2Round(mv_y >> 2)`).
 
+### Interlaced-direct probe pins (`dm_probe_*.yuv`)
+
+The eight `dm_probe_*.yuv` files are reference decodes of constructed
+probe streams that arbitrated the §7.7.2.2 interlaced-direct
+derivation with **non-zero co-located field MVs over textured
+anchors** (see `tests/direct_mode_probes.rs`, which rebuilds each
+probe bitstream deterministically). Each probe is the
+`ilaced_ipb_64x64.m4v` configuration headers + I-VOP, a hand-written
+P-VOP whose macroblock (1, 1) is field-predicted with chosen field
+reference selections and field MVs (all else skipped), and a
+hand-written B-VOP whose macroblock (1, 1) is a direct macroblock
+(zero-bit `modb "1"`, or explicit `modb "01"` + `mb_type "1"` with a
+chosen `MVD[0]`). Expected outputs via the standard oracle command:
+
+```
+ffmpeg -idct faani -i dm_probe_<name>.m4v -f rawvideo -pix_fmt yuv420p dm_probe_<name>.yuv
+```
+
+Findings: the compat zero-co-located model is confirmed
+unconditionally for non-zero and absent `MVD[0]`; a transmitted
+`MVD[0] == (0, 0)` instead observes progressive direct over
+`Div2Round(MVf1 + MVf2)` (documented divergence, ruling pending —
+`tests/direct_mode_probes.rs` module docs).
+
 ### From earlier rounds
 
 The remaining thirteen `.m4v` streams predate this notes file; they
@@ -183,6 +207,14 @@ c6c38a7b94714432027886065c6f4f6bd0044cb81bba99ecaaec2d265e66defd  mq_qpel_mv4_ip
 ca2cb8b3cbb12801ede055f71d101004a65e13707f514bf7a8084a2feb74839d  mq_dp_ipb_64x64.yuv
 7f3af441a9b0f41f5d8bbf689339388607581fc842be1b3c467c291d33bd9a8b  ilaced_qpel_ipb_64x64.m4v
 ce464e80c84845d59f2a674d98ce37bedae4cd828c8429e26876d5725cc21df9  ilaced_qpel_ipb_64x64.yuv
+5355f5c045c119ffe20d58a1c9c7938d0c4879c14773de02332115c96a2b8e2d  dm_probe_mixed.yuv
+b58a72baed33fc9c2bc5b4f449c8e7c8c070b7e4c5d5d304ccab8489984a16a6  dm_probe_modb1.yuv
+625426911d12683b122cf46975c87182ac9bc0a9916dd98188fea7c1307eba13  dm_probe_mvd0_a.yuv
+0bbb86abc6a33704e3d5d11c0e6927eacdd18a6098799df759dee11d67236b8a  dm_probe_mvd0_b.yuv
+03c5ca94625cf38431dd1427f0e7e6477b7c66ac0ef2fbf4902c0e6692041f08  dm_probe_mvd0_c.yuv
+45d3f03857c26c9b7a479897e5433081ea6571a26ec2eca29e6767d7ac4bf916  dm_probe_mvdnz.yuv
+0ccac0ec839f99f37348004c392e34afc029ca07be08781c84d7c2a62c3c4ef3  dm_probe_xref.yuv
+bd5ebcb899e9cbf564155ffae0e0383486b5d03f7e35d3353547838a5bf60206  dm_probe_zero_ctl.yuv
 750f917ee35f593d5766bf33309aa6659b39884ed56af3cf9d785a2a609f2c1d  fq_probe_diag.yuv
 b29588dfd261fe8f4e04a4f8cba31df8150a7b77bb10b2714af5f1ab0c9d46ab  fq_probe_half_seam.yuv
 133f043fbdb383ef5721aaf501a7a183efe840fba8a4a255f7e98bdc26006235  fq_probe_mixed.yuv

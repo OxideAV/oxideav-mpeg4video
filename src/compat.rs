@@ -22,6 +22,21 @@
 //!    macroblock's field selections (root-caused by exhaustive
 //!    per-macroblock-field pixel search — see `tests/conformance.rs`).
 //!
+//!    Constructed-probe arbitration with provably **non-zero**
+//!    co-located field MVs over textured anchors
+//!    (`tests/direct_mode_probes.rs`) confirmed this model
+//!    unconditionally for a transmitted non-zero `MVD[0]` and for the
+//!    zero-bit `modb == "1"` form. The same probes established a
+//!    boundary the compat mode deliberately does **not** reproduce
+//!    yet: for a direct macroblock whose `MVD[0]` is *transmitted but
+//!    exactly (0, 0)*, the observed ecosystem runs **progressive**
+//!    direct mode over the co-located frame vector
+//!    `Div2Round(MVf1 + MVf2)` instead. No conformance-corpus stream
+//!    contains such a macroblock; whether the compat mode should
+//!    adopt that branch awaits a project ruling (the probe pins
+//!    record both modes' measured envelopes so any change is
+//!    deliberate).
+//!
 //! 2. **§7.4.4.5 mismatch control.** The spec applies the method-1
 //!    (`quant_type == 1`) sum-parity toggle of `F[7][7]` to every
 //!    block. Observed reference decodes apply it to **non-intra blocks
