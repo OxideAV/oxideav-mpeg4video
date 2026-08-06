@@ -20,6 +20,13 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Encoder robustness sweep (round 438, stage 7)** —
+  `tests/encoder_stress.rs`: adversarial content (full-range LCG
+  noise, 1×1 0/255 checkerboards, saturated flats, hard vertical
+  edges) across qp {1, 13, 31}, both quantisation methods, partial-
+  edge and single-macroblock grids, in I/P/I/P GOPs — every stream
+  self-decodes sample-exact against the closed-loop reconstructions.
+
 
 - **P-VOP encoder end-to-end (round 438, stage 6)** — `pvop_encode`:
   §7.6 motion estimation (±8-pel full-search SAD with §7.6.4
