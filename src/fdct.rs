@@ -36,33 +36,14 @@ use crate::inverse_quant::saturation_bounds;
 
 const N: usize = 8;
 
-/// Pre-computed cosine table `COS[u][x] = cos((2x + 1)uπ / 16)` —
-/// the same kernel the inverse side uses, indexed here as the forward
-/// sum over `x` for each output frequency `u`.
-///
-/// The values are **compile-time `f64` literals** (each is the
-/// nearest-`f64` to the mathematical cosine, printed to full
-/// round-trip precision) rather than runtime `f64::cos` calls: libm
-/// implementations legitimately differ by an ulp across platforms,
-/// and an encoder must emit **byte-identical** streams everywhere for
-/// the committed black-box fixtures to pin anything. With literal
-/// kernel constants every operation below is IEEE-754-determined, so
-/// the emitted bitstream is platform-independent.
-#[rustfmt::skip]
-const COS: [[f64; N]; N] = [
-    [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
-    [0.9807852804032304, 0.8314696123025452, 0.5555702330196023, 0.19509032201612833, -0.1950903220161282, -0.555570233019602, -0.8314696123025453, -0.9807852804032304],
-    [0.9238795325112867, 0.38268343236508984, -0.3826834323650897, -0.9238795325112867, -0.9238795325112868, -0.38268343236509034, 0.38268343236509, 0.9238795325112865],
-    [0.8314696123025452, -0.1950903220161282, -0.9807852804032304, -0.5555702330196022, 0.5555702330196018, 0.9807852804032304, 0.19509032201612878, -0.8314696123025451],
-    [0.7071067811865476, -0.7071067811865475, -0.7071067811865477, 0.7071067811865474, 0.7071067811865477, -0.7071067811865467, -0.7071067811865472, 0.7071067811865466],
-    [0.5555702330196023, -0.9807852804032304, 0.1950903220161283, 0.8314696123025455, -0.8314696123025451, -0.19509032201612803, 0.9807852804032307, -0.5555702330196015],
-    [0.38268343236508984, -0.9238795325112868, 0.9238795325112865, -0.3826834323650899, -0.38268343236509056, 0.9238795325112867, -0.9238795325112864, 0.38268343236508956],
-    [0.19509032201612833, -0.5555702330196022, 0.8314696123025455, -0.9807852804032307, 0.9807852804032304, -0.831469612302545, 0.5555702330196015, -0.19509032201612858],
-];
-
+/// The forward kernel is the decoder's Annex A.1 cosine table
+/// ([`crate::idct`]'s correctly-rounded compile-time constants),
+/// indexed here as the forward sum over `x` for each output
+/// frequency `u` — the two directions can never drift, and the
+/// emitted bitstream is byte-deterministic on every platform.
 #[inline]
 fn cos_table() -> &'static [[f64; N]; N] {
-    &COS
+    crate::idct::cos_table()
 }
 
 /// `C(k)` from Annex A.1: `1/√2` when `k == 0`, `1` otherwise.

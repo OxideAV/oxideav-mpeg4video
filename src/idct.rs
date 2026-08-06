@@ -59,27 +59,46 @@ const N: usize = 8;
 /// for `N = 8`. Lazy-initialised on first use.
 ///
 /// Used by both passes of the separable 2-D IDCT.
-fn cos_table() -> &'static [[f64; N]; N] {
-    // Compile-time `f64` literals (nearest-`f64` to the mathematical
-    // cosines, full round-trip precision) instead of runtime
-    // `f64::cos`: libm implementations differ by an ulp across
-    // platforms, and both the conformance pins and the encoder's
-    // closed decode loop (whose reconstruction feeds the next P-VOP's
-    // residuals) need the transform to be byte-deterministic
-    // everywhere. Every arithmetic operation on these constants is
-    // IEEE-754-determined. Values match `src/fdct.rs`'s `COS` table.
-    #[rustfmt::skip]
-    const COS: [[f64; N]; N] = [
-    [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
-    [0.9807852804032304, 0.8314696123025452, 0.5555702330196023, 0.19509032201612833, -0.1950903220161282, -0.555570233019602, -0.8314696123025453, -0.9807852804032304],
-    [0.9238795325112867, 0.38268343236508984, -0.3826834323650897, -0.9238795325112867, -0.9238795325112868, -0.38268343236509034, 0.38268343236509, 0.9238795325112865],
-    [0.8314696123025452, -0.1950903220161282, -0.9807852804032304, -0.5555702330196022, 0.5555702330196018, 0.9807852804032304, 0.19509032201612878, -0.8314696123025451],
-    [0.7071067811865476, -0.7071067811865475, -0.7071067811865477, 0.7071067811865474, 0.7071067811865477, -0.7071067811865467, -0.7071067811865472, 0.7071067811865466],
-    [0.5555702330196023, -0.9807852804032304, 0.1950903220161283, 0.8314696123025455, -0.8314696123025451, -0.19509032201612803, 0.9807852804032307, -0.5555702330196015],
-    [0.38268343236508984, -0.9238795325112868, 0.9238795325112865, -0.3826834323650899, -0.38268343236509056, 0.9238795325112867, -0.9238795325112864, 0.38268343236508956],
-    [0.19509032201612833, -0.5555702330196022, 0.8314696123025455, -0.9807852804032307, 0.9807852804032304, -0.831469612302545, 0.5555702330196015, -0.19509032201612858],
-    ];
-    &COS
+/// `cos(kπ/16)` for `k = 0..=8`, each the **correctly-rounded**
+/// nearest-`f64` to the mathematical value (`k == 4` is exactly
+/// `1/√2`, `k == 8` exactly `0`). Compile-time literals instead of
+/// runtime `f64::cos`: libm implementations differ by an ulp across
+/// platforms, and both the conformance pins and the encoder's closed
+/// decode loop need the transform byte-deterministic everywhere.
+pub(crate) const COS_K_PI_16: [f64; 9] = [
+    1.0,
+    0.980_785_280_403_230_4,
+    0.923_879_532_511_286_7,
+    0.831_469_612_302_545_2,
+    core::f64::consts::FRAC_1_SQRT_2,
+    0.555_570_233_019_602_2,
+    0.382_683_432_365_089_8,
+    0.195_090_322_016_128_28,
+    0.0,
+];
+
+/// Build `COS[u][x] = cos((2x + 1)uπ / 16)` from [`COS_K_PI_16`] via
+/// the quarter-wave symmetry of the cosine (`m = (2x+1)·u mod 32`;
+/// the four quadrants map onto `±COS_K_PI_16[k]`). Sign flips and
+/// copies only — every value stays correctly rounded.
+pub(crate) fn cos_table() -> &'static [[f64; N]; N] {
+    use std::sync::OnceLock;
+    static TABLE: OnceLock<[[f64; N]; N]> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut table = [[0.0f64; N]; N];
+        for (u, row) in table.iter_mut().enumerate() {
+            for (x, cell) in row.iter_mut().enumerate() {
+                let m = ((2 * x + 1) * u) % 32;
+                *cell = match m {
+                    0..=8 => COS_K_PI_16[m],
+                    9..=16 => -COS_K_PI_16[16 - m],
+                    17..=24 => -COS_K_PI_16[m - 16],
+                    _ => COS_K_PI_16[32 - m],
+                };
+            }
+        }
+        table
+    })
 }
 
 /// `C(k)` from Annex A.1: `1/√2` when `k == 0`, `1` otherwise.
