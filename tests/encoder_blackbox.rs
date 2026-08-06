@@ -1,0 +1,207 @@
+//! Black-box cross-check of the I-VOP encoder: the committed streams
+//! under `tests/fixtures/` were produced by THIS encoder from the
+//! deterministic synthetic source below, then decoded by the opaque
+//! reference binary with the floating-point IDCT selected (commands +
+//! SHA-256 in `tests/fixtures/NOTES.md`). The tests assert
+//!
+//! 1. **byte determinism** — re-encoding the same synthetic input
+//!    reproduces the committed stream byte-for-byte (any encoder
+//!    change that alters the bitstream must regenerate the fixture
+//!    and re-run the black-box decode), and
+//! 2. **decode agreement** — the crate's own decoder reproduces the
+//!    reference decode of our stream **bit-exactly**, i.e. an
+//!    independent decoder accepts and identically interprets what we
+//!    emit.
+//!
+//! No external implementation source was consulted — the reference
+//! binary was invoked as an opaque validator only.
+
+use oxideav_mpeg4video::decoder::Mpeg4VideoDecoder;
+use oxideav_mpeg4video::ivop_encode::{
+    encode_i_vop, write_configuration_headers, EncoderConfig, FrameView,
+};
+use oxideav_mpeg4video::vol::parse_video_object_layer;
+
+fn fixture(name: &str) -> Vec<u8> {
+    let path = format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"));
+    std::fs::read(&path).unwrap_or_else(|e| panic!("read {path}: {e}"))
+}
+
+/// Deterministic LCG (numerical recipes constants).
+fn lcg(state: &mut u32) -> u32 {
+    *state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+    *state
+}
+
+/// The deterministic 64×64 4:2:0 source shared with the fixture
+/// generation run — gradients, an LCG texture field, and a
+/// frame-indexed bright square.
+fn synthesise(frame_index: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let (width, height) = (64usize, 64usize);
+    let (cw, ch) = (width / 2, height / 2);
+    let mut y = vec![0u8; width * height];
+    let mut state = 0x1234_5678u32 ^ (frame_index as u32).wrapping_mul(0x9E37_79B9);
+    for row in 0..height {
+        for col in 0..width {
+            let grad = (row * 3 + col * 2) as i32 % 200 + 20;
+            let noise = (lcg(&mut state) >> 28) as i32;
+            let mut v = grad + noise;
+            let bx = (frame_index * 7) % width;
+            if col >= bx && col < (bx + 12).min(width) && (8..20).contains(&row) {
+                v = 235;
+            }
+            y[row * width + col] = v.clamp(16, 235) as u8;
+        }
+    }
+    let mut cb = vec![0u8; cw * ch];
+    let mut cr = vec![0u8; cw * ch];
+    for row in 0..ch {
+        for col in 0..cw {
+            cb[row * cw + col] = (96 + ((row + col + frame_index) % 64)) as u8;
+            cr[row * cw + col] = (160u32.wrapping_sub((row * 2 + col) as u32 % 48)) as u8;
+        }
+    }
+    (y, cb, cr)
+}
+
+/// Build the fixture stream: 3 I-VOPs, 64×64, the given quantisation
+/// method, qp 4, resolution 25, cost-decided AC prediction.
+fn build_stream(quant_type: bool) -> Vec<u8> {
+    let cfg = EncoderConfig {
+        width: 64,
+        height: 64,
+        quant_type,
+        ..EncoderConfig::default()
+    };
+    let headers = write_configuration_headers(&cfg);
+    let pos = headers
+        .windows(4)
+        .position(|w| w == [0, 0, 1, 0x20])
+        .expect("VOL start code");
+    let vol = parse_video_object_layer(&headers[pos..], cfg.profile_and_level()).unwrap();
+    let mut stream = headers;
+    for k in 0..3usize {
+        let (y, cb, cr) = synthesise(k);
+        let view = FrameView {
+            y: &y,
+            cb: &cb,
+            cr: &cr,
+            width: 64,
+            height: 64,
+        };
+        let (unit, _recon) = encode_i_vop(&vol, &cfg, &view, 0, k as u16, 4);
+        stream.extend_from_slice(&unit);
+    }
+    stream
+}
+
+fn assert_own_decode_matches_reference(m4v: &str, yuv: &str) {
+    let stream = fixture(m4v);
+    let reference = fixture(yuv);
+    let mut dec = Mpeg4VideoDecoder::new();
+    let mut frames = dec.decode(&stream).expect("committed stream must decode");
+    frames.extend(dec.flush());
+    let frame_len = 64 * 64 + 2 * 32 * 32;
+    assert_eq!(
+        reference.len(),
+        frames.len() * frame_len,
+        "{yuv}: frame count"
+    );
+    for (k, frame) in frames.iter().enumerate() {
+        let base = k * frame_len;
+        assert_eq!(
+            frame.luma_samples(),
+            &reference[base..base + 64 * 64],
+            "{m4v}: frame {k} luma vs reference decode"
+        );
+        assert_eq!(
+            frame.cb_samples(),
+            &reference[base + 64 * 64..base + 64 * 64 + 32 * 32],
+            "{m4v}: frame {k} cb"
+        );
+        assert_eq!(
+            frame.cr_samples(),
+            &reference[base + 64 * 64 + 32 * 32..base + frame_len],
+            "{m4v}: frame {k} cr"
+        );
+    }
+}
+
+#[test]
+fn method2_stream_reproduces_committed_fixture() {
+    assert_eq!(
+        build_stream(false),
+        fixture("enc_intra_m2_64x64.m4v"),
+        "encoder output drifted from the black-box-validated fixture; \
+         regenerate the fixture AND its reference decode"
+    );
+}
+
+#[test]
+fn method1_stream_reproduces_committed_fixture() {
+    assert_eq!(
+        build_stream(true),
+        fixture("enc_intra_m1_64x64.m4v"),
+        "encoder output drifted from the black-box-validated fixture; \
+         regenerate the fixture AND its reference decode"
+    );
+}
+
+#[test]
+fn method2_stream_decodes_bit_exact_against_reference_decoder() {
+    assert_own_decode_matches_reference("enc_intra_m2_64x64.m4v", "enc_intra_m2_64x64.yuv");
+}
+
+/// The method-1 stream hits the documented §7.4.4.5 spec-vs-ecosystem
+/// divergence (see `crate::compat`): the reference decoder applies
+/// the mismatch toggle to non-intra blocks only, so the **ecosystem**
+/// mode must be bit-exact while the literal-spec decode carries a
+/// bounded ±1 envelope on the toggled-`F[7][7]` blocks.
+#[test]
+fn method1_stream_decodes_against_reference_decoder_per_compat_contract() {
+    use oxideav_mpeg4video::compat::DecodeOptions;
+    let stream = fixture("enc_intra_m1_64x64.m4v");
+    let reference = fixture("enc_intra_m1_64x64.yuv");
+    let frame_len = 64 * 64 + 2 * 32 * 32;
+    let mut stats = Vec::new();
+    for opts in [DecodeOptions::ecosystem(), DecodeOptions::spec()] {
+        let mut dec = Mpeg4VideoDecoder::with_options(opts);
+        let mut frames = dec.decode(&stream).expect("committed stream must decode");
+        frames.extend(dec.flush());
+        assert_eq!(reference.len(), frames.len() * frame_len);
+        let (mut differing, mut max) = (0usize, 0i32);
+        for (k, frame) in frames.iter().enumerate() {
+            let ours: Vec<u8> = frame
+                .luma_samples()
+                .iter()
+                .chain(frame.cb_samples())
+                .chain(frame.cr_samples())
+                .copied()
+                .collect();
+            for (a, b) in ours
+                .iter()
+                .zip(&reference[k * frame_len..(k + 1) * frame_len])
+            {
+                let d = (i32::from(*a) - i32::from(*b)).abs();
+                if d > 0 {
+                    differing += 1;
+                }
+                max = max.max(d);
+            }
+        }
+        stats.push((differing, max));
+    }
+    assert_eq!(
+        stats[0],
+        (0, 0),
+        "ecosystem-compat decode must reproduce the reference bit-exactly"
+    );
+    // Literal-spec decode: the intra mismatch toggle flips isolated
+    // samples by at most ±1. The count is a property of the pinned
+    // fixture — regenerate both fixture files if the encoder changes.
+    assert_eq!(stats[1].1, 1, "spec-mode envelope must stay ±1");
+    assert_eq!(
+        stats[1].0, 834,
+        "spec-mode differing-sample count drifted; re-measure after regenerating fixtures"
+    );
+}

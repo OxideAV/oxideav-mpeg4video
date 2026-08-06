@@ -164,6 +164,28 @@ staged in `docs/video/mpeg4-visual/fixtures/interlaced-direct-bframes/`
 their SHA-256 below pins the byte-exact inputs, and every `.yuv` was
 regenerated this round with the command above.
 
+## Encoder-produced streams (round 438)
+
+The `enc_intra_*` pairs flow the OTHER way from every fixture above:
+the `.m4v` streams were produced by **this crate's own encoder**
+(`ivop_encode`, see `tests/encoder_blackbox.rs` — 3 I-VOPs, 64x64,
+qp 4, cost-decided AC prediction, method-2 / method-1 quantisation)
+from the deterministic synthetic source embedded in that test, and
+the `.yuv` files are the black-box reference decodes of those
+streams with the floating-point IDCT:
+
+```
+ffmpeg -idct faani -i enc_intra_m2_64x64.m4v -f rawvideo -pix_fmt yuv420p enc_intra_m2_64x64.yuv
+ffmpeg -idct faani -i enc_intra_m1_64x64.m4v -f rawvideo -pix_fmt yuv420p enc_intra_m1_64x64.yuv
+```
+
+The tests assert byte-determinism of re-encoding and bit-exact
+agreement between this crate's decode of the streams and the
+reference decode (the method-1 pair carries the documented §7.4.4.5
+intra-mismatch divergence: ecosystem-compat mode is bit-exact, the
+literal-spec decode differs on 834 samples by at most ±1). If the
+encoder's output changes, regenerate BOTH files and re-measure.
+
 ## SHA-256
 
 ```
@@ -230,6 +252,10 @@ b29588dfd261fe8f4e04a4f8cba31df8150a7b77bb10b2714af5f1ab0c9d46ab  fq_probe_half_
 1b754a60781267ac0f8cea8ff94608283f7c3240ef04976e11e9564965de19dc  fq_probe_odd_a.yuv
 60918961e4ead055d11d56659173eef8b78a87f82a5c43b2160b69bb673ca9fd  fq_probe_odd_c.yuv
 53e56fede4435ec365f4498832930c976414d7a52efe2d489e7ee275fb1ad6d7  fq_probe_odd_d.yuv
+6fe3321046b6132d318a5d407c0b6bb7ff6df9fa91a3423c8503235f492ff7b6  enc_intra_m1_64x64.m4v
+8d7f27a402d66eedf8421eb35798ad767714051875da174357773144c64e00e2  enc_intra_m1_64x64.yuv
+287a0ee5fd4341bbd0142b206eecf3afd7e6a9b7379634f964567c578cc0c9aa  enc_intra_m2_64x64.m4v
+6b41967056fd3f8df32ab57999ca6e4c2881532f7934fb14b073f6e0b57aa915  enc_intra_m2_64x64.yuv
 ```
 
 (Note: `aic_ipb_64x64.yuv` and `altscan_ipb_64x64.yuv` are

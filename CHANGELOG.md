@@ -8,6 +8,20 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Black-box cross-check of the encoder (round 438, stage 4)** —
+  `tests/encoder_blackbox.rs` + the `enc_intra_m2_64x64` /
+  `enc_intra_m1_64x64` fixture pairs: streams produced by this
+  crate's own I-VOP encoder from a deterministic synthetic source,
+  reference-decoded by the opaque black-box binary with the
+  floating-point IDCT (commands + SHA-256 in
+  `tests/fixtures/NOTES.md`). Pinned: byte-determinism of
+  re-encoding, and decode agreement — the method-2 stream is
+  **bit-exact** between this decoder and the reference decoder; the
+  method-1 stream exercises the documented §7.4.4.5
+  intra-mismatch divergence exactly as the compat contract predicts
+  (ecosystem-compat decode bit-exact, literal-spec decode 834
+  samples off by at most ±1).
+
 - **I-VOP encoder end-to-end (round 438, stage 3)** — `ivop_encode`:
   §6.2 configuration-header emission (VisualObjectSequence with the
   Table G.1 profile — SP/L3 for method-2, ASP/L3 for method-1 —
