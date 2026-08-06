@@ -8,6 +8,28 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **I-VOP encoder end-to-end (round 438, stage 3)** — `ivop_encode`:
+  §6.2 configuration-header emission (VisualObjectSequence with the
+  Table G.1 profile — SP/L3 for method-2, ASP/L3 for method-1 —
+  VisualObject, VideoObject, and a minimal-literal rectangular VOL),
+  the §6.2.5 I-VOP header, and the full §6.2.6/§6.2.7 intra
+  macroblock walk: forward DCT → quantisation → §7.4.3 DC/AC
+  prediction *emission* (same `IntraBlockGrid` neighbour resolution
+  as the decoder, incremental per-block recording, differentials
+  instead of adds) → §7.4.2 forward scan (derived from the decoder's
+  `inverse_scan`, drift-proof) → Tcoef VLC emission. The
+  `ac_pred_flag` is decided per macroblock by measured cost (both
+  variants emitted to probe writers). Every emitted VOP is decoded
+  back through the crate's own `decode_i_vop_macroblocks` — the
+  closed loop that makes the returned reconstruction the decoder's
+  by construction. Validation (`tests/encoder_i_vop.rs`): multi-VOP
+  streams under both quantisation methods and partial-edge
+  macroblock grids decode through `Mpeg4VideoDecoder`
+  **sample-exact** against the encoder reconstruction; PSNR floors
+  at qp 4–6; byte determinism; a qp 2/8/31 sweep with monotone
+  rate and distortion; and cost-decided AC prediction never grows
+  the stream.
+
 - **Encoder VLC emission (round 438, stage 2)** — `vlc_encode`, the
   exact inverses of the crate's transcribed decode tables:
   `put_intra_dc` (Table B.13/B.14 `dct_dc_size` + Table B.15

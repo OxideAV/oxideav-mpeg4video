@@ -358,6 +358,7 @@ pub mod interlaced_padding;
 pub mod inverse_quant;
 #[doc(hidden)]
 pub mod inverse_sadct;
+pub mod ivop_encode;
 pub mod macroblock; // mixed: `MacroblockParseError` stays visible
 pub mod motion; // mixed: `MotionParseError` / `DirectMvError` stay visible
 pub mod mv_predictor_grid; // mixed: `MvGridError` stays visible
