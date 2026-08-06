@@ -398,6 +398,7 @@ pub mod vector_padding; // mixed: `VectorPaddingError` stays visible
 #[doc(hidden)]
 pub mod vertical_padding;
 pub mod video_packet; // mixed: `VideoPacketParseError` stays visible
+pub mod vlc_encode;
 pub mod vol; // mixed: `VolHeader` + parse-error / field types stay visible
 pub mod vop; // mixed: `VopCodingType` / `VopParseError` stay visible
 pub mod vop_decode; // mixed: `VopDecodeError` stays visible

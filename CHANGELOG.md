@@ -8,6 +8,21 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Encoder VLC emission (round 438, stage 2)** — `vlc_encode`, the
+  exact inverses of the crate's transcribed decode tables:
+  `put_intra_dc` (Table B.13/B.14 `dct_dc_size` + Table B.15
+  additional code + NOTE-2 marker), `put_ac_event` /
+  `put_ac_events` (Table B.16/B.17 Tcoef with §7.4.1.3 escape
+  selection — direct codeword, Type 1 LMAX, Type 2 RMAX, Type 3
+  fixed-length), `put_mcbpc_i` / `put_mcbpc_p` (Tables B.6/B.7),
+  `put_cbpy` (Table B.8), `put_dquant` (Table 6-32), and
+  `put_motion_vector` / `put_mv_component` / `wrap_mvd_component`
+  (Table B.12 `mv_data` + §7.6.3 residuals and range wrap).
+  Round-trip pinned against the decoder's own `decode_intra_dc` /
+  `decode_ac_event` / `decode_mcbpc` / `decode_cbpy4` /
+  `decode_motion_vector_delta` across the full domains (every
+  tabulated EVENT both signs, escape sweeps, all `fcode` 1..=7).
+
 - **Encoder groundwork (round 438, stage 1)** — the first pieces of
   the encoder arc: `bitwriter::BitWriter` (MSB-first `uimsbf`/`bslbf`
   emission with the §5.2.4 `next_start_code()` stuffing discipline),

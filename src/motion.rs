@@ -254,6 +254,13 @@ const MVD_TABLE: &[(u16, u8, i32)] = &[
 /// The widest Table B.12 code is 13 bits.
 const MVD_MAX_CODE_LEN: usize = 13;
 
+/// Encoder-side view of the Table B.12 `mv_data` VLC list
+/// (`(code_bits, code_len, mv_data)` rows), used by
+/// [`crate::vlc_encode`] to build its reverse lookup.
+pub(crate) fn mvd_table() -> &'static [(u16, u8, i32)] {
+    MVD_TABLE
+}
+
 /// Decode one `mv_data` VLC (Table B.12) from `br`. Returns the doubled
 /// integer `mv_data` value (`= 2 * vector_differences`).
 fn decode_mv_data(br: &mut BitReader<'_>) -> Result<i32, MotionParseError> {

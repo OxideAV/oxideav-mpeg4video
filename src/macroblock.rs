@@ -482,6 +482,10 @@ fn match_vlc_u8<T: Copy>(
 /// data-partitioned I-VOP parser which shares this table.
 pub(crate) const MCBPC_I: &[(u16, u8, u8, u8)] = MCBPC_I_TABLE;
 
+/// Table B.8 `cbpy` codes (4 non-transparent blocks), exposed for the
+/// encoder-side VLC emitters which invert this table.
+pub(crate) const CBPY_4: &[(u8, u8, u8, u8)] = CBPY_4_TABLE;
+
 /// Table B.7 `mcbpc` codes for a P-VOP / S(GMC)-VOP, exposed for the
 /// §6.2.5.3 data-partitioned P-VOP parser which shares this table.
 pub(crate) const MCBPC_P: &[(u16, u8, u8, u8)] = MCBPC_P_TABLE;

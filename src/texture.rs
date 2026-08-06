@@ -431,6 +431,48 @@ include!("rvlc_tables.rs");
 const RVLC_ESCAPE_OPEN: u32 = 0b00001;
 const RVLC_ESCAPE_OPEN_LEN: u8 = 5;
 
+/// Encoder-side view of the decode tables: the Table B.16 / B.17
+/// Tcoef list for `kind` (each row `(code_bits, code_len, last, run,
+/// level)` without the trailing sign bit), used by
+/// [`crate::vlc_encode`] to build its reverse lookup.
+pub(crate) fn tcoef_table(kind: TcoefTable) -> &'static [(u32, u8, u8, u8, u16)] {
+    match kind {
+        TcoefTable::Intra => TCOEF_INTRA,
+        TcoefTable::Inter => TCOEF_INTER,
+    }
+}
+
+/// Encoder-side view of the Table B.13 / B.14 `dct_dc_size` VLCs
+/// (`(code_bits, code_len, size)` rows), used by
+/// [`crate::vlc_encode`].
+pub(crate) fn dc_size_table(component: DcComponent) -> &'static [(u16, u8, u8)] {
+    match component {
+        DcComponent::Luminance => DC_SIZE_LUMINANCE,
+        DcComponent::Chrominance => DC_SIZE_CHROMINANCE,
+    }
+}
+
+/// Encoder-side view of the §7.4.1.3 escape prefix (`0000 011`, 7
+/// bits).
+pub(crate) const ESCAPE: (u32, u8) = (TCOEF_ESCAPE_CODE, TCOEF_ESCAPE_LEN);
+
+/// Encoder-side LMAX lookup (Table B.19 intra / B.20 inter).
+pub(crate) fn lmax(kind: TcoefTable, last: bool, run: u32) -> Option<i32> {
+    match kind {
+        TcoefTable::Intra => lmax_intra(last, run),
+        TcoefTable::Inter => lmax_inter(last, run),
+    }
+}
+
+/// Encoder-side RMAX lookup (Table B.21 intra / B.22 inter). `level`
+/// is the absolute magnitude.
+pub(crate) fn rmax(kind: TcoefTable, last: bool, level: i32) -> Option<u32> {
+    match kind {
+        TcoefTable::Intra => rmax_intra(last, level),
+        TcoefTable::Inter => rmax_inter(last, level),
+    }
+}
+
 /// Match a prefix-free Tcoef table against the leading bits of `window`.
 /// Returns `(code_len, last, run, level)` on a hit (before the sign bit),
 /// `None` on no match.
