@@ -6,6 +6,21 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Encoder groundwork (round 438, stage 1)** — the first pieces of
+  the encoder arc: `bitwriter::BitWriter` (MSB-first `uimsbf`/`bslbf`
+  emission with the §5.2.4 `next_start_code()` stuffing discipline),
+  `fdct::forward_dct_8x8` (the Annex A.1 orthonormal forward
+  transform in `f64`, rounded per §4.1 and saturated to the §7.4.4.4
+  coefficient range — the exact dual of the crate's ideal IDCT), and
+  `quantise` (forward quantisers inverting the §7.4.4 decoder
+  formulas: intra DC via Table 7-1 `dc_scaler`, method-2
+  intra/inter dead-zone quantisers, method-1 intra/inter against the
+  `W` matrices, all levels clamped inside the escape-codable
+  `[-2047, 2047]` domain). Each is pinned by round-trip tests
+  against the crate's own decoder-side inverse pipeline.
+
 ### Fixed
 
 - **Interlaced-direct macroblocks in a quarter-sample VOL now

@@ -319,6 +319,7 @@ use oxideav_core::RuntimeContext;
 // the crate's semver-stable API.
 #[doc(hidden)]
 pub mod bitreader;
+pub mod bitwriter;
 pub mod block; // mixed: `BlockAssemblyError` stays visible
 pub mod bvop; // mixed: `BVopMbParseError` stays visible
 #[doc(hidden)]
@@ -338,6 +339,7 @@ pub mod data_partition; // mixed: `DataPartitionError` stays visible
 pub mod decoder;
 #[doc(hidden)]
 pub mod extended_padding;
+pub mod fdct;
 #[doc(hidden)]
 pub mod field_motion;
 pub mod frame_decode; // mixed: `FrameDecodeError` stays visible
@@ -369,6 +371,7 @@ pub mod perspective_warp;
 pub mod predictor;
 pub mod pvop_mv; // mixed: `PvopMvError` stays visible
 #[doc(hidden)]
+pub mod quantise;
 pub mod quarter_sample;
 #[doc(hidden)]
 pub mod reconstruct;
@@ -405,6 +408,7 @@ pub mod warp;
 // modules; the visible re-exports below them are the stable surface.
 #[doc(hidden)]
 pub use bitreader::{BitReader, BitReaderError};
+pub use bitwriter::BitWriter;
 pub use block::BlockAssemblyError;
 #[doc(hidden)]
 pub use block::{
@@ -475,6 +479,8 @@ pub use extended_padding::{
     BoundaryNeighbours, ExteriorNeighbourPosition, ExteriorPaddingOutcome,
 };
 #[doc(hidden)]
+pub use fdct::forward_dct_8x8;
+#[doc(hidden)]
 pub use field_motion::{
     div2_round, field_motion_compensate_one_reference, field_motion_compensate_one_reference_qpel,
     half_pel_chroma_mv_from_qpel, mc, reconstruct_field_motion_vectors, FieldMotionVectors,
@@ -498,7 +504,6 @@ pub use half_sample::{
     fetch_clamped_sample, interpolate_block, interpolate_block_into, interpolate_pixel,
     split_half_pel, ReferenceVop,
 };
-#[doc(hidden)]
 pub use idct::{idct_8x8, idct_saturation_bounds, saturate_idct_sample};
 #[doc(hidden)]
 pub use interlaced_information::{
@@ -559,6 +564,10 @@ pub use pvop_mv::{
     predict_luma_macroblock, reconstruct_pvop_macroblock, MvDriver, PvopMbMotion,
 };
 #[doc(hidden)]
+pub use quantise::{
+    quantise_intra_dc, quantise_method1_inter, quantise_method1_intra, quantise_method2_inter,
+    quantise_method2_intra,
+};
 pub use quarter_sample::{
     field_mvy_to_field_grid, fir_8tap_clip, half_pel_b, half_pel_c, half_pel_d,
     interpolate_block_qpel, interpolate_block_qpel_field, interpolate_block_qpel_field_into,
