@@ -8,6 +8,17 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Registry-facing encoder (round 438, stage 5)** —
+  `encoder::Mpeg4VideoEncoder` implements the
+  `oxideav_core::Encoder` contract over the I-VOP encoder
+  (send_frame → per-frame keyframe packets in the VOL tick time
+  base, §6.3.5 modulo/increment clock from the caller's frame rate,
+  configuration run in `output_params().extradata` and prepended to
+  the first packet), with the `Mpeg4EncoderOptions` schema (`qp`,
+  `mpeg-quant`, `ac-pred`) and the direct `make_encoder` factory —
+  the dual-API sibling of `make_decoder`. `register()` now declares
+  `encode` capability and the encoder factory + options schema.
+
 - **Black-box cross-check of the encoder (round 438, stage 4)** —
   `tests/encoder_blackbox.rs` + the `enc_intra_m2_64x64` /
   `enc_intra_m1_64x64` fixture pairs: streams produced by this

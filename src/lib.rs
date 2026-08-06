@@ -338,6 +338,7 @@ pub mod compat;
 pub mod data_partition; // mixed: `DataPartitionError` stays visible
 pub mod decoder;
 #[doc(hidden)]
+pub mod encoder;
 pub mod extended_padding;
 pub mod fdct;
 #[doc(hidden)]
@@ -848,6 +849,7 @@ impl From<SpriteTrajectoryError> for Error {
 }
 
 pub use decoder::{make_decoder, Mpeg4DecoderOptions, Mpeg4PacketDecoder};
+pub use encoder::{make_encoder, Mpeg4EncoderOptions, Mpeg4VideoEncoder};
 
 /// Register the MPEG-4 Part 2 Visual decoder with the runtime codec
 /// registry under the id `mpeg4video`, claiming the common container
@@ -865,6 +867,7 @@ pub fn register(ctx: &mut RuntimeContext) {
 
     let mut caps = CodecCapabilities::video("mpeg4video_sw");
     caps.decode = true;
+    caps.encode = true;
     caps.lossy = true;
 
     ctx.codecs.register(
@@ -872,6 +875,8 @@ pub fn register(ctx: &mut RuntimeContext) {
             .capabilities(caps)
             .decoder(decoder::make_decoder)
             .decoder_options::<Mpeg4DecoderOptions>()
+            .encoder(encoder::make_encoder)
+            .encoder_options::<Mpeg4EncoderOptions>()
             .tags([
                 CodecTag::fourcc(b"XVID"),
                 CodecTag::fourcc(b"DIVX"),
