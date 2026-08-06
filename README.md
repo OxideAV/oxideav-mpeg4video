@@ -2,8 +2,8 @@
 
 [![CI](https://github.com/OxideAV/oxideav-mpeg4video/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-mpeg4video/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-mpeg4video.svg)](https://crates.io/crates/oxideav-mpeg4video) [![docs.rs](https://docs.rs/oxideav-mpeg4video/badge.svg)](https://docs.rs/oxideav-mpeg4video) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Pure-Rust clean-room decoder for MPEG-4 Part 2 Video (ISO/IEC 14496-2 /
-MPEG-4 Visual / ASP) for the
+Pure-Rust clean-room decoder **and encoder** for MPEG-4 Part 2 Video
+(ISO/IEC 14496-2 / MPEG-4 Visual / ASP) for the
 [oxideav](https://github.com/OxideAV/oxideav-workspace) framework. This
 is the standard MPEG-4 Part 2 bitstream (XVID / DIVX / DX50 / FMP4 /
 MP4V) — *not* the pre-standard Microsoft MPEG-4 family, which lives in
@@ -93,7 +93,35 @@ per-sub-block Figure 7-30 mirroring, and floor-halving of the chroma
 field MV's vertical quarter → half step — was black-box-arbitrated
 over seven constructed single-macroblock field-prediction probe
 streams, now committed as regression pins
-(`tests/field_qpel_probes.rs`). There is no encoder.
+(`tests/field_qpel_probes.rs`).
+
+**The encoder arc opened in round 438** and already covers rectangular
+progressive **I- and P-VOPs** end-to-end: §6.2 configuration-header
+emission (VOS/VO/VOL, SP/L3 or ASP/L3 per the tool set), Annex A.1
+forward DCT (compile-time correctly-rounded cosine kernels shared with
+the IDCT, so both directions are byte-deterministic on every
+platform), method-1 and method-2 forward quantisation, §7.4.3 DC/AC
+prediction *emission* (same `IntraBlockGrid` neighbour resolution as
+the decoder, `ac_pred_flag` decided per macroblock by measured cost),
+inverse-table VLC emission (Tables B.6–B.17 + all three §7.4.1.3
+escape modes, exhaustively round-tripped against the decode tables),
+§7.6 motion estimation (±8-pel full search + half-sample refinement
+through the decoder's own interpolator), the §7.6.5 median predictor
+over decoder-mirrored `MvGrid` state, `not_coded` skips, and a
+`gop-size` keyframe cadence. Every emitted VOP is **decoded back
+through the crate's own decoder walk** — the closed loop that makes
+encoder reference state a conformant decoder's by construction.
+Validation: self-encoded streams decode through `Mpeg4VideoDecoder`
+sample-exact against the closed-loop reconstructions (I-only, I+P
+with real motion, adversarial stress content across qp 1..=31 and
+partial-edge grids); black-box cross-checks pin byte-determinism and
+decode agreement — the reference decoder's decode of our method-2
+intra and I+P streams is **bit-exact** against our own, and the
+method-1 stream lands exactly on the documented §7.4.4.5 compat
+contract (ecosystem mode bit-exact, literal-spec ±1 on 834 samples).
+The registry entry now declares `encode`: `encoder::make_encoder` /
+`Mpeg4VideoEncoder` (options `qp`, `mpeg-quant`, `ac-pred`,
+`gop-size`) is the dual-API sibling of `make_decoder`.
 
 ## Compatibility modes
 
@@ -339,7 +367,11 @@ both modes' envelopes are pinned).
 
 ## Not yet supported
 
-- Encoder.
+- Encoder: B-VOPs, quarter-sample and 4MV emission, interlaced tools,
+  `fcode > 1` motion ranges (search is ±8 pels), rate control /
+  bit-budget targeting (fixed `qp` only), data-partitioned /
+  RVLC / video-packet emission, GMC and short-header syntax. The
+  decoder-side feature set below is unchanged.
 - §E.1.4.4 recovery on **I-VOP** texture partitions (an I-VOP texture
   error still propagates: §E.1.4.4.2.2 conceals every INTRA macroblock
   of an errored packet, and an I-VOP has no inter macroblocks to
