@@ -6,7 +6,20 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Cross-platform byte determinism of the transform pair** — the
+  forward DCT and the Annex A.1 IDCT now evaluate against
+  compile-time `f64` cosine literals (the nearest-`f64` to the
+  mathematical values) instead of runtime `f64::cos`: libm
+  implementations differ by an ulp across platforms, which round 438
+  caught as a one-bit encoder-output drift on the other CI hosts
+  (the method-1 fixture-determinism pin). With literal kernels every
+  arithmetic step is IEEE-754-determined, so decode conformance and
+  encoder emission are byte-identical on every platform.
+
 ### Added
+
 
 - **P-VOP encoder end-to-end (round 438, stage 6)** — `pvop_encode`:
   §7.6 motion estimation (±8-pel full-search SAD with §7.6.4

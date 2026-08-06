@@ -60,19 +60,26 @@ const N: usize = 8;
 ///
 /// Used by both passes of the separable 2-D IDCT.
 fn cos_table() -> &'static [[f64; N]; N] {
-    use std::sync::OnceLock;
-    static TABLE: OnceLock<[[f64; N]; N]> = OnceLock::new();
-    TABLE.get_or_init(|| {
-        let mut table = [[0.0f64; N]; N];
-        for u in 0..N {
-            for x in 0..N {
-                let angle =
-                    (2.0 * x as f64 + 1.0) * u as f64 * core::f64::consts::PI / (2.0 * N as f64);
-                table[u][x] = angle.cos();
-            }
-        }
-        table
-    })
+    // Compile-time `f64` literals (nearest-`f64` to the mathematical
+    // cosines, full round-trip precision) instead of runtime
+    // `f64::cos`: libm implementations differ by an ulp across
+    // platforms, and both the conformance pins and the encoder's
+    // closed decode loop (whose reconstruction feeds the next P-VOP's
+    // residuals) need the transform to be byte-deterministic
+    // everywhere. Every arithmetic operation on these constants is
+    // IEEE-754-determined. Values match `src/fdct.rs`'s `COS` table.
+    #[rustfmt::skip]
+    const COS: [[f64; N]; N] = [
+    [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+    [0.9807852804032304, 0.8314696123025452, 0.5555702330196023, 0.19509032201612833, -0.1950903220161282, -0.555570233019602, -0.8314696123025453, -0.9807852804032304],
+    [0.9238795325112867, 0.38268343236508984, -0.3826834323650897, -0.9238795325112867, -0.9238795325112868, -0.38268343236509034, 0.38268343236509, 0.9238795325112865],
+    [0.8314696123025452, -0.1950903220161282, -0.9807852804032304, -0.5555702330196022, 0.5555702330196018, 0.9807852804032304, 0.19509032201612878, -0.8314696123025451],
+    [0.7071067811865476, -0.7071067811865475, -0.7071067811865477, 0.7071067811865474, 0.7071067811865477, -0.7071067811865467, -0.7071067811865472, 0.7071067811865466],
+    [0.5555702330196023, -0.9807852804032304, 0.1950903220161283, 0.8314696123025455, -0.8314696123025451, -0.19509032201612803, 0.9807852804032307, -0.5555702330196015],
+    [0.38268343236508984, -0.9238795325112868, 0.9238795325112865, -0.3826834323650899, -0.38268343236509056, 0.9238795325112867, -0.9238795325112864, 0.38268343236508956],
+    [0.19509032201612833, -0.5555702330196022, 0.8314696123025455, -0.9807852804032307, 0.9807852804032304, -0.831469612302545, 0.5555702330196015, -0.19509032201612858],
+    ];
+    &COS
 }
 
 /// `C(k)` from Annex A.1: `1/√2` when `k == 0`, `1` otherwise.
