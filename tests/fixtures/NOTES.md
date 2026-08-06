@@ -177,7 +177,13 @@ streams with the floating-point IDCT:
 ```
 ffmpeg -idct faani -i enc_intra_m2_64x64.m4v -f rawvideo -pix_fmt yuv420p enc_intra_m2_64x64.yuv
 ffmpeg -idct faani -i enc_intra_m1_64x64.m4v -f rawvideo -pix_fmt yuv420p enc_intra_m1_64x64.yuv
+ffmpeg -idct faani -i enc_ip_m2_64x64.m4v -f rawvideo -pix_fmt yuv420p enc_ip_m2_64x64.yuv
 ```
+
+`enc_ip_m2_64x64.m4v` is the I+P sibling (1 I-VOP + 5 P-VOPs over a
+translating scene: §7.6 motion estimation, half-pel refinement,
+`not_coded` skips; method-2, qp 4); its reference decode is
+**bit-exact** against this crate's decode of the same stream.
 
 The tests assert byte-determinism of re-encoding and bit-exact
 agreement between this crate's decode of the streams and the
@@ -256,6 +262,8 @@ b29588dfd261fe8f4e04a4f8cba31df8150a7b77bb10b2714af5f1ab0c9d46ab  fq_probe_half_
 8d7f27a402d66eedf8421eb35798ad767714051875da174357773144c64e00e2  enc_intra_m1_64x64.yuv
 287a0ee5fd4341bbd0142b206eecf3afd7e6a9b7379634f964567c578cc0c9aa  enc_intra_m2_64x64.m4v
 6b41967056fd3f8df32ab57999ca6e4c2881532f7934fb14b073f6e0b57aa915  enc_intra_m2_64x64.yuv
+d30f44c7b36ce898848a82a2580003361ff09468ce2da889b10d1b68a3142038  enc_ip_m2_64x64.m4v
+d5c878de5f2c5bba83c3ebaaa1223167a041c6d7253690ad0f6f78b3d1de3531  enc_ip_m2_64x64.yuv
 ```
 
 (Note: `aic_ipb_64x64.yuv` and `altscan_ipb_64x64.yuv` are

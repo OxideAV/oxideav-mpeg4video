@@ -371,6 +371,7 @@ pub mod obmc;
 pub mod perspective_warp;
 #[doc(hidden)]
 pub mod predictor;
+pub mod pvop_encode;
 pub mod pvop_mv; // mixed: `PvopMvError` stays visible
 #[doc(hidden)]
 pub mod quantise;

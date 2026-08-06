@@ -3,12 +3,13 @@
 //! [`make_encoder`] is the direct factory endpoint (the dual-API
 //! sibling of [`crate::decoder::make_decoder`]).
 //!
-//! The current tool set is the round-438 encoder arc so far:
-//! rectangular progressive **I-VOPs** (method-1 or method-2
-//! quantisation, cost-decided AC prediction). Every emitted VOP is
-//! reconstructed through the crate's own decoder walk before the
-//! packet is surfaced, so the encoder's reference state can never
-//! drift from a conformant decoder's.
+//! The current tool set is the round-438 encoder arc: rectangular
+//! progressive **I- and P-VOPs** (method-1 or method-2 quantisation,
+//! cost-decided AC prediction, §7.6 motion estimation with half-pel
+//! refinement, `not_coded` skips, `gop-size`-driven keyframe cadence).
+//! Every emitted VOP is reconstructed through the crate's own decoder
+//! walk before the packet is surfaced, so the encoder's reference
+//! state can never drift from a conformant decoder's.
 //!
 //! Timing: the output elementary stream uses the VOL's §6.3.5 time
 //! model with `vop_time_increment_resolution` taken from the
@@ -22,7 +23,9 @@ use oxideav_core::{
     CodecId, CodecParameters, Error, Frame, Packet, PixelFormat, Rational, Result, TimeBase,
 };
 
+use crate::framestore::FrameStore;
 use crate::ivop_encode::{encode_i_vop, write_configuration_headers, EncoderConfig, FrameView};
+use crate::pvop_encode::{encode_p_vop, reconstruct_own_p_vop};
 use crate::vol::{parse_video_object_layer, VolHeader};
 
 /// Typed options struct for the registry / options-bag construction
@@ -37,6 +40,9 @@ pub struct Mpeg4EncoderOptions {
     /// `ac-pred` — enable the cost-decided §7.4.3.3 AC-prediction
     /// emission (default on).
     pub ac_pred: bool,
+    /// `gop-size` — I-VOP cadence: one keyframe every `gop_size`
+    /// frames (`1` = intra-only). Default 12.
+    pub gop_size: u32,
 }
 
 impl Default for Mpeg4EncoderOptions {
@@ -45,6 +51,7 @@ impl Default for Mpeg4EncoderOptions {
             qp: 4,
             mpeg_quant: false,
             ac_pred: true,
+            gop_size: 12,
         }
     }
 }
@@ -71,6 +78,12 @@ impl oxideav_core::CodecOptionsStruct for Mpeg4EncoderOptions {
             help: "enable cost-decided §7.4.3.3 AC-prediction emission on intra \
                    macroblocks",
         },
+        oxideav_core::OptionField {
+            name: "gop-size",
+            kind: oxideav_core::OptionKind::U32,
+            default: oxideav_core::OptionValue::U32(12),
+            help: "keyframe cadence: one I-VOP every gop-size frames (1 = intra-only)",
+        },
     ];
 
     fn apply(&mut self, key: &str, value: &oxideav_core::OptionValue) -> Result<()> {
@@ -84,6 +97,13 @@ impl oxideav_core::CodecOptionsStruct for Mpeg4EncoderOptions {
             }
             "mpeg-quant" => self.mpeg_quant = value.as_bool()?,
             "ac-pred" => self.ac_pred = value.as_bool()?,
+            "gop-size" => {
+                let g = value.as_u32()?;
+                if g == 0 {
+                    return Err(Error::invalid("gop-size must be >= 1"));
+                }
+                self.gop_size = g;
+            }
             _ => unreachable!("guarded by SCHEMA"),
         }
         Ok(())
@@ -109,6 +129,9 @@ pub struct Mpeg4VideoEncoder {
     /// for the §6.3.5 `modulo_time_base` derivation.
     prev_seconds: u64,
     frames_encoded: u64,
+    /// §7.6.1 anchor chain — the closed-loop references produced by
+    /// decoding our own emitted units.
+    store: FrameStore,
     ready: VecDeque<Packet>,
     flushed: bool,
 }
@@ -174,6 +197,7 @@ impl Mpeg4VideoEncoder {
             next_ticks: 0,
             prev_seconds: 0,
             frames_encoded: 0,
+            store: FrameStore::new(),
             ready: VecDeque::new(),
             flushed: false,
         })
@@ -245,14 +269,39 @@ impl oxideav_core::Encoder for Mpeg4VideoEncoder {
         let modulo = (seconds - self.prev_seconds) as u32;
         let increment = (ticks % res) as u16;
 
-        let (unit, _recon) = encode_i_vop(
-            &self.vol,
-            &self.cfg,
-            &view,
-            modulo,
-            increment,
-            self.options.qp,
-        );
+        // GOP cadence: an I-VOP every `gop_size` frames (and always
+        // when no anchor exists yet).
+        let is_keyframe = self.frames_encoded % u64::from(self.options.gop_size) == 0
+            || self.store.backward().is_none();
+        let unit = if is_keyframe {
+            let (unit, recon) = encode_i_vop(
+                &self.vol,
+                &self.cfg,
+                &view,
+                modulo,
+                increment,
+                self.options.qp,
+            );
+            self.store.push_anchor(recon);
+            unit
+        } else {
+            let reference = self
+                .store
+                .backward()
+                .expect("anchor present on the P path")
+                .clone();
+            let (unit, _stats) = encode_p_vop(
+                &self.vol,
+                &self.cfg,
+                &view,
+                &reference,
+                modulo,
+                increment,
+                self.options.qp,
+            );
+            let _recon = reconstruct_own_p_vop(&self.vol, &unit, &mut self.store);
+            unit
+        };
 
         let mut data = Vec::new();
         if self.frames_encoded == 0 {
@@ -265,7 +314,7 @@ impl oxideav_core::Encoder for Mpeg4VideoEncoder {
             .with_pts(pts)
             .with_dts(pts)
             .with_duration(self.ticks_per_frame as i64)
-            .with_keyframe(true);
+            .with_keyframe(is_keyframe);
         self.ready.push_back(packet);
 
         self.prev_seconds = seconds;
@@ -331,33 +380,58 @@ mod tests {
     }
 
     #[test]
-    fn encodes_decodable_packets_with_extradata() {
+    fn encodes_decodable_ip_packets_with_extradata() {
         let mut enc = Mpeg4VideoEncoder::from_params(&base_params()).unwrap();
         assert!(!enc.output_params().extradata.is_empty());
-        for k in 0..2 {
+        for k in 0..3 {
             enc.send_frame(&gray_frame(48, 32, 100 + k * 30)).unwrap();
         }
         enc.flush().unwrap();
         let mut stream = Vec::new();
-        let mut count = 0;
+        let mut keyframes = Vec::new();
         loop {
             match enc.receive_packet() {
                 Ok(p) => {
-                    assert!(p.flags.keyframe);
+                    keyframes.push(p.flags.keyframe);
                     stream.extend_from_slice(&p.data);
+                }
+                Err(Error::Eof) => break,
+                Err(e) => panic!("unexpected {e}"),
+            }
+        }
+        // gop-size 12 → frame 0 is the only keyframe of the three.
+        assert_eq!(keyframes, vec![true, false, false]);
+        let mut dec = crate::decoder::Mpeg4VideoDecoder::new();
+        let mut frames = dec.decode(&stream).unwrap();
+        frames.extend(dec.flush());
+        assert_eq!(frames.len(), 3);
+        // Flat gray reconstructs exactly at low qp, including through
+        // the two P-VOPs' luminance step changes.
+        assert!(frames[0].luma_samples()[..48].iter().all(|&s| s == 100));
+        assert!(frames[2].luma_samples()[..48].iter().all(|&s| s == 160));
+    }
+
+    #[test]
+    fn gop_size_one_is_intra_only() {
+        let mut p = base_params();
+        p.options = oxideav_core::CodecOptions::default().set("gop-size", "1");
+        let mut enc = Mpeg4VideoEncoder::from_params(&p).unwrap();
+        for _ in 0..3 {
+            enc.send_frame(&gray_frame(48, 32, 90)).unwrap();
+        }
+        enc.flush().unwrap();
+        let mut count = 0;
+        loop {
+            match enc.receive_packet() {
+                Ok(pk) => {
+                    assert!(pk.flags.keyframe, "every packet must be an I-VOP");
                     count += 1;
                 }
                 Err(Error::Eof) => break,
                 Err(e) => panic!("unexpected {e}"),
             }
         }
-        assert_eq!(count, 2);
-        let mut dec = crate::decoder::Mpeg4VideoDecoder::new();
-        let mut frames = dec.decode(&stream).unwrap();
-        frames.extend(dec.flush());
-        assert_eq!(frames.len(), 2);
-        // Flat gray reconstructs exactly at low qp.
-        assert!(frames[0].luma_samples()[..48].iter().all(|&s| s == 100));
+        assert_eq!(count, 3);
     }
 
     #[test]

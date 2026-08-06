@@ -17,9 +17,11 @@
 //! binary was invoked as an opaque validator only.
 
 use oxideav_mpeg4video::decoder::Mpeg4VideoDecoder;
+use oxideav_mpeg4video::framestore::FrameStore;
 use oxideav_mpeg4video::ivop_encode::{
     encode_i_vop, write_configuration_headers, EncoderConfig, FrameView,
 };
+use oxideav_mpeg4video::pvop_encode::{encode_p_vop, reconstruct_own_p_vop};
 use oxideav_mpeg4video::vol::parse_video_object_layer;
 
 fn fixture(name: &str) -> Vec<u8> {
@@ -91,6 +93,78 @@ fn build_stream(quant_type: bool) -> Vec<u8> {
         };
         let (unit, _recon) = encode_i_vop(&vol, &cfg, &view, 0, k as u16, 4);
         stream.extend_from_slice(&unit);
+    }
+    stream
+}
+
+/// Translating-scene picture for the I+P fixture: a fixed background
+/// sampled at a per-frame (2, 1)-pel offset plus a static corner
+/// block, 64×64.
+fn ip_picture(frame_index: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let (w, h) = (64usize, 64usize);
+    let (cw, ch) = (w / 2, h / 2);
+    let bg = |x: i64, y: i64| -> u8 {
+        let v = (x * 7 + y * 5) % 160 + ((x / 9 + y / 7) % 13) * 6;
+        (40 + v.rem_euclid(170)) as u8
+    };
+    let (ox, oy) = ((frame_index * 2) as i64, frame_index as i64);
+    let mut y = vec![0u8; w * h];
+    for row in 0..h {
+        for col in 0..w {
+            y[row * w + col] = bg(col as i64 + ox, row as i64 + oy);
+        }
+    }
+    for row in 0..8 {
+        for col in 0..8 {
+            y[row * w + col] = 200;
+        }
+    }
+    let mut cb = vec![0u8; cw * ch];
+    let mut cr = vec![0u8; cw * ch];
+    for row in 0..ch {
+        for col in 0..cw {
+            cb[row * cw + col] = bg(col as i64 + ox / 2, row as i64 + oy / 2) / 2 + 64;
+            cr[row * cw + col] = 128;
+        }
+    }
+    (y, cb, cr)
+}
+
+/// Build the I+P fixture stream: 1 I-VOP + 5 P-VOPs, 64×64, method-2
+/// quantisation, qp 4.
+fn build_ip_stream() -> Vec<u8> {
+    let cfg = EncoderConfig {
+        width: 64,
+        height: 64,
+        ..EncoderConfig::default()
+    };
+    let headers = write_configuration_headers(&cfg);
+    let pos = headers
+        .windows(4)
+        .position(|w| w == [0, 0, 1, 0x20])
+        .expect("VOL start code");
+    let vol = parse_video_object_layer(&headers[pos..], cfg.profile_and_level()).unwrap();
+    let mut stream = headers;
+    let mut store = FrameStore::new();
+    for k in 0..6usize {
+        let (y, cb, cr) = ip_picture(k);
+        let view = FrameView {
+            y: &y,
+            cb: &cb,
+            cr: &cr,
+            width: 64,
+            height: 64,
+        };
+        if k == 0 {
+            let (unit, recon) = encode_i_vop(&vol, &cfg, &view, 0, 0, 4);
+            store.push_anchor(recon);
+            stream.extend_from_slice(&unit);
+        } else {
+            let reference = store.backward().expect("anchor present").clone();
+            let (unit, _stats) = encode_p_vop(&vol, &cfg, &view, &reference, 0, k as u16, 4);
+            let _ = reconstruct_own_p_vop(&vol, &unit, &mut store);
+            stream.extend_from_slice(&unit);
+        }
     }
     stream
 }
@@ -204,4 +278,19 @@ fn method1_stream_decodes_against_reference_decoder_per_compat_contract() {
         stats[1].0, 834,
         "spec-mode differing-sample count drifted; re-measure after regenerating fixtures"
     );
+}
+
+#[test]
+fn ip_stream_reproduces_committed_fixture() {
+    assert_eq!(
+        build_ip_stream(),
+        fixture("enc_ip_m2_64x64.m4v"),
+        "encoder output drifted from the black-box-validated fixture; \
+         regenerate the fixture AND its reference decode"
+    );
+}
+
+#[test]
+fn ip_stream_decodes_bit_exact_against_reference_decoder() {
+    assert_own_decode_matches_reference("enc_ip_m2_64x64.m4v", "enc_ip_m2_64x64.yuv");
 }

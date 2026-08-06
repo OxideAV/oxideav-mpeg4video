@@ -244,7 +244,7 @@ impl<'a> FrameView<'a> {
 
     /// The Figure 6-8 block `i` (0..=5) of macroblock
     /// `(mb_row, mb_col)`.
-    fn block(&self, mb_row: usize, mb_col: usize, i: usize) -> [[i32; 8]; 8] {
+    pub(crate) fn block(&self, mb_row: usize, mb_col: usize, i: usize) -> [[i32; 8]; 8] {
         match i {
             0..=3 => {
                 let y0 = mb_row * 16 + if i >= 2 { 8 } else { 0 };
@@ -281,7 +281,7 @@ fn scan_positions(scan_type: ScanType) -> [(usize, usize); 64] {
 
 /// Serialise an 8×8 `PQF` block into the 1-D `QFS[64]` stream under
 /// `scan_type` (the inverse of §7.4.2's inverse scan).
-fn forward_scan(pqf: &[[i32; 8]; 8], scan_type: ScanType) -> [i32; 64] {
+pub(crate) fn forward_scan(pqf: &[[i32; 8]; 8], scan_type: ScanType) -> [i32; 64] {
     let positions = scan_positions(scan_type);
     let mut qfs = [0i32; 64];
     for (n, &(v, u)) in positions.iter().enumerate() {
@@ -293,7 +293,7 @@ fn forward_scan(pqf: &[[i32; 8]; 8], scan_type: ScanType) -> [i32; 64] {
 /// Convert `QFS[from..64]` into the §7.4.1.2 EVENT list (`from` is 1
 /// when the DC is carried by the DC VLC, 0 when it rides the AC
 /// stream). Empty when every coefficient is zero.
-fn qfs_to_events(qfs: &[i32; 64], from: usize) -> Vec<AcEvent> {
+pub(crate) fn qfs_to_events(qfs: &[i32; 64], from: usize) -> Vec<AcEvent> {
     let mut events = Vec::new();
     let mut run = 0u32;
     for &q in &qfs[from..] {
@@ -315,17 +315,17 @@ fn qfs_to_events(qfs: &[i32; 64], from: usize) -> Vec<AcEvent> {
 }
 
 /// One quantised intra block prepared for emission.
-struct PreparedBlock {
+pub(crate) struct PreparedBlock {
     /// Quantised coefficients `QF` (DC at `[0][0]`) — the value the
     /// decoder reconstructs after its §7.4.3 predictor adds.
-    qf: [[i32; 8]; 8],
+    pub(crate) qf: [[i32; 8]; 8],
     /// The §7.4.4.1.1 inverse-quantised DC (`F[0][0]`), for the
     /// neighbour grid.
-    dc_f: i32,
+    pub(crate) dc_f: i32,
 }
 
 /// Quantise one intra block per the VOL's method.
-fn quantise_intra_block(
+pub(crate) fn quantise_intra_block(
     f: &[[i32; 8]; 8],
     component: DcComponent,
     qp: u32,
@@ -350,9 +350,9 @@ fn quantise_intra_block(
 
 /// The per-block emission plan of one variant (`ac_pred_flag` on or
 /// off): the DC differential, the AC EVENT list, and the coded flag.
-struct BlockPlan {
-    dc_differential: i32,
-    events: Vec<AcEvent>,
+pub(crate) struct BlockPlan {
+    pub(crate) dc_differential: i32,
+    pub(crate) events: Vec<AcEvent>,
 }
 
 /// Build the emission plan for one block under a given `ac_pred_flag`,
@@ -360,7 +360,7 @@ struct BlockPlan {
 /// escape-codable domain (the caller then falls back to the
 /// no-prediction variant for the whole macroblock).
 #[allow(clippy::too_many_arguments)]
-fn plan_block(
+pub(crate) fn plan_block(
     prepared: &PreparedBlock,
     predictors: &crate::block::BlockPredictors,
     direction: DcPredictionDirection,
@@ -432,15 +432,30 @@ fn scale_ac_pred(qf_neighbour: i32, qp_neighbour: u32, qp_x: u32) -> i32 {
 /// Emit one intra macroblock body (mcbpc / ac_pred_flag / cbpy /
 /// blocks) for a fixed `ac_pred_flag` choice.
 fn emit_intra_mb(bw: &mut BitWriter, plans: &[BlockPlan; 6], ac_pred_flag: bool, use_dc_vlc: bool) {
+    let (cbpy, cbpc) = intra_mb_cbp(plans);
+    put_mcbpc_i(bw, 3, cbpc); // derived_mb_type 3 = intra, no dquant
+    bw.write_bit(ac_pred_flag);
+    put_cbpy(bw, cbpy, true);
+    emit_intra_blocks(bw, plans, use_dc_vlc);
+}
+
+/// The `(cbpy, cbpc)` coded-block pattern of an intra macroblock's six
+/// emission plans (§6.3.7 "1 = coded" convention, Figure 6-8 order).
+pub(crate) fn intra_mb_cbp(plans: &[BlockPlan; 6]) -> (u8, u8) {
     let coded: Vec<bool> = plans.iter().map(|p| !p.events.is_empty()).collect();
     let cbpy = (u8::from(coded[0]) << 3)
         | (u8::from(coded[1]) << 2)
         | (u8::from(coded[2]) << 1)
         | u8::from(coded[3]);
     let cbpc = (u8::from(coded[4]) << 1) | u8::from(coded[5]);
-    put_mcbpc_i(bw, 3, cbpc); // derived_mb_type 3 = intra, no dquant
-    bw.write_bit(ac_pred_flag);
-    put_cbpy(bw, cbpy, true);
+    (cbpy, cbpc)
+}
+
+/// Emit the six §6.2.7 `block(i)` bodies of an intra macroblock (DC
+/// prologue per block when `use_dc_vlc`, AC EVENTs for coded blocks).
+/// Shared between the I-VOP walk and the P-VOP walk's intra
+/// macroblocks.
+pub(crate) fn emit_intra_blocks(bw: &mut BitWriter, plans: &[BlockPlan; 6], use_dc_vlc: bool) {
     for (i, plan) in plans.iter().enumerate() {
         if use_dc_vlc {
             put_intra_dc(bw, DcComponent::from_block_index(i), plan.dc_differential);

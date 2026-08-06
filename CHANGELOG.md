@@ -8,6 +8,27 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **P-VOP encoder end-to-end (round 438, stage 6)** — `pvop_encode`:
+  §7.6 motion estimation (±8-pel full-search SAD with §7.6.4
+  edge-clamped fetches + §7.6.2.1 half-sample refinement through the
+  decoder's own interpolator, zero-vector bias), intra/inter/skip
+  mode decision, and the §6.2.6 P-VOP emission — `not_coded` skips,
+  Table B.7 `mcbpc`, inter `cbpy`, Table B.12 `motion_vector()`
+  against the §7.6.5 median predictor over the decoder-mirrored
+  `MvGrid` state, Table B.17 inter residual EVENTs, and intra
+  macroblocks through the shared I-VOP plan/emission path. The
+  registry encoder now emits I+P streams under a `gop-size` option
+  (default 12; 1 = intra-only) with per-packet keyframe flags, still
+  closing the loop by decoding every emitted unit
+  (`reconstruct_own_p_vop` drives the §7.6.1 anchor chain).
+  Validation: I+5P self-decode **sample-exact** against the encoder
+  reconstructions with real motion in play (`tests/encoder_p_vop.rs`;
+  P units all smaller than the I unit, static scenes collapse to
+  all-skip 15-byte P-VOPs, luma PSNR > 32 dB at qp 4, byte
+  determinism incl. method-1), and a new black-box pair
+  (`enc_ip_m2_64x64`): the reference decoder's decode of our I+P
+  stream is **bit-exact** against this crate's own.
+
 - **Registry-facing encoder (round 438, stage 5)** —
   `encoder::Mpeg4VideoEncoder` implements the
   `oxideav_core::Encoder` contract over the I-VOP encoder
