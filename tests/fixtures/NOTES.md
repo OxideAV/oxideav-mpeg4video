@@ -210,15 +210,20 @@ The round-443 encoder tail added three more encoder-produced pairs
   interpolated §7.6.9 modes, `co_located_not_coded` zero-bit MBs,
   `vol_control_parameters` with `low_delay == 0`), 6 frames of the
   translating scene.
+* `enc_ipb_qpel4mv_64x64` — the combined-tools sibling: `bf` 2 +
+  `quarter_sample` + inter4v in one stream (direct mode over 4-MV
+  co-located anchors on the quarter grid), 6 frames of the
+  divergent-motion scene.
 
 ```
 ffmpeg -idct faani -i enc_ip_4mv_64x64.m4v -f rawvideo -pix_fmt yuv420p enc_ip_4mv_64x64.yuv
 ffmpeg -idct faani -i enc_ip_qpel_64x64.m4v -f rawvideo -pix_fmt yuv420p enc_ip_qpel_64x64.yuv
 ffmpeg -idct faani -i enc_ip_qpel4mv_64x64.m4v -f rawvideo -pix_fmt yuv420p enc_ip_qpel4mv_64x64.yuv
 ffmpeg -idct faani -i enc_ipb_64x64.m4v -f rawvideo -pix_fmt yuv420p enc_ipb_64x64.yuv
+ffmpeg -idct faani -i enc_ipb_qpel4mv_64x64.m4v -f rawvideo -pix_fmt yuv420p enc_ipb_qpel4mv_64x64.yuv
 ```
 
-All four reference decodes are **bit-exact** against this crate's
+All five reference decodes are **bit-exact** against this crate's
 decode of the same streams (asserted in `tests/encoder_blackbox.rs`).
 
 ## SHA-256
@@ -301,6 +306,8 @@ e1e4c9d7fce8198331e805bc6a3743b5839c96b213747e9bd5a84ec438ec894f  enc_ip_qpel_64
 37eb3c51c6a921daa19f9636de8b3c702a5f08f82dcbd9a88df81300fa1f2e3b  enc_ip_qpel4mv_64x64.yuv
 4ba90df847a537c63f54275ca36306f44e35814ed4db130f034358d50615d1eb  enc_ipb_64x64.m4v
 96f18d82ee50631c03daa101d460e00eafeed2643ab36bde90af32de1997b3b2  enc_ipb_64x64.yuv
+5961b4f908f8ed069ac17ac29c8051ae2f51893324417d23fe36ccad27e3972e  enc_ipb_qpel4mv_64x64.m4v
+2bb083df0e8d5a92f041822b026b119be92c0b5384e1170a0ce2ff9b62807c64  enc_ipb_qpel4mv_64x64.yuv
 ```
 
 (Note: `aic_ipb_64x64.yuv` and `altscan_ipb_64x64.yuv` are

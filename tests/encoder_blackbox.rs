@@ -314,15 +314,37 @@ fn build_qpel_4mv_stream() -> Vec<u8> {
 /// (`bf == 2`, so the coded order is I0 P3 B1 B2 P5 B4 with a flush
 /// tail): 6 frames of the translating scene, method 2, qp 4.
 fn build_ipb_stream() -> Vec<u8> {
+    build_registry_stream(
+        oxideav_core::CodecOptions::default().set("bf", "2"),
+        ip_picture,
+    )
+}
+
+/// The combined-tools sibling of [`build_ipb_stream`]: quarter-sample
+/// + inter4v + B-VOPs in one stream over the divergent-motion scene.
+fn build_ipb_qpel4mv_stream() -> Vec<u8> {
+    build_registry_stream(
+        oxideav_core::CodecOptions::default()
+            .set("bf", "2")
+            .set("qpel", "true")
+            .set("four-mv", "true"),
+        divergent_picture,
+    )
+}
+
+fn build_registry_stream(
+    options: oxideav_core::CodecOptions,
+    picture: fn(usize) -> Planes,
+) -> Vec<u8> {
     use oxideav_core::Encoder as _;
     let mut params = oxideav_core::CodecParameters::video(oxideav_core::CodecId::new("mpeg4video"));
     params.width = Some(64);
     params.height = Some(64);
     params.pixel_format = Some(oxideav_core::PixelFormat::Yuv420P);
-    params.options = oxideav_core::CodecOptions::default().set("bf", "2");
+    params.options = options;
     let mut enc = oxideav_mpeg4video::encoder::Mpeg4VideoEncoder::from_params(&params).unwrap();
     for k in 0..6usize {
-        let (y, cb, cr) = ip_picture(k);
+        let (y, cb, cr) = picture(k);
         let frame = oxideav_core::Frame::Video(oxideav_core::VideoFrame {
             pts: None,
             planes: vec![
@@ -554,4 +576,23 @@ fn ipb_stream_reproduces_committed_fixture() {
 #[test]
 fn ipb_stream_decodes_bit_exact_against_reference_decoder() {
     assert_own_decode_matches_reference("enc_ipb_64x64.m4v", "enc_ipb_64x64.yuv");
+}
+
+#[test]
+fn ipb_qpel_4mv_stream_reproduces_committed_fixture() {
+    let built = build_ipb_qpel4mv_stream();
+    if maybe_write_fixture("enc_ipb_qpel4mv_64x64.m4v", &built) {
+        return;
+    }
+    assert_eq!(
+        built,
+        fixture("enc_ipb_qpel4mv_64x64.m4v"),
+        "encoder output drifted from the black-box-validated fixture; \
+         regenerate the fixture AND its reference decode"
+    );
+}
+
+#[test]
+fn ipb_qpel_4mv_stream_decodes_bit_exact_against_reference_decoder() {
+    assert_own_decode_matches_reference("enc_ipb_qpel4mv_64x64.m4v", "enc_ipb_qpel4mv_64x64.yuv");
 }
