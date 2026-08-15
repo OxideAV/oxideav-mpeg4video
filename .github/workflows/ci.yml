@@ -13,9 +13,7 @@ on:
 jobs:
   ci:
     uses: OxideAV/.github/.github/workflows/crate-ci.yml@master
-    with:
-      # dp_p_vop_inter4mv_roundtrip hard-asserts on ffmpeg presence.
-      extra_packages_apt: "ffmpeg"
-      extra_packages_brew: "ffmpeg"
-      extra_packages_choco: "ffmpeg"
+    # No extra system packages: every conformance/black-box expectation
+    # is a committed fixture (tests/fixtures/NOTES.md records how they
+    # were produced offline); nothing shells out at test time.
     secrets: inherit
