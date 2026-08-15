@@ -8,6 +8,33 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Annex D rate control (round 443, stage 4)** — `rate_control`:
+  the normative D.2 video-rate-buffer model simulated on the encoder
+  side (`B = 16384 × vbv_buffer_size`; peak-rate channel
+  `Rvol <= 400 × bit_rate` filling `min(B − b, R·Δt)` per decode
+  interval, so overflow is structurally impossible; instantaneous
+  item-6 removals; the item-8 `b_0` seed including the §6.2.1
+  configuration bits; real-valued arithmetic per item 9) plus a
+  bit-budget-regulated quantiser adaptation (encoder freedom):
+  per-VOP budget = channel refill + a proportional correction
+  steering occupancy to the two-thirds operating point (the Annex D
+  default `vbv_occupancy = 170 × vbv_buffer_size`), multiplicative
+  qp scaling bounded ±2 per VOP, and an item-9 admission gate — a
+  VOP larger than the current occupancy is **re-encoded** at a
+  coarsened quantiser (+4 per step, saturating at 31) before its
+  packet is surfaced. Registry options `bitrate` (bits/s; 0 =
+  constant qp) and `vbv-buffer` (16384-bit units; 0 = auto: two
+  seconds at the target); the VOL now emits the §6.2.3
+  `vbv_parameters` triple (30-bit rate in 400-bit units, 18-bit
+  buffer size, 26-bit occupancy, with the marker layout mirrored
+  from the crate's own parser). Validation (`tests/encoder_rate.rs`):
+  measured rate lands inside [0.6, 1.1]× target on a moving scene at
+  150/400 kb/s; an **independent Annex D re-simulation from the
+  emitted packet sizes** proves `d_i < B` and no underflow across the
+  run; stream sizes grow monotonically with the target; bf-2 +
+  rate-control streams decode in display order and re-encode
+  byte-identically.
+
 - **B-VOP encoder end-to-end (round 443, stage 3)** — `bvop_encode`:
   per-macroblock §7.6.9 mode decision (direct with an `MVD` window
   search over the §7.6.9.5.2 TRB/TRD derivation from the co-located

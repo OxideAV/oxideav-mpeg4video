@@ -89,6 +89,21 @@ pub struct EncoderConfig {
     /// only the profile signalling (B-VOPs are an ASP tool; the VOL
     /// carries no flag for them).
     pub b_vops: bool,
+    /// Optional §6.2.3 `vbv_parameters` signalling (emitted inside a
+    /// `vol_control_parameters` block; see [`VbvSignalling`] /
+    /// `crate::rate_control`).
+    pub vbv: Option<VbvSignalling>,
+}
+
+/// The §6.2.3 `vbv_parameters` triple (Annex D rate-buffer model).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VbvSignalling {
+    /// Peak rate in 400-bit-per-second units (30 bits, non-zero).
+    pub bit_rate_400: u32,
+    /// Buffer size in 16384-bit units (18 bits, non-zero).
+    pub buffer_units: u32,
+    /// Initial occupancy in 64-bit units (26 bits).
+    pub occupancy_64: u32,
 }
 
 impl Default for EncoderConfig {
@@ -102,6 +117,7 @@ impl Default for EncoderConfig {
             four_mv: false,
             quarter_sample: false,
             b_vops: false,
+            vbv: None,
         }
     }
 }
@@ -180,14 +196,34 @@ pub fn write_configuration_headers(cfg: &EncoderConfig) -> Vec<u8> {
         bw.write_bit(false); // is_object_layer_identifier = 0 → verid 1
     }
     bw.write_bits(1, 4); // aspect_ratio_info = 1:1
-    if cfg.b_vops {
-        // §6.2.3 vol_control_parameters: declare `low_delay == 0` (the
-        // VOL contains B-VOPs) explicitly so a decoder never has to
-        // guess the reorder delay from the first coded VOPs.
+    if cfg.b_vops || cfg.vbv.is_some() {
+        // §6.2.3 vol_control_parameters: declare `low_delay` (0 when
+        // the VOL contains B-VOPs, so a decoder never has to guess the
+        // reorder delay) and the Annex D vbv_parameters when rate
+        // control is active.
         bw.write_bit(true); // vol_control_parameters = 1
         bw.write_bits(0b01, 2); // chroma_format = 4:2:0 (Table 6-15)
-        bw.write_bit(false); // low_delay = 0
-        bw.write_bit(false); // vbv_parameters = 0
+        bw.write_bit(!cfg.b_vops); // low_delay
+        match &cfg.vbv {
+            Some(v) => {
+                assert!(v.bit_rate_400 > 0 && v.bit_rate_400 < (1 << 30));
+                assert!(v.buffer_units > 0 && v.buffer_units < (1 << 18));
+                assert!(v.occupancy_64 < (1 << 26));
+                bw.write_bit(true); // vbv_parameters = 1
+                bw.write_bits(v.bit_rate_400 >> 15, 15); // first_half_bit_rate
+                bw.write_marker();
+                bw.write_bits(v.bit_rate_400 & 0x7FFF, 15); // latter_half_bit_rate
+                bw.write_marker();
+                bw.write_bits(v.buffer_units >> 3, 15); // first_half_vbv_buffer_size
+                bw.write_marker();
+                bw.write_bits(v.buffer_units & 0x7, 3); // latter_half_vbv_buffer_size
+                bw.write_bits(v.occupancy_64 >> 15, 11); // first_half_vbv_occupancy
+                bw.write_marker();
+                bw.write_bits(v.occupancy_64 & 0x7FFF, 15); // latter_half_vbv_occupancy
+                bw.write_marker();
+            }
+            None => bw.write_bit(false), // vbv_parameters = 0
+        }
     } else {
         bw.write_bit(false); // vol_control_parameters = 0
     }

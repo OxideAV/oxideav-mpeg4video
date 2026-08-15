@@ -377,6 +377,7 @@ pub mod pvop_mv; // mixed: `PvopMvError` stays visible
 #[doc(hidden)]
 pub mod quantise;
 pub mod quarter_sample;
+pub mod rate_control;
 #[doc(hidden)]
 pub mod reconstruct;
 #[doc(hidden)]

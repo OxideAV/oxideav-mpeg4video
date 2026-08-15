@@ -50,6 +50,16 @@ pub struct Mpeg4EncoderOptions {
     /// `bf` — number of B-VOPs between anchors (0..=8; selects the
     /// ASP profile when non-zero). Default 0.
     pub bf: u32,
+    /// `bitrate` — target/peak rate in bits per second. Non-zero
+    /// enables the Annex D VBV-regulated quantiser adaptation
+    /// (`crate::rate_control`; `qp` then only seeds the controller)
+    /// and signals `vbv_parameters` in the VOL. Default 0 (constant
+    /// quantiser).
+    pub bitrate: u32,
+    /// `vbv-buffer` — VBV buffer size in 16384-bit units (Annex D
+    /// item 2). 0 (the default) sizes the buffer automatically to two
+    /// seconds at `bitrate`.
+    pub vbv_buffer: u32,
     /// `gop-size` — I-VOP cadence: one keyframe every `gop_size`
     /// frames (`1` = intra-only). Default 12.
     pub gop_size: u32,
@@ -64,6 +74,8 @@ impl Default for Mpeg4EncoderOptions {
             four_mv: false,
             qpel: false,
             bf: 0,
+            bitrate: 0,
+            vbv_buffer: 0,
             gop_size: 12,
         }
     }
@@ -114,6 +126,21 @@ impl oxideav_core::CodecOptionsStruct for Mpeg4EncoderOptions {
                    encoder latency)",
         },
         oxideav_core::OptionField {
+            name: "bitrate",
+            kind: oxideav_core::OptionKind::U32,
+            default: oxideav_core::OptionValue::U32(0),
+            help: "target/peak rate in bits per second; non-zero enables the \
+                   ISO/IEC 14496-2 Annex D VBV-regulated quantiser adaptation \
+                   (0 = constant qp)",
+        },
+        oxideav_core::OptionField {
+            name: "vbv-buffer",
+            kind: oxideav_core::OptionKind::U32,
+            default: oxideav_core::OptionValue::U32(0),
+            help: "VBV buffer size in 16384-bit units (0 = automatic: two \
+                   seconds at the target bitrate)",
+        },
+        oxideav_core::OptionField {
             name: "gop-size",
             kind: oxideav_core::OptionKind::U32,
             default: oxideav_core::OptionValue::U32(12),
@@ -140,6 +167,14 @@ impl oxideav_core::CodecOptionsStruct for Mpeg4EncoderOptions {
                     return Err(Error::invalid("bf must be in 0..=8"));
                 }
                 self.bf = bf;
+            }
+            "bitrate" => self.bitrate = value.as_u32()?,
+            "vbv-buffer" => {
+                let v = value.as_u32()?;
+                if v >= (1 << 18) {
+                    return Err(Error::invalid("vbv-buffer must fit the 18-bit field"));
+                }
+                self.vbv_buffer = v;
             }
             "gop-size" => {
                 let g = value.as_u32()?;
@@ -202,6 +237,9 @@ pub struct Mpeg4VideoEncoder {
     /// §7.6.9.5.1 / §6.2.6 co-located source for the B-VOPs it
     /// brackets (`None` after an intra anchor).
     anchor_motion: Option<Vec<crate::pvop_mv::PvopMbMotion>>,
+    /// The Annex D VBV-regulated quantiser controller (`Some` when a
+    /// bitrate target is set).
+    rc: Option<crate::rate_control::RateController>,
     /// §7.6.1 anchor chain — the closed-loop references produced by
     /// decoding our own emitted units.
     store: FrameStore,
@@ -236,6 +274,26 @@ impl Mpeg4VideoEncoder {
                  (it becomes vop_time_increment_resolution)",
             ));
         }
+        // Annex D VBV signalling + controller (rate control active
+        // when a bitrate target is given).
+        let vbv = if options.bitrate > 0 {
+            let buffer_units = if options.vbv_buffer > 0 {
+                options.vbv_buffer
+            } else {
+                // Automatic: two seconds at the target rate.
+                ((u64::from(options.bitrate) * 2).div_ceil(16384) as u32).clamp(1, (1 << 18) - 1)
+            };
+            Some(crate::ivop_encode::VbvSignalling {
+                bit_rate_400: (u64::from(options.bitrate).div_ceil(400) as u32)
+                    .clamp(1, (1 << 30) - 1),
+                buffer_units,
+                // The Annex D default operating point: vbv_occupancy =
+                // 170 × vbv_buffer_size (≈ two-thirds of the buffer).
+                occupancy_64: (170u32.saturating_mul(buffer_units)).min((1 << 26) - 1),
+            })
+        } else {
+            None
+        };
         let cfg = EncoderConfig {
             width: width as u16,
             height: height as u16,
@@ -245,6 +303,7 @@ impl Mpeg4VideoEncoder {
             four_mv: options.four_mv,
             quarter_sample: options.qpel,
             b_vops: options.bf > 0,
+            vbv,
         };
         let config_headers = write_configuration_headers(&cfg);
         let vol_pos = config_headers
@@ -261,6 +320,19 @@ impl Mpeg4VideoEncoder {
         output_params.frame_rate = Some(frame_rate);
         output_params.extradata = config_headers.clone();
         output_params.tag = Some(oxideav_core::CodecTag::fourcc(b"FMP4"));
+
+        let rc = vbv.map(|v| {
+            crate::rate_control::RateController::new(
+                crate::rate_control::RateControlConfig {
+                    bit_rate: u64::from(options.bitrate),
+                    vbv_buffer_units: v.buffer_units,
+                    occupancy_64: v.occupancy_64,
+                    seconds_per_vop: frame_rate.den as f64 / frame_rate.num as f64,
+                    initial_qp: options.qp,
+                },
+                config_headers.len() as u64 * 8,
+            )
+        });
 
         Ok(Self {
             codec_id: params.codec_id.clone(),
@@ -279,6 +351,7 @@ impl Mpeg4VideoEncoder {
             frames_coded: 0,
             pending_bs: Vec::new(),
             anchor_motion: None,
+            rc,
             store: FrameStore::new(),
             ready: VecDeque::new(),
             flushed: false,
@@ -416,6 +489,39 @@ impl Mpeg4VideoEncoder {
         self.frames_coded += 1;
     }
 
+    /// The quantiser for the next VOP: the VBV controller's when rate
+    /// control is active, else the constant `qp` option.
+    fn current_qp(&self) -> u32 {
+        self.rc
+            .as_ref()
+            .map(|rc| rc.qp())
+            .unwrap_or(self.options.qp)
+    }
+
+    /// Annex D item-9 admission for a freshly encoded VOP of
+    /// `unit_bytes` (plus the configuration run on the first packet):
+    /// `true` accepts the unit (occupancy committed); `false` asks the
+    /// caller to re-encode at the controller's coarsened quantiser.
+    fn rc_admit(&mut self, unit_bytes: usize) -> bool {
+        let extra = if self.frames_coded == 0 {
+            self.config_headers.len()
+        } else {
+            0
+        };
+        let d_bits = (unit_bytes + extra) as u64 * 8;
+        match &mut self.rc {
+            None => true,
+            Some(rc) => {
+                if rc.accepts(d_bits) || !rc.escalate() {
+                    rc.commit(d_bits);
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
     /// Encode one anchor VOP (I when `force_i`, else P), advance the
     /// §7.6.1 chain + §6.3.5 anchor time bases, and emit its packet.
     fn encode_anchor(&mut self, frame: &PendingFrame, force_i: bool) {
@@ -433,14 +539,13 @@ impl Mpeg4VideoEncoder {
         let increment = (frame.ticks % res) as u16;
 
         let unit = if force_i {
-            let (unit, recon) = encode_i_vop(
-                &self.vol,
-                &self.cfg,
-                &view,
-                modulo,
-                increment,
-                self.options.qp,
-            );
+            let (unit, recon) = loop {
+                let qp = self.current_qp();
+                let produced = encode_i_vop(&self.vol, &self.cfg, &view, modulo, increment, qp);
+                if self.rc_admit(produced.0.len()) {
+                    break produced;
+                }
+            };
             self.store.push_anchor(recon);
             self.anchor_motion = None;
             unit
@@ -450,15 +555,15 @@ impl Mpeg4VideoEncoder {
                 .backward()
                 .expect("anchor present on the P path")
                 .clone();
-            let (unit, _stats) = encode_p_vop(
-                &self.vol,
-                &self.cfg,
-                &view,
-                &reference,
-                modulo,
-                increment,
-                self.options.qp,
-            );
+            let unit = loop {
+                let qp = self.current_qp();
+                let (unit, _stats) = encode_p_vop(
+                    &self.vol, &self.cfg, &view, &reference, modulo, increment, qp,
+                );
+                if self.rc_admit(unit.len()) {
+                    break unit;
+                }
+            };
             let (_recon, motion) =
                 reconstruct_own_p_vop_with_motion(&self.vol, &unit, &mut self.store);
             self.anchor_motion = Some(motion);
@@ -511,18 +616,24 @@ impl Mpeg4VideoEncoder {
             let seconds = b.ticks / res;
             let modulo = (seconds - self.b_base_sec) as u32;
             let increment = (b.ticks % res) as u16;
-            let (unit, _recon, _stats) = encode_b_vop(
-                &self.vol,
-                &self.cfg,
-                &view,
-                &self.store,
-                self.anchor_motion.as_deref(),
-                trb,
-                trd,
-                modulo,
-                increment,
-                self.options.qp,
-            );
+            let unit = loop {
+                let qp = self.current_qp();
+                let (unit, _recon, _stats) = encode_b_vop(
+                    &self.vol,
+                    &self.cfg,
+                    &view,
+                    &self.store,
+                    self.anchor_motion.as_deref(),
+                    trb,
+                    trd,
+                    modulo,
+                    increment,
+                    qp,
+                );
+                if self.rc_admit(unit.len()) {
+                    break unit;
+                }
+            };
             // Annex D item 7: a B-VOP's decode time is its own
             // composition time.
             self.push_packet(unit, b.ticks, b.pts, false, b.ticks as i64);
