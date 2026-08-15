@@ -40,6 +40,12 @@ pub struct Mpeg4EncoderOptions {
     /// `ac-pred` — enable the cost-decided §7.4.3.3 AC-prediction
     /// emission (default on).
     pub ac_pred: bool,
+    /// `four-mv` — enable cost-decided §6.3.7 four-motion-vector
+    /// (`inter4v`) P-VOP macroblocks (default off).
+    pub four_mv: bool,
+    /// `qpel` — emit quarter-sample motion (§7.6.2.2; sets the VOL's
+    /// `quarter_sample` flag and the ASP profile). Default off.
+    pub qpel: bool,
     /// `gop-size` — I-VOP cadence: one keyframe every `gop_size`
     /// frames (`1` = intra-only). Default 12.
     pub gop_size: u32,
@@ -51,6 +57,8 @@ impl Default for Mpeg4EncoderOptions {
             qp: 4,
             mpeg_quant: false,
             ac_pred: true,
+            four_mv: false,
+            qpel: false,
             gop_size: 12,
         }
     }
@@ -79,6 +87,20 @@ impl oxideav_core::CodecOptionsStruct for Mpeg4EncoderOptions {
                    macroblocks",
         },
         oxideav_core::OptionField {
+            name: "four-mv",
+            kind: oxideav_core::OptionKind::Bool,
+            default: oxideav_core::OptionValue::Bool(false),
+            help: "enable cost-decided four-motion-vector (inter4v) P-VOP \
+                   macroblocks",
+        },
+        oxideav_core::OptionField {
+            name: "qpel",
+            kind: oxideav_core::OptionKind::Bool,
+            default: oxideav_core::OptionValue::Bool(false),
+            help: "emit quarter-sample motion vectors (ISO/IEC 14496-2 \
+                   §7.6.2.2; selects the ASP profile)",
+        },
+        oxideav_core::OptionField {
             name: "gop-size",
             kind: oxideav_core::OptionKind::U32,
             default: oxideav_core::OptionValue::U32(12),
@@ -97,6 +119,8 @@ impl oxideav_core::CodecOptionsStruct for Mpeg4EncoderOptions {
             }
             "mpeg-quant" => self.mpeg_quant = value.as_bool()?,
             "ac-pred" => self.ac_pred = value.as_bool()?,
+            "four-mv" => self.four_mv = value.as_bool()?,
+            "qpel" => self.qpel = value.as_bool()?,
             "gop-size" => {
                 let g = value.as_u32()?;
                 if g == 0 {
@@ -169,6 +193,8 @@ impl Mpeg4VideoEncoder {
             time_increment_resolution: frame_rate.num as u16,
             quant_type: options.mpeg_quant,
             ac_prediction: options.ac_pred,
+            four_mv: options.four_mv,
+            quarter_sample: options.qpel,
         };
         let config_headers = write_configuration_headers(&cfg);
         let vol_pos = config_headers

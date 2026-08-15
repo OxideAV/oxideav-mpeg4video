@@ -6,6 +6,38 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Encoder 4MV + quarter-sample motion (round 443, stages 1–2)** —
+  the encoder tail's first two arms:
+  - *§6.3.7 inter4v emission* (`four-mv` option / `EncoderConfig::
+    four_mv`): per-8×8-block motion estimation (a full-pel window
+    around the 1-MV winner + the sub-pel refinement), cost-decided
+    against the 1-MV form, emitted as Table B.7 `derived_mb_type == 2`
+    with four `motion_vector()` bodies — each against the §7.6.5
+    median for *that* block index with the in-MB Figure 7-34
+    candidates threaded incrementally, mirroring the decoder's
+    `MvDriver::decode_four_mv` exactly.
+  - *§7.6.2.2 quarter-sample emission* (`qpel` option /
+    `EncoderConfig::quarter_sample`): the VOL declares verid 2 (the
+    §6.2.3 `quarter_sample` flag exists only under
+    `video_object_layer_verid != 1`, widening `sprite_enable` to two
+    bits and adding the `newpred_enable` /
+    `reduced_resolution_vop_enable` pair) and the ASP profile
+    (Table G.1 `0xF3` / Table 6-11 `0x11`); motion estimation refines
+    full-pel → half-pel → quarter-pel through the decoder's own
+    §7.6.2.2 interpolator (16×16 single-block for 1-MV, per-8×8
+    Figure 7-30 mirroring for inter4v), clamped to the `fcode == 1`
+    quarter-unit range; `reconstruct_own_p_vop` follows the VOL's
+    sample mode.
+  - Validation: divergent-block-motion and fractional-motion scenes
+    self-decode **sample-exact** through `Mpeg4VideoDecoder` in all
+    tool combinations (4MV, qpel, qpel+4MV), byte-deterministic; three
+    new black-box fixture pairs (`enc_ip_4mv_64x64`,
+    `enc_ip_qpel_64x64`, `enc_ip_qpel4mv_64x64` — commands + SHA-256
+    in `tests/fixtures/NOTES.md`) pin that the reference decoder's
+    decode of our streams is **bit-exact** against this crate's own.
+
 ### Fixed
 
 - **Cross-platform byte determinism of the transform pair** — the

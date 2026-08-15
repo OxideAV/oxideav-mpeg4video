@@ -192,6 +192,29 @@ intra-mismatch divergence: ecosystem-compat mode is bit-exact, the
 literal-spec decode differs on 834 samples by at most ±1). If the
 encoder's output changes, regenerate BOTH files and re-measure.
 
+## Encoder-produced streams (round 443)
+
+The round-443 encoder tail added three more encoder-produced pairs
+(each 1 I-VOP + 4 P-VOPs, 64x64, method-2, qp 4; sources embedded in
+`tests/encoder_blackbox.rs`; regenerate the streams with
+`OXIDEAV_MPEG4VIDEO_WRITE_FIXTURES=1 cargo test --test encoder_blackbox`):
+
+* `enc_ip_4mv_64x64` — §6.3.7 inter4v (four-MV) macroblocks over a
+  checkerboard of divergent 8x8-block motion fields;
+* `enc_ip_qpel_64x64` — `quarter_sample == 1` (verid-2 VOL, ASP)
+  over a smooth quarter-grid texture translating by (3, 1) quarter
+  pels per frame (true fractional §7.6.2.2 motion);
+* `enc_ip_qpel4mv_64x64` — both tools on the divergent-motion scene.
+
+```
+ffmpeg -idct faani -i enc_ip_4mv_64x64.m4v -f rawvideo -pix_fmt yuv420p enc_ip_4mv_64x64.yuv
+ffmpeg -idct faani -i enc_ip_qpel_64x64.m4v -f rawvideo -pix_fmt yuv420p enc_ip_qpel_64x64.yuv
+ffmpeg -idct faani -i enc_ip_qpel4mv_64x64.m4v -f rawvideo -pix_fmt yuv420p enc_ip_qpel4mv_64x64.yuv
+```
+
+All three reference decodes are **bit-exact** against this crate's
+decode of the same streams (asserted in `tests/encoder_blackbox.rs`).
+
 ## SHA-256
 
 ```
@@ -264,6 +287,12 @@ b29588dfd261fe8f4e04a4f8cba31df8150a7b77bb10b2714af5f1ab0c9d46ab  fq_probe_half_
 4f13eb5e87a747ce02d5a859e49af6a06b4a90b4200d7f5f475d7756f734ae99  enc_intra_m2_64x64.yuv
 9137ec57b46495fe659de018b8f27db6ee15b3add9529128aadf7fa7f9009d68  enc_ip_m2_64x64.m4v
 9b9a9e622de3afb760bf461afe24c90478001acad21a19137fe5d5db3e737542  enc_ip_m2_64x64.yuv
+4a14ef0d5089a070f71e0b79df13f310f9c0a1ff5de1652845550870544892b6  enc_ip_4mv_64x64.m4v
+945a4da88674c8dd81c0bec23c0afbad480964d78f9f41d827861485505067c1  enc_ip_4mv_64x64.yuv
+1dbefcff4a7749287a8588564f4e23f39b84a3058f0607fa5cf7e3af3c415996  enc_ip_qpel_64x64.m4v
+e1e4c9d7fce8198331e805bc6a3743b5839c96b213747e9bd5a84ec438ec894f  enc_ip_qpel_64x64.yuv
+67af5c1c95fdf1fd2a607cb6b646f234a39dd6ce79e25171784e550429d7ff2d  enc_ip_qpel4mv_64x64.m4v
+37eb3c51c6a921daa19f9636de8b3c702a5f08f82dcbd9a88df81300fa1f2e3b  enc_ip_qpel4mv_64x64.yuv
 ```
 
 (Note: `aic_ipb_64x64.yuv` and `altscan_ipb_64x64.yuv` are

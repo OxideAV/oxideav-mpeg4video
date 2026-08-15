@@ -98,6 +98,8 @@ pub struct PVopEncodeStats {
     pub skipped: usize,
     /// Inter (1-MV) macroblocks.
     pub inter: usize,
+    /// inter4v (4-MV) macroblocks.
+    pub inter4v: usize,
     /// Intra macroblocks.
     pub intra: usize,
 }
@@ -138,14 +140,26 @@ fn sad_full_pel(
     sad
 }
 
-/// SAD of the source macroblock against a half-pel motion vector,
-/// through the decoder's own §7.6.2.1 interpolator.
-fn sad_half_pel(
+/// The number of MV units per pel under a sub-pel `mode` (§7.6.3:
+/// half-sample units when `quarter_sample == 0`, quarter-sample units
+/// otherwise).
+fn units_per_pel(mode: BVopSampleMode) -> i32 {
+    match mode {
+        BVopSampleMode::HalfPel => 2,
+        BVopSampleMode::QuarterPel { .. } => 4,
+    }
+}
+
+/// SAD of the source macroblock against a sub-pel motion vector (in
+/// `mode`'s units), through the decoder's own §7.6.2.1 / §7.6.2.2
+/// interpolator.
+fn sad_subpel(
     src: &[[i32; 16]; 16],
     reference: &crate::half_sample::ReferenceVop<'_>,
     mb_x: i32,
     mb_y: i32,
     mv: MotionVector,
+    mode: BVopSampleMode,
 ) -> u32 {
     let pred = crate::pvop_mv::predict_luma_macroblock(
         PvopMbMotion::OneMv(mv),
@@ -153,7 +167,7 @@ fn sad_half_pel(
         mb_x,
         mb_y,
         0,
-        BVopSampleMode::HalfPel,
+        mode,
     )
     .expect("OneMv always yields a prediction");
     let mut sad = 0u32;
@@ -165,14 +179,56 @@ fn sad_half_pel(
     sad
 }
 
-/// Full-pel search + half-pel refinement. Returns the best half-pel
-/// MV and its SAD. The zero vector gets the classic small favouring
-/// bias so flat areas stay skippable.
+/// Sub-pel refinement around a full-pel winner: a half-pel ring pass,
+/// then (in quarter mode) a quarter-pel ring pass, each keeping the
+/// running best. The `[-32, 31]` clamp is the §7.6.3 `fcode == 1`
+/// range in `mode`'s units.
+fn refine_subpel<F: FnMut(MotionVector) -> u32>(
+    full: (i32, i32),
+    mode: BVopSampleMode,
+    mut sad_of: F,
+) -> (MotionVector, u32) {
+    let unit = units_per_pel(mode);
+    let mut best_mv = MotionVector {
+        x: (full.0 * unit).clamp(-32, 31),
+        y: (full.1 * unit).clamp(-32, 31),
+    };
+    let mut best_sad = sad_of(best_mv);
+    let mut steps = vec![unit / 2];
+    if matches!(mode, BVopSampleMode::QuarterPel { .. }) {
+        steps.push(1);
+    }
+    for step in steps {
+        let centre = best_mv;
+        for hy in -1..=1 {
+            for hx in -1..=1 {
+                if (hx, hy) == (0, 0) {
+                    continue;
+                }
+                let cand = MotionVector {
+                    x: (centre.x + hx * step).clamp(-32, 31),
+                    y: (centre.y + hy * step).clamp(-32, 31),
+                };
+                let sad = sad_of(cand);
+                if sad < best_sad {
+                    best_sad = sad;
+                    best_mv = cand;
+                }
+            }
+        }
+    }
+    (best_mv, best_sad)
+}
+
+/// Full-pel search + sub-pel refinement. Returns the best MV (in
+/// `mode`'s units) and its SAD. The zero vector gets the classic small
+/// favouring bias so flat areas stay skippable.
 fn estimate_motion(
     src: &[[i32; 16]; 16],
     reference: &crate::half_sample::ReferenceVop<'_>,
     mb_x: i32,
     mb_y: i32,
+    mode: BVopSampleMode,
 ) -> (MotionVector, u32) {
     let mut best = (0i32, 0i32);
     let mut best_sad = sad_full_pel(src, reference, mb_x, mb_y, 0, 0).saturating_sub(128);
@@ -188,29 +244,127 @@ fn estimate_motion(
             }
         }
     }
-    // Half-pel refinement around the full-pel winner.
-    let mut best_mv = MotionVector {
-        x: best.0 * 2,
-        y: best.1 * 2,
-    };
-    let mut best_half = sad_half_pel(src, reference, mb_x, mb_y, best_mv);
-    for hy in -1..=1 {
-        for hx in -1..=1 {
-            if (hx, hy) == (0, 0) {
-                continue;
-            }
-            let cand = MotionVector {
-                x: (best.0 * 2 + hx).clamp(-32, 31),
-                y: (best.1 * 2 + hy).clamp(-32, 31),
-            };
-            let sad = sad_half_pel(src, reference, mb_x, mb_y, cand);
-            if sad < best_half {
-                best_half = sad;
-                best_mv = cand;
-            }
+    refine_subpel(best, mode, |cand| {
+        sad_subpel(src, reference, mb_x, mb_y, cand, mode)
+    })
+}
+
+/// SAD of one 8×8 luminance sub-block (Figure 6-8 index `i`, luma
+/// blocks 0..=3) against a full-pel reference position.
+fn sad_full_pel_block8(
+    src: &[[i32; 16]; 16],
+    reference: &crate::half_sample::ReferenceVop<'_>,
+    mb_x: i32,
+    mb_y: i32,
+    block: usize,
+    dx: i32,
+    dy: i32,
+) -> u32 {
+    let (row0, col0) = (8 * (block / 2), 8 * (block % 2));
+    let (bx, by) = (mb_x + col0 as i32, mb_y + row0 as i32);
+    let mut sad = 0u32;
+    for j in 0..8 {
+        for i in 0..8 {
+            let s = src[row0 + j][col0 + i];
+            let r = reference.fetch_clamped(bx + i as i32 + dx, by + j as i32 + dy);
+            sad += (s - i32::from(r)).unsigned_abs();
         }
     }
-    (best_mv, best_half)
+    sad
+}
+
+/// SAD of one 8×8 sub-block against a sub-pel motion vector (in
+/// `mode`'s units), through the decoder's own §7.6.2.1 / §7.6.2.2
+/// per-block interpolator (the 8×8 §7.6.2.2 path carries its own
+/// Figure 7-30 boundary mirroring, exactly as a decoded inter4v block
+/// does).
+fn sad_subpel_block8(
+    src: &[[i32; 16]; 16],
+    reference: &crate::half_sample::ReferenceVop<'_>,
+    mb_x: i32,
+    mb_y: i32,
+    block: usize,
+    mv: MotionVector,
+    mode: BVopSampleMode,
+) -> u32 {
+    let (row0, col0) = (8 * (block / 2), 8 * (block % 2));
+    let (bx, by) = (mb_x + col0 as i32, mb_y + row0 as i32);
+    let mut pred = [0u8; 64];
+    match mode {
+        BVopSampleMode::HalfPel => {
+            crate::half_sample::interpolate_block_into(
+                reference, mv.x, mv.y, bx, by, 8, 8, 0, &mut pred,
+            );
+        }
+        BVopSampleMode::QuarterPel { bits_per_pixel } => {
+            crate::quarter_sample::interpolate_block_qpel_into(
+                reference,
+                mv.x,
+                mv.y,
+                bx,
+                by,
+                8,
+                8,
+                0,
+                bits_per_pixel,
+                &mut pred,
+            );
+        }
+    }
+    let mut sad = 0u32;
+    for j in 0..8 {
+        for i in 0..8 {
+            sad += (src[row0 + j][col0 + i] - i32::from(pred[j * 8 + i])).unsigned_abs();
+        }
+    }
+    sad
+}
+
+/// §6.3.7 inter4v motion estimation: per 8×8 luminance block, a
+/// full-pel search over a window around the 1-MV winner (plus the zero
+/// vector), then the sub-pel refinement. Returns the four Figure
+/// 6-8-ordered block MVs (in `mode`'s units) and the summed SAD.
+fn estimate_motion_4mv(
+    src: &[[i32; 16]; 16],
+    reference: &crate::half_sample::ReferenceVop<'_>,
+    mb_x: i32,
+    mb_y: i32,
+    seed: MotionVector,
+    mode: BVopSampleMode,
+) -> ([MotionVector; 4], u32) {
+    // Full-pel part of the 1-MV winner (truncating — the sub-pel
+    // refinement recovers the fraction).
+    let unit = units_per_pel(mode);
+    let (sx, sy) = (seed.x / unit, seed.y / unit);
+    let mut mvs = [MotionVector { x: 0, y: 0 }; 4];
+    let mut total = 0u32;
+    for (block, out) in mvs.iter_mut().enumerate() {
+        let mut best = (0i32, 0i32);
+        let mut best_sad = sad_full_pel_block8(src, reference, mb_x, mb_y, block, 0, 0);
+        for dy in (sy - 2)..=(sy + 2) {
+            for dx in (sx - 2)..=(sx + 2) {
+                if (dx, dy) == (0, 0) {
+                    continue;
+                }
+                if !(-SEARCH_RANGE..=SEARCH_RANGE).contains(&dx)
+                    || !(-SEARCH_RANGE..=SEARCH_RANGE).contains(&dy)
+                {
+                    continue;
+                }
+                let sad = sad_full_pel_block8(src, reference, mb_x, mb_y, block, dx, dy);
+                if sad < best_sad {
+                    best_sad = sad;
+                    best = (dx, dy);
+                }
+            }
+        }
+        let (best_mv, best_sub) = refine_subpel(best, mode, |cand| {
+            sad_subpel_block8(src, reference, mb_x, mb_y, block, cand, mode)
+        });
+        *out = best_mv;
+        total += best_sub;
+    }
+    (mvs, total)
 }
 
 /// Mean-removed activity of the source macroblock — the classic
@@ -266,6 +420,7 @@ pub fn encode_p_vop(
     let w_intra = crate::block::intra_quant_matrix(vol);
     let w_inter = nonintra_quant_matrix(vol);
     let use_dc_vlc = use_intra_dc_vlc(0, qp);
+    let mode = sample_mode_of(vol);
     let luma_ref = reference.luma_reference();
     let cb_ref = reference.cb_reference();
     let cr_ref = reference.cr_reference();
@@ -289,7 +444,25 @@ pub fn encode_p_vop(
             let src = source_luma_mb(frame, mb_row, mb_col);
 
             // Motion estimation + mode decision.
-            let (mv, inter_sad) = estimate_motion(&src, &luma_ref, mb_x, mb_y);
+            let (mv, one_mv_sad) = estimate_motion(&src, &luma_ref, mb_x, mb_y, mode);
+            // §6.3.7 inter4v: per-block refinement around the 1-MV
+            // winner; chosen only when the summed block SADs undercut
+            // the 1-MV SAD by a margin covering the three extra
+            // motion_vector() bodies. Four equal vectors collapse to
+            // the (cheaper, prediction-identical on the half-pel grid)
+            // 1-MV form.
+            let four = if cfg.four_mv {
+                let (mvs, sad4) = estimate_motion_4mv(&src, &luma_ref, mb_x, mb_y, mv, mode);
+                let distinct = mvs.iter().any(|&m| m != mvs[0]);
+                if distinct && sad4 + 256 < one_mv_sad {
+                    Some((mvs, sad4))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let inter_sad = four.map_or(one_mv_sad, |(_, s)| s);
             let activity = intra_activity(&src);
             let choose_intra = activity + 512 < inter_sad;
 
@@ -315,17 +488,13 @@ pub fn encode_p_vop(
             }
 
             // Inter: build the prediction, quantise the residual.
-            let prediction = predict_inter_macroblock(
-                PvopMbMotion::OneMv(mv),
-                &luma_ref,
-                &cb_ref,
-                &cr_ref,
-                mb_x,
-                mb_y,
-                0,
-                BVopSampleMode::HalfPel,
-            )
-            .expect("OneMv always yields a prediction");
+            let motion = match four {
+                Some((mvs, _)) => PvopMbMotion::FourMv(mvs),
+                None => PvopMbMotion::OneMv(mv),
+            };
+            let prediction =
+                predict_inter_macroblock(motion, &luma_ref, &cb_ref, &cr_ref, mb_x, mb_y, 0, mode)
+                    .expect("inter motion always yields a prediction");
 
             let mut events: Vec<Vec<AcEvent>> = Vec::with_capacity(6);
             for i in 0..6 {
@@ -350,7 +519,9 @@ pub fn encode_p_vop(
             }
             let all_zero = events.iter().all(|e| e.is_empty());
 
-            if all_zero && mv == (MotionVector { x: 0, y: 0 }) {
+            if all_zero
+                && matches!(motion, PvopMbMotion::OneMv(m) if m == (MotionVector { x: 0, y: 0 }))
+            {
                 // §6.3.6 skip: not_coded = 1, zero MV, no residual.
                 stats.skipped += 1;
                 bw.write_bit(true);
@@ -360,7 +531,6 @@ pub fn encode_p_vop(
                 continue;
             }
 
-            stats.inter += 1;
             let cbpy = (u8::from(!events[0].is_empty()) << 3)
                 | (u8::from(!events[1].is_empty()) << 2)
                 | (u8::from(!events[2].is_empty()) << 1)
@@ -368,19 +538,53 @@ pub fn encode_p_vop(
             let cbpc = (u8::from(!events[4].is_empty()) << 1) | u8::from(!events[5].is_empty());
 
             bw.write_bit(false); // not_coded = 0
-            put_mcbpc_p(&mut bw, 0, cbpc); // derived_mb_type 0 = inter, 1 MV
-            put_cbpy(&mut bw, cbpy, false);
+            match motion {
+                PvopMbMotion::FourMv(mvs) => {
+                    stats.inter4v += 1;
+                    put_mcbpc_p(&mut bw, 2, cbpc); // derived_mb_type 2 = inter4v
+                    put_cbpy(&mut bw, cbpy, false);
+                    // Four §6.2.6.2 motion_vector() bodies, each against
+                    // the §7.6.5 median for *that* block index, with the
+                    // in-MB candidates made visible incrementally —
+                    // mirroring the decoder's MvDriver::decode_four_mv.
+                    let mut recorded = [MotionVector { x: 0, y: 0 }; 4];
+                    mv_grid
+                        .record_four_mv(mb_row, mb_col, recorded)
+                        .expect("grid coordinates in range");
+                    for (i, &block_mv) in mvs.iter().enumerate() {
+                        let candidates = mv_grid
+                            .predictor_candidates(mb_row, mb_col, i)
+                            .expect("grid coordinates in range");
+                        let predictor = predict_motion_vector(candidates);
+                        put_motion_vector(
+                            &mut bw,
+                            block_mv.x - predictor.x,
+                            block_mv.y - predictor.y,
+                            1,
+                        );
+                        recorded[i] = block_mv;
+                        mv_grid
+                            .record_four_mv(mb_row, mb_col, recorded)
+                            .expect("grid coordinates in range");
+                    }
+                }
+                _ => {
+                    stats.inter += 1;
+                    put_mcbpc_p(&mut bw, 0, cbpc); // derived_mb_type 0 = inter, 1 MV
+                    put_cbpy(&mut bw, cbpy, false);
 
-            // §7.6.5 median predictor over the shared grid state, then
-            // the §7.6.3 differential (fcode 1).
-            let candidates = mv_grid
-                .predictor_candidates(mb_row, mb_col, 0)
-                .expect("grid coordinates in range");
-            let predictor = predict_motion_vector(candidates);
-            put_motion_vector(&mut bw, mv.x - predictor.x, mv.y - predictor.y, 1);
-            mv_grid
-                .record_one_mv(mb_row, mb_col, mv)
-                .expect("grid coordinates in range");
+                    // §7.6.5 median predictor over the shared grid state,
+                    // then the §7.6.3 differential (fcode 1).
+                    let candidates = mv_grid
+                        .predictor_candidates(mb_row, mb_col, 0)
+                        .expect("grid coordinates in range");
+                    let predictor = predict_motion_vector(candidates);
+                    put_motion_vector(&mut bw, mv.x - predictor.x, mv.y - predictor.y, 1);
+                    mv_grid
+                        .record_one_mv(mb_row, mb_col, mv)
+                        .expect("grid coordinates in range");
+                }
+            }
 
             for ev in &events {
                 if !ev.is_empty() {
@@ -501,12 +705,25 @@ pub fn reconstruct_own_p_vop(
         mb_height,
         &entries,
         vop.rounding_type,
-        BVopSampleMode::HalfPel,
+        sample_mode_of(vol),
         8,
     )
     .expect("own P-VOP must assemble")
     .clone();
     frame
+}
+
+/// The §7.6.2 sub-pel interpolation mode a VOL selects
+/// (`quarter_sample == 1` → §7.6.2.2 quarter-sample, else §7.6.2.1
+/// half-sample).
+pub(crate) fn sample_mode_of(vol: &crate::vol::VolHeader) -> BVopSampleMode {
+    if vol.quarter_sample {
+        BVopSampleMode::QuarterPel {
+            bits_per_pixel: u32::from(vol.bits_per_pixel),
+        }
+    } else {
+        BVopSampleMode::HalfPel
+    }
 }
 
 /// The I-VOP sibling of [`reconstruct_own_p_vop`]: install an

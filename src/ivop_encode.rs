@@ -76,6 +76,15 @@ pub struct EncoderConfig {
     /// cost-decided). DC prediction is always on — it is not optional
     /// in the syntax.
     pub ac_prediction: bool,
+    /// Enable §6.3.7 four-motion-vector (`inter4v`) P-VOP macroblocks
+    /// (per-macroblock cost-decided). Purely an encode-side mode
+    /// choice — the VOL carries no flag for it.
+    pub four_mv: bool,
+    /// `quarter_sample` (§6.3.3): emit motion vectors on the
+    /// quarter-sample grid and compensate through the §7.6.2.2
+    /// interpolation. Requires (and selects) the verid-2 VOL layout
+    /// and the ASP profile.
+    pub quarter_sample: bool,
 }
 
 impl Default for EncoderConfig {
@@ -86,17 +95,26 @@ impl Default for EncoderConfig {
             time_increment_resolution: 25,
             quant_type: false,
             ac_prediction: true,
+            four_mv: false,
+            quarter_sample: false,
         }
     }
 }
 
 impl EncoderConfig {
+    /// Whether the configuration uses any Advanced-Simple-profile
+    /// tool (method-1 quantisation, quarter-sample MC).
+    fn uses_asp_tools(&self) -> bool {
+        self.quant_type || self.quarter_sample
+    }
+
     /// Table G.1 `profile_and_level_indication` for this
     /// configuration: Simple Profile/Level 3 (`0x03`) for the plain
     /// method-2 tool set, Advanced Simple Profile/Level 3 (`0xF3`)
-    /// once method-1 quantisation (an ASP tool) is selected.
+    /// once an ASP tool (method-1 quantisation, quarter-sample) is
+    /// selected.
     pub fn profile_and_level(&self) -> u8 {
-        if self.quant_type {
+        if self.uses_asp_tools() {
             0xF3
         } else {
             0x03
@@ -107,7 +125,7 @@ impl EncoderConfig {
     /// Advanced Simple (`0x11`), matching
     /// [`Self::profile_and_level`].
     pub fn video_object_type(&self) -> u8 {
-        if self.quant_type {
+        if self.uses_asp_tools() {
             0x11
         } else {
             0x01
@@ -147,7 +165,15 @@ pub fn write_configuration_headers(cfg: &EncoderConfig) -> Vec<u8> {
     bw.write_start_code(VIDEO_OBJECT_LAYER_START_CODE);
     bw.write_bit(false); // random_accessible_vol
     bw.write_bits(u32::from(cfg.video_object_type()), 8);
-    bw.write_bit(false); // is_object_layer_identifier = 0 → verid 1
+    if cfg.quarter_sample {
+        // §6.2.3: the quarter_sample flag exists only when
+        // video_object_layer_verid != 1, so declare verid 2.
+        bw.write_bit(true); // is_object_layer_identifier = 1
+        bw.write_bits(2, 4); // video_object_layer_verid = 2
+        bw.write_bits(1, 3); // video_object_layer_priority = 1
+    } else {
+        bw.write_bit(false); // is_object_layer_identifier = 0 → verid 1
+    }
     bw.write_bits(1, 4); // aspect_ratio_info = 1:1
     bw.write_bit(false); // vol_control_parameters = 0
     bw.write_bits(0, 2); // video_object_layer_shape = rectangular
@@ -162,16 +188,29 @@ pub fn write_configuration_headers(cfg: &EncoderConfig) -> Vec<u8> {
     bw.write_marker();
     bw.write_bit(false); // interlaced = 0
     bw.write_bit(true); // obmc_disable = 1
-    bw.write_bit(false); // sprite_enable = 0 (verid 1 → 1 bit)
+    if cfg.quarter_sample {
+        bw.write_bits(0, 2); // sprite_enable = 00 (verid 2 → 2 bits)
+    } else {
+        bw.write_bit(false); // sprite_enable = 0 (verid 1 → 1 bit)
+    }
     bw.write_bit(false); // not_8_bit = 0
     bw.write_bit(cfg.quant_type); // quant_type
     if cfg.quant_type {
         bw.write_bit(false); // load_intra_quant_mat = 0 (default matrix)
         bw.write_bit(false); // load_nonintra_quant_mat = 0
     }
+    if cfg.quarter_sample {
+        // Present only under verid != 1 (declared above).
+        bw.write_bit(true); // quarter_sample = 1
+    }
     bw.write_bit(true); // complexity_estimation_disable = 1
     bw.write_bit(true); // resync_marker_disable = 1
     bw.write_bit(false); // data_partitioned = 0
+    if cfg.quarter_sample {
+        // Present only under verid != 1.
+        bw.write_bit(false); // newpred_enable = 0
+        bw.write_bit(false); // reduced_resolution_vop_enable = 0
+    }
     bw.write_bit(false); // scalability = 0
     bw.next_start_code();
     bw.into_bytes()

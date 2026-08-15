@@ -29,6 +29,20 @@ fn fixture(name: &str) -> Vec<u8> {
     std::fs::read(&path).unwrap_or_else(|e| panic!("read {path}: {e}"))
 }
 
+/// Fixture (re)generation hook: with `OXIDEAV_MPEG4VIDEO_WRITE_FIXTURES=1`
+/// the reproduction tests write the freshly built stream to
+/// `tests/fixtures/` instead of comparing (the black-box reference
+/// decode must then be regenerated per `tests/fixtures/NOTES.md`).
+/// Returns `true` when the fixture was (re)written.
+fn maybe_write_fixture(name: &str, bytes: &[u8]) -> bool {
+    if std::env::var_os("OXIDEAV_MPEG4VIDEO_WRITE_FIXTURES").is_none() {
+        return false;
+    }
+    let path = format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"));
+    std::fs::write(&path, bytes).unwrap_or_else(|e| panic!("write {path}: {e}"));
+    true
+}
+
 /// Deterministic LCG (numerical recipes constants).
 fn lcg(state: &mut u32) -> u32 {
     *state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
@@ -169,6 +183,133 @@ fn build_ip_stream() -> Vec<u8> {
     stream
 }
 
+/// A checkerboard of divergent 8×8-block motion fields (the 4MV
+/// exercise scene): even-parity blocks translate by (+2, +1) pels per
+/// frame, odd-parity blocks by (-2, 0).
+fn divergent_picture(frame_index: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let (w, h) = (64usize, 64usize);
+    let (cw, ch) = (w / 2, h / 2);
+    let bg = |x: i64, y: i64| -> u8 {
+        let v = (x * 7 + y * 5) % 160 + ((x / 9 + y / 7) % 13) * 6;
+        (40 + v.rem_euclid(170)) as u8
+    };
+    let mut y = vec![0u8; w * h];
+    for row in 0..h {
+        for col in 0..w {
+            let parity = (row / 8 + col / 8) % 2;
+            let (ox, oy) = if parity == 0 {
+                ((frame_index * 2) as i64, frame_index as i64)
+            } else {
+                (-((frame_index * 2) as i64), 0)
+            };
+            y[row * w + col] = bg(col as i64 + ox, row as i64 + oy);
+        }
+    }
+    let cb = vec![100u8; cw * ch];
+    let cr = vec![128u8; cw * ch];
+    (y, cb, cr)
+}
+
+/// Sub-pel translating scene for the quarter-sample fixture: a smooth
+/// integer-arithmetic texture defined on the quarter-pel grid, sampled
+/// at a per-frame offset of (3, 1) **quarter** pels — real fractional
+/// motion for the §7.6.2.2 path to chase.
+fn qpel_picture(frame_index: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let (w, h) = (64usize, 64usize);
+    let (cw, ch) = (w / 2, h / 2);
+    // Quarter-grid texture: triangle waves in two directions, smooth
+    // at the quarter step (pure integer arithmetic — deterministic).
+    let bg_q = |xq: i64, yq: i64| -> u8 {
+        let t1 = (xq * 3 + yq * 2).rem_euclid(512);
+        let t2 = (xq - yq * 4).rem_euclid(768);
+        let tri1 = (t1 - 256).abs(); // 0..=256
+        let tri2 = (t2 - 384).abs() / 2; // 0..=192
+        (32 + (tri1 * 2 + tri2) / 5) as u8
+    };
+    let (oxq, oyq) = ((frame_index * 3) as i64, frame_index as i64);
+    let mut y = vec![0u8; w * h];
+    for row in 0..h {
+        for col in 0..w {
+            y[row * w + col] = bg_q(col as i64 * 4 + oxq, row as i64 * 4 + oyq);
+        }
+    }
+    let mut cb = vec![0u8; cw * ch];
+    let cr = vec![128u8; cw * ch];
+    for row in 0..ch {
+        for col in 0..cw {
+            cb[row * cw + col] = bg_q(col as i64 * 8 + oxq, row as i64 * 8 + oyq) / 2 + 64;
+        }
+    }
+    (y, cb, cr)
+}
+
+/// One planar 4:2:0 synthetic picture (`(y, cb, cr)` planes).
+type Planes = (Vec<u8>, Vec<u8>, Vec<u8>);
+
+/// Build an I+4P stream over `picture` with the given tool set.
+fn build_tooled_ip_stream(cfg: &EncoderConfig, picture: fn(usize) -> Planes) -> Vec<u8> {
+    let headers = write_configuration_headers(cfg);
+    let pos = headers
+        .windows(4)
+        .position(|w| w == [0, 0, 1, 0x20])
+        .expect("VOL start code");
+    let vol = parse_video_object_layer(&headers[pos..], cfg.profile_and_level()).unwrap();
+    let mut stream = headers;
+    let mut store = FrameStore::new();
+    for k in 0..5usize {
+        let (y, cb, cr) = picture(k);
+        let view = FrameView {
+            y: &y,
+            cb: &cb,
+            cr: &cr,
+            width: 64,
+            height: 64,
+        };
+        if k == 0 {
+            let (unit, recon) = encode_i_vop(&vol, cfg, &view, 0, 0, 4);
+            store.push_anchor(recon);
+            stream.extend_from_slice(&unit);
+        } else {
+            let reference = store.backward().expect("anchor present").clone();
+            let (unit, _stats) = encode_p_vop(&vol, cfg, &view, &reference, 0, k as u16, 4);
+            let _ = reconstruct_own_p_vop(&vol, &unit, &mut store);
+            stream.extend_from_slice(&unit);
+        }
+    }
+    stream
+}
+
+fn build_4mv_stream() -> Vec<u8> {
+    let cfg = EncoderConfig {
+        width: 64,
+        height: 64,
+        four_mv: true,
+        ..EncoderConfig::default()
+    };
+    build_tooled_ip_stream(&cfg, divergent_picture)
+}
+
+fn build_qpel_stream() -> Vec<u8> {
+    let cfg = EncoderConfig {
+        width: 64,
+        height: 64,
+        quarter_sample: true,
+        ..EncoderConfig::default()
+    };
+    build_tooled_ip_stream(&cfg, qpel_picture)
+}
+
+fn build_qpel_4mv_stream() -> Vec<u8> {
+    let cfg = EncoderConfig {
+        width: 64,
+        height: 64,
+        four_mv: true,
+        quarter_sample: true,
+        ..EncoderConfig::default()
+    };
+    build_tooled_ip_stream(&cfg, divergent_picture)
+}
+
 fn assert_own_decode_matches_reference(m4v: &str, yuv: &str) {
     let stream = fixture(m4v);
     let reference = fixture(yuv);
@@ -293,4 +434,61 @@ fn ip_stream_reproduces_committed_fixture() {
 #[test]
 fn ip_stream_decodes_bit_exact_against_reference_decoder() {
     assert_own_decode_matches_reference("enc_ip_m2_64x64.m4v", "enc_ip_m2_64x64.yuv");
+}
+
+#[test]
+fn four_mv_stream_reproduces_committed_fixture() {
+    let built = build_4mv_stream();
+    if maybe_write_fixture("enc_ip_4mv_64x64.m4v", &built) {
+        return;
+    }
+    assert_eq!(
+        built,
+        fixture("enc_ip_4mv_64x64.m4v"),
+        "encoder output drifted from the black-box-validated fixture; \
+         regenerate the fixture AND its reference decode"
+    );
+}
+
+#[test]
+fn four_mv_stream_decodes_bit_exact_against_reference_decoder() {
+    assert_own_decode_matches_reference("enc_ip_4mv_64x64.m4v", "enc_ip_4mv_64x64.yuv");
+}
+
+#[test]
+fn qpel_stream_reproduces_committed_fixture() {
+    let built = build_qpel_stream();
+    if maybe_write_fixture("enc_ip_qpel_64x64.m4v", &built) {
+        return;
+    }
+    assert_eq!(
+        built,
+        fixture("enc_ip_qpel_64x64.m4v"),
+        "encoder output drifted from the black-box-validated fixture; \
+         regenerate the fixture AND its reference decode"
+    );
+}
+
+#[test]
+fn qpel_stream_decodes_bit_exact_against_reference_decoder() {
+    assert_own_decode_matches_reference("enc_ip_qpel_64x64.m4v", "enc_ip_qpel_64x64.yuv");
+}
+
+#[test]
+fn qpel_4mv_stream_reproduces_committed_fixture() {
+    let built = build_qpel_4mv_stream();
+    if maybe_write_fixture("enc_ip_qpel4mv_64x64.m4v", &built) {
+        return;
+    }
+    assert_eq!(
+        built,
+        fixture("enc_ip_qpel4mv_64x64.m4v"),
+        "encoder output drifted from the black-box-validated fixture; \
+         regenerate the fixture AND its reference decode"
+    );
+}
+
+#[test]
+fn qpel_4mv_stream_decodes_bit_exact_against_reference_decoder() {
+    assert_own_decode_matches_reference("enc_ip_qpel4mv_64x64.m4v", "enc_ip_qpel4mv_64x64.yuv");
 }

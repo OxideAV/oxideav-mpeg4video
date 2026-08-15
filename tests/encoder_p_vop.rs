@@ -219,6 +219,7 @@ fn static_scene_collapses_to_skips() {
         PVopEncodeStats {
             skipped: 9,
             inter: 0,
+            inter4v: 0,
             intra: 0
         }
     );
@@ -234,6 +235,216 @@ fn static_scene_collapses_to_skips() {
     assert_eq!(p_recon.luma_samples(), recon.luma_samples());
     let decoded = decode_full(&stream);
     assert_frames_match(&decoded, &[recon, p_recon]);
+}
+
+/// A scene whose 8×8 blocks alternate between two motion fields (a
+/// checkerboard of (+2, +1)- and (-2, 0)-per-frame translations), so a
+/// 16×16 macroblock straddles divergent motion and §6.3.7 inter4v wins.
+fn divergent_picture(w: usize, h: usize, k: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let scene = Scene {
+        width: w,
+        height: h,
+    };
+    let (cw, ch) = (w / 2, h / 2);
+    let mut y = vec![0u8; w * h];
+    for row in 0..h {
+        for col in 0..w {
+            let parity = (row / 8 + col / 8) % 2;
+            let (ox, oy) = if parity == 0 {
+                ((k * 2) as i64, k as i64)
+            } else {
+                (-((k * 2) as i64), 0)
+            };
+            y[row * w + col] = scene.background(col as i64 + ox, row as i64 + oy);
+        }
+    }
+    let cb = vec![100u8; cw * ch];
+    let cr = vec![128u8; cw * ch];
+    (y, cb, cr)
+}
+
+#[test]
+fn divergent_block_motion_selects_inter4v_and_self_decodes() {
+    let (w, h) = (64usize, 64usize);
+    let cfg = EncoderConfig {
+        width: 64,
+        height: 64,
+        four_mv: true,
+        ..EncoderConfig::default()
+    };
+    let headers = write_configuration_headers(&cfg);
+    let pos = headers
+        .windows(4)
+        .position(|win| win == [0, 0, 1, 0x20])
+        .unwrap();
+    let vol = parse_video_object_layer(&headers[pos..], cfg.profile_and_level()).unwrap();
+
+    let mut store = FrameStore::new();
+    let mut stream = headers;
+    let mut recons = Vec::new();
+    let mut four_mv_total = 0usize;
+    for k in 0..4 {
+        let (y, cb, cr) = divergent_picture(w, h, k);
+        let view = FrameView {
+            y: &y,
+            cb: &cb,
+            cr: &cr,
+            width: w,
+            height: h,
+        };
+        if k == 0 {
+            let (unit, recon) = encode_i_vop(&vol, &cfg, &view, 0, 0, 4);
+            stream.extend_from_slice(&unit);
+            store.push_anchor(recon.clone());
+            recons.push(recon);
+        } else {
+            let reference = store.backward().unwrap().clone();
+            let (unit, stats) = encode_p_vop(&vol, &cfg, &view, &reference, 0, k as u16, 4);
+            four_mv_total += stats.inter4v;
+            let recon = reconstruct_own_p_vop(&vol, &unit, &mut store);
+            stream.extend_from_slice(&unit);
+            recons.push(recon);
+        }
+    }
+    assert!(
+        four_mv_total > 0,
+        "divergent per-block motion never selected inter4v"
+    );
+    let decoded = decode_full(&stream);
+    assert_frames_match(&decoded, &recons);
+
+    // With four-mv disabled the same content still self-decodes (and
+    // emits no inter4v macroblocks).
+    let cfg_off = EncoderConfig {
+        four_mv: false,
+        ..cfg
+    };
+    let mut store = FrameStore::new();
+    let mut stream = write_configuration_headers(&cfg_off);
+    let mut recons = Vec::new();
+    for k in 0..3 {
+        let (y, cb, cr) = divergent_picture(w, h, k);
+        let view = FrameView {
+            y: &y,
+            cb: &cb,
+            cr: &cr,
+            width: w,
+            height: h,
+        };
+        if k == 0 {
+            let (unit, recon) = encode_i_vop(&vol, &cfg_off, &view, 0, 0, 4);
+            stream.extend_from_slice(&unit);
+            store.push_anchor(recon.clone());
+            recons.push(recon);
+        } else {
+            let reference = store.backward().unwrap().clone();
+            let (unit, stats) = encode_p_vop(&vol, &cfg_off, &view, &reference, 0, k as u16, 4);
+            assert_eq!(stats.inter4v, 0, "four_mv off must never emit inter4v");
+            let recon = reconstruct_own_p_vop(&vol, &unit, &mut store);
+            stream.extend_from_slice(&unit);
+            recons.push(recon);
+        }
+    }
+    let decoded = decode_full(&stream);
+    assert_frames_match(&decoded, &recons);
+}
+
+#[test]
+fn four_mv_stream_is_byte_deterministic() {
+    let scene = Scene {
+        width: 64,
+        height: 48,
+    };
+    let cfg = EncoderConfig {
+        width: 64,
+        height: 48,
+        four_mv: true,
+        ..EncoderConfig::default()
+    };
+    let a = encode_ip_stream(&cfg, 4, 4, &scene);
+    let b = encode_ip_stream(&cfg, 4, 4, &scene);
+    assert_eq!(a.stream, b.stream);
+    let decoded = decode_full(&a.stream);
+    assert_frames_match(&decoded, &a.recons);
+}
+
+#[test]
+fn qpel_ip_stream_self_decodes_sample_exact() {
+    let scene = Scene {
+        width: 64,
+        height: 64,
+    };
+    let cfg = EncoderConfig {
+        width: 64,
+        height: 64,
+        quarter_sample: true,
+        ..EncoderConfig::default()
+    };
+    assert_eq!(cfg.profile_and_level(), 0xF3, "qpel selects ASP");
+    let enc = encode_ip_stream(&cfg, 4, 5, &scene);
+    let decoded = decode_full(&enc.stream);
+    assert_frames_match(&decoded, &enc.recons);
+    let inter_total: usize = enc.stats.iter().map(|s| s.inter + s.skipped).sum();
+    assert!(inter_total > 0, "qpel P-VOPs never used inter coding");
+    for (k, recon) in enc.recons.iter().enumerate() {
+        let (y, _, _) = scene.picture(k);
+        let p = psnr_luma(&y, recon, 64, 64);
+        assert!(p > 32.0, "qpel frame {k} luma PSNR {p:.2} dB below floor");
+    }
+    // Determinism.
+    let again = encode_ip_stream(&cfg, 4, 5, &scene);
+    assert_eq!(enc.stream, again.stream);
+}
+
+#[test]
+fn qpel_four_mv_divergent_motion_self_decodes() {
+    let (w, h) = (64usize, 64usize);
+    let cfg = EncoderConfig {
+        width: 64,
+        height: 64,
+        four_mv: true,
+        quarter_sample: true,
+        ..EncoderConfig::default()
+    };
+    let headers = write_configuration_headers(&cfg);
+    let pos = headers
+        .windows(4)
+        .position(|win| win == [0, 0, 1, 0x20])
+        .unwrap();
+    let vol = parse_video_object_layer(&headers[pos..], cfg.profile_and_level()).unwrap();
+    assert!(vol.quarter_sample, "emitted VOL must carry quarter_sample");
+    assert_eq!(vol.video_object_layer_verid, 2);
+
+    let mut store = FrameStore::new();
+    let mut stream = headers;
+    let mut recons = Vec::new();
+    let mut four_mv_total = 0usize;
+    for k in 0..4 {
+        let (y, cb, cr) = divergent_picture(w, h, k);
+        let view = FrameView {
+            y: &y,
+            cb: &cb,
+            cr: &cr,
+            width: w,
+            height: h,
+        };
+        if k == 0 {
+            let (unit, recon) = encode_i_vop(&vol, &cfg, &view, 0, 0, 4);
+            stream.extend_from_slice(&unit);
+            store.push_anchor(recon.clone());
+            recons.push(recon);
+        } else {
+            let reference = store.backward().unwrap().clone();
+            let (unit, stats) = encode_p_vop(&vol, &cfg, &view, &reference, 0, k as u16, 4);
+            four_mv_total += stats.inter4v;
+            let recon = reconstruct_own_p_vop(&vol, &unit, &mut store);
+            stream.extend_from_slice(&unit);
+            recons.push(recon);
+        }
+    }
+    assert!(four_mv_total > 0, "qpel+4MV never selected inter4v");
+    let decoded = decode_full(&stream);
+    assert_frames_match(&decoded, &recons);
 }
 
 #[test]
