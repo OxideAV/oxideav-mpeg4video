@@ -85,6 +85,10 @@ pub struct EncoderConfig {
     /// interpolation. Requires (and selects) the verid-2 VOL layout
     /// and the ASP profile.
     pub quarter_sample: bool,
+    /// The stream will contain B-VOPs (`crate::bvop_encode`). Affects
+    /// only the profile signalling (B-VOPs are an ASP tool; the VOL
+    /// carries no flag for them).
+    pub b_vops: bool,
 }
 
 impl Default for EncoderConfig {
@@ -97,15 +101,16 @@ impl Default for EncoderConfig {
             ac_prediction: true,
             four_mv: false,
             quarter_sample: false,
+            b_vops: false,
         }
     }
 }
 
 impl EncoderConfig {
     /// Whether the configuration uses any Advanced-Simple-profile
-    /// tool (method-1 quantisation, quarter-sample MC).
+    /// tool (method-1 quantisation, quarter-sample MC, B-VOPs).
     fn uses_asp_tools(&self) -> bool {
-        self.quant_type || self.quarter_sample
+        self.quant_type || self.quarter_sample || self.b_vops
     }
 
     /// Table G.1 `profile_and_level_indication` for this
@@ -175,7 +180,17 @@ pub fn write_configuration_headers(cfg: &EncoderConfig) -> Vec<u8> {
         bw.write_bit(false); // is_object_layer_identifier = 0 → verid 1
     }
     bw.write_bits(1, 4); // aspect_ratio_info = 1:1
-    bw.write_bit(false); // vol_control_parameters = 0
+    if cfg.b_vops {
+        // §6.2.3 vol_control_parameters: declare `low_delay == 0` (the
+        // VOL contains B-VOPs) explicitly so a decoder never has to
+        // guess the reorder delay from the first coded VOPs.
+        bw.write_bit(true); // vol_control_parameters = 1
+        bw.write_bits(0b01, 2); // chroma_format = 4:2:0 (Table 6-15)
+        bw.write_bit(false); // low_delay = 0
+        bw.write_bit(false); // vbv_parameters = 0
+    } else {
+        bw.write_bit(false); // vol_control_parameters = 0
+    }
     bw.write_bits(0, 2); // video_object_layer_shape = rectangular
     bw.write_marker();
     bw.write_bits(u32::from(cfg.time_increment_resolution), 16);

@@ -8,6 +8,41 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **B-VOP encoder end-to-end (round 443, stage 3)** — `bvop_encode`:
+  per-macroblock §7.6.9 mode decision (direct with an `MVD` window
+  search over the §7.6.9.5.2 TRB/TRD derivation from the co-located
+  future-anchor vectors; forward / backward via the §7.6 motion search
+  against each anchor; interpolated), every candidate scored on the
+  prediction the decoder's own machinery generates
+  (`BVopMbDecode::reconstruct` with a zero residual). Emission follows
+  §6.2.6: `modb` (Table B.3, `"1"` for a direct zero-delta macroblock
+  with no coded blocks), Table B.4 `mb_type`, `cbpb`, `dbquant`
+  (Table 6-33, delta 0), the motion bodies against the §7.6.8 running
+  per-direction predictors (row-reset; direct coded with predictor
+  zero + `f_code` 1), Table B.17 residuals — and the §6.2.6
+  `co_located_not_coded` **zero-bit** form when the co-located
+  future-P macroblock was skipped. The registry encoder gains the
+  `bf` option (0..=8 B-VOPs between anchors): a display-order reorder
+  queue, anchors coded first (I per `gop-size` cadence, else P), the
+  bracketed B run after, §6.3.5 anchor/B time bases mirroring the
+  decoder's model, and Annex D item-7 decode-time stamps
+  (`dts == pts` for `bf == 0`; anchor `dts` = previous anchor's
+  composition time otherwise). The VOL now declares
+  `vol_control_parameters` with `low_delay == 0` when B-VOPs are in
+  play; B streams select the ASP profile. Every emitted B unit is
+  decoded back through `decode_b_vop_macroblocks` +
+  `assemble_b_vop_frame` (closed loop). This encoder emits
+  progressive B-VOPs only, where the §7.7.2.2 interlaced-direct
+  compat divergence cannot arise.
+  Validation (`tests/encoder_b_vop.rs`): I/B/P streams (plain, qpel,
+  method-1, both) self-decode **sample-exact** against the closed-loop
+  reconstructions; a static scene over an all-skip P collapses to an
+  all-zero-bit B unit (≤ 8 bytes); registry `bf` 2 round-trips 8
+  frames in display order with monotone `dts <= pts` and the coded
+  order `I0 P3 B1 B2 P6 B4 B5 P7`; byte-determinism. A new black-box
+  pair (`enc_ipb_64x64`) pins that the reference decoder's decode of
+  our I/P/B stream is **bit-exact** against this crate's own.
+
 - **Encoder 4MV + quarter-sample motion (round 443, stages 1–2)** —
   the encoder tail's first two arms:
   - *§6.3.7 inter4v emission* (`four-mv` option / `EncoderConfig::

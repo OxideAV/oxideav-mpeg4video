@@ -310,6 +310,50 @@ fn build_qpel_4mv_stream() -> Vec<u8> {
     build_tooled_ip_stream(&cfg, divergent_picture)
 }
 
+/// Build the I/P/B fixture stream through the registry encoder
+/// (`bf == 2`, so the coded order is I0 P3 B1 B2 P5 B4 with a flush
+/// tail): 6 frames of the translating scene, method 2, qp 4.
+fn build_ipb_stream() -> Vec<u8> {
+    use oxideav_core::Encoder as _;
+    let mut params = oxideav_core::CodecParameters::video(oxideav_core::CodecId::new("mpeg4video"));
+    params.width = Some(64);
+    params.height = Some(64);
+    params.pixel_format = Some(oxideav_core::PixelFormat::Yuv420P);
+    params.options = oxideav_core::CodecOptions::default().set("bf", "2");
+    let mut enc = oxideav_mpeg4video::encoder::Mpeg4VideoEncoder::from_params(&params).unwrap();
+    for k in 0..6usize {
+        let (y, cb, cr) = ip_picture(k);
+        let frame = oxideav_core::Frame::Video(oxideav_core::VideoFrame {
+            pts: None,
+            planes: vec![
+                oxideav_core::VideoPlane {
+                    stride: 64,
+                    data: y,
+                },
+                oxideav_core::VideoPlane {
+                    stride: 32,
+                    data: cb,
+                },
+                oxideav_core::VideoPlane {
+                    stride: 32,
+                    data: cr,
+                },
+            ],
+        });
+        enc.send_frame(&frame).unwrap();
+    }
+    enc.flush().unwrap();
+    let mut stream = Vec::new();
+    loop {
+        match enc.receive_packet() {
+            Ok(p) => stream.extend_from_slice(&p.data),
+            Err(oxideav_core::Error::Eof) => break,
+            Err(e) => panic!("unexpected {e}"),
+        }
+    }
+    stream
+}
+
 fn assert_own_decode_matches_reference(m4v: &str, yuv: &str) {
     let stream = fixture(m4v);
     let reference = fixture(yuv);
@@ -491,4 +535,23 @@ fn qpel_4mv_stream_reproduces_committed_fixture() {
 #[test]
 fn qpel_4mv_stream_decodes_bit_exact_against_reference_decoder() {
     assert_own_decode_matches_reference("enc_ip_qpel4mv_64x64.m4v", "enc_ip_qpel4mv_64x64.yuv");
+}
+
+#[test]
+fn ipb_stream_reproduces_committed_fixture() {
+    let built = build_ipb_stream();
+    if maybe_write_fixture("enc_ipb_64x64.m4v", &built) {
+        return;
+    }
+    assert_eq!(
+        built,
+        fixture("enc_ipb_64x64.m4v"),
+        "encoder output drifted from the black-box-validated fixture; \
+         regenerate the fixture AND its reference decode"
+    );
+}
+
+#[test]
+fn ipb_stream_decodes_bit_exact_against_reference_decoder() {
+    assert_own_decode_matches_reference("enc_ipb_64x64.m4v", "enc_ipb_64x64.yuv");
 }

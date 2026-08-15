@@ -105,7 +105,11 @@ pub struct PVopEncodeStats {
 }
 
 /// 16×16 source luma of one macroblock (edge-replicated), as rows.
-fn source_luma_mb(frame: &FrameView<'_>, mb_row: usize, mb_col: usize) -> [[i32; 16]; 16] {
+pub(crate) fn source_luma_mb(
+    frame: &FrameView<'_>,
+    mb_row: usize,
+    mb_col: usize,
+) -> [[i32; 16]; 16] {
     let mut out = [[0i32; 16]; 16];
     for (i, &(row_off, col_off)) in [(0usize, 0usize), (0, 8), (8, 0), (8, 8)]
         .iter()
@@ -223,7 +227,7 @@ fn refine_subpel<F: FnMut(MotionVector) -> u32>(
 /// Full-pel search + sub-pel refinement. Returns the best MV (in
 /// `mode`'s units) and its SAD. The zero vector gets the classic small
 /// favouring bias so flat areas stay skippable.
-fn estimate_motion(
+pub(crate) fn estimate_motion(
     src: &[[i32; 16]; 16],
     reference: &crate::half_sample::ReferenceVop<'_>,
     mb_x: i32,
@@ -380,7 +384,7 @@ fn intra_activity(src: &[[i32; 16]; 16]) -> u32 {
 
 /// Quantise one inter residual block; returns the EVENT list (empty
 /// when every level is zero).
-fn quantise_inter_block(
+pub(crate) fn quantise_inter_block(
     residual: &[[i32; 8]; 8],
     qp: u32,
     quant_type: bool,
@@ -682,6 +686,17 @@ pub fn reconstruct_own_p_vop(
     unit: &[u8],
     store: &mut FrameStore,
 ) -> DecodedFrame {
+    reconstruct_own_p_vop_with_motion(vol, unit, store).0
+}
+
+/// [`reconstruct_own_p_vop`] plus the decoded per-macroblock motion in
+/// raster order — the §7.6.9.5.1 / §7.6.9.6 co-located source the
+/// following B-VOPs consume (`crate::bvop_encode`).
+pub fn reconstruct_own_p_vop_with_motion(
+    vol: &crate::vol::VolHeader,
+    unit: &[u8],
+    store: &mut FrameStore,
+) -> (DecodedFrame, Vec<PvopMbMotion>) {
     let (mb_width, mb_height) = (
         usize::from(vol.width).div_ceil(16),
         usize::from(vol.height).div_ceil(16),
@@ -699,6 +714,17 @@ pub fn reconstruct_own_p_vop(
     let entries =
         decode_p_vop_macroblocks(&mut br, vol, &vop, crate::compat::DecodeOptions::spec())
             .expect("own P-VOP payload must decode");
+    let motion = entries
+        .iter()
+        .map(|e| match e {
+            crate::frame_decode::PVopMbContent::Inter { motion, .. } => *motion,
+            crate::frame_decode::PVopMbContent::Intra(_) => PvopMbMotion::Intra,
+            // The progressive encoder never emits field-predicted MBs.
+            crate::frame_decode::PVopMbContent::FieldInter { .. } => {
+                unreachable!("progressive encoder emitted a field-predicted macroblock")
+            }
+        })
+        .collect();
     let frame = crate::frame_decode::decode_p_vop(
         store,
         mb_width,
@@ -710,7 +736,7 @@ pub fn reconstruct_own_p_vop(
     )
     .expect("own P-VOP must assemble")
     .clone();
-    frame
+    (frame, motion)
 }
 
 /// The §7.6.2 sub-pel interpolation mode a VOL selects

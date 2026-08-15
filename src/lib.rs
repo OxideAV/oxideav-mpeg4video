@@ -322,6 +322,7 @@ pub mod bitreader;
 pub mod bitwriter;
 pub mod block; // mixed: `BlockAssemblyError` stays visible
 pub mod bvop; // mixed: `BVopMbParseError` stays visible
+pub mod bvop_encode;
 #[doc(hidden)]
 pub mod bvop_field_direct;
 #[doc(hidden)]

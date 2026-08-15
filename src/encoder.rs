@@ -23,9 +23,10 @@ use oxideav_core::{
     CodecId, CodecParameters, Error, Frame, Packet, PixelFormat, Rational, Result, TimeBase,
 };
 
+use crate::bvop_encode::encode_b_vop;
 use crate::framestore::FrameStore;
 use crate::ivop_encode::{encode_i_vop, write_configuration_headers, EncoderConfig, FrameView};
-use crate::pvop_encode::{encode_p_vop, reconstruct_own_p_vop};
+use crate::pvop_encode::{encode_p_vop, reconstruct_own_p_vop_with_motion};
 use crate::vol::{parse_video_object_layer, VolHeader};
 
 /// Typed options struct for the registry / options-bag construction
@@ -46,6 +47,9 @@ pub struct Mpeg4EncoderOptions {
     /// `qpel` — emit quarter-sample motion (§7.6.2.2; sets the VOL's
     /// `quarter_sample` flag and the ASP profile). Default off.
     pub qpel: bool,
+    /// `bf` — number of B-VOPs between anchors (0..=8; selects the
+    /// ASP profile when non-zero). Default 0.
+    pub bf: u32,
     /// `gop-size` — I-VOP cadence: one keyframe every `gop_size`
     /// frames (`1` = intra-only). Default 12.
     pub gop_size: u32,
@@ -59,6 +63,7 @@ impl Default for Mpeg4EncoderOptions {
             ac_pred: true,
             four_mv: false,
             qpel: false,
+            bf: 0,
             gop_size: 12,
         }
     }
@@ -101,6 +106,14 @@ impl oxideav_core::CodecOptionsStruct for Mpeg4EncoderOptions {
                    §7.6.2.2; selects the ASP profile)",
         },
         oxideav_core::OptionField {
+            name: "bf",
+            kind: oxideav_core::OptionKind::U32,
+            default: oxideav_core::OptionValue::U32(0),
+            help: "number of B-VOPs between anchors (0..=8; non-zero \
+                   selects the ASP profile and adds one anchor of \
+                   encoder latency)",
+        },
+        oxideav_core::OptionField {
             name: "gop-size",
             kind: oxideav_core::OptionKind::U32,
             default: oxideav_core::OptionValue::U32(12),
@@ -121,6 +134,13 @@ impl oxideav_core::CodecOptionsStruct for Mpeg4EncoderOptions {
             "ac-pred" => self.ac_pred = value.as_bool()?,
             "four-mv" => self.four_mv = value.as_bool()?,
             "qpel" => self.qpel = value.as_bool()?,
+            "bf" => {
+                let bf = value.as_u32()?;
+                if bf > 8 {
+                    return Err(Error::invalid("bf must be in 0..=8"));
+                }
+                self.bf = bf;
+            }
             "gop-size" => {
                 let g = value.as_u32()?;
                 if g == 0 {
@@ -132,6 +152,19 @@ impl oxideav_core::CodecOptionsStruct for Mpeg4EncoderOptions {
         }
         Ok(())
     }
+}
+
+/// One buffered input picture awaiting its bracketing future anchor
+/// (the B-VOP reorder queue).
+#[derive(Debug)]
+struct PendingFrame {
+    y: Vec<u8>,
+    cb: Vec<u8>,
+    cr: Vec<u8>,
+    /// §6.3.5 composed VOP time in ticks.
+    ticks: u64,
+    /// Caller-supplied presentation stamp.
+    pts: Option<i64>,
 }
 
 /// The registry-facing MPEG-4 Part 2 Visual encoder.
@@ -149,10 +182,26 @@ pub struct Mpeg4VideoEncoder {
     ticks_per_frame: u64,
     /// Running tick clock of the next frame to encode.
     next_ticks: u64,
-    /// Second boundary (in whole seconds) of the previously coded VOP,
-    /// for the §6.3.5 `modulo_time_base` derivation.
-    prev_seconds: u64,
-    frames_encoded: u64,
+    /// §6.3.5 seconds accumulated at the most recently coded anchor's
+    /// sync point (mirrors the decoder's `sync_sec`).
+    sync_sec: u64,
+    /// The sync value one anchor earlier — the base a B-VOP's
+    /// `modulo_time_base` counts from.
+    b_base_sec: u64,
+    /// Absolute tick time of the past (forward) anchor.
+    prev_anchor_ticks: Option<u64>,
+    /// Absolute tick time of the most recent (backward) anchor.
+    last_anchor_ticks: Option<u64>,
+    /// Display-order input frame counter (keyframe cadence).
+    frames_seen: u64,
+    /// Coded (bitstream-order) packet counter.
+    frames_coded: u64,
+    /// The B-VOP reorder queue (display order).
+    pending_bs: Vec<PendingFrame>,
+    /// The future anchor's per-macroblock decoded motion — the
+    /// §7.6.9.5.1 / §6.2.6 co-located source for the B-VOPs it
+    /// brackets (`None` after an intra anchor).
+    anchor_motion: Option<Vec<crate::pvop_mv::PvopMbMotion>>,
     /// §7.6.1 anchor chain — the closed-loop references produced by
     /// decoding our own emitted units.
     store: FrameStore,
@@ -195,6 +244,7 @@ impl Mpeg4VideoEncoder {
             ac_prediction: options.ac_pred,
             four_mv: options.four_mv,
             quarter_sample: options.qpel,
+            b_vops: options.bf > 0,
         };
         let config_headers = write_configuration_headers(&cfg);
         let vol_pos = config_headers
@@ -221,8 +271,14 @@ impl Mpeg4VideoEncoder {
             config_headers,
             ticks_per_frame: frame_rate.den as u64,
             next_ticks: 0,
-            prev_seconds: 0,
-            frames_encoded: 0,
+            sync_sec: 0,
+            b_base_sec: 0,
+            prev_anchor_ticks: None,
+            last_anchor_ticks: None,
+            frames_seen: 0,
+            frames_coded: 0,
+            pending_bs: Vec::new(),
+            anchor_motion: None,
             store: FrameStore::new(),
             ready: VecDeque::new(),
             flushed: false,
@@ -277,29 +333,106 @@ impl oxideav_core::Encoder for Mpeg4VideoEncoder {
         if planes.len() != 3 {
             return Err(Error::invalid("expected 3 Yuv420P planes"));
         }
-        let y = Self::tight_plane(&planes[0], w, h, "luma")?;
-        let cb = Self::tight_plane(&planes[1], cw, ch, "cb")?;
-        let cr = Self::tight_plane(&planes[2], cw, ch, "cr")?;
+        let pending = PendingFrame {
+            y: Self::tight_plane(&planes[0], w, h, "luma")?,
+            cb: Self::tight_plane(&planes[1], cw, ch, "cb")?,
+            cr: Self::tight_plane(&planes[2], cw, ch, "cr")?,
+            ticks: self.next_ticks,
+            pts: video.pts,
+        };
+        self.next_ticks += self.ticks_per_frame;
+        let display_index = self.frames_seen;
+        self.frames_seen += 1;
+
+        // Anchor selection: the first frame, the keyframe cadence, and
+        // every (bf + 1)-th frame terminate a B run.
+        let keyframe_due = display_index % u64::from(self.options.gop_size) == 0;
+        let no_anchor = self.store.backward().is_none();
+        let is_anchor =
+            no_anchor || keyframe_due || self.pending_bs.len() as u32 >= self.options.bf;
+        if !is_anchor {
+            self.pending_bs.push(pending);
+            return Ok(());
+        }
+        self.encode_anchor(&pending, no_anchor || keyframe_due);
+        self.drain_pending_bs();
+        Ok(())
+    }
+
+    fn receive_packet(&mut self) -> Result<Packet> {
+        match self.ready.pop_front() {
+            Some(p) => Ok(p),
+            None if self.flushed => Err(Error::Eof),
+            None => Err(Error::NeedMore),
+        }
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        if self.flushed {
+            return Ok(());
+        }
+        // A tail of buffered pictures with no future anchor yet: code
+        // the last one as the terminating anchor, the rest as the
+        // B-VOPs it brackets.
+        if let Some(last) = self.pending_bs.pop() {
+            let keyframe_due = self.store.backward().is_none() || {
+                // The anchor's display index is frames_seen - 1.
+                (self.frames_seen - 1) % u64::from(self.options.gop_size) == 0
+            };
+            self.encode_anchor(&last, keyframe_due);
+            self.drain_pending_bs();
+        }
+        self.flushed = true;
+        Ok(())
+    }
+}
+
+impl Mpeg4VideoEncoder {
+    /// Bitstream-order packet emission: wrap `unit` (prepending the
+    /// configuration run on the very first packet) with the Annex D
+    /// item-7 timing — an anchor's decode time is the previous
+    /// anchor's composition time once B-VOPs are in play (`bf > 0`);
+    /// with `low_delay`-style `bf == 0` streams `dts == pts`.
+    fn push_packet(
+        &mut self,
+        unit: Vec<u8>,
+        ticks: u64,
+        pts: Option<i64>,
+        keyframe: bool,
+        dts: i64,
+    ) {
+        let mut data = Vec::new();
+        if self.frames_coded == 0 {
+            data.extend_from_slice(&self.config_headers);
+        }
+        data.extend_from_slice(&unit);
+        let pts = pts.unwrap_or(ticks as i64);
+        let packet = Packet::new(0, self.time_base(), data)
+            .with_pts(pts)
+            .with_dts(dts)
+            .with_duration(self.ticks_per_frame as i64)
+            .with_keyframe(keyframe);
+        self.ready.push_back(packet);
+        self.frames_coded += 1;
+    }
+
+    /// Encode one anchor VOP (I when `force_i`, else P), advance the
+    /// §7.6.1 chain + §6.3.5 anchor time bases, and emit its packet.
+    fn encode_anchor(&mut self, frame: &PendingFrame, force_i: bool) {
+        let (w, h) = (usize::from(self.cfg.width), usize::from(self.cfg.height));
         let view = FrameView {
-            y: &y,
-            cb: &cb,
-            cr: &cr,
+            y: &frame.y,
+            cb: &frame.cb,
+            cr: &frame.cr,
             width: w,
             height: h,
         };
-
-        // §6.3.5 time fields for this VOP.
         let res = u64::from(self.cfg.time_increment_resolution);
-        let ticks = self.next_ticks;
-        let seconds = ticks / res;
-        let modulo = (seconds - self.prev_seconds) as u32;
-        let increment = (ticks % res) as u16;
+        let seconds = frame.ticks / res;
+        let modulo = (seconds - self.sync_sec) as u32;
+        let increment = (frame.ticks % res) as u16;
 
-        // GOP cadence: an I-VOP every `gop_size` frames (and always
-        // when no anchor exists yet).
-        let is_keyframe = self.frames_encoded % u64::from(self.options.gop_size) == 0
-            || self.store.backward().is_none();
-        let unit = if is_keyframe {
+        let unit = if force_i {
             let (unit, recon) = encode_i_vop(
                 &self.vol,
                 &self.cfg,
@@ -309,6 +442,7 @@ impl oxideav_core::Encoder for Mpeg4VideoEncoder {
                 self.options.qp,
             );
             self.store.push_anchor(recon);
+            self.anchor_motion = None;
             unit
         } else {
             let reference = self
@@ -325,41 +459,74 @@ impl oxideav_core::Encoder for Mpeg4VideoEncoder {
                 increment,
                 self.options.qp,
             );
-            let _recon = reconstruct_own_p_vop(&self.vol, &unit, &mut self.store);
+            let (_recon, motion) =
+                reconstruct_own_p_vop_with_motion(&self.vol, &unit, &mut self.store);
+            self.anchor_motion = Some(motion);
             unit
         };
 
-        let mut data = Vec::new();
-        if self.frames_encoded == 0 {
-            data.extend_from_slice(&self.config_headers);
-        }
-        data.extend_from_slice(&unit);
+        // §6.3.5 anchor time bookkeeping (mirrors the decoder).
+        self.b_base_sec = self.sync_sec;
+        self.sync_sec = seconds;
+        self.prev_anchor_ticks = self.last_anchor_ticks;
+        self.last_anchor_ticks = Some(frame.ticks);
 
-        let pts = video.pts.unwrap_or(ticks as i64);
-        let packet = Packet::new(0, self.time_base(), data)
-            .with_pts(pts)
-            .with_dts(pts)
-            .with_duration(self.ticks_per_frame as i64)
-            .with_keyframe(is_keyframe);
-        self.ready.push_back(packet);
-
-        self.prev_seconds = seconds;
-        self.next_ticks += self.ticks_per_frame;
-        self.frames_encoded += 1;
-        Ok(())
+        // Annex D item 7: with B-VOPs in play the anchor's decode time
+        // is the *previous* anchor's composition time (t0 = τ0 − Δ for
+        // the first anchor); without B-VOPs, dts == pts.
+        let dts = if self.options.bf == 0 {
+            frame.pts.unwrap_or(frame.ticks as i64)
+        } else {
+            match self.prev_anchor_ticks {
+                Some(prev) => prev as i64,
+                None => frame.ticks as i64 - self.ticks_per_frame as i64,
+            }
+        };
+        self.push_packet(unit, frame.ticks, frame.pts, force_i, dts);
     }
 
-    fn receive_packet(&mut self) -> Result<Packet> {
-        match self.ready.pop_front() {
-            Some(p) => Ok(p),
-            None if self.flushed => Err(Error::Eof),
-            None => Err(Error::NeedMore),
+    /// Encode every buffered B-VOP (display order) between the two
+    /// anchors now in the chain and emit their packets.
+    fn drain_pending_bs(&mut self) {
+        if self.pending_bs.is_empty() {
+            return;
         }
-    }
-
-    fn flush(&mut self) -> Result<()> {
-        self.flushed = true;
-        Ok(())
+        let (prev, last) = (
+            self.prev_anchor_ticks.expect("B-VOPs need a past anchor"),
+            self.last_anchor_ticks.expect("B-VOPs need a future anchor"),
+        );
+        let trd = (last - prev) as i32;
+        let res = u64::from(self.cfg.time_increment_resolution);
+        let (w, h) = (usize::from(self.cfg.width), usize::from(self.cfg.height));
+        let pending = std::mem::take(&mut self.pending_bs);
+        for b in &pending {
+            let view = FrameView {
+                y: &b.y,
+                cb: &b.cb,
+                cr: &b.cr,
+                width: w,
+                height: h,
+            };
+            let trb = (b.ticks - prev) as i32;
+            let seconds = b.ticks / res;
+            let modulo = (seconds - self.b_base_sec) as u32;
+            let increment = (b.ticks % res) as u16;
+            let (unit, _recon, _stats) = encode_b_vop(
+                &self.vol,
+                &self.cfg,
+                &view,
+                &self.store,
+                self.anchor_motion.as_deref(),
+                trb,
+                trd,
+                modulo,
+                increment,
+                self.options.qp,
+            );
+            // Annex D item 7: a B-VOP's decode time is its own
+            // composition time.
+            self.push_packet(unit, b.ticks, b.pts, false, b.ticks as i64);
+        }
     }
 }
 
