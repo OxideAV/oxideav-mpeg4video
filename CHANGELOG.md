@@ -8,6 +8,16 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Encoder robustness sweep for the round-443 tool set (stage 5)** —
+  `tests/encoder_stress.rs` gains I/B/P round-trips with inter4v +
+  quarter-sample + B-VOPs enabled together over the adversarial
+  content matrix (full-range noise, 1×1 checkerboards, saturated
+  flats, hard bars; qp 1/31, both quantisation methods, partial-edge
+  and single-macroblock grids) — all sample-exact against the
+  closed-loop reconstructions — plus a registry-level
+  four-mv + qpel + bf 2 + rate-control noise run pinning display
+  order and byte-determinism.
+
 - **Annex D rate control (round 443, stage 4)** — `rate_control`:
   the normative D.2 video-rate-buffer model simulated on the encoder
   side (`B = 16384 × vbv_buffer_size`; peak-rate channel
