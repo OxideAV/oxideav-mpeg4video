@@ -176,8 +176,6 @@ fn minimum_size_single_macroblock() {
 /// quarter-sample + B-VOPs) on adversarial content — every stream
 /// self-decodes sample-exact against the closed-loop reconstructions.
 fn roundtrip_ibp(kind: Kind, w: u16, h: u16, qp: u32, quant_type: bool) {
-    use oxideav_mpeg4video::bvop_encode::encode_b_vop;
-    use oxideav_mpeg4video::pvop_encode::reconstruct_own_p_vop_with_motion;
     let cfg = EncoderConfig {
         width: w,
         height: h,
@@ -187,6 +185,38 @@ fn roundtrip_ibp(kind: Kind, w: u16, h: u16, qp: u32, quant_type: bool) {
         b_vops: true,
         ..EncoderConfig::default()
     };
+    roundtrip_ibp_cfg(kind, &cfg, qp);
+}
+
+/// The round-452 sibling: the round-443 tool set plus `fcode` 3,
+/// per-macroblock `dquant` / `dbquant`, ~200-bit video packets, data
+/// partitioning and reversible VLCs.
+fn roundtrip_ibp_resilient(kind: Kind, w: u16, h: u16, qp: u32, quant_type: bool) {
+    let cfg = EncoderConfig {
+        width: w,
+        height: h,
+        quant_type,
+        four_mv: true,
+        quarter_sample: true,
+        b_vops: true,
+        fcode: 3,
+        adaptive_quant: true,
+        resilience: oxideav_mpeg4video::packet_encode::ResilienceConfig {
+            packet_bits: 200,
+            data_partitioned: true,
+            reversible_vlc: true,
+        },
+        ..EncoderConfig::default()
+    };
+    roundtrip_ibp_cfg(kind, &cfg, qp);
+}
+
+fn roundtrip_ibp_cfg(kind: Kind, cfg: &EncoderConfig, qp: u32) {
+    use oxideav_mpeg4video::bvop_encode::encode_b_vop;
+    use oxideav_mpeg4video::pvop_encode::reconstruct_own_p_vop_with_motion;
+    let cfg = *cfg;
+    let (w, h) = (cfg.width, cfg.height);
+    let quant_type = cfg.quant_type;
     let headers = write_configuration_headers(&cfg);
     let pos = headers
         .windows(4)
@@ -254,7 +284,27 @@ fn full_toolset_ibp_survives_adversarial_content() {
     roundtrip_ibp(Kind::Noise, 16, 16, 13, true);
 }
 
-/// Registry-level full tool set (four-mv + qpel + bf + rate control)
+/// The round-452 tools (fcode 3, dquant / dbquant, video packets, data
+/// partitioning, RVLC) on the same adversarial matrix: noise at both
+/// quantiser extremes forces the RVLC Type-5 escape and the ±2 dquant
+/// band against the 1 / 31 clip; flats collapse to skips / zero-bit
+/// macroblocks around packet cuts; the odd grids exercise the Table
+/// 6-27 macroblock_number widths of 1..=2 bits.
+#[test]
+fn resilient_toolset_ibp_survives_adversarial_content() {
+    roundtrip_ibp_resilient(Kind::Noise, 32, 32, 1, false);
+    roundtrip_ibp_resilient(Kind::Noise, 32, 32, 31, true);
+    roundtrip_ibp_resilient(Kind::Checkerboard, 48, 32, 1, false);
+    roundtrip_ibp_resilient(Kind::Flat(255), 32, 32, 31, false);
+    roundtrip_ibp_resilient(Kind::Flat(0), 48, 48, 1, true);
+    roundtrip_ibp_resilient(Kind::Bars, 40, 24, 2, true);
+    roundtrip_ibp_resilient(Kind::Noise, 17, 17, 7, false);
+    roundtrip_ibp_resilient(Kind::Noise, 16, 16, 13, true);
+    roundtrip_ibp_resilient(Kind::Checkerboard, 80, 16, 30, false);
+}
+
+/// Registry-level full tool set (four-mv + qpel + bf + rate control +
+/// fcode 2 + mb-aq + video packets + data partitioning + RVLC)
 /// on noise: decodes to the right frame count in display order and is
 /// byte-deterministic.
 #[test]
@@ -270,7 +320,12 @@ fn registry_full_toolset_with_rate_control() {
             .set("four-mv", "true")
             .set("qpel", "true")
             .set("bf", "2")
-            .set("bitrate", "400000");
+            .set("bitrate", "400000")
+            .set("fcode", "2")
+            .set("mb-aq", "true")
+            .set("packet-bits", "300")
+            .set("data-partitioned", "true")
+            .set("rvlc", "true");
         let mut enc = oxideav_mpeg4video::encoder::Mpeg4VideoEncoder::from_params(&params).unwrap();
         for k in 0..8usize {
             let (y, cb, cr) = synthesise(&Kind::Noise, 48, 48, 0xAB00 ^ k as u32);

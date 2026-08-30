@@ -95,52 +95,77 @@ over seven constructed single-macroblock field-prediction probe
 streams, now committed as regression pins
 (`tests/field_qpel_probes.rs`).
 
-**The encoder** (opened round 438, tail closed round 443) covers
-rectangular progressive **I-, P- and B-VOPs** end-to-end: §6.2
-configuration-header emission (VOS/VO/VOL, SP/L3 or ASP/L3 per the
-tool set; verid-2 VOL for quarter-sample; `vol_control_parameters`
-with `low_delay` and the Annex D `vbv_parameters` when applicable),
-Annex A.1 forward DCT (compile-time correctly-rounded cosine kernels
-shared with the IDCT, so both directions are byte-deterministic on
-every platform), method-1 and method-2 forward quantisation, §7.4.3
-DC/AC prediction *emission* (same `IntraBlockGrid` neighbour
-resolution as the decoder, `ac_pred_flag` decided per macroblock by
-measured cost), inverse-table VLC emission (Tables B.6–B.17 + all
-three §7.4.1.3 escape modes, exhaustively round-tripped against the
-decode tables), §7.6 motion estimation (±8-pel full search +
-half-sample — and in `qpel` mode §7.6.2.2 quarter-sample —
-refinement through the decoder's own interpolators), cost-decided
-§6.3.7 **inter4v (4MV)** macroblocks (per-block §7.6.5 medians with
-the in-MB Figure 7-34 candidates threaded exactly as the decoder's
-`MvDriver` does), the §7.6.5 median predictor over decoder-mirrored
-`MvGrid` state, `not_coded` skips, **B-VOP encoding** (per-MB §7.6.9
-mode decision across direct / forward / backward / interpolated —
-every candidate scored on the prediction the decoder's own machinery
-generates; §6.2.6 emission incl. the `modb "1"` compact form, the
-`co_located_not_coded` zero-bit form, and the §7.6.8 running
-per-direction predictors; a `bf`-deep reorder queue with Annex D
-item-7 decode-time stamps), a `gop-size` keyframe cadence, and
-**Annex D rate control** (the D.2 VBV rate-buffer model simulated on
-the encoder side with an item-9 admission gate that re-encodes an
-oversized VOP at a coarser quantiser, plus bit-budget-regulated
-per-VOP quantiser adaptation). Every emitted VOP is **decoded back
-through the crate's own decoder walk** — the closed loop that makes
-encoder reference state a conformant decoder's by construction.
-Validation: self-encoded streams decode through `Mpeg4VideoDecoder`
-sample-exact against the closed-loop reconstructions (I-only, I+P
-with real motion, I/B/P in every tool combination, adversarial
-stress content across qp 1..=31 and partial-edge grids); black-box
-cross-checks pin byte-determinism and decode agreement — the
-reference decoder's decode of our method-2 intra, I+P, 4MV, qpel,
-qpel+4MV and I/P/B streams is **bit-exact** against our own, and the
-method-1 stream lands exactly on the documented §7.4.4.5 compat
-contract (ecosystem mode bit-exact, literal-spec ±1 on 834 samples);
-rate-controlled streams satisfy an independent Annex D re-simulation
-(no underflow, `d_i < B`) and land within [0.6, 1.1]× of the target.
-The registry entry declares `encode`: `encoder::make_encoder` /
-`Mpeg4VideoEncoder` (options `qp`, `mpeg-quant`, `ac-pred`,
-`four-mv`, `qpel`, `bf`, `bitrate`, `vbv-buffer`, `gop-size`) is the
-dual-API sibling of `make_decoder`.
+**The encoder** covers rectangular progressive **I-, P- and B-VOPs**
+end-to-end: §6.2 configuration-header emission (VOS/VO/VOL, SP/L3 or
+ASP/L3 per the tool set; verid-2 VOL for quarter-sample;
+`vol_control_parameters` with `low_delay` and the Annex D
+`vbv_parameters` when applicable; `resync_marker_disable` /
+`data_partitioned` / `reversible_vlc` per the resilience tools), Annex
+A.1 forward DCT (compile-time correctly-rounded cosine kernels shared
+with the IDCT, so both directions are byte-deterministic on every
+platform), method-1 and method-2 forward quantisation, §7.4.3 DC/AC
+prediction *emission* (same `IntraBlockGrid` neighbour resolution as
+the decoder, `ac_pred_flag` decided per macroblock by measured cost
+under the active syntax layout), inverse-table VLC emission (Tables
+B.6–B.17 + all three §7.4.1.3 escape modes, and the Table B.23
+reversible VLC + Type-5 escape, each exhaustively round-tripped
+against the decode tables), §7.6 motion estimation over the **Table
+7-9 range of any `fcode` 1..=7** (dense ±8-pel search, and beyond it
+a coarse 4-pel lattice over the `±16·2^(fcode−1)`-pel window with
+dense refinement; half-sample — and in `qpel` mode §7.6.2.2
+quarter-sample — refinement through the decoder's own interpolators,
+clamped to `[low, high]`; differentials in the `r_size`-bit residual
+form after the §7.6.3 wrap), cost-decided §6.3.7 **inter4v (4MV)**
+macroblocks (per-block §7.6.5 medians with the in-MB Figure 7-34
+candidates threaded exactly as the decoder's `MvDriver` does), the
+§7.6.5 median predictor over decoder-mirrored `MvGrid` state,
+`not_coded` skips, **per-macroblock quantiser modulation**
+(`mb_quant`: activity-classed ±2 offsets around the VOP quantiser
+planned against the §6.3.7 running value — Table 6-32 `dquant` via the
+`intra+q` / `inter+q` types on I/P-VOPs, Table 6-33 `dbquant` on
+non-direct coded B macroblocks; inter4v and skips keep the running
+value), **B-VOP encoding** (per-MB §7.6.9 mode decision across direct /
+forward / backward / interpolated — every candidate scored on the
+prediction the decoder's own machinery generates; §6.2.6 emission
+incl. the `modb "1"` compact form, the `co_located_not_coded` zero-bit
+form, and the §7.6.8 running per-direction predictors; a `bf`-deep
+reorder queue with Annex D item-7 decode-time stamps), a `gop-size`
+keyframe cadence, **Annex D rate control** (the D.2 VBV rate-buffer
+model simulated on the encoder side with an item-9 admission gate that
+re-encodes an oversized VOP at a coarser quantiser, plus
+bit-budget-regulated per-VOP quantiser adaptation), and the
+**error-resilience tools** (`packet_encode`: §6.2.5 video packets cut
+at the first macroblock boundary past a bit target — §5.2.5 stuffing,
+the §6.3.3 `resync_marker` of the VOP type / fcode, Table 6-27
+`macroblock_number`, `quant_scale`, alternating
+`header_extension_code` bodies — with every prediction state reset as
+the decoder's walks reset it; §6.2.5.3 **data partitioning** of I- and
+P-VOPs with the `dc_marker` / `motion_marker` partitions; the
+**reversible-VLC** texture partition; B-VOPs stay combined-syntax
+inside a partitioned VOL per the §6.2.5.3 NOTE). Every emitted VOP is
+**decoded back through the crate's own decoder walk** — the closed
+loop that makes encoder reference state a conformant decoder's by
+construction. Validation: self-encoded streams decode through
+`Mpeg4VideoDecoder` sample-exact against the closed-loop
+reconstructions (I-only, I+P with real motion, I/B/P in every tool
+combination, every `fcode` × sample mode, adversarial stress content
+across qp 1..=31 and partial-edge grids with the full resilient tool
+set, and a corrupted RVLC texture partition still decoding through the
+§E.1.4.4 recovery); black-box cross-checks pin byte-determinism and
+decode agreement — the reference decoder's decode of our method-2
+intra, I+P, 4MV, qpel, qpel+4MV, I/P/B, fcode-2 I+P, fcode-3 +
+qpel + 4MV + B, adaptive-quant I/P/B, video-packet I/P/B,
+data-partitioned I+P and data-partitioned + RVLC + packets I/P/B
+streams is **bit-exact** against our own (fourteen encoder-produced
+pairs), and the method-1 stream lands exactly on the documented
+§7.4.4.5 compat contract (ecosystem mode bit-exact, literal-spec ±1 on
+834 samples); rate-controlled streams satisfy an independent Annex D
+re-simulation (no underflow, `d_i < B`) and land within [0.6, 1.1]× of
+the target. The registry entry declares `encode`:
+`encoder::make_encoder` / `Mpeg4VideoEncoder` (options `qp`,
+`mpeg-quant`, `ac-pred`, `four-mv`, `qpel`, `bf`, `bitrate`,
+`vbv-buffer`, `gop-size`, `fcode`, `mb-aq`, `packet-bits`,
+`data-partitioned`, `rvlc`) is the dual-API sibling of `make_decoder`.
 
 ## Compatibility modes
 
@@ -386,14 +411,14 @@ both modes' envelopes are pinned).
 
 ## Not yet supported
 
-- Encoder: interlaced tools, `fcode > 1` motion ranges (search is ±8
-  pels; quarter-sample mode saturates at the `fcode == 1` ±8-pel
-  quarter-unit range), data-partitioned / RVLC / video-packet
-  emission, GMC and short-header syntax, per-macroblock `dquant` /
-  `dbquant` quantiser modulation (rate control adapts per VOP). The
-  encoder emits progressive B-VOPs only — the §7.7.2.2
-  interlaced-direct compat divergence cannot arise in its output.
-  The decoder-side feature set below is unchanged.
+- Encoder: interlaced tools (field DCT / field motion /
+  `interlaced_information()`), GMC (S(GMC)-VOPs + `sprite_trajectory`)
+  and short-header (H.263-compatible) syntax emission; rate control
+  adapts per VOP (the per-macroblock `dquant` / `dbquant` steps are
+  activity-driven, not budget-driven); `intra_dc_vlc_thr` is always 0
+  (DC VLC for the whole VOP). The encoder emits progressive VOPs only —
+  the §7.7.2.2 interlaced-direct compat divergence cannot arise in its
+  output. The decoder-side feature set below is unchanged.
 - §E.1.4.4 recovery on **I-VOP** texture partitions (an I-VOP texture
   error still propagates: §E.1.4.4.2.2 conceals every INTRA macroblock
   of an errored packet, and an I-VOP has no inter macroblocks to

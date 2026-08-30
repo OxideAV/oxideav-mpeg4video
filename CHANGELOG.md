@@ -8,6 +8,18 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round-452 stress sweep + README (stage 4)** — `tests/encoder_stress.rs`
+  gains the resilient tool set (fcode 3 + dquant / dbquant + 200-bit
+  video packets + data partitioning + RVLC on top of inter4v +
+  quarter-sample + B-VOPs) over the adversarial content matrix (noise
+  at qp 1 / 31 forcing the RVLC Type-5 escape and the dquant clip,
+  saturated flats collapsing to skips / zero-bit macroblocks around
+  packet cuts, 1×1 checkerboards, bars, partial-edge / single- /
+  1-bit-`macroblock_number` grids), and the registry run adds
+  `fcode` 2 + `mb-aq` + packets + DP + RVLC to rate control. README
+  encoder section and "Not yet supported" rewritten for the round-452
+  tool set.
+
 - **Encoder error-resilience emission (round 452)** — new
   `packet_encode` module: every I-/P-VOP macroblock is described as an
   `MbFields` record and laid out by a `PacketWriter` that owns the
