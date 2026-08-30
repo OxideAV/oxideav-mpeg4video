@@ -8,6 +8,25 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Encoder per-macroblock quantiser modulation (round 452)** —
+  `EncoderConfig::adaptive_quant` / registry option `mb-aq`: the new
+  `mb_quant` module classes each macroblock's mean-removed luma
+  activity into a ±2 quantiser offset around the VOP quantiser and
+  plans the §6.3.7 running-quantiser step against it — `dquant`
+  (Table 6-32, `{−2, −1, +1, +2}`) on I-/P-VOP macroblocks emitted as
+  the Table B.6/B.7 `intra+q` / `inter+q` types (inter4v carries no
+  `dquant` and keeps the running value; skips leave it untouched), and
+  `dbquant` (Table 6-33, `{−2, 0, +2}`) on non-direct coded B-VOP
+  macroblocks (the only place the B running quantiser moves). Every
+  block is quantised at the macroblock's own quantiser and the intra
+  neighbour grid records it, so the §7.4.3 cross-quantiser predictor
+  scaling is mirrored. `PVopEncodeStats::dquant` /
+  `BVopEncodeStats::dbquant` count the carried steps. New
+  `tests/encoder_adaptive_quant.rs` (both quantisation methods,
+  inter4v + quarter-sample, B-VOP `dbquant`, registry path) and the
+  black-box pair `enc_ipb_aq4mv_96x48` decoded bit-exact by the
+  reference decoder.
+
 - **Encoder `fcode > 1` motion ranges (round 452)** — `EncoderConfig::fcode`
   / registry option `fcode` (1..=7) emits `vop_fcode_forward` (P) and
   `vop_fcode_forward` + `vop_fcode_backward` (B) and moves the §7.6

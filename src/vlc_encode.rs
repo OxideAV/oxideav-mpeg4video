@@ -262,6 +262,21 @@ pub fn put_dquant(bw: &mut BitWriter, delta: i8) {
     bw.write_bits(code, 2);
 }
 
+/// Emit a B-VOP `dbquant` (Table 6-33): `0` → "0", `-2` → "10",
+/// `+2` → "11".
+///
+/// # Panics
+///
+/// Panics on any other delta.
+pub fn put_dbquant(bw: &mut BitWriter, delta: i8) {
+    match delta {
+        0 => bw.write_bit(false),
+        -2 => bw.write_bits(0b10, 2),
+        2 => bw.write_bits(0b11, 2),
+        other => panic!("dbquant delta {other} not in Table 6-33"),
+    }
+}
+
 /// Wrap a raw differential (MV − predictor) into the §7.6.3
 /// `[low, high]` range for `fcode` by adding / subtracting `range`
 /// once — the exact inverse the decoder's modulo wrap undoes.

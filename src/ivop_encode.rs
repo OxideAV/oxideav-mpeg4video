@@ -99,6 +99,11 @@ pub struct EncoderConfig {
     /// quarter-sample units per `quarter_sample`) and the matching
     /// §7.6 search window. Default 1.
     pub fcode: u8,
+    /// Per-macroblock quantiser modulation (`crate::mb_quant`):
+    /// activity-classed `dquant` (I-/P-VOPs, `inter+q` / `intra+q`
+    /// macroblock types) and `dbquant` (B-VOPs) steps around the VOP
+    /// quantiser. Default off.
+    pub adaptive_quant: bool,
 }
 
 /// The §6.2.3 `vbv_parameters` triple (Annex D rate-buffer model).
@@ -125,6 +130,7 @@ impl Default for EncoderConfig {
             b_vops: false,
             vbv: None,
             fcode: 1,
+            adaptive_quant: false,
         }
     }
 }
@@ -527,12 +533,24 @@ fn scale_ac_pred(qf_neighbour: i32, qp_neighbour: u32, qp_x: u32) -> i32 {
 }
 
 /// Emit one intra macroblock body (mcbpc / ac_pred_flag / cbpy /
-/// blocks) for a fixed `ac_pred_flag` choice.
-fn emit_intra_mb(bw: &mut BitWriter, plans: &[BlockPlan; 6], ac_pred_flag: bool, use_dc_vlc: bool) {
+/// [dquant] / blocks) for a fixed `ac_pred_flag` choice. A `dquant`
+/// delta selects the Table B.6 `intra+q` type (derived type 4) and
+/// places the Table 6-32 code after `cbpy` (§6.2.6 order).
+fn emit_intra_mb(
+    bw: &mut BitWriter,
+    plans: &[BlockPlan; 6],
+    ac_pred_flag: bool,
+    use_dc_vlc: bool,
+    dquant: Option<i8>,
+) {
     let (cbpy, cbpc) = intra_mb_cbp(plans);
-    put_mcbpc_i(bw, 3, cbpc); // derived_mb_type 3 = intra, no dquant
+    // derived_mb_type 3 = intra, 4 = intra+q.
+    put_mcbpc_i(bw, if dquant.is_some() { 4 } else { 3 }, cbpc);
     bw.write_bit(ac_pred_flag);
     put_cbpy(bw, cbpy, true);
+    if let Some(d) = dquant {
+        crate::vlc_encode::put_dquant(bw, d);
+    }
     emit_intra_blocks(bw, plans, use_dc_vlc);
 }
 
@@ -596,8 +614,21 @@ pub fn encode_i_vop(
     );
 
     let mut grid = IntraBlockGrid::new(mb_height, mb_width);
+    // §6.3.7 running quantiser (seeded by vop_quant, moved by dquant).
+    let mut running_qp = qp;
     for mb_row in 0..mb_height {
         for mb_col in 0..mb_width {
+            // Per-macroblock quantiser: the activity-classed dquant
+            // step from the running value (or the VOP quantiser).
+            let (qp, dquant) = if cfg.adaptive_quant {
+                let src = crate::pvop_encode::source_luma_mb(frame, mb_row, mb_col);
+                let class =
+                    crate::mb_quant::activity_class(crate::pvop_encode::intra_activity(&src));
+                crate::mb_quant::plan_dquant(running_qp, crate::mb_quant::target_qp(qp, class))
+            } else {
+                (qp, None)
+            };
+            running_qp = qp;
             // Quantise the six blocks first (grid state is variant-
             // independent — the decoder records post-prediction QF).
             let mut prepared: Vec<PreparedBlock> = Vec::with_capacity(6);
@@ -656,9 +687,9 @@ pub fn encode_i_vop(
                     .try_into()
                     .unwrap_or_else(|_| unreachable!("six blocks per macroblock"));
                 let mut probe_off = BitWriter::new();
-                emit_intra_mb(&mut probe_off, &plans_off, false, use_dc_vlc);
+                emit_intra_mb(&mut probe_off, &plans_off, false, use_dc_vlc, dquant);
                 let mut probe_on = BitWriter::new();
-                emit_intra_mb(&mut probe_on, &on, true, use_dc_vlc);
+                emit_intra_mb(&mut probe_on, &on, true, use_dc_vlc, dquant);
                 if probe_on.bit_position() < probe_off.bit_position() {
                     Some(on)
                 } else {
@@ -666,8 +697,8 @@ pub fn encode_i_vop(
                 }
             });
             match &chosen_on {
-                Some(on) => emit_intra_mb(&mut bw, on, true, use_dc_vlc),
-                None => emit_intra_mb(&mut bw, &plans_off, false, use_dc_vlc),
+                Some(on) => emit_intra_mb(&mut bw, on, true, use_dc_vlc, dquant),
+                None => emit_intra_mb(&mut bw, &plans_off, false, use_dc_vlc, dquant),
             }
         }
     }

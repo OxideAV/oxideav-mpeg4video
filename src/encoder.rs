@@ -68,6 +68,10 @@ pub struct Mpeg4EncoderOptions {
     /// window (±`16 << (fcode - 1)` pels in half-sample mode,
     /// ±`8 << (fcode - 1)` in quarter-sample mode). Default 1.
     pub fcode: u32,
+    /// `mb-aq` — per-macroblock adaptive quantisation: activity-classed
+    /// `dquant` / `dbquant` steps in a ±2 band around the VOP
+    /// quantiser (`crate::mb_quant`). Default off.
+    pub mb_aq: bool,
 }
 
 impl Default for Mpeg4EncoderOptions {
@@ -83,6 +87,7 @@ impl Default for Mpeg4EncoderOptions {
             vbv_buffer: 0,
             gop_size: 12,
             fcode: 1,
+            mb_aq: false,
         }
     }
 }
@@ -159,6 +164,13 @@ impl oxideav_core::CodecOptionsStruct for Mpeg4EncoderOptions {
             help: "vop_fcode_forward/backward (1..=7): ISO/IEC 14496-2 Table 7-9 \
                    motion-vector range and search window (±16<<(fcode-1) pels)",
         },
+        oxideav_core::OptionField {
+            name: "mb-aq",
+            kind: oxideav_core::OptionKind::Bool,
+            default: oxideav_core::OptionValue::Bool(false),
+            help: "per-macroblock adaptive quantisation: activity-classed dquant / \
+                   dbquant steps (±2) around the VOP quantiser",
+        },
     ];
 
     fn apply(&mut self, key: &str, value: &oxideav_core::OptionValue) -> Result<()> {
@@ -203,6 +215,7 @@ impl oxideav_core::CodecOptionsStruct for Mpeg4EncoderOptions {
                 }
                 self.fcode = f;
             }
+            "mb-aq" => self.mb_aq = value.as_bool()?,
             _ => unreachable!("guarded by SCHEMA"),
         }
         Ok(())
@@ -325,6 +338,7 @@ impl Mpeg4VideoEncoder {
             b_vops: options.bf > 0,
             vbv,
             fcode: options.fcode as u8,
+            adaptive_quant: options.mb_aq,
         };
         let config_headers = write_configuration_headers(&cfg);
         let vol_pos = config_headers

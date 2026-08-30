@@ -116,6 +116,8 @@ pub fn write_b_vop_header(
 pub struct BVopEncodeStats {
     /// §6.2.6 zero-bit macroblocks (co-located future-P MB skipped).
     pub zero_bit: usize,
+    /// Macroblocks that carried a non-zero `dbquant`.
+    pub dbquant: usize,
     /// `modb == "1"` macroblocks (direct, zero delta, no residual).
     pub modb_one: usize,
     /// Explicit direct macroblocks.
@@ -330,6 +332,10 @@ pub fn encode_b_vop(
     );
 
     let mut stats = BVopEncodeStats::default();
+    // §6.3.7 running quantiser (seeded by vop_quant, moved by dbquant
+    // on the macroblocks whose syntax carries it).
+    let vop_qp = qp;
+    let mut running_qp = vop_qp;
     for mb_row in 0..mb_height {
         // §7.6.8: the running per-direction predictors reset at each
         // row start (mirrors BVopMvDriver::start_row).
@@ -401,6 +407,18 @@ pub fn encode_b_vop(
                 }
             }
 
+            // ---- Quantiser -------------------------------------------
+            // dbquant rides only non-direct macroblocks with cbpb != 0;
+            // plan the step now, commit it below once the syntax is
+            // known to carry it.
+            let (qp, dbquant) = if cfg.adaptive_quant && best.decode.mb_type != BVopMbType::Direct {
+                let class =
+                    crate::mb_quant::activity_class(crate::pvop_encode::intra_activity(&src));
+                crate::mb_quant::plan_dbquant(running_qp, crate::mb_quant::target_qp(vop_qp, class))
+            } else {
+                (running_qp, None)
+            };
+
             // ---- Residual --------------------------------------------
             let pred =
                 best.decode
@@ -455,11 +473,15 @@ pub fn encode_b_vop(
             if !all_zero {
                 bw.write_bits(u32::from(cbpb), 6);
             }
-            // dbquant — present iff non-direct && cbpb != 0 (§6.2.6);
-            // this encoder keeps the VOP quantiser (Table 6-33 code
-            // "0" → delta 0).
+            // dbquant — present iff non-direct && cbpb != 0 (§6.2.6):
+            // the planned Table 6-33 step (or "0" → delta 0), and the
+            // only place the running quantiser moves.
             if mb_type != BVopMbType::Direct && !all_zero && cbpb != 0 {
-                bw.write_bit(false);
+                crate::vlc_encode::put_dbquant(&mut bw, dbquant.unwrap_or(0));
+                running_qp = qp;
+                if dbquant.is_some() {
+                    stats.dbquant += 1;
+                }
             }
 
             // Motion bodies in §6.2.6 order: forward, backward, direct.

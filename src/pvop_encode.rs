@@ -128,6 +128,8 @@ pub struct PVopEncodeStats {
     pub inter4v: usize,
     /// Intra macroblocks.
     pub intra: usize,
+    /// Macroblocks that carried a `dquant` (`inter+q` / `intra+q`).
+    pub dquant: usize,
 }
 
 /// 16×16 source luma of one macroblock (edge-replicated), as rows.
@@ -458,8 +460,9 @@ fn estimate_motion_4mv(
 }
 
 /// Mean-removed activity of the source macroblock — the classic
-/// intra/inter decision statistic.
-fn intra_activity(src: &[[i32; 16]; 16]) -> u32 {
+/// intra/inter decision statistic (also the `crate::mb_quant`
+/// activity-class input).
+pub(crate) fn intra_activity(src: &[[i32; 16]; 16]) -> u32 {
     let sum: i32 = src.iter().flatten().sum();
     let mean = sum / 256;
     src.iter()
@@ -529,11 +532,24 @@ pub fn encode_p_vop(
     let mut intra_grid = IntraBlockGrid::new(mb_height, mb_width);
     let mut mv_grid = MvGrid::new(mb_height, mb_width);
     let mut stats = PVopEncodeStats::default();
+    // §6.3.7 running quantiser (seeded by vop_quant, moved by dquant;
+    // a skipped macroblock leaves it untouched).
+    let vop_qp = qp;
+    let mut running_qp = vop_qp;
 
     for mb_row in 0..mb_height {
         for mb_col in 0..mb_width {
             let (mb_x, mb_y) = ((mb_col * 16) as i32, (mb_row * 16) as i32);
             let src = source_luma_mb(frame, mb_row, mb_col);
+            let activity = intra_activity(&src);
+            let plan_quant = |running: u32| -> (u32, Option<i8>) {
+                if cfg.adaptive_quant {
+                    let class = crate::mb_quant::activity_class(activity);
+                    crate::mb_quant::plan_dquant(running, crate::mb_quant::target_qp(vop_qp, class))
+                } else {
+                    (running, None)
+                }
+            };
 
             // Motion estimation + mode decision.
             let (mv, one_mv_sad) = estimate_motion(&src, &luma_ref, mb_x, mb_y, mode, fcode);
@@ -555,11 +571,15 @@ pub fn encode_p_vop(
                 None
             };
             let inter_sad = four.map_or(one_mv_sad, |(_, s)| s);
-            let activity = intra_activity(&src);
             let choose_intra = activity + 512 < inter_sad;
 
             if choose_intra {
                 stats.intra += 1;
+                let (qp, dquant) = plan_quant(running_qp);
+                running_qp = qp;
+                if dquant.is_some() {
+                    stats.dquant += 1;
+                }
                 // §7.6.5: an intra macroblock contributes a zero-vector
                 // candidate (mirrors MvDriver::decode_macroblock).
                 mv_grid
@@ -575,9 +595,18 @@ pub fn encode_p_vop(
                     cfg,
                     &w_intra,
                     use_dc_vlc,
+                    dquant,
                 );
                 continue;
             }
+
+            // Table B.7 has no `inter4v+q` type, so a four-vector
+            // macroblock keeps the running quantiser.
+            let (qp, dquant) = if four.is_some() {
+                (running_qp, None)
+            } else {
+                plan_quant(running_qp)
+            };
 
             // Inter: build the prediction, quantise the residual.
             let motion = match four {
@@ -614,13 +643,18 @@ pub fn encode_p_vop(
             if all_zero
                 && matches!(motion, PvopMbMotion::OneMv(m) if m == (MotionVector { x: 0, y: 0 }))
             {
-                // §6.3.6 skip: not_coded = 1, zero MV, no residual.
+                // §6.3.6 skip: not_coded = 1, zero MV, no residual (the
+                // running quantiser is untouched — no dquant is sent).
                 stats.skipped += 1;
                 bw.write_bit(true);
                 mv_grid
                     .record_one_mv(mb_row, mb_col, MotionVector { x: 0, y: 0 })
                     .expect("grid coordinates in range");
                 continue;
+            }
+            running_qp = qp;
+            if dquant.is_some() {
+                stats.dquant += 1;
             }
 
             let cbpy = (u8::from(!events[0].is_empty()) << 3)
@@ -662,8 +696,12 @@ pub fn encode_p_vop(
                 }
                 _ => {
                     stats.inter += 1;
-                    put_mcbpc_p(&mut bw, 0, cbpc); // derived_mb_type 0 = inter, 1 MV
+                    // derived_mb_type 0 = inter (1 MV), 1 = inter+q.
+                    put_mcbpc_p(&mut bw, if dquant.is_some() { 1 } else { 0 }, cbpc);
                     put_cbpy(&mut bw, cbpy, false);
+                    if let Some(d) = dquant {
+                        crate::vlc_encode::put_dquant(&mut bw, d);
+                    }
 
                     // §7.6.5 median predictor over the shared grid state,
                     // then the §7.6.3 differential under the VOP's fcode.
@@ -703,6 +741,7 @@ fn encode_intra_mb_in_p(
     cfg: &EncoderConfig,
     w_intra: &[[u8; 8]; 8],
     use_dc_vlc: bool,
+    dquant: Option<i8>,
 ) {
     let mut plans_off: Vec<BlockPlan> = Vec::with_capacity(6);
     let mut plans_on: Option<Vec<BlockPlan>> = if cfg.ac_prediction {
@@ -740,9 +779,13 @@ fn encode_intra_mb_in_p(
     let emit = |bw: &mut BitWriter, plans: &[BlockPlan; 6], flag: bool| {
         let (cbpy, cbpc) = intra_mb_cbp(plans);
         bw.write_bit(false); // not_coded = 0
-        put_mcbpc_p(bw, 3, cbpc); // derived_mb_type 3 = intra
+                             // derived_mb_type 3 = intra, 4 = intra+q.
+        put_mcbpc_p(bw, if dquant.is_some() { 4 } else { 3 }, cbpc);
         bw.write_bit(flag); // ac_pred_flag
         put_cbpy(bw, cbpy, true);
+        if let Some(d) = dquant {
+            crate::vlc_encode::put_dquant(bw, d);
+        }
         emit_intra_blocks(bw, plans, use_dc_vlc);
     };
 

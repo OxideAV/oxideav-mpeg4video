@@ -246,6 +246,35 @@ fn qpel_picture(frame_index: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
 /// One planar 4:2:0 synthetic picture (`(y, cb, cr)` planes).
 type Planes = (Vec<u8>, Vec<u8>, Vec<u8>);
 
+/// A 96×48 picture spanning every `crate::mb_quant` activity class —
+/// a flat band, a smooth gradient, a textured band and a full-range
+/// noise band — translating by (2, 1) pels per frame.
+fn mixed_activity_picture(frame_index: usize) -> Planes {
+    let (w, h) = (96usize, 48usize);
+    let (cw, ch) = (w / 2, h / 2);
+    let band = w / 4;
+    let mut y = vec![0u8; w * h];
+    let (ox, oy) = ((frame_index * 2) as i64, frame_index as i64);
+    for row in 0..h {
+        for col in 0..w {
+            let (x, yy) = (col as i64 + ox, row as i64 + oy);
+            let bx = (x.rem_euclid(w as i64) as usize) / band;
+            let v: i64 = match bx {
+                0 => 120,
+                1 => 60 + (x + yy).rem_euclid(64) * 2,
+                2 => 40 + ((x * 7 + yy * 5).rem_euclid(160)),
+                _ => {
+                    let mut s = (x as u32).wrapping_mul(0x9E37_79B9)
+                        ^ (yy as u32).wrapping_mul(0x85EB_CA6B);
+                    16 + i64::from(lcg(&mut s) >> 24) * 219 / 255
+                }
+            };
+            y[row * w + col] = v.clamp(16, 235) as u8;
+        }
+    }
+    (y, vec![110u8; cw * ch], vec![140u8; cw * ch])
+}
+
 /// A 96×64 textured background translating by (20, 5) pels per frame
 /// — a displacement outside the `fcode == 1` Table 7-9 range, so the
 /// `fcode > 1` `r_size`-bit residual form of `motion_vector()` is
@@ -365,6 +394,21 @@ fn build_registry_stream(
     picture: fn(usize) -> Planes,
 ) -> Vec<u8> {
     build_registry_stream_dims(options, picture, 64, 64)
+}
+
+/// Per-macroblock adaptive quantisation (`dquant` on I/P, `dbquant`
+/// on B) + inter4v + `bf` 2 over the mixed-activity scene.
+fn build_aq_ipb_stream() -> Vec<u8> {
+    build_registry_stream_dims(
+        oxideav_core::CodecOptions::default()
+            .set("mb-aq", "true")
+            .set("four-mv", "true")
+            .set("bf", "2")
+            .set("qp", "10"),
+        mixed_activity_picture,
+        96,
+        48,
+    )
 }
 
 /// `fcode` 2 half-sample I/P over the 20-pel-per-frame scene.
@@ -706,5 +750,29 @@ fn fcode3_qpel_ipb_stream_decodes_bit_exact_against_reference_decoder() {
         "enc_ipb_fcode3_qpel4mv_96x64.yuv",
         96,
         64,
+    );
+}
+
+#[test]
+fn aq_ipb_stream_reproduces_committed_fixture() {
+    let built = build_aq_ipb_stream();
+    if maybe_write_fixture("enc_ipb_aq4mv_96x48.m4v", &built) {
+        return;
+    }
+    assert_eq!(
+        built,
+        fixture("enc_ipb_aq4mv_96x48.m4v"),
+        "encoder output drifted from the black-box-validated fixture; \
+         regenerate the fixture AND its reference decode"
+    );
+}
+
+#[test]
+fn aq_ipb_stream_decodes_bit_exact_against_reference_decoder() {
+    assert_own_decode_matches_reference_dims(
+        "enc_ipb_aq4mv_96x48.m4v",
+        "enc_ipb_aq4mv_96x48.yuv",
+        96,
+        48,
     );
 }

@@ -362,6 +362,7 @@ pub mod inverse_quant;
 pub mod inverse_sadct;
 pub mod ivop_encode;
 pub mod macroblock; // mixed: `MacroblockParseError` stays visible
+pub mod mb_quant;
 pub mod motion; // mixed: `MotionParseError` / `DirectMvError` stay visible
 pub mod mv_predictor_grid; // mixed: `MvGridError` stays visible
 #[doc(hidden)]

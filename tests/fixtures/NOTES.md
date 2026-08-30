@@ -248,6 +248,21 @@ hit one near-tie sample — a single ±1 in one B-VOP, with the qp 3 /
 single-precision oracle caveat above, so the `bf` 2 variant was
 pinned.)
 
+The per-macroblock quantiser pair (96×48, four bands spanning every
+activity class — flat / gradient / texture / full-range noise —
+translating by (2, 1) pels per frame):
+
+* `enc_ipb_aq4mv_96x48` — `mb-aq` (activity-classed `dquant` on
+  I/P-VOPs as `intra+q` / `inter+q`, `dbquant` on B-VOPs) + inter4v
+  (which carries no `dquant` and keeps the running quantiser) + `bf`
+  2, qp 10, 6 frames.
+
+```
+ffmpeg -idct faani -i enc_ipb_aq4mv_96x48.m4v -f rawvideo -pix_fmt yuv420p enc_ipb_aq4mv_96x48.yuv
+```
+
+Bit-exact.
+
 ## SHA-256
 
 ```
@@ -334,6 +349,8 @@ e1e4c9d7fce8198331e805bc6a3743b5839c96b213747e9bd5a84ec438ec894f  enc_ip_qpel_64
 769fc2f8f88c2038b18592649e8aa1bf324a452187533a7b399ee89ea193b1a9  enc_ip_fcode2_96x64.yuv
 7b9ce94a56292b8541b2fabe1927d2ca30f867cd1fb3544f2daeeca4b5791e46  enc_ipb_fcode3_qpel4mv_96x64.m4v
 584711548f66a8f862ce5bee4cc8c5fd48fd78f264c732097956756dbcf73779  enc_ipb_fcode3_qpel4mv_96x64.yuv
+7f200f5e4089ebcc29b8899bc746db11fa5dbd6b0802d5a70998a5bb05ea6a48  enc_ipb_aq4mv_96x48.m4v
+66e3662a5fc4fd1c58068e40ce5b7e722300c6efa02c2f744f308544a454a63a  enc_ipb_aq4mv_96x48.yuv
 ```
 
 (Note: `aic_ipb_64x64.yuv` and `altscan_ipb_64x64.yuv` are
