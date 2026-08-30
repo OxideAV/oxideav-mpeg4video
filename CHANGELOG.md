@@ -8,6 +8,24 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Compat divergence 3 — §7.8.7.3 GMC averaged MV (round 452)** —
+  the opt-in ecosystem-compat mode now reproduces the deployed
+  reference decoder's averaged-MV derivation: each **non-positive**
+  component comes out one MV-grid unit lower than the spec
+  quantisation (zero included, 0 → −1; strictly positive components
+  exact), probed per component at half- and quarter-sample with
+  crafted GMC-neighbour + zero-MVD-local streams and re-clipped to
+  the Table 7-9 range. Wired through `gmc_averaged_mv` (S(GMC) walk +
+  the B frame-direct co-located substitution that consumes those
+  AMVs); the default stays spec-literal and the encoder's closed
+  loop keeps mirroring it. Pinned by three committed fixture pairs
+  (`dec_sgmc_negamv_hp_64x64`, `dec_sgmc_negamv_qp_64x64`,
+  `dec_sgmc_negtraj_96x64` — the last a full encoder-produced
+  negative-trajectory S(GMC) stream that decodes **bit-exact**
+  against the reference decoder under ecosystem-compat on every
+  frame, while the spec-literal decode diverges exactly where the
+  rule bites; `tests/compat_gmc_amv.rs`).
+
 - **GMC (sprite trajectory) emission (round 452)** — new `svop_encode`
   module: with `EncoderConfig::gmc` / registry option `gmc`,
   non-keyframe anchors become **S(GMC)-VOPs** (verid-2 VOL,

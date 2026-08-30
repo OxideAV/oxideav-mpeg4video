@@ -178,12 +178,12 @@ the target. The registry entry declares `encode`:
 ## Compatibility modes
 
 The decoder's default behaviour is always the **literal ISO/IEC
-14496-2 text**. For two clauses, black-box pixel comparison against
+14496-2 text**. For three clauses, black-box pixel comparison against
 reference decodes of conformant streams shows the deployed decoder
 ecosystem behaves differently (no implementation source was consulted
 — outputs only). The opt-in **ecosystem-compat** mode reproduces the
 observed behaviour bit-for-bit so real-world files can be matched
-exactly; it covers exactly these two divergences (`crate::compat`
+exactly; it covers exactly these three divergences (`crate::compat`
 module docs carry the full write-up):
 
 1. **§7.7.2.2 interlaced direct mode** — spec: the four field MVs are
@@ -195,6 +195,15 @@ module docs carry the full write-up):
 2. **§7.4.4.5 mismatch control** — spec: the method-1 sum-parity
    toggle of `F[7][7]` applies to every block; observed: **non-intra
    blocks only**.
+3. **§7.8.7.3 GMC averaged MV** — spec: the averaged pel-wise warping
+   vector quantises to the half-/quarter-sample grid with the `//`
+   rounding; observed: each **non-positive** component derives one
+   MV-grid unit lower (zero included, 0 → −1; strictly positive
+   components exact). Probed per component at both sample accuracies
+   and pinned by the `dec_sgmc_*` fixture pairs
+   (`tests/compat_gmc_amv.rs`): a full encoder-produced
+   negative-trajectory S(GMC) stream decodes **bit-exact** against
+   the reference decoder under ecosystem-compat.
 
 Selection is wired through every decode surface:
 
@@ -432,13 +441,7 @@ both modes' envelopes are pinned).
   side). The encoder emits progressive VOPs only — the §7.7.2.2
   interlaced-direct compat divergence cannot arise in its output. The
   decoder-side feature set below is unchanged.
-- The §7.8.7.3 **negative averaged-MV ecosystem divergence**: the
-  deployed reference decoder derives each negative AMV component of a
-  GMC macroblock one half-sample lower than the spec quantisation
-  (measured on crafted probes; positives exact). The decoder here is
-  spec-literal; covering it under the opt-in ecosystem-compat mode
-  (incl. probing the quarter-sample rule) is an open follow-up
-  (`tests/fixtures/NOTES.md`).
+
 - §E.1.4.4 recovery on **I-VOP** texture partitions (an I-VOP texture
   error still propagates: §E.1.4.4.2.2 conceals every INTRA macroblock
   of an errored packet, and an I-VOP has no inter macroblocks to

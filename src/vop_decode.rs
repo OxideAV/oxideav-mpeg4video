@@ -1498,6 +1498,7 @@ pub(crate) fn gmc_averaged_mv(
     mb_y: i64,
     quarter_sample: bool,
     vop_fcode: u8,
+    ecosystem_compat: bool,
 ) -> Result<MotionVector, VopDecodeError> {
     let mut mvs_x = [0i64; AMV_PIXEL_COUNT];
     let mut mvs_y = [0i64; AMV_PIXEL_COUNT];
@@ -1511,8 +1512,26 @@ pub(crate) fn gmc_averaged_mv(
             mvs_y[idx] = g - geometry.s * py;
         }
     }
-    averaged_motion_vector(&mvs_x, &mvs_y, geometry.s as u32, quarter_sample, vop_fcode)
-        .map_err(|e| VopDecodeError::Motion(PvopMvError::Motion(e)))
+    let mut amv =
+        averaged_motion_vector(&mvs_x, &mvs_y, geometry.s as u32, quarter_sample, vop_fcode)
+            .map_err(|e| VopDecodeError::Motion(PvopMvError::Motion(e)))?;
+    if ecosystem_compat {
+        // Compat divergence 3 (`crate::compat`): the deployed ecosystem
+        // derives each non-positive AMV component one MV-grid unit
+        // lower than the §7.8.7.3 quantisation (strictly positive
+        // components exact; measured on crafted GMC-neighbour probes at
+        // both half- and quarter-sample, zero included: 0 → −1).
+        // Re-clip to the Table 7-9 range afterwards.
+        let f = 1i32 << (vop_fcode - 1);
+        let (low, high) = (-32 * f, 32 * f - 1);
+        if amv.x <= 0 {
+            amv.x = (amv.x - 1).clamp(low, high);
+        }
+        if amv.y <= 0 {
+            amv.y = (amv.y - 1).clamp(low, high);
+        }
+    }
+    Ok(amv)
 }
 
 /// Decode a complete rectangular progressive **S(GMC)-VOP**'s
@@ -1605,8 +1624,14 @@ pub fn decode_s_gmc_vop_macroblocks(
             if header.not_coded {
                 // §6.3.6: a not-coded S(GMC) macroblock is GMC-predicted
                 // (implied mcsel == 1) with a zero residual.
-                let amv =
-                    gmc_averaged_mv(&geometry, mb_x, mb_y, vol.quarter_sample, vop.fcode_fwd)?;
+                let amv = gmc_averaged_mv(
+                    &geometry,
+                    mb_x,
+                    mb_y,
+                    vol.quarter_sample,
+                    vop.fcode_fwd,
+                    opts.ecosystem_compat,
+                )?;
                 driver.record_gmc_macroblock(mb_row, mb_col, amv)?;
                 out.push(SGmcMbContent::Gmc {
                     amv,
@@ -1646,8 +1671,14 @@ pub fn decode_s_gmc_vop_macroblocks(
             } else if header.mcsel == Some(true) {
                 // §6.3.6: mcsel == 1 codes no local motion vectors; the
                 // texture follows the header directly.
-                let amv =
-                    gmc_averaged_mv(&geometry, mb_x, mb_y, vol.quarter_sample, vop.fcode_fwd)?;
+                let amv = gmc_averaged_mv(
+                    &geometry,
+                    mb_x,
+                    mb_y,
+                    vol.quarter_sample,
+                    vop.fcode_fwd,
+                    opts.ecosystem_compat,
+                )?;
                 driver.record_gmc_macroblock(mb_row, mb_col, amv)?;
                 let residual = decode_inter_macroblock(br, &header, ctx, &inter_matrix)?;
                 out.push(SGmcMbContent::Gmc {

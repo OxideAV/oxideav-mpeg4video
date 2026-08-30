@@ -307,17 +307,39 @@ Bit-exact. Two findings from this pair's validation:
   pure-GMC-copy probes (integer-pel, half-pel, negative, ±16-pel,
   vertical trajectories) then decoded **bit-exact** through the
   reference binary.
-* **§7.8.7.3 negative averaged-MV divergence** — the reference
-  decoder derives each *negative* AMV component one half-sample lower
-  than the §7.8.7.3 quantisation (probed with crafted
-  GMC-neighbour + zero-MVD-local streams: du −2→−3, −3→−4, −4→−5,
-  −10→−11; positive components exact; per-component independent).
-  The AMV feeds the §7.6.5 predictor candidates of local macroblocks
-  and the §7.6.9 frame-direct co-located substitution, so streams
-  whose trajectories go negative decode differently there. The
-  decoder keeps the spec-literal quantisation (the crate's
-  compatibility-mode policy); the pinned fixture pans so every
-  trajectory stays non-negative.
+* **§7.8.7.3 non-positive averaged-MV divergence** — the reference
+  decoder derives each *non-positive* AMV component one MV-grid unit
+  lower than the §7.8.7.3 quantisation (probed with crafted
+  GMC-neighbour + zero-MVD-local streams: half-sample du −2→−3,
+  −3→−4, −4→−5, −10→−11, 0→−1; quarter-sample −6→−7, −8→−9, −18→−19,
+  −20→−21; strictly positive components exact; per-component
+  independent). The AMV feeds the §7.6.5 predictor candidates of
+  local macroblocks and the §7.6.9 frame-direct co-located
+  substitution. The decoder keeps the spec-literal quantisation by
+  default; the opt-in **ecosystem-compat** mode now covers the rule
+  (compat divergence 3), pinned by the `dec_sgmc_*` pairs below. The
+  encoder fixture pans so every trajectory component stays strictly
+  positive.
+
+The compat-divergence-3 pins (`tests/compat_gmc_amv.rs`; the `.m4v`
+sides are deterministic builds of that file, the `.yuv` sides the
+reference decodes):
+
+* `dec_sgmc_negamv_hp_64x64` — crafted half-pel probe (trajectory
+  (−3, −7); GMC-coded MB, zero-MVD local MB, `not_coded` GMC copies);
+* `dec_sgmc_negamv_qp_64x64` — the quarter-sample sibling
+  (trajectory (−4, −10));
+* `dec_sgmc_negtraj_96x64` — a full encoder-produced 4-frame S(GMC)
+  stream whose dominant-motion trajectories go negative and zero
+  (fcode 1 against 20-pel-per-frame motion). Ecosystem-compat decode
+  is **bit-exact** against all three reference decodes; the
+  spec-literal decode differs exactly where the rule bites.
+
+```
+ffmpeg -idct faani -i dec_sgmc_negamv_hp_64x64.m4v -f rawvideo -pix_fmt yuv420p dec_sgmc_negamv_hp_64x64.yuv
+ffmpeg -idct faani -i dec_sgmc_negamv_qp_64x64.m4v -f rawvideo -pix_fmt yuv420p dec_sgmc_negamv_qp_64x64.yuv
+ffmpeg -idct faani -i dec_sgmc_negtraj_96x64.m4v -f rawvideo -pix_fmt yuv420p dec_sgmc_negtraj_96x64.yuv
+```
 
 ## SHA-256
 
@@ -407,6 +429,12 @@ e1e4c9d7fce8198331e805bc6a3743b5839c96b213747e9bd5a84ec438ec894f  enc_ip_qpel_64
 584711548f66a8f862ce5bee4cc8c5fd48fd78f264c732097956756dbcf73779  enc_ipb_fcode3_qpel4mv_96x64.yuv
 23aacccba29bac9f850ab4729e811dcd531302c3cc61e86c3111add3c3bfce6f  enc_isb_gmc_qpel_96x64.m4v
 f1a65b08166aaab11863c5478cadefc201912db150551c5ed2f88c658900aa28  enc_isb_gmc_qpel_96x64.yuv
+43ba930a07b45c825b5df81b66331bc1a8cfef066540ef9f22af8cd02a78d844  dec_sgmc_negamv_hp_64x64.m4v
+e560f779d1d598419c80bf30629463fd1e0046834a2d0ac1ecf592ea130c8483  dec_sgmc_negamv_hp_64x64.yuv
+60fd1ec7342131f55276c248c308be9f3c0d4a691d74338c77f9d7f874d31880  dec_sgmc_negamv_qp_64x64.m4v
+69dd677fbcf59914484d3b9f27a67e3f7bbc2c36e45df2c688933de88db31e17  dec_sgmc_negamv_qp_64x64.yuv
+7a8d5a086be97592b96ad1b4f276642df250feec564728637305b78afd44edf2  dec_sgmc_negtraj_96x64.m4v
+fc61e5e5bb934ea9c3894ad9ab6316067307e2aef53f9642ad2a32d3ee6f97c5  dec_sgmc_negtraj_96x64.yuv
 7f200f5e4089ebcc29b8899bc746db11fa5dbd6b0802d5a70998a5bb05ea6a48  enc_ipb_aq4mv_96x48.m4v
 66e3662a5fc4fd1c58068e40ce5b7e722300c6efa02c2f744f308544a454a63a  enc_ipb_aq4mv_96x48.yuv
 81e92c81b778fec93a78607b06fa3000343e58dd137e402227573324cb8b58d3  enc_ipb_vp_fcode2_96x64.m4v

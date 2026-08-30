@@ -398,6 +398,7 @@ pub fn encode_s_vop(
                     i64::from(mb_y),
                     vol.quarter_sample,
                     fcode,
+                    false, // the encoder mirrors the spec-literal decode
                 )
                 .expect("AMV derivation cannot fail on a valid fcode");
                 mv_grid
