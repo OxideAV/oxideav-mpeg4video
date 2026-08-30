@@ -91,6 +91,17 @@ impl VopCodingType {
             _ => unreachable!("masked to 2 bits"),
         }
     }
+
+    /// The 2-bit `vop_coding_type` field value (Table 6-24) — the
+    /// inverse of [`Self::from_bits`].
+    pub fn to_bits(self) -> u32 {
+        match self {
+            VopCodingType::I => 0b00,
+            VopCodingType::P => 0b01,
+            VopCodingType::B => 0b10,
+            VopCodingType::S => 0b11,
+        }
+    }
 }
 
 /// Decoded `time_code` field (§6.2.4, Table 6-23).

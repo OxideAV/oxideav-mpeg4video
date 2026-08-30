@@ -74,6 +74,21 @@ impl BitWriter {
         self.write_bits(u32::from(bit), 1);
     }
 
+    /// Append every bit written so far into `other` (bit-exact, no
+    /// alignment) — how the partition writers of a video packet are
+    /// spliced into the unit.
+    pub fn append(&mut self, other: &BitWriter) {
+        let full = other.bit_len / 8;
+        for &byte in &other.bytes[..full] {
+            self.write_bits(u32::from(byte), 8);
+        }
+        let rem = other.bit_len % 8;
+        if rem != 0 {
+            let tail = other.bytes[full] >> (8 - rem);
+            self.write_bits(u32::from(tail), rem);
+        }
+    }
+
     /// Append a `marker_bit` (always `1`, §6.2.x).
     pub fn write_marker(&mut self) {
         self.write_bits(1, 1);

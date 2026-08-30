@@ -118,6 +118,8 @@ pub struct BVopEncodeStats {
     pub zero_bit: usize,
     /// Macroblocks that carried a non-zero `dbquant`.
     pub dbquant: usize,
+    /// Video packets cut inside the VOP (resync markers emitted).
+    pub packets: usize,
     /// `modb == "1"` macroblocks (direct, zero delta, no residual).
     pub modb_one: usize,
     /// Explicit direct macroblocks.
@@ -321,14 +323,31 @@ pub fn encode_b_vop(
     };
 
     let fcode = cfg.fcode;
-    let mut bw = BitWriter::new();
+    let mut header = BitWriter::new();
     write_b_vop_header(
-        &mut bw,
+        &mut header,
         cfg.time_increment_resolution,
         modulo_time_base,
         time_increment,
         qp,
         fcode,
+    );
+    // B-VOPs always use the combined syntax (§6.2.5.3 NOTE), video
+    // packets included.
+    let mut pw = crate::packet_encode::PacketWriter::new(
+        header,
+        cfg.resilience,
+        crate::packet_encode::PacketVopInfo {
+            coding_type: VopCodingType::B,
+            fcode_fwd: fcode,
+            fcode_bwd: fcode,
+            modulo_time_base,
+            time_increment,
+            time_increment_bits: vop_time_increment_bits(cfg.time_increment_resolution),
+            intra_dc_vlc_thr: 0,
+            total_macroblocks: (mb_width * mb_height) as u32,
+        },
+        crate::packet_encode::Layout::Combined,
     );
 
     let mut stats = BVopEncodeStats::default();
@@ -343,6 +362,13 @@ pub fn encode_b_vop(
         let mut pred_b = MotionVector { x: 0, y: 0 };
         for mb_col in 0..mb_width {
             let idx = mb_row * mb_width + mb_col;
+            if pw.maybe_cut(idx, running_qp) {
+                // §7.6.8 / §E.1.2: a resync marker resets the running
+                // predictors like a row start (BVopMvDriver::start_row)
+                // and re-seeds the quantiser from quant_scale.
+                pred_f = MotionVector { x: 0, y: 0 };
+                pred_b = MotionVector { x: 0, y: 0 };
+            }
             let co_motion = anchor_motion.map(|m| m[idx]);
 
             // §6.2.6 co_located_not_coded: no bits at all.
@@ -456,28 +482,28 @@ pub fn encode_b_vop(
                 && all_zero
             {
                 // modb "1": direct, zero delta, nothing coded.
-                bw.write_bit(true);
+                pw.writer().write_bit(true);
                 stats.modb_one += 1;
                 continue;
             }
             if all_zero {
                 // modb "01": mb_type present, no cbpb.
-                bw.write_bit(false);
-                bw.write_bit(true);
+                pw.writer().write_bit(false);
+                pw.writer().write_bit(true);
             } else {
                 // modb "00": mb_type + cbpb.
-                bw.write_bit(false);
-                bw.write_bit(false);
+                pw.writer().write_bit(false);
+                pw.writer().write_bit(false);
             }
-            put_b_mb_type(&mut bw, mb_type);
+            put_b_mb_type(pw.writer(), mb_type);
             if !all_zero {
-                bw.write_bits(u32::from(cbpb), 6);
+                pw.writer().write_bits(u32::from(cbpb), 6);
             }
             // dbquant — present iff non-direct && cbpb != 0 (§6.2.6):
             // the planned Table 6-33 step (or "0" → delta 0), and the
             // only place the running quantiser moves.
             if mb_type != BVopMbType::Direct && !all_zero && cbpb != 0 {
-                crate::vlc_encode::put_dbquant(&mut bw, dbquant.unwrap_or(0));
+                crate::vlc_encode::put_dbquant(pw.writer(), dbquant.unwrap_or(0));
                 running_qp = qp;
                 if dbquant.is_some() {
                     stats.dbquant += 1;
@@ -488,28 +514,28 @@ pub fn encode_b_vop(
             match mb_type {
                 BVopMbType::Forward => {
                     let mv = best.decode.mvs[0].forward;
-                    put_motion_vector(&mut bw, mv.x - pred_f.x, mv.y - pred_f.y, fcode);
+                    put_motion_vector(pw.writer(), mv.x - pred_f.x, mv.y - pred_f.y, fcode);
                     pred_f = mv;
                     stats.forward += 1;
                 }
                 BVopMbType::Backward => {
                     let mv = best.decode.mvs[0].backward;
-                    put_motion_vector(&mut bw, mv.x - pred_b.x, mv.y - pred_b.y, fcode);
+                    put_motion_vector(pw.writer(), mv.x - pred_b.x, mv.y - pred_b.y, fcode);
                     pred_b = mv;
                     stats.backward += 1;
                 }
                 BVopMbType::Interpolated => {
                     let f = best.decode.mvs[0].forward;
                     let b = best.decode.mvs[0].backward;
-                    put_motion_vector(&mut bw, f.x - pred_f.x, f.y - pred_f.y, fcode);
-                    put_motion_vector(&mut bw, b.x - pred_b.x, b.y - pred_b.y, fcode);
+                    put_motion_vector(pw.writer(), f.x - pred_f.x, f.y - pred_f.y, fcode);
+                    put_motion_vector(pw.writer(), b.x - pred_b.x, b.y - pred_b.y, fcode);
                     pred_f = f;
                     pred_b = b;
                     stats.interpolated += 1;
                 }
                 BVopMbType::Direct => {
                     // §7.6.8: predictor zero, f_code 1; bank untouched.
-                    put_motion_vector(&mut bw, best.direct_delta.dx, best.direct_delta.dy, 1);
+                    put_motion_vector(pw.writer(), best.direct_delta.dx, best.direct_delta.dy, 1);
                     stats.direct += 1;
                 }
             }
@@ -517,13 +543,13 @@ pub fn encode_b_vop(
             // Texture: Table B.17 inter EVENTs per coded block.
             for ev in &events {
                 if !ev.is_empty() {
-                    put_ac_events(&mut bw, TcoefTable::Inter, ev);
+                    put_ac_events(pw.writer(), TcoefTable::Inter, ev);
                 }
             }
         }
     }
-    bw.next_start_code();
-    let bytes = bw.into_bytes();
+    stats.packets = pw.packets_cut();
+    let bytes = pw.finish();
     let recon = reconstruct_own_b_vop(vol, &bytes, store, anchor_motion, trb, trd);
     (bytes, recon, stats)
 }

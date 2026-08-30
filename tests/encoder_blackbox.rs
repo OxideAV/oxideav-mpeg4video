@@ -411,6 +411,53 @@ fn build_aq_ipb_stream() -> Vec<u8> {
     )
 }
 
+/// Video packets (~500-bit target, HEC alternating) in a combined-
+/// syntax I/P/B stream with `fcode` 2.
+fn build_vp_ipb_stream() -> Vec<u8> {
+    build_registry_stream_dims(
+        oxideav_core::CodecOptions::default()
+            .set("packet-bits", "500")
+            .set("fcode", "2")
+            .set("bf", "2"),
+        long_motion_picture,
+        96,
+        64,
+    )
+}
+
+/// Data partitioning (dc_marker / motion_marker) + video packets +
+/// per-macroblock dquant, I/P only.
+fn build_dp_ip_stream() -> Vec<u8> {
+    build_registry_stream_dims(
+        oxideav_core::CodecOptions::default()
+            .set("packet-bits", "400")
+            .set("data-partitioned", "true")
+            .set("mb-aq", "true"),
+        mixed_activity_picture,
+        96,
+        48,
+    )
+}
+
+/// Data partitioning + reversible VLCs + video packets + dquant /
+/// dbquant + inter4v + `fcode` 2 + B-VOPs (combined syntax inside the
+/// partitioned VOL).
+fn build_dp_rvlc_ipb_stream() -> Vec<u8> {
+    build_registry_stream_dims(
+        oxideav_core::CodecOptions::default()
+            .set("packet-bits", "400")
+            .set("data-partitioned", "true")
+            .set("rvlc", "true")
+            .set("mb-aq", "true")
+            .set("four-mv", "true")
+            .set("fcode", "2")
+            .set("bf", "2"),
+        mixed_activity_picture,
+        96,
+        48,
+    )
+}
+
 /// `fcode` 2 half-sample I/P over the 20-pel-per-frame scene.
 fn build_fcode2_stream() -> Vec<u8> {
     build_registry_stream_dims(
@@ -772,6 +819,78 @@ fn aq_ipb_stream_decodes_bit_exact_against_reference_decoder() {
     assert_own_decode_matches_reference_dims(
         "enc_ipb_aq4mv_96x48.m4v",
         "enc_ipb_aq4mv_96x48.yuv",
+        96,
+        48,
+    );
+}
+
+#[test]
+fn ipb_vp_fcode2_96x64_stream_reproduces_committed_fixture() {
+    let built = build_vp_ipb_stream();
+    if maybe_write_fixture("enc_ipb_vp_fcode2_96x64.m4v", &built) {
+        return;
+    }
+    assert_eq!(
+        built,
+        fixture("enc_ipb_vp_fcode2_96x64.m4v"),
+        "encoder output drifted from the black-box-validated fixture; \
+         regenerate the fixture AND its reference decode"
+    );
+}
+
+#[test]
+fn ipb_vp_fcode2_96x64_stream_decodes_bit_exact_against_reference_decoder() {
+    assert_own_decode_matches_reference_dims(
+        "enc_ipb_vp_fcode2_96x64.m4v",
+        "enc_ipb_vp_fcode2_96x64.yuv",
+        96,
+        64,
+    );
+}
+
+#[test]
+fn ip_dp_aq_96x48_stream_reproduces_committed_fixture() {
+    let built = build_dp_ip_stream();
+    if maybe_write_fixture("enc_ip_dp_aq_96x48.m4v", &built) {
+        return;
+    }
+    assert_eq!(
+        built,
+        fixture("enc_ip_dp_aq_96x48.m4v"),
+        "encoder output drifted from the black-box-validated fixture; \
+         regenerate the fixture AND its reference decode"
+    );
+}
+
+#[test]
+fn ip_dp_aq_96x48_stream_decodes_bit_exact_against_reference_decoder() {
+    assert_own_decode_matches_reference_dims(
+        "enc_ip_dp_aq_96x48.m4v",
+        "enc_ip_dp_aq_96x48.yuv",
+        96,
+        48,
+    );
+}
+
+#[test]
+fn ipb_dprvlc_aq4mv_96x48_stream_reproduces_committed_fixture() {
+    let built = build_dp_rvlc_ipb_stream();
+    if maybe_write_fixture("enc_ipb_dprvlc_aq4mv_96x48.m4v", &built) {
+        return;
+    }
+    assert_eq!(
+        built,
+        fixture("enc_ipb_dprvlc_aq4mv_96x48.m4v"),
+        "encoder output drifted from the black-box-validated fixture; \
+         regenerate the fixture AND its reference decode"
+    );
+}
+
+#[test]
+fn ipb_dprvlc_aq4mv_96x48_stream_decodes_bit_exact_against_reference_decoder() {
+    assert_own_decode_matches_reference_dims(
+        "enc_ipb_dprvlc_aq4mv_96x48.m4v",
+        "enc_ipb_dprvlc_aq4mv_96x48.yuv",
         96,
         48,
     );

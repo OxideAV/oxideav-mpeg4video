@@ -72,6 +72,15 @@ pub struct Mpeg4EncoderOptions {
     /// `dquant` / `dbquant` steps in a ±2 band around the VOP
     /// quantiser (`crate::mb_quant`). Default off.
     pub mb_aq: bool,
+    /// `packet-bits` — target video-packet size in bits (0 = no
+    /// resync markers). Non-zero clears the VOL's
+    /// `resync_marker_disable` and cuts §6.2.5 video packets.
+    pub packet_bits: u32,
+    /// `data-partitioned` — §6.2.5.3 data partitioning of I-/P-VOPs.
+    pub data_partitioned: bool,
+    /// `rvlc` — reversible VLCs for the partitioned texture (requires
+    /// `data-partitioned`).
+    pub rvlc: bool,
 }
 
 impl Default for Mpeg4EncoderOptions {
@@ -88,6 +97,9 @@ impl Default for Mpeg4EncoderOptions {
             gop_size: 12,
             fcode: 1,
             mb_aq: false,
+            packet_bits: 0,
+            data_partitioned: false,
+            rvlc: false,
         }
     }
 }
@@ -171,6 +183,26 @@ impl oxideav_core::CodecOptionsStruct for Mpeg4EncoderOptions {
             help: "per-macroblock adaptive quantisation: activity-classed dquant / \
                    dbquant steps (±2) around the VOP quantiser",
         },
+        oxideav_core::OptionField {
+            name: "packet-bits",
+            kind: oxideav_core::OptionKind::U32,
+            default: oxideav_core::OptionValue::U32(0),
+            help: "target video-packet size in bits (ISO/IEC 14496-2 §6.2.5 \
+                   resync markers + video_packet_header); 0 = one packet per VOP",
+        },
+        oxideav_core::OptionField {
+            name: "data-partitioned",
+            kind: oxideav_core::OptionKind::Bool,
+            default: oxideav_core::OptionValue::Bool(false),
+            help: "§6.2.5.3 data partitioning of I-/P-VOPs (dc_marker / motion_marker)",
+        },
+        oxideav_core::OptionField {
+            name: "rvlc",
+            kind: oxideav_core::OptionKind::Bool,
+            default: oxideav_core::OptionValue::Bool(false),
+            help: "reversible VLCs (Table B.23) for the data-partitioned texture \
+                   partition; requires data-partitioned",
+        },
     ];
 
     fn apply(&mut self, key: &str, value: &oxideav_core::OptionValue) -> Result<()> {
@@ -216,6 +248,9 @@ impl oxideav_core::CodecOptionsStruct for Mpeg4EncoderOptions {
                 self.fcode = f;
             }
             "mb-aq" => self.mb_aq = value.as_bool()?,
+            "packet-bits" => self.packet_bits = value.as_u32()?,
+            "data-partitioned" => self.data_partitioned = value.as_bool()?,
+            "rvlc" => self.rvlc = value.as_bool()?,
             _ => unreachable!("guarded by SCHEMA"),
         }
         Ok(())
@@ -284,6 +319,9 @@ impl Mpeg4VideoEncoder {
     /// Construct from codec parameters (see [`make_encoder`]).
     pub fn from_params(params: &CodecParameters) -> Result<Self> {
         let options: Mpeg4EncoderOptions = oxideav_core::parse_options(&params.options)?;
+        if options.rvlc && !options.data_partitioned {
+            return Err(Error::invalid("rvlc requires data-partitioned"));
+        }
         let width = params
             .width
             .ok_or_else(|| Error::invalid("encoder needs width"))?;
@@ -339,6 +377,11 @@ impl Mpeg4VideoEncoder {
             vbv,
             fcode: options.fcode as u8,
             adaptive_quant: options.mb_aq,
+            resilience: crate::packet_encode::ResilienceConfig {
+                packet_bits: options.packet_bits,
+                data_partitioned: options.data_partitioned,
+                reversible_vlc: options.rvlc,
+            },
         };
         let config_headers = write_configuration_headers(&cfg);
         let vol_pos = config_headers

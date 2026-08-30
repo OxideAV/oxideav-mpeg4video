@@ -201,6 +201,58 @@ pub fn put_ac_events(bw: &mut BitWriter, kind: TcoefTable, events: &[AcEvent]) {
     }
 }
 
+/// Emit one EVENT with the reversible VLC (Table B.23 column for
+/// `kind` + sign bit), falling back to the §7.4.1.3 Type-5 escape —
+/// opener `00001`, `LAST(1) RUN(6) marker LEVEL(11) marker`, closer
+/// `0000`, sign — when the triple is not tabulated. Exact inverse of
+/// [`crate::texture::decode_ac_event_rvlc`].
+///
+/// # Panics
+///
+/// Panics when `run > 63` or `|level|` is outside `1..=2047`.
+pub fn put_ac_event_rvlc(bw: &mut BitWriter, kind: TcoefTable, event: AcEvent) {
+    let magnitude = event.level.unsigned_abs();
+    assert!(
+        (1..=2047).contains(&magnitude) && event.run <= 63,
+        "RVLC EVENT {event:?} outside the Type-5 escape domain"
+    );
+    let last = u8::from(event.last);
+    let hit = crate::texture::rvlc_tcoef_table().iter().find(
+        |&&(_, _, i_last, i_run, i_level, n_last, n_run, n_level)| match kind {
+            TcoefTable::Intra => {
+                i_last == last && u32::from(i_run) == event.run && u32::from(i_level) == magnitude
+            }
+            TcoefTable::Inter => {
+                n_last == last && u32::from(n_run) == event.run && u32::from(n_level) == magnitude
+            }
+        },
+    );
+    match hit {
+        Some(&(code, len, ..)) => {
+            bw.write_bits(code, usize::from(len));
+            bw.write_bit(event.level < 0);
+        }
+        None => {
+            let (open, open_len) = crate::texture::RVLC_ESCAPE;
+            bw.write_bits(open, usize::from(open_len));
+            bw.write_bit(event.last);
+            bw.write_bits(event.run, 6);
+            bw.write_marker();
+            bw.write_bits(magnitude, 11);
+            bw.write_marker();
+            bw.write_bits(0, 4);
+            bw.write_bit(event.level < 0);
+        }
+    }
+}
+
+/// Emit every EVENT of one block with the reversible VLC.
+pub fn put_ac_events_rvlc(bw: &mut BitWriter, kind: TcoefTable, events: &[AcEvent]) {
+    for ev in events {
+        put_ac_event_rvlc(bw, kind, *ev);
+    }
+}
+
 /// Emit an I-VOP `mcbpc` (Table B.6) for `derived_mb_type` 3 (intra)
 /// or 4 (intra+q) with the 2-bit `cbpc`.
 ///
@@ -365,6 +417,50 @@ mod tests {
                 let mut br = BitReader::new(&bytes);
                 let got = decode_intra_dc(&mut br, component).unwrap();
                 assert_eq!(got.differential, diff, "component {component:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn rvlc_events_round_trip_table_and_escape() {
+        for kind in [TcoefTable::Intra, TcoefTable::Inter] {
+            for last in [false, true] {
+                for run in [0u32, 1, 2, 5, 12, 20, 40, 63] {
+                    for level in [1i32, -1, 2, -3, 7, -20, 100, -2047, 2047] {
+                        let ev = AcEvent { last, run, level };
+                        let mut bw = BitWriter::new();
+                        put_ac_event_rvlc(&mut bw, kind, ev);
+                        bw.next_start_code();
+                        let bytes = bw.into_bytes();
+                        let mut br = BitReader::new(&bytes);
+                        let got = crate::texture::decode_ac_event_rvlc(&mut br, kind).unwrap();
+                        assert_eq!(got, ev, "{kind:?}");
+                    }
+                }
+            }
+        }
+        // Every tabulated row survives its own column.
+        for &(_, _, i_last, i_run, i_level, n_last, n_run, n_level) in
+            crate::texture::rvlc_tcoef_table()
+        {
+            for (kind, last, run, level) in [
+                (TcoefTable::Intra, i_last, i_run, i_level),
+                (TcoefTable::Inter, n_last, n_run, n_level),
+            ] {
+                let ev = AcEvent {
+                    last: last != 0,
+                    run: u32::from(run),
+                    level: -i32::from(level),
+                };
+                let mut bw = BitWriter::new();
+                put_ac_event_rvlc(&mut bw, kind, ev);
+                bw.next_start_code();
+                let bytes = bw.into_bytes();
+                let mut br = BitReader::new(&bytes);
+                assert_eq!(
+                    crate::texture::decode_ac_event_rvlc(&mut br, kind).unwrap(),
+                    ev
+                );
             }
         }
     }

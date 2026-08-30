@@ -369,6 +369,7 @@ pub mod mv_predictor_grid; // mixed: `MvGridError` stays visible
 pub mod neighbour;
 #[doc(hidden)]
 pub mod obmc;
+pub mod packet_encode;
 #[doc(hidden)]
 pub mod perspective_warp;
 #[doc(hidden)]

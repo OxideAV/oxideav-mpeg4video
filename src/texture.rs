@@ -452,6 +452,18 @@ pub(crate) fn dc_size_table(component: DcComponent) -> &'static [(u16, u8, u8)] 
     }
 }
 
+/// Encoder-side view of the Table B.23 reversible Tcoef list (rows
+/// `(code_bits, code_len, intra_last, intra_run, intra_level,
+/// inter_last, inter_run, inter_level)`, sign bit excluded) plus the
+/// Type-5 escape opener, used by [`crate::vlc_encode`].
+pub(crate) fn rvlc_tcoef_table() -> &'static [RvlcEntry] {
+    RVLC_TCOEF
+}
+
+/// Encoder-side view of the §7.4.1.3 Type-5 (RVLC) escape opener
+/// `00001`.
+pub(crate) const RVLC_ESCAPE: (u32, u8) = (RVLC_ESCAPE_OPEN, RVLC_ESCAPE_OPEN_LEN);
+
 /// Encoder-side view of the §7.4.1.3 escape prefix (`0000 011`, 7
 /// bits).
 pub(crate) const ESCAPE: (u32, u8) = (TCOEF_ESCAPE_CODE, TCOEF_ESCAPE_LEN);

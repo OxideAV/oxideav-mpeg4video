@@ -40,18 +40,18 @@ use crate::data_partition::use_intra_dc_vlc;
 use crate::fdct::forward_dct_8x8;
 use crate::framestore::{DecodedFrame, FrameStore};
 use crate::ivop_encode::{
-    emit_intra_blocks, forward_scan, intra_mb_cbp, plan_block, qfs_to_events, quantise_intra_block,
-    BlockPlan, EncoderConfig, FrameView, PreparedBlock,
+    forward_scan, intra_mb_fields, plan_block, qfs_to_events, quantise_intra_block, BlockPlan,
+    EncoderConfig, FrameView, PreparedBlock,
 };
 use crate::motion::{predict_motion_vector, MotionVector};
 use crate::mv_predictor_grid::MvGrid;
 use crate::neighbour::{BlockNeighbour, IntraBlockGrid};
+use crate::packet_encode::{Layout, MbFields, PacketVopInfo, PacketWriter};
 use crate::predictor::select_dc_direction;
 use crate::pvop_mv::{predict_inter_macroblock, PvopMbMotion};
 use crate::quantise::{quantise_method1_inter, quantise_method2_inter};
 use crate::scan::ScanType;
-use crate::texture::{AcEvent, DcComponent, TcoefTable};
-use crate::vlc_encode::{put_cbpy, put_mcbpc_p, put_motion_vector};
+use crate::texture::{AcEvent, DcComponent};
 use crate::vop::{parse_vop_header_body, vop_time_increment_bits, VopCodingType, VopContext};
 use crate::vop_decode::decode_p_vop_macroblocks;
 
@@ -130,6 +130,8 @@ pub struct PVopEncodeStats {
     pub intra: usize,
     /// Macroblocks that carried a `dquant` (`inter+q` / `intra+q`).
     pub dquant: usize,
+    /// Video packets cut inside the VOP (resync markers emitted).
+    pub packets: usize,
 }
 
 /// 16×16 source luma of one macroblock (edge-replicated), as rows.
@@ -529,16 +531,44 @@ pub fn encode_p_vop(
         fcode,
     );
 
+    let layout = if cfg.resilience.data_partitioned {
+        Layout::PartitionedP
+    } else {
+        Layout::Combined
+    };
+    let mut pw = PacketWriter::new(
+        bw,
+        cfg.resilience,
+        PacketVopInfo {
+            coding_type: VopCodingType::P,
+            fcode_fwd: fcode,
+            fcode_bwd: 0,
+            modulo_time_base,
+            time_increment,
+            time_increment_bits: vop_time_increment_bits(cfg.time_increment_resolution),
+            intra_dc_vlc_thr: 0,
+            total_macroblocks: (mb_width * mb_height) as u32,
+        },
+        layout,
+    );
+
     let mut intra_grid = IntraBlockGrid::new(mb_height, mb_width);
     let mut mv_grid = MvGrid::new(mb_height, mb_width);
     let mut stats = PVopEncodeStats::default();
-    // §6.3.7 running quantiser (seeded by vop_quant, moved by dquant;
-    // a skipped macroblock leaves it untouched).
+    // §6.3.7 running quantiser (seeded by vop_quant, moved by dquant,
+    // re-seeded by each video packet's quant_scale; a skipped
+    // macroblock leaves it untouched).
     let vop_qp = qp;
     let mut running_qp = vop_qp;
 
     for mb_row in 0..mb_height {
         for mb_col in 0..mb_width {
+            if pw.maybe_cut(mb_row * mb_width + mb_col, running_qp) {
+                // §E.1.2: no prediction crosses a packet boundary —
+                // the decoder rebuilds both grids at the header.
+                intra_grid = IntraBlockGrid::new(mb_height, mb_width);
+                mv_grid = MvGrid::new(mb_height, mb_width);
+            }
             let (mb_x, mb_y) = ((mb_col * 16) as i32, (mb_row * 16) as i32);
             let src = source_luma_mb(frame, mb_row, mb_col);
             let activity = intra_activity(&src);
@@ -585,8 +615,8 @@ pub fn encode_p_vop(
                 mv_grid
                     .record_one_mv(mb_row, mb_col, MotionVector { x: 0, y: 0 })
                     .expect("grid coordinates in range");
-                encode_intra_mb_in_p(
-                    &mut bw,
+                let fields = intra_mb_in_p_fields(
+                    &pw,
                     frame,
                     &mut intra_grid,
                     mb_row,
@@ -597,6 +627,7 @@ pub fn encode_p_vop(
                     use_dc_vlc,
                     dquant,
                 );
+                pw.push(&fields);
                 continue;
             }
 
@@ -646,7 +677,18 @@ pub fn encode_p_vop(
                 // §6.3.6 skip: not_coded = 1, zero MV, no residual (the
                 // running quantiser is untouched — no dquant is sent).
                 stats.skipped += 1;
-                bw.write_bit(true);
+                pw.push(&MbFields {
+                    not_coded: true,
+                    mb_type: 0,
+                    cbpc: 0,
+                    cbpy: 0,
+                    ac_pred_flag: false,
+                    dquant: None,
+                    mvds: Vec::new(),
+                    fcode,
+                    intra_dc: None,
+                    blocks: Default::default(),
+                });
                 mv_grid
                     .record_one_mv(mb_row, mb_col, MotionVector { x: 0, y: 0 })
                     .expect("grid coordinates in range");
@@ -663,12 +705,9 @@ pub fn encode_p_vop(
                 | u8::from(!events[3].is_empty());
             let cbpc = (u8::from(!events[4].is_empty()) << 1) | u8::from(!events[5].is_empty());
 
-            bw.write_bit(false); // not_coded = 0
-            match motion {
+            let (mb_type, mvds) = match motion {
                 PvopMbMotion::FourMv(mvs) => {
                     stats.inter4v += 1;
-                    put_mcbpc_p(&mut bw, 2, cbpc); // derived_mb_type 2 = inter4v
-                    put_cbpy(&mut bw, cbpy, false);
                     // Four §6.2.6.2 motion_vector() bodies, each against
                     // the §7.6.5 median for *that* block index, with the
                     // in-MB candidates made visible incrementally —
@@ -677,62 +716,66 @@ pub fn encode_p_vop(
                     mv_grid
                         .record_four_mv(mb_row, mb_col, recorded)
                         .expect("grid coordinates in range");
+                    let mut mvds = Vec::with_capacity(4);
                     for (i, &block_mv) in mvs.iter().enumerate() {
                         let candidates = mv_grid
                             .predictor_candidates(mb_row, mb_col, i)
                             .expect("grid coordinates in range");
                         let predictor = predict_motion_vector(candidates);
-                        put_motion_vector(
-                            &mut bw,
-                            block_mv.x - predictor.x,
-                            block_mv.y - predictor.y,
-                            fcode,
-                        );
+                        mvds.push((block_mv.x - predictor.x, block_mv.y - predictor.y));
                         recorded[i] = block_mv;
                         mv_grid
                             .record_four_mv(mb_row, mb_col, recorded)
                             .expect("grid coordinates in range");
                     }
+                    (2u8, mvds) // derived_mb_type 2 = inter4v
                 }
                 _ => {
                     stats.inter += 1;
-                    // derived_mb_type 0 = inter (1 MV), 1 = inter+q.
-                    put_mcbpc_p(&mut bw, if dquant.is_some() { 1 } else { 0 }, cbpc);
-                    put_cbpy(&mut bw, cbpy, false);
-                    if let Some(d) = dquant {
-                        crate::vlc_encode::put_dquant(&mut bw, d);
-                    }
-
                     // §7.6.5 median predictor over the shared grid state,
                     // then the §7.6.3 differential under the VOP's fcode.
                     let candidates = mv_grid
                         .predictor_candidates(mb_row, mb_col, 0)
                         .expect("grid coordinates in range");
                     let predictor = predict_motion_vector(candidates);
-                    put_motion_vector(&mut bw, mv.x - predictor.x, mv.y - predictor.y, fcode);
                     mv_grid
                         .record_one_mv(mb_row, mb_col, mv)
                         .expect("grid coordinates in range");
+                    // derived_mb_type 0 = inter (1 MV), 1 = inter+q.
+                    (
+                        if dquant.is_some() { 1 } else { 0 },
+                        vec![(mv.x - predictor.x, mv.y - predictor.y)],
+                    )
                 }
-            }
-
-            for ev in &events {
-                if !ev.is_empty() {
-                    crate::vlc_encode::put_ac_events(&mut bw, TcoefTable::Inter, ev);
-                }
-            }
+            };
+            let blocks: [Vec<AcEvent>; 6] = events
+                .try_into()
+                .unwrap_or_else(|_| unreachable!("six blocks per macroblock"));
+            pw.push(&MbFields {
+                not_coded: false,
+                mb_type,
+                cbpc,
+                cbpy,
+                ac_pred_flag: false,
+                dquant,
+                mvds,
+                fcode,
+                intra_dc: None,
+                blocks,
+            });
         }
     }
-    bw.next_start_code();
-    (bw.into_bytes(), stats)
+    stats.packets = pw.packets_cut();
+    (pw.finish(), stats)
 }
 
-/// Encode one intra macroblock inside a P-VOP (Table B.7 `mcbpc`,
-/// otherwise the I-VOP plan/emission path with cost-decided AC
-/// prediction).
+/// Build the [`MbFields`] of one intra macroblock inside a P-VOP
+/// (Table B.7 `intra` / `intra+q`, otherwise the I-VOP plan path with
+/// the cost-decided `ac_pred_flag` measured under the writer's
+/// layout).
 #[allow(clippy::too_many_arguments)]
-fn encode_intra_mb_in_p(
-    bw: &mut BitWriter,
+fn intra_mb_in_p_fields(
+    pw: &PacketWriter,
     frame: &FrameView<'_>,
     grid: &mut IntraBlockGrid,
     mb_row: usize,
@@ -742,7 +785,7 @@ fn encode_intra_mb_in_p(
     w_intra: &[[u8; 8]; 8],
     use_dc_vlc: bool,
     dquant: Option<i8>,
-) {
+) -> MbFields {
     let mut plans_off: Vec<BlockPlan> = Vec::with_capacity(6);
     let mut plans_on: Option<Vec<BlockPlan>> = if cfg.ac_prediction {
         Some(Vec::with_capacity(6))
@@ -775,38 +818,16 @@ fn encode_intra_mb_in_p(
     let plans_off: [BlockPlan; 6] = plans_off
         .try_into()
         .unwrap_or_else(|_| unreachable!("six blocks per macroblock"));
-
-    let emit = |bw: &mut BitWriter, plans: &[BlockPlan; 6], flag: bool| {
-        let (cbpy, cbpc) = intra_mb_cbp(plans);
-        bw.write_bit(false); // not_coded = 0
-                             // derived_mb_type 3 = intra, 4 = intra+q.
-        put_mcbpc_p(bw, if dquant.is_some() { 4 } else { 3 }, cbpc);
-        bw.write_bit(flag); // ac_pred_flag
-        put_cbpy(bw, cbpy, true);
-        if let Some(d) = dquant {
-            crate::vlc_encode::put_dquant(bw, d);
-        }
-        emit_intra_blocks(bw, plans, use_dc_vlc);
-    };
-
-    let chosen_on = plans_on.and_then(|on| {
-        let on: [BlockPlan; 6] = on
-            .try_into()
-            .unwrap_or_else(|_| unreachable!("six blocks per macroblock"));
-        let mut probe_off = BitWriter::new();
-        emit(&mut probe_off, &plans_off, false);
-        let mut probe_on = BitWriter::new();
-        emit(&mut probe_on, &on, true);
-        if probe_on.bit_position() < probe_off.bit_position() {
-            Some(on)
-        } else {
-            None
-        }
-    });
-    match &chosen_on {
-        Some(on) => emit(bw, on, true),
-        None => emit(bw, &plans_off, false),
-    }
+    let fields_off = intra_mb_fields(&plans_off, false, use_dc_vlc, dquant);
+    plans_on
+        .and_then(|on| {
+            let on: [BlockPlan; 6] = on
+                .try_into()
+                .unwrap_or_else(|_| unreachable!("six blocks per macroblock"));
+            let fields_on = intra_mb_fields(&on, true, use_dc_vlc, dquant);
+            (pw.cost_of(&fields_on) < pw.cost_of(&fields_off)).then_some(fields_on)
+        })
+        .unwrap_or(fields_off)
 }
 
 /// Decode an emitted P-VOP unit through the crate's decoder walk and
@@ -842,9 +863,17 @@ pub fn reconstruct_own_p_vop_with_motion(
     )
     .expect("own VOP header must parse");
     assert!(matches!(vop.coding_type, VopCodingType::P));
-    let entries =
+    let entries = if vol.data_partitioned {
+        crate::vop_decode::decode_p_vop_macroblocks_dp(
+            &mut br,
+            vol,
+            &vop,
+            crate::compat::DecodeOptions::spec(),
+        )
+    } else {
         decode_p_vop_macroblocks(&mut br, vol, &vop, crate::compat::DecodeOptions::spec())
-            .expect("own P-VOP payload must decode");
+    }
+    .expect("own P-VOP payload must decode");
     let motion = entries
         .iter()
         .map(|e| match e {

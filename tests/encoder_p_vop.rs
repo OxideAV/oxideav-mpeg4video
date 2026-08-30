@@ -222,6 +222,7 @@ fn static_scene_collapses_to_skips() {
             inter4v: 0,
             intra: 0,
             dquant: 0,
+            packets: 0,
         }
     );
     // A fully-skipped P-VOP is tiny (header + 9 bits + stuffing).

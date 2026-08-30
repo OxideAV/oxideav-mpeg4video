@@ -8,6 +8,39 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Encoder error-resilience emission (round 452)** — new
+  `packet_encode` module: every I-/P-VOP macroblock is described as an
+  `MbFields` record and laid out by a `PacketWriter` that owns the
+  syntax (combined `macroblock()` order, or the §6.2.5.3
+  `data_partitioned_i_vop()` / `data_partitioned_p_vop()` partitions
+  with the `dc_marker` / `motion_marker` between them). Video packets
+  (`EncoderConfig::resilience.packet_bits` / option `packet-bits`) are
+  cut at the first macroblock boundary past the size target: §5.2.5
+  stuffing, the §6.3.3 `resync_marker` of the VOP type / fcode length,
+  `macroblock_number` (Table 6-27 width), `quant_scale`, and a
+  `header_extension_code` body alternating packet by packet (restated
+  `modulo_time_base` / `vop_time_increment` / `vop_coding_type` /
+  `intra_dc_vlc_thr` / fcodes); the intra grid, motion-vector grid, B
+  running predictors and running quantiser reset exactly as the
+  decoder's walks do. Data partitioning (`data-partitioned`) and the
+  reversible VLC texture partition (`rvlc`; Table B.23 inverse lookup
+  + the Type-5 escape, `vlc_encode::put_ac_events_rvlc`, exhaustively
+  round-tripped against `decode_ac_event_rvlc`) are VOL flags now
+  written by `write_configuration_headers`; B-VOPs keep the combined
+  syntax inside a partitioned VOL (§6.2.5.3 NOTE) but still cut
+  packets. `BitWriter::append` splices partition writers bit-exactly;
+  `VopCodingType::to_bits` is the header-field inverse. New
+  `tests/encoder_resilience.rs` (packets under every fcode, packets +
+  dquant re-seeding, DP single-/multi-packet under both quantisation
+  methods, RVLC with every tool at qp 2/12/31, B-VOPs in a DP+RVLC
+  VOL, registry wiring incl. the `rvlc`-needs-`data-partitioned`
+  guard, and a corrupted RVLC texture partition still decoding through
+  the §E.1.4.4 recovery) plus three black-box pairs
+  (`enc_ipb_vp_fcode2_96x64`, `enc_ip_dp_aq_96x48`,
+  `enc_ipb_dprvlc_aq4mv_96x48`) decoded bit-exact by the reference
+  decoder. Every previously pinned fixture still reproduces
+  byte-for-byte through the new writer.
+
 - **Encoder per-macroblock quantiser modulation (round 452)** —
   `EncoderConfig::adaptive_quant` / registry option `mb-aq`: the new
   `mb_quant` module classes each macroblock's mean-removed luma

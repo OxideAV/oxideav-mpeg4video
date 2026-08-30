@@ -263,6 +263,30 @@ ffmpeg -idct faani -i enc_ipb_aq4mv_96x48.m4v -f rawvideo -pix_fmt yuv420p enc_i
 
 Bit-exact.
 
+The error-resilience trio (registry encoder, 6 frames each):
+
+* `enc_ipb_vp_fcode2_96x64` — §6.2.5 video packets (~500-bit
+  target; `header_extension_code` alternating 1/0 so both header
+  branches are decoded) in a combined-syntax I/P/B stream (`bf` 2,
+  `fcode` 2 — the P marker is 17 zeros + 1, the B marker 17 zeros +
+  1) over the 20-pel-per-frame scene;
+* `enc_ip_dp_aq_96x48` — §6.2.5.3 data partitioning (`dc_marker` /
+  `motion_marker`) + ~400-bit packets + per-macroblock `dquant`
+  (`intra+q` in partition 1 of the I-VOP, `inter+q` / `intra+q` in
+  partition 2 of the P-VOPs), I + 5 P over the mixed-activity scene;
+* `enc_ipb_dprvlc_aq4mv_96x48` — data partitioning + reversible VLCs
+  (Table B.23 texture partition incl. the Type-5 escape) + packets +
+  `dquant` / `dbquant` + inter4v + `fcode` 2 + `bf` 2 (the B-VOPs stay
+  combined-syntax inside the partitioned VOL, §6.2.5.3 NOTE).
+
+```
+ffmpeg -idct faani -i enc_ipb_vp_fcode2_96x64.m4v -f rawvideo -pix_fmt yuv420p enc_ipb_vp_fcode2_96x64.yuv
+ffmpeg -idct faani -i enc_ip_dp_aq_96x48.m4v -f rawvideo -pix_fmt yuv420p enc_ip_dp_aq_96x48.yuv
+ffmpeg -idct faani -i enc_ipb_dprvlc_aq4mv_96x48.m4v -f rawvideo -pix_fmt yuv420p enc_ipb_dprvlc_aq4mv_96x48.yuv
+```
+
+All three bit-exact.
+
 ## SHA-256
 
 ```
@@ -351,6 +375,12 @@ e1e4c9d7fce8198331e805bc6a3743b5839c96b213747e9bd5a84ec438ec894f  enc_ip_qpel_64
 584711548f66a8f862ce5bee4cc8c5fd48fd78f264c732097956756dbcf73779  enc_ipb_fcode3_qpel4mv_96x64.yuv
 7f200f5e4089ebcc29b8899bc746db11fa5dbd6b0802d5a70998a5bb05ea6a48  enc_ipb_aq4mv_96x48.m4v
 66e3662a5fc4fd1c58068e40ce5b7e722300c6efa02c2f744f308544a454a63a  enc_ipb_aq4mv_96x48.yuv
+81e92c81b778fec93a78607b06fa3000343e58dd137e402227573324cb8b58d3  enc_ipb_vp_fcode2_96x64.m4v
+4f8f03392dccd42405d26e33ccf97940be497c60834b743453e80efd17217685  enc_ipb_vp_fcode2_96x64.yuv
+ea4de652b9352b4ebadec471d53b71435a1bb36101d636e8c504c57dc5a7e409  enc_ip_dp_aq_96x48.m4v
+f958498a6b00db8595f0be1c28f77e042f8e7c4ef8fc863bb0b05537d76c30a0  enc_ip_dp_aq_96x48.yuv
+498b14b46e2aa39f720f1c085bd62280ca52e00561529e30373034c268340d79  enc_ipb_dprvlc_aq4mv_96x48.m4v
+57305ad87ed09378b0b41fe56cab77636e43d4bba0a62615caa2faa86604e2a8  enc_ipb_dprvlc_aq4mv_96x48.yuv
 ```
 
 (Note: `aic_ipb_64x64.yuv` and `altscan_ipb_64x64.yuv` are

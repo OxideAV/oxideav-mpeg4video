@@ -45,11 +45,11 @@ use crate::fdct::forward_dct_8x8;
 use crate::framestore::DecodedFrame;
 use crate::inverse_quant::{inverse_quant_intra_dc, saturate_fprime};
 use crate::neighbour::{BlockNeighbour, IntraBlockGrid};
+use crate::packet_encode::{Layout, MbFields, PacketVopInfo, PacketWriter};
 use crate::predictor::{dc_scaler, predict_intra_dc, select_dc_direction};
 use crate::quantise::{quantise_intra_dc, quantise_method1_intra, quantise_method2_intra};
 use crate::scan::{inverse_scan, select_scan_type, DcPredictionDirection, ScanType};
-use crate::texture::{AcEvent, DcComponent, TcoefTable};
-use crate::vlc_encode::{put_ac_events, put_cbpy, put_intra_dc, put_mcbpc_i};
+use crate::texture::{AcEvent, DcComponent};
 use crate::vop::{vop_time_increment_bits, VopCodingType};
 use crate::vop_decode::decode_i_vop_macroblocks;
 
@@ -104,6 +104,9 @@ pub struct EncoderConfig {
     /// macroblock types) and `dbquant` (B-VOPs) steps around the VOP
     /// quantiser. Default off.
     pub adaptive_quant: bool,
+    /// Error-resilience tools (`crate::packet_encode`): video packets,
+    /// data partitioning, reversible VLCs. Default: none.
+    pub resilience: crate::packet_encode::ResilienceConfig,
 }
 
 /// The §6.2.3 `vbv_parameters` triple (Annex D rate-buffer model).
@@ -131,6 +134,7 @@ impl Default for EncoderConfig {
             vbv: None,
             fcode: 1,
             adaptive_quant: false,
+            resilience: crate::packet_encode::ResilienceConfig::default(),
         }
     }
 }
@@ -268,8 +272,16 @@ pub fn write_configuration_headers(cfg: &EncoderConfig) -> Vec<u8> {
         bw.write_bit(true); // quarter_sample = 1
     }
     bw.write_bit(true); // complexity_estimation_disable = 1
-    bw.write_bit(true); // resync_marker_disable = 1
-    bw.write_bit(false); // data_partitioned = 0
+    bw.write_bit(cfg.resilience.packet_bits == 0); // resync_marker_disable
+    bw.write_bit(cfg.resilience.data_partitioned); // data_partitioned
+    if cfg.resilience.data_partitioned {
+        bw.write_bit(cfg.resilience.reversible_vlc); // reversible_vlc
+    } else {
+        assert!(
+            !cfg.resilience.reversible_vlc,
+            "reversible_vlc requires data_partitioned (§6.2.3)"
+        );
+    }
     if cfg.quarter_sample {
         // Present only under verid != 1.
         bw.write_bit(false); // newpred_enable = 0
@@ -532,26 +544,37 @@ fn scale_ac_pred(qf_neighbour: i32, qp_neighbour: u32, qp_x: u32) -> i32 {
     }
 }
 
-/// Emit one intra macroblock body (mcbpc / ac_pred_flag / cbpy /
-/// [dquant] / blocks) for a fixed `ac_pred_flag` choice. A `dquant`
-/// delta selects the Table B.6 `intra+q` type (derived type 4) and
-/// places the Table 6-32 code after `cbpy` (§6.2.6 order).
-fn emit_intra_mb(
-    bw: &mut BitWriter,
+/// Build the [`MbFields`] record of one intra macroblock (`mcbpc` type
+/// 3, or 4 with a `dquant`) for a fixed `ac_pred_flag` choice. With
+/// `use_dc_vlc` the six DC differentials ride the DC VLC (partition 1
+/// / 2 under data partitioning, the per-block prologue otherwise).
+pub(crate) fn intra_mb_fields(
     plans: &[BlockPlan; 6],
     ac_pred_flag: bool,
     use_dc_vlc: bool,
     dquant: Option<i8>,
-) {
+) -> MbFields {
     let (cbpy, cbpc) = intra_mb_cbp(plans);
-    // derived_mb_type 3 = intra, 4 = intra+q.
-    put_mcbpc_i(bw, if dquant.is_some() { 4 } else { 3 }, cbpc);
-    bw.write_bit(ac_pred_flag);
-    put_cbpy(bw, cbpy, true);
-    if let Some(d) = dquant {
-        crate::vlc_encode::put_dquant(bw, d);
+    assert!(
+        use_dc_vlc,
+        "intra_dc_vlc_thr == 0: the DC always rides the DC VLC"
+    );
+    let mut dc = [0i32; 6];
+    for (slot, plan) in dc.iter_mut().zip(plans.iter()) {
+        *slot = plan.dc_differential;
     }
-    emit_intra_blocks(bw, plans, use_dc_vlc);
+    MbFields {
+        not_coded: false,
+        mb_type: if dquant.is_some() { 4 } else { 3 },
+        cbpc,
+        cbpy,
+        ac_pred_flag,
+        dquant,
+        mvds: Vec::new(),
+        fcode: 1,
+        intra_dc: Some(dc),
+        blocks: std::array::from_fn(|i| plans[i].events.clone()),
+    }
 }
 
 /// The `(cbpy, cbpc)` coded-block pattern of an intra macroblock's six
@@ -564,21 +587,6 @@ pub(crate) fn intra_mb_cbp(plans: &[BlockPlan; 6]) -> (u8, u8) {
         | u8::from(coded[3]);
     let cbpc = (u8::from(coded[4]) << 1) | u8::from(coded[5]);
     (cbpy, cbpc)
-}
-
-/// Emit the six §6.2.7 `block(i)` bodies of an intra macroblock (DC
-/// prologue per block when `use_dc_vlc`, AC EVENTs for coded blocks).
-/// Shared between the I-VOP walk and the P-VOP walk's intra
-/// macroblocks.
-pub(crate) fn emit_intra_blocks(bw: &mut BitWriter, plans: &[BlockPlan; 6], use_dc_vlc: bool) {
-    for (i, plan) in plans.iter().enumerate() {
-        if use_dc_vlc {
-            put_intra_dc(bw, DcComponent::from_block_index(i), plan.dc_differential);
-        }
-        if !plan.events.is_empty() {
-            put_ac_events(bw, TcoefTable::Intra, &plan.events);
-        }
-    }
 }
 
 /// Encode one rectangular progressive I-VOP: VOP header + §6.2.6
@@ -612,12 +620,37 @@ pub fn encode_i_vop(
         time_increment,
         qp,
     );
+    let layout = if cfg.resilience.data_partitioned {
+        Layout::PartitionedI
+    } else {
+        Layout::Combined
+    };
+    let mut pw = PacketWriter::new(
+        bw,
+        cfg.resilience,
+        PacketVopInfo {
+            coding_type: VopCodingType::I,
+            fcode_fwd: 0,
+            fcode_bwd: 0,
+            modulo_time_base,
+            time_increment,
+            time_increment_bits: vop_time_increment_bits(cfg.time_increment_resolution),
+            intra_dc_vlc_thr: 0,
+            total_macroblocks: (mb_width * mb_height) as u32,
+        },
+        layout,
+    );
 
     let mut grid = IntraBlockGrid::new(mb_height, mb_width);
-    // §6.3.7 running quantiser (seeded by vop_quant, moved by dquant).
+    // §6.3.7 running quantiser (seeded by vop_quant, moved by dquant,
+    // re-seeded by each video packet's quant_scale).
     let mut running_qp = qp;
     for mb_row in 0..mb_height {
         for mb_col in 0..mb_width {
+            if pw.maybe_cut(mb_row * mb_width + mb_col, running_qp) {
+                // §E.1.2: no prediction crosses a packet boundary.
+                grid = IntraBlockGrid::new(mb_height, mb_width);
+            }
             // Per-macroblock quantiser: the activity-classed dquant
             // step from the running value (or the VOP quantiser).
             let (qp, dquant) = if cfg.adaptive_quant {
@@ -682,28 +715,20 @@ pub fn encode_i_vop(
                 .unwrap_or_else(|_| unreachable!("six blocks per macroblock"));
 
             // Measured-cost ac_pred decision.
-            let chosen_on = plans_on.and_then(|on| {
-                let on: [BlockPlan; 6] = on
-                    .try_into()
-                    .unwrap_or_else(|_| unreachable!("six blocks per macroblock"));
-                let mut probe_off = BitWriter::new();
-                emit_intra_mb(&mut probe_off, &plans_off, false, use_dc_vlc, dquant);
-                let mut probe_on = BitWriter::new();
-                emit_intra_mb(&mut probe_on, &on, true, use_dc_vlc, dquant);
-                if probe_on.bit_position() < probe_off.bit_position() {
-                    Some(on)
-                } else {
-                    None
-                }
-            });
-            match &chosen_on {
-                Some(on) => emit_intra_mb(&mut bw, on, true, use_dc_vlc, dquant),
-                None => emit_intra_mb(&mut bw, &plans_off, false, use_dc_vlc, dquant),
-            }
+            let fields_off = intra_mb_fields(&plans_off, false, use_dc_vlc, dquant);
+            let chosen = plans_on
+                .and_then(|on| {
+                    let on: [BlockPlan; 6] = on
+                        .try_into()
+                        .unwrap_or_else(|_| unreachable!("six blocks per macroblock"));
+                    let fields_on = intra_mb_fields(&on, true, use_dc_vlc, dquant);
+                    (pw.cost_of(&fields_on) < pw.cost_of(&fields_off)).then_some(fields_on)
+                })
+                .unwrap_or(fields_off);
+            pw.push(&chosen);
         }
     }
-    bw.next_start_code();
-    let bytes = bw.into_bytes();
+    let bytes = pw.finish();
 
     // Closed decode loop: run the crate's own decoder walk over the
     // freshly emitted unit and blit the reconstruction.
@@ -732,8 +757,12 @@ fn decode_own_i_vop(
         VopContext::from_vol(vol),
     )
     .expect("own VOP header must parse");
-    let mbs = decode_i_vop_macroblocks(&mut br, vol, &vop, DecodeOptions::spec())
-        .expect("own I-VOP payload must decode");
+    let mbs = if vol.data_partitioned {
+        crate::vop_decode::decode_i_vop_macroblocks_dp(&mut br, vol, &vop, DecodeOptions::spec())
+    } else {
+        decode_i_vop_macroblocks(&mut br, vol, &vop, DecodeOptions::spec())
+    }
+    .expect("own I-VOP payload must decode");
     let mut frame = DecodedFrame::new(mb_width * 16, mb_height * 16, VopCodingType::I)
         .expect("frame dimensions are valid");
     for (idx, mb) in mbs.iter().enumerate() {
