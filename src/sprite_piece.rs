@@ -898,12 +898,18 @@ mod tests {
         assert_eq!(entries[1].mode, SpriteTransmitMode::Stop);
     }
 
-    /// Emit a `warping_mv_code(dmv)`: unary SSS, FLC, marker.
+    /// Emit a `warping_mv_code(dmv)`: Table B.34 dmv_length VLC, FLC, marker.
     fn write_warping(w: &mut BitWriter, sss: u32, code: u32) {
-        for _ in 0..sss {
-            w.write_bits(1, 1);
+        match sss {
+            0 => w.write_bits(0b00, 2),
+            1..=5 => w.write_bits(sss + 1, 3), // Table B.34: 010..110
+            _ => {
+                for _ in 0..(sss - 3) {
+                    w.write_bits(1, 1);
+                }
+                w.write_bits(0, 1);
+            }
         }
-        w.write_bits(0, 1);
         if sss != 0 {
             w.write_bits(code, sss as usize);
         }

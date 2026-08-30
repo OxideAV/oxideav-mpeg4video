@@ -458,6 +458,53 @@ fn build_dp_rvlc_ipb_stream() -> Vec<u8> {
     )
 }
 
+/// A 96×64 background panning by (6, 2) pels per frame — fast enough
+/// for real global motion, slow enough that every inter-anchor
+/// trajectory stays trackable and **non-negative** (the deployed
+/// reference decoder derives each *negative* §7.8.7.3 averaged-MV
+/// component one half-sample lower than the spec quantisation — see
+/// NOTES.md — so the pinned GMC fixture keeps to the agreeing
+/// region).
+fn gmc_pan_picture(frame_index: usize) -> Planes {
+    let (w, h) = (96usize, 64usize);
+    let (cw, ch) = (w / 2, h / 2);
+    let bg = |x: i64, y: i64| -> u8 {
+        let v = (x * 7 + y * 5).rem_euclid(160) + ((x.div_euclid(9) + y.div_euclid(7)) % 13) * 6;
+        (40 + v.rem_euclid(170)) as u8
+    };
+    let (ox, oy) = (frame_index as i64 * 6, frame_index as i64 * 2);
+    let mut y = vec![0u8; w * h];
+    for row in 0..h {
+        for col in 0..w {
+            y[row * w + col] = bg(col as i64 + ox, row as i64 + oy);
+        }
+    }
+    let mut cb = vec![0u8; cw * ch];
+    let cr = vec![130u8; cw * ch];
+    for row in 0..ch {
+        for col in 0..cw {
+            cb[row * cw + col] = bg(col as i64 + ox / 2, row as i64 + oy / 2) / 2 + 64;
+        }
+    }
+    (y, cb, cr)
+}
+
+/// GMC: S(GMC)-VOP anchors (one warping point) + qpel + B-VOPs +
+/// video packets over the panning scene.
+fn build_gmc_ipb_stream() -> Vec<u8> {
+    build_registry_stream_dims(
+        oxideav_core::CodecOptions::default()
+            .set("gmc", "true")
+            .set("qpel", "true")
+            .set("bf", "2")
+            .set("fcode", "3")
+            .set("packet-bits", "600"),
+        gmc_pan_picture,
+        96,
+        64,
+    )
+}
+
 /// `fcode` 2 half-sample I/P over the 20-pel-per-frame scene.
 fn build_fcode2_stream() -> Vec<u8> {
     build_registry_stream_dims(
@@ -893,5 +940,29 @@ fn ipb_dprvlc_aq4mv_96x48_stream_decodes_bit_exact_against_reference_decoder() {
         "enc_ipb_dprvlc_aq4mv_96x48.yuv",
         96,
         48,
+    );
+}
+
+#[test]
+fn gmc_ipb_stream_reproduces_committed_fixture() {
+    let built = build_gmc_ipb_stream();
+    if maybe_write_fixture("enc_isb_gmc_qpel_96x64.m4v", &built) {
+        return;
+    }
+    assert_eq!(
+        built,
+        fixture("enc_isb_gmc_qpel_96x64.m4v"),
+        "encoder output drifted from the black-box-validated fixture; \
+         regenerate the fixture AND its reference decode"
+    );
+}
+
+#[test]
+fn gmc_ipb_stream_decodes_bit_exact_against_reference_decoder() {
+    assert_own_decode_matches_reference_dims(
+        "enc_isb_gmc_qpel_96x64.m4v",
+        "enc_isb_gmc_qpel_96x64.yuv",
+        96,
+        64,
     );
 }

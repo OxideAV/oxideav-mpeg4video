@@ -287,6 +287,38 @@ ffmpeg -idct faani -i enc_ipb_dprvlc_aq4mv_96x48.m4v -f rawvideo -pix_fmt yuv420
 
 All three bit-exact.
 
+The GMC pair (96×64, a background panning by (6, 2) pels per frame):
+
+* `enc_isb_gmc_qpel_96x64` — S(GMC)-VOP anchors (one §7.8.4 warping
+  point, half-pel accuracy, per-MB `mcsel`) + quarter-sample + `bf` 2
+  + `fcode` 3 + ~600-bit video packets (S packets carry no HEC), 6
+  frames.
+
+```
+ffmpeg -idct faani -i enc_isb_gmc_qpel_96x64.m4v -f rawvideo -pix_fmt yuv420p enc_isb_gmc_qpel_96x64.yuv
+```
+
+Bit-exact. Two findings from this pair's validation:
+
+* **Table B.34 `dmv_length`** — the crate's `warping_mv_code()`
+  reader (and the first encoder cut) treated `dmv_length` as a plain
+  unary run; Table B.34 actually assigns `00`→0, `010`..`110`→1..=5
+  and `SSS−3` one-bits + `0` for 6..=14. Fixed on both sides; crafted
+  pure-GMC-copy probes (integer-pel, half-pel, negative, ±16-pel,
+  vertical trajectories) then decoded **bit-exact** through the
+  reference binary.
+* **§7.8.7.3 negative averaged-MV divergence** — the reference
+  decoder derives each *negative* AMV component one half-sample lower
+  than the §7.8.7.3 quantisation (probed with crafted
+  GMC-neighbour + zero-MVD-local streams: du −2→−3, −3→−4, −4→−5,
+  −10→−11; positive components exact; per-component independent).
+  The AMV feeds the §7.6.5 predictor candidates of local macroblocks
+  and the §7.6.9 frame-direct co-located substitution, so streams
+  whose trajectories go negative decode differently there. The
+  decoder keeps the spec-literal quantisation (the crate's
+  compatibility-mode policy); the pinned fixture pans so every
+  trajectory stays non-negative.
+
 ## SHA-256
 
 ```
@@ -373,6 +405,8 @@ e1e4c9d7fce8198331e805bc6a3743b5839c96b213747e9bd5a84ec438ec894f  enc_ip_qpel_64
 769fc2f8f88c2038b18592649e8aa1bf324a452187533a7b399ee89ea193b1a9  enc_ip_fcode2_96x64.yuv
 7b9ce94a56292b8541b2fabe1927d2ca30f867cd1fb3544f2daeeca4b5791e46  enc_ipb_fcode3_qpel4mv_96x64.m4v
 584711548f66a8f862ce5bee4cc8c5fd48fd78f264c732097956756dbcf73779  enc_ipb_fcode3_qpel4mv_96x64.yuv
+23aacccba29bac9f850ab4729e811dcd531302c3cc61e86c3111add3c3bfce6f  enc_isb_gmc_qpel_96x64.m4v
+f1a65b08166aaab11863c5478cadefc201912db150551c5ed2f88c658900aa28  enc_isb_gmc_qpel_96x64.yuv
 7f200f5e4089ebcc29b8899bc746db11fa5dbd6b0802d5a70998a5bb05ea6a48  enc_ipb_aq4mv_96x48.m4v
 66e3662a5fc4fd1c58068e40ce5b7e722300c6efa02c2f744f308544a454a63a  enc_ipb_aq4mv_96x48.yuv
 81e92c81b778fec93a78607b06fa3000343e58dd137e402227573324cb8b58d3  enc_ipb_vp_fcode2_96x64.m4v

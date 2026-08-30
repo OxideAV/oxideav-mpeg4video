@@ -107,6 +107,11 @@ pub struct EncoderConfig {
     /// Error-resilience tools (`crate::packet_encode`): video packets,
     /// data partitioning, reversible VLCs. Default: none.
     pub resilience: crate::packet_encode::ResilienceConfig,
+    /// `sprite_enable == "GMC"` with one warping point at half-pel
+    /// accuracy (`crate::svop_encode`): anchors after the first I-VOP
+    /// are S(GMC)-VOPs. Requires (and selects) the verid-2 VOL and
+    /// the ASP profile; incompatible with `data_partitioned`.
+    pub gmc: bool,
 }
 
 /// The §6.2.3 `vbv_parameters` triple (Annex D rate-buffer model).
@@ -135,6 +140,7 @@ impl Default for EncoderConfig {
             fcode: 1,
             adaptive_quant: false,
             resilience: crate::packet_encode::ResilienceConfig::default(),
+            gmc: false,
         }
     }
 }
@@ -143,7 +149,14 @@ impl EncoderConfig {
     /// Whether the configuration uses any Advanced-Simple-profile
     /// tool (method-1 quantisation, quarter-sample MC, B-VOPs).
     fn uses_asp_tools(&self) -> bool {
-        self.quant_type || self.quarter_sample || self.b_vops
+        self.quant_type || self.quarter_sample || self.b_vops || self.gmc
+    }
+
+    /// Whether the VOL needs `video_object_layer_verid == 2` (the
+    /// `quarter_sample` flag and the 2-bit `sprite_enable` with its
+    /// GMC value only exist there).
+    fn verid2(&self) -> bool {
+        self.quarter_sample || self.gmc
     }
 
     /// Table G.1 `profile_and_level_indication` for this
@@ -203,9 +216,10 @@ pub fn write_configuration_headers(cfg: &EncoderConfig) -> Vec<u8> {
     bw.write_start_code(VIDEO_OBJECT_LAYER_START_CODE);
     bw.write_bit(false); // random_accessible_vol
     bw.write_bits(u32::from(cfg.video_object_type()), 8);
-    if cfg.quarter_sample {
-        // §6.2.3: the quarter_sample flag exists only when
-        // video_object_layer_verid != 1, so declare verid 2.
+    if cfg.verid2() {
+        // §6.2.3: the quarter_sample flag and the GMC sprite_enable
+        // value exist only when video_object_layer_verid != 1, so
+        // declare verid 2.
         bw.write_bit(true); // is_object_layer_identifier = 1
         bw.write_bits(2, 4); // video_object_layer_verid = 2
         bw.write_bits(1, 3); // video_object_layer_priority = 1
@@ -256,8 +270,18 @@ pub fn write_configuration_headers(cfg: &EncoderConfig) -> Vec<u8> {
     bw.write_marker();
     bw.write_bit(false); // interlaced = 0
     bw.write_bit(true); // obmc_disable = 1
-    if cfg.quarter_sample {
-        bw.write_bits(0, 2); // sprite_enable = 00 (verid 2 → 2 bits)
+    if cfg.verid2() {
+        // sprite_enable (verid 2 → 2 bits): 10 = GMC, 00 = not used.
+        bw.write_bits(if cfg.gmc { 0b10 } else { 0b00 }, 2);
+        if cfg.gmc {
+            assert!(
+                !cfg.resilience.data_partitioned,
+                "GMC S-VOPs use the combined syntax only"
+            );
+            bw.write_bits(1, 6); // no_of_sprite_warping_points = 1
+            bw.write_bits(0b00, 2); // sprite_warping_accuracy = 1/2 pel
+            bw.write_bit(false); // sprite_brightness_change = 0 (§6.3.3)
+        }
     } else {
         bw.write_bit(false); // sprite_enable = 0 (verid 1 → 1 bit)
     }
@@ -267,9 +291,9 @@ pub fn write_configuration_headers(cfg: &EncoderConfig) -> Vec<u8> {
         bw.write_bit(false); // load_intra_quant_mat = 0 (default matrix)
         bw.write_bit(false); // load_nonintra_quant_mat = 0
     }
-    if cfg.quarter_sample {
+    if cfg.verid2() {
         // Present only under verid != 1 (declared above).
-        bw.write_bit(true); // quarter_sample = 1
+        bw.write_bit(cfg.quarter_sample); // quarter_sample
     }
     bw.write_bit(true); // complexity_estimation_disable = 1
     bw.write_bit(cfg.resilience.packet_bits == 0); // resync_marker_disable
@@ -282,7 +306,7 @@ pub fn write_configuration_headers(cfg: &EncoderConfig) -> Vec<u8> {
             "reversible_vlc requires data_partitioned (§6.2.3)"
         );
     }
-    if cfg.quarter_sample {
+    if cfg.verid2() {
         // Present only under verid != 1.
         bw.write_bit(false); // newpred_enable = 0
         bw.write_bit(false); // reduced_resolution_vop_enable = 0
@@ -570,6 +594,7 @@ pub(crate) fn intra_mb_fields(
         cbpy,
         ac_pred_flag,
         dquant,
+        mcsel: None,
         mvds: Vec::new(),
         fcode: 1,
         intra_dc: Some(dc),

@@ -398,6 +398,7 @@ pub mod sprite; // mixed: `SpriteTrajectoryError` stays visible
 pub mod sprite_piece;
 #[doc(hidden)]
 pub mod static_sprite;
+pub mod svop_encode;
 pub mod texture; // mixed: `TextureParseError` stays visible
 #[doc(hidden)]
 pub mod transform_select;

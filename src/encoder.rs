@@ -81,6 +81,11 @@ pub struct Mpeg4EncoderOptions {
     /// `rvlc` — reversible VLCs for the partitioned texture (requires
     /// `data-partitioned`).
     pub rvlc: bool,
+    /// `gmc` — global motion compensation: non-keyframe anchors become
+    /// S(GMC)-VOPs (one §7.8.4 warping point, half-pel accuracy; per-MB
+    /// `mcsel` GMC-vs-local decision). Selects the ASP profile;
+    /// incompatible with `data-partitioned`.
+    pub gmc: bool,
 }
 
 impl Default for Mpeg4EncoderOptions {
@@ -100,6 +105,7 @@ impl Default for Mpeg4EncoderOptions {
             packet_bits: 0,
             data_partitioned: false,
             rvlc: false,
+            gmc: false,
         }
     }
 }
@@ -203,6 +209,14 @@ impl oxideav_core::CodecOptionsStruct for Mpeg4EncoderOptions {
             help: "reversible VLCs (Table B.23) for the data-partitioned texture \
                    partition; requires data-partitioned",
         },
+        oxideav_core::OptionField {
+            name: "gmc",
+            kind: oxideav_core::OptionKind::Bool,
+            default: oxideav_core::OptionValue::Bool(false),
+            help: "global motion compensation: S(GMC)-VOP anchors with one \
+                   warping point (ISO/IEC 14496-2 §7.8; ASP profile); \
+                   incompatible with data-partitioned",
+        },
     ];
 
     fn apply(&mut self, key: &str, value: &oxideav_core::OptionValue) -> Result<()> {
@@ -251,6 +265,7 @@ impl oxideav_core::CodecOptionsStruct for Mpeg4EncoderOptions {
             "packet-bits" => self.packet_bits = value.as_u32()?,
             "data-partitioned" => self.data_partitioned = value.as_bool()?,
             "rvlc" => self.rvlc = value.as_bool()?,
+            "gmc" => self.gmc = value.as_bool()?,
             _ => unreachable!("guarded by SCHEMA"),
         }
         Ok(())
@@ -322,6 +337,11 @@ impl Mpeg4VideoEncoder {
         if options.rvlc && !options.data_partitioned {
             return Err(Error::invalid("rvlc requires data-partitioned"));
         }
+        if options.gmc && options.data_partitioned {
+            return Err(Error::invalid(
+                "gmc S-VOPs use the combined syntax (no data-partitioned)",
+            ));
+        }
         let width = params
             .width
             .ok_or_else(|| Error::invalid("encoder needs width"))?;
@@ -382,6 +402,7 @@ impl Mpeg4VideoEncoder {
                 data_partitioned: options.data_partitioned,
                 reversible_vlc: options.rvlc,
             },
+            gmc: options.gmc,
         };
         let config_headers = write_configuration_headers(&cfg);
         let vol_pos = config_headers
@@ -626,6 +647,29 @@ impl Mpeg4VideoEncoder {
             };
             self.store.push_anchor(recon);
             self.anchor_motion = None;
+            unit
+        } else if self.cfg.gmc {
+            // GMC: non-keyframe anchors are S(GMC)-VOPs.
+            let reference = self
+                .store
+                .backward()
+                .expect("anchor present on the S path")
+                .clone();
+            let unit = loop {
+                let qp = self.current_qp();
+                let (unit, _stats) = crate::svop_encode::encode_s_vop(
+                    &self.vol, &self.cfg, &view, &reference, modulo, increment, qp,
+                );
+                if self.rc_admit(unit.len()) {
+                    break unit;
+                }
+            };
+            let (_recon, motion) = crate::svop_encode::reconstruct_own_s_vop_with_motion(
+                &self.vol,
+                &unit,
+                &mut self.store,
+            );
+            self.anchor_motion = Some(motion);
             unit
         } else {
             let reference = self

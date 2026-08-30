@@ -8,6 +8,55 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **GMC (sprite trajectory) emission (round 452)** — new `svop_encode`
+  module: with `EncoderConfig::gmc` / registry option `gmc`,
+  non-keyframe anchors become **S(GMC)-VOPs** (verid-2 VOL,
+  `sprite_enable == "GMC"`, one §7.8.4 warping point at half-pel
+  accuracy). The global translation is estimated as the dominant
+  per-MB §7.6 motion vector, clamped into the Table 7-9 range so the
+  §7.8.7.3 averaged-MV clip can never fire, and emitted as the
+  §6.2.5 `sprite_trajectory()` (`put_warping_mv_code`, the exact
+  Table B.34 inverse); per macroblock the §7.8.7.1 GMC prediction
+  (built by the decoder's own warp) competes with local §7.6
+  candidates and intra activity, emitting `mcsel`, the §6.3.6
+  `not_coded` GMC copy, or the plain local path; GMC macroblocks
+  record the §7.8.7.3 averaged MV into the predictor grid exactly as
+  the decoder does, and B-VOPs bracket S anchors through the same
+  co-located mapping the stream decoder applies. Works with
+  quarter-sample, adaptive quant, `fcode > 1` and video packets (an
+  S-VOP packet header never carries the HEC body — it would restate
+  `sprite_trajectory()`, which the packet-header parser does not
+  consume). `tests/encoder_gmc.rs` + the black-box pair
+  `enc_isb_gmc_qpel_96x64` decoded bit-exact by the reference
+  decoder.
+
+### Fixed
+
+- **Table B.34 `warping_mv_code` layout (round 452)** — the sprite
+  trajectory reader treated `dmv_length` as a plain unary run of
+  one-bits; Table B.34 actually assigns `00` → 0, `010`..`110` →
+  1..=5, and `SSS − 3` one-bits + `0` for 6..=14. Every GMC /
+  static-sprite trajectory decode used the wrong VLC. Found by
+  black-box validation of the new S(GMC) encoder (crafted
+  pure-GMC-copy streams now decode bit-exact through the reference
+  binary); both directions fixed, all crafted-bit tests rewritten to
+  the table layout.
+
+### Notes
+
+- **§7.8.7.3 negative averaged-MV ecosystem divergence (round 452)** —
+  black-box probing shows the deployed reference decoder derives each
+  *negative* averaged-MV component of a GMC macroblock one
+  half-sample lower than the spec's §7.8.7.3 quantisation (positives
+  exact; measured du −2→−3, −3→−4, −4→−5, −10→−11 on crafted
+  GMC-neighbour probes). This alters the §7.6.5 predictor of local
+  macroblocks next to GMC ones and the §7.6.9 frame-direct
+  substitution over S anchors. The decoder keeps the spec-literal
+  behaviour (per the crate's compatibility policy); extending the
+  opt-in ecosystem-compat mode to cover it (including the unprobed
+  quarter-sample rule) is recorded as a follow-up in
+  `tests/fixtures/NOTES.md`.
+
 - **Round-452 stress sweep + README (stage 4)** — `tests/encoder_stress.rs`
   gains the resilient tool set (fcode 3 + dquant / dbquant + 200-bit
   video packets + data partitioning + RVLC on top of inter4v +

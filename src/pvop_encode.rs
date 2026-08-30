@@ -418,7 +418,7 @@ fn sad_subpel_block8(
 /// full-pel search over a window around the 1-MV winner (plus the zero
 /// vector), then the sub-pel refinement. Returns the four Figure
 /// 6-8-ordered block MVs (in `mode`'s units) and the summed SAD.
-fn estimate_motion_4mv(
+pub(crate) fn estimate_motion_4mv(
     src: &[[i32; 16]; 16],
     reference: &crate::half_sample::ReferenceVop<'_>,
     mb_x: i32,
@@ -684,6 +684,7 @@ pub fn encode_p_vop(
                     cbpy: 0,
                     ac_pred_flag: false,
                     dquant: None,
+                    mcsel: None,
                     mvds: Vec::new(),
                     fcode,
                     intra_dc: None,
@@ -758,6 +759,7 @@ pub fn encode_p_vop(
                 cbpy,
                 ac_pred_flag: false,
                 dquant,
+                mcsel: None,
                 mvds,
                 fcode,
                 intra_dc: None,
@@ -774,7 +776,7 @@ pub fn encode_p_vop(
 /// the cost-decided `ac_pred_flag` measured under the writer's
 /// layout).
 #[allow(clippy::too_many_arguments)]
-fn intra_mb_in_p_fields(
+pub(crate) fn intra_mb_in_p_fields(
     pw: &PacketWriter,
     frame: &FrameView<'_>,
     grid: &mut IntraBlockGrid,

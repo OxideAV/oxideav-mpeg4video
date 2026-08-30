@@ -1492,7 +1492,7 @@ fn forward_zero_b_mb(quantiser_scale: u32) -> BVopMbTexturedDecode {
 /// `(F(i,j) − s·i, G(i,j) − s·j)` (each in `1/s`-pel units), summed and
 /// quantised to the half-pel (or quarter-pel) grid with the Table 7-9
 /// clip for `vop_fcode`.
-fn gmc_averaged_mv(
+pub(crate) fn gmc_averaged_mv(
     geometry: &WarpGeometry,
     mb_x: i64,
     mb_y: i64,
@@ -2201,13 +2201,12 @@ mod tests {
         w.write_bits(0, 3); // intra_dc_vlc_thr
         if let Some((du, dv)) = du {
             // §6.2.5 sprite_trajectory(): one warping point. Table B.34:
-            // value 0 → dmv_length SSS = 0 (a lone "0" unary terminator,
-            // no magnitude bits) + the trailing marker_bit. Only (0, 0)
-            // is emitted by this helper.
+            // value 0 → dmv_length "00" (no magnitude bits) + the
+            // trailing marker_bit. Only (0, 0) is emitted here.
             assert_eq!((du, dv), (0, 0), "helper only encodes a zero du/dv");
-            w.write_bits(0, 1); // warping_mv_code(du): SSS = 0
+            w.write_bits(0b00, 2); // warping_mv_code(du): dmv_length = 0
             w.write_bits(1, 1); // marker
-            w.write_bits(0, 1); // warping_mv_code(dv): SSS = 0
+            w.write_bits(0b00, 2); // warping_mv_code(dv): dmv_length = 0
             w.write_bits(1, 1); // marker
         }
         w.write_bits(quant, 5); // vop_quant

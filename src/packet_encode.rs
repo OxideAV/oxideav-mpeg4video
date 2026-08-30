@@ -30,7 +30,10 @@
 //! performs those resets when [`PacketWriter::maybe_cut`] reports a
 //! cut. `header_extension_code` alternates packet by packet so both
 //! decoder branches are exercised (HEC on the first packet after the
-//! VOP header carries the duplicated timing / type / fcode fields).
+//! VOP header carries the duplicated timing / type / fcode fields);
+//! S(GMC)-VOP packets never carry it (its body would restate
+//! `sprite_trajectory()`, which the crate's packet-header parser does
+//! not consume).
 //!
 //! Provenance: ISO/IEC 14496-2:2004 (3rd edition) §5.2.5, §6.2.5
 //! (`video_packet_header`, `resync_marker` lengths per §6.3.3),
@@ -90,6 +93,9 @@ pub(crate) struct MbFields {
     pub ac_pred_flag: bool,
     /// Table 6-32 `dquant` delta (types 1 / 4 only).
     pub dquant: Option<i8>,
+    /// §6.3.6 `mcsel` (S(GMC)-VOP inter / inter+q macroblocks only):
+    /// `true` = GMC prediction (no `motion_vector()` bodies follow).
+    pub mcsel: Option<bool>,
     /// Raw `(dx, dy)` motion-vector differentials in emission order
     /// (one for inter / inter+q, four for inter4v, none for intra),
     /// wrapped by [`put_motion_vector`] under `fcode`.
@@ -163,6 +169,10 @@ impl MbFields {
             }
         }
         self.write_mcbpc(bw, intra_vop);
+        if let Some(mcsel) = self.mcsel {
+            assert!(self.mb_type < 2, "mcsel rides inter / inter+q only");
+            bw.write_bit(mcsel);
+        }
         if self.is_intra() {
             bw.write_bit(self.ac_pred_flag);
         }
@@ -346,7 +356,10 @@ impl PacketWriter {
         bw.write_bits(macroblock_number, usize::from(mb_bits));
         assert!((1..=31).contains(&quant_scale));
         bw.write_bits(quant_scale, 5); // quant_precision 5
-        let hec = self.packets_cut % 2 == 1;
+                                       // The HEC body of an S(GMC) packet would also restate
+                                       // sprite_trajectory() (§6.2.5), which this crate's packet-header
+                                       // parser does not consume yet — S-VOP packets carry no HEC.
+        let hec = self.packets_cut % 2 == 1 && !matches!(self.info.coding_type, VopCodingType::S);
         bw.write_bit(hec); // header_extension_code
         if hec {
             for _ in 0..self.info.modulo_time_base {

@@ -94,25 +94,49 @@ const MAX_SSS: u32 = 14;
 /// Decode one `warping_mv_code()` (§6.3.5.4) returning the signed
 /// differential `dmv` value.
 ///
-/// Layout: VLC `dmv_length` (a unary run of `SSS` `1`-bits then a `0`),
-/// then — when `SSS != 0` — an `SSS`-bit FLC `dmv_code`, then a
+/// Layout (Table B.34): the `dmv_length` VLC — `00` → 0, `010` → 1,
+/// `011` → 2, `100` → 3, `101` → 4, `110` → 5, then `1110` → 6 up to
+/// `111111111110` → 14 (`SSS - 3` one-bits and a terminating `0`) —
+/// then, when `SSS != 0`, an `SSS`-bit FLC `dmv_code`, then a
 /// `marker_bit` (`1`).
 #[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn decode_warping_mv_code(br: &mut BitReader<'_>) -> Result<i32, SpriteTrajectoryError> {
-    // Read the unary `dmv_length` (SSS): count leading 1s, stop at the 0.
-    let mut sss: u32 = 0;
-    loop {
-        let bit = br
-            .read_bits(1)
-            .map_err(|_| SpriteTrajectoryError::Truncated)?;
-        if bit == 0 {
-            break;
+    // Table B.34 dmv_length.
+    let two = br
+        .read_bits(2)
+        .map_err(|_| SpriteTrajectoryError::Truncated)?;
+    let sss: u32 = match two {
+        0b00 => 0,
+        0b01 | 0b10 => {
+            let low = br
+                .read_bits(1)
+                .map_err(|_| SpriteTrajectoryError::Truncated)?;
+            // "010"→1, "011"→2, "100"→3, "101"→4.
+            (two - 1) * 2 + 1 + low
         }
-        sss += 1;
-        if sss > MAX_SSS {
-            return Err(SpriteTrajectoryError::LengthOverflow);
+        _ => {
+            // "11": a third 0 bit closes SSS = 5; otherwise count the
+            // extra one-bits of the 6..=14 tail.
+            let mut extra = 0u32;
+            loop {
+                let bit = br
+                    .read_bits(1)
+                    .map_err(|_| SpriteTrajectoryError::Truncated)?;
+                if bit == 0 {
+                    break;
+                }
+                extra += 1;
+                if 5 + extra > MAX_SSS {
+                    return Err(SpriteTrajectoryError::LengthOverflow);
+                }
+            }
+            if extra == 0 {
+                5
+            } else {
+                5 + extra
+            }
         }
-    }
+    };
 
     let dmv = if sss == 0 {
         0
@@ -262,12 +286,19 @@ mod tests {
                 }
             }
         }
-        /// Emit a `warping_mv_code` for the given `dmv`: unary SSS, FLC, marker.
+        /// Emit a `warping_mv_code`: the Table B.34 `dmv_length` VLC
+        /// for `sss`, the `sss`-bit FLC, and the marker.
         fn write_warping(&mut self, sss: u32, code: u32) {
-            for _ in 0..sss {
-                self.write_bits(1, 1);
+            match sss {
+                0 => self.write_bits(0b00, 2),
+                1..=5 => self.write_bits(sss + 1, 3), // 010,011,100,101,110
+                _ => {
+                    for _ in 0..(sss - 3) {
+                        self.write_bits(1, 1);
+                    }
+                    self.write_bits(0, 1);
+                }
             }
-            self.write_bits(0, 1); // terminating 0
             if sss != 0 {
                 self.write_bits(code, sss as usize);
             }

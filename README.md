@@ -134,6 +134,13 @@ keyframe cadence, **Annex D rate control** (the D.2 VBV rate-buffer
 model simulated on the encoder side with an item-9 admission gate that
 re-encodes an oversized VOP at a coarser quantiser, plus
 bit-budget-regulated per-VOP quantiser adaptation), and the
+**GMC emission** (`svop_encode`: S(GMC)-VOP anchors with one §7.8.4
+warping point at half-pel accuracy — the dominant per-MB motion
+becomes the §6.2.5 `sprite_trajectory()`, clamped into the Table 7-9
+range so the §7.8.7.3 averaged-MV clip never fires; per-MB `mcsel`
+decides GMC vs local prediction, `not_coded` GMC copies included, and
+the averaged MV threads the predictor grid exactly as the decoder's
+`MvDriver` does), and the
 **error-resilience tools** (`packet_encode`: §6.2.5 video packets cut
 at the first macroblock boundary past a bit target — §5.2.5 stuffing,
 the §6.3.3 `resync_marker` of the VOP type / fcode, Table 6-27
@@ -155,9 +162,9 @@ set, and a corrupted RVLC texture partition still decoding through the
 decode agreement — the reference decoder's decode of our method-2
 intra, I+P, 4MV, qpel, qpel+4MV, I/P/B, fcode-2 I+P, fcode-3 +
 qpel + 4MV + B, adaptive-quant I/P/B, video-packet I/P/B,
-data-partitioned I+P and data-partitioned + RVLC + packets I/P/B
-streams is **bit-exact** against our own (fourteen encoder-produced
-pairs), and the method-1 stream lands exactly on the documented
+data-partitioned I+P, data-partitioned + RVLC + packets I/P/B and
+GMC + qpel I/S/B streams is **bit-exact** against our own (fifteen
+encoder-produced pairs), and the method-1 stream lands exactly on the documented
 §7.4.4.5 compat contract (ecosystem mode bit-exact, literal-spec ±1 on
 834 samples); rate-controlled streams satisfy an independent Annex D
 re-simulation (no underflow, `d_i < B`) and land within [0.6, 1.1]× of
@@ -165,7 +172,8 @@ the target. The registry entry declares `encode`:
 `encoder::make_encoder` / `Mpeg4VideoEncoder` (options `qp`,
 `mpeg-quant`, `ac-pred`, `four-mv`, `qpel`, `bf`, `bitrate`,
 `vbv-buffer`, `gop-size`, `fcode`, `mb-aq`, `packet-bits`,
-`data-partitioned`, `rvlc`) is the dual-API sibling of `make_decoder`.
+`data-partitioned`, `rvlc`, `gmc`) is the dual-API sibling of
+`make_decoder`.
 
 ## Compatibility modes
 
@@ -412,13 +420,25 @@ both modes' envelopes are pinned).
 ## Not yet supported
 
 - Encoder: interlaced tools (field DCT / field motion /
-  `interlaced_information()`), GMC (S(GMC)-VOPs + `sprite_trajectory`)
-  and short-header (H.263-compatible) syntax emission; rate control
-  adapts per VOP (the per-macroblock `dquant` / `dbquant` steps are
-  activity-driven, not budget-driven); `intra_dc_vlc_thr` is always 0
-  (DC VLC for the whole VOP). The encoder emits progressive VOPs only —
-  the §7.7.2.2 interlaced-direct compat divergence cannot arise in its
-  output. The decoder-side feature set below is unchanged.
+  `interlaced_information()`) and short-header (H.263-compatible)
+  syntax emission (the decoder has no short-header read side either);
+  GMC emission is one warping point (pure translation) — 2-/3-point
+  affine trajectories and the ±2-pel `dbquant`-band rate coupling are
+  encoder headroom; rate control adapts per VOP (the per-macroblock
+  `dquant` / `dbquant` steps are activity-driven, not budget-driven);
+  `intra_dc_vlc_thr` is always 0 (DC VLC for the whole VOP); an S-VOP
+  video-packet header never carries the HEC body (its
+  `sprite_trajectory()` restatement is unimplemented on the parse
+  side). The encoder emits progressive VOPs only — the §7.7.2.2
+  interlaced-direct compat divergence cannot arise in its output. The
+  decoder-side feature set below is unchanged.
+- The §7.8.7.3 **negative averaged-MV ecosystem divergence**: the
+  deployed reference decoder derives each negative AMV component of a
+  GMC macroblock one half-sample lower than the spec quantisation
+  (measured on crafted probes; positives exact). The decoder here is
+  spec-literal; covering it under the opt-in ecosystem-compat mode
+  (incl. probing the quarter-sample rule) is an open follow-up
+  (`tests/fixtures/NOTES.md`).
 - §E.1.4.4 recovery on **I-VOP** texture partitions (an I-VOP texture
   error still propagates: §E.1.4.4.2.2 conceals every INTRA macroblock
   of an errored packet, and an I-VOP has no inter macroblocks to
