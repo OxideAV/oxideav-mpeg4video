@@ -55,14 +55,35 @@ use crate::vlc_encode::{put_cbpy, put_mcbpc_p, put_motion_vector};
 use crate::vop::{parse_vop_header_body, vop_time_increment_bits, VopCodingType, VopContext};
 use crate::vop_decode::decode_p_vop_macroblocks;
 
-/// Full-pel motion search radius in pels (each direction). The
-/// refined half-pel vector stays comfortably inside the `fcode == 1`
-/// §7.6.3 range `[-32, 31]` (half-sample units).
+/// Dense full-pel motion search radius in pels (each direction) —
+/// the `fcode == 1` window, whose refined half-pel vector stays inside
+/// the Table 7-9 range `[-32, 31]` (half-sample units). Wider `fcode`
+/// windows extend this with a coarse-to-fine search
+/// ([`search_window_pels`]).
 pub const SEARCH_RANGE: i32 = 8;
+
+/// The Table 7-9 motion-vector range `[low, high]` for `fcode`, in
+/// the unitless MV integers of `mode` (half- or quarter-sample).
+pub(crate) fn mv_range(fcode: u8) -> (i32, i32) {
+    assert!((1..=7).contains(&fcode), "fcode {fcode} out of range");
+    let f = 1i32 << (fcode - 1);
+    (-32 * f, 32 * f - 1)
+}
+
+/// Full-pel search window radius for `fcode` under `mode`: the
+/// largest full-pel displacement whose sub-pel refinement still lands
+/// inside the Table 7-9 range — `16 << (fcode - 1)` pels in
+/// half-sample mode, `8 << (fcode - 1)` in quarter-sample mode
+/// (minus one so the positive side's sub-pel neighbours stay
+/// representable).
+pub(crate) fn search_window_pels(fcode: u8, mode: BVopSampleMode) -> i32 {
+    let (_, high) = mv_range(fcode);
+    (high + 1) / units_per_pel(mode) - 1
+}
 
 const VOP_START_CODE: u32 = 0x0000_01B6;
 
-/// Emit a §6.2.5 P-VOP header (through `vop_fcode_forward == 1`). The
+/// Emit a §6.2.5 P-VOP header (through `vop_fcode_forward`). The
 /// writer is left mid-unit — the macroblock walk follows.
 pub fn write_p_vop_header(
     bw: &mut BitWriter,
@@ -70,6 +91,7 @@ pub fn write_p_vop_header(
     modulo_time_base: u32,
     time_increment: u16,
     quant: u32,
+    fcode: u8,
 ) {
     bw.write_start_code(VOP_START_CODE);
     bw.write_bits(0b01, 2); // vop_coding_type = P
@@ -88,7 +110,11 @@ pub fn write_p_vop_header(
     bw.write_bits(0, 3); // intra_dc_vlc_thr = 0
     assert!((1..=31).contains(&quant), "vop_quant {quant} out of range");
     bw.write_bits(quant, 5);
-    bw.write_bits(1, 3); // vop_fcode_forward = 1
+    assert!(
+        (1..=7).contains(&fcode),
+        "vop_fcode_forward {fcode} out of range"
+    );
+    bw.write_bits(u32::from(fcode), 3); // vop_fcode_forward
 }
 
 /// Per-VOP encode statistics (mode-decision observability for tests).
@@ -183,19 +209,32 @@ fn sad_subpel(
     sad
 }
 
+/// The full-pel window the estimators actually walk: the dense
+/// ±[`SEARCH_RANGE`] under `fcode == 1`, the Table 7-9 window
+/// ([`search_window_pels`]) beyond it.
+fn full_pel_window(fcode: u8, mode: BVopSampleMode) -> i32 {
+    if fcode == 1 {
+        SEARCH_RANGE
+    } else {
+        search_window_pels(fcode, mode).max(SEARCH_RANGE)
+    }
+}
+
 /// Sub-pel refinement around a full-pel winner: a half-pel ring pass,
 /// then (in quarter mode) a quarter-pel ring pass, each keeping the
-/// running best. The `[-32, 31]` clamp is the §7.6.3 `fcode == 1`
-/// range in `mode`'s units.
+/// running best. The `[low, high]` clamp is the §7.6.3 / Table 7-9
+/// range for `fcode` in `mode`'s units.
 fn refine_subpel<F: FnMut(MotionVector) -> u32>(
     full: (i32, i32),
     mode: BVopSampleMode,
+    fcode: u8,
     mut sad_of: F,
 ) -> (MotionVector, u32) {
     let unit = units_per_pel(mode);
+    let (low, high) = mv_range(fcode);
     let mut best_mv = MotionVector {
-        x: (full.0 * unit).clamp(-32, 31),
-        y: (full.1 * unit).clamp(-32, 31),
+        x: (full.0 * unit).clamp(low, high),
+        y: (full.1 * unit).clamp(low, high),
     };
     let mut best_sad = sad_of(best_mv);
     let mut steps = vec![unit / 2];
@@ -210,8 +249,8 @@ fn refine_subpel<F: FnMut(MotionVector) -> u32>(
                     continue;
                 }
                 let cand = MotionVector {
-                    x: (centre.x + hx * step).clamp(-32, 31),
-                    y: (centre.y + hy * step).clamp(-32, 31),
+                    x: (centre.x + hx * step).clamp(low, high),
+                    y: (centre.y + hy * step).clamp(low, high),
                 };
                 let sad = sad_of(cand);
                 if sad < best_sad {
@@ -227,28 +266,75 @@ fn refine_subpel<F: FnMut(MotionVector) -> u32>(
 /// Full-pel search + sub-pel refinement. Returns the best MV (in
 /// `mode`'s units) and its SAD. The zero vector gets the classic small
 /// favouring bias so flat areas stay skippable.
+///
+/// The search is the dense ±[`SEARCH_RANGE`] window around the zero
+/// vector (the whole search under `fcode == 1`); for `fcode > 1` a
+/// coarse 4-pel lattice over the whole
+/// Table 7-9 window ([`search_window_pels`]) is scanned first and its
+/// winner densely refined (±3 pels), so long displacements are found
+/// without an exhaustive walk of the (up to ±1024-pel) window. Lattice
+/// points whose 16×16 block lies entirely beyond the §7.6.4 padded
+/// reference edge are skipped (they only duplicate the edge sample).
 pub(crate) fn estimate_motion(
     src: &[[i32; 16]; 16],
     reference: &crate::half_sample::ReferenceVop<'_>,
     mb_x: i32,
     mb_y: i32,
     mode: BVopSampleMode,
+    fcode: u8,
 ) -> (MotionVector, u32) {
     let mut best = (0i32, 0i32);
     let mut best_sad = sad_full_pel(src, reference, mb_x, mb_y, 0, 0).saturating_sub(128);
+    let consider = |dx: i32, dy: i32, best: &mut (i32, i32), best_sad: &mut u32| {
+        if (dx, dy) == (0, 0) {
+            return;
+        }
+        let sad = sad_full_pel(src, reference, mb_x, mb_y, dx, dy);
+        if sad < *best_sad {
+            *best_sad = sad;
+            *best = (dx, dy);
+        }
+    };
     for dy in -SEARCH_RANGE..=SEARCH_RANGE {
         for dx in -SEARCH_RANGE..=SEARCH_RANGE {
-            if (dx, dy) == (0, 0) {
-                continue;
-            }
-            let sad = sad_full_pel(src, reference, mb_x, mb_y, dx, dy);
-            if sad < best_sad {
-                best_sad = sad;
-                best = (dx, dy);
-            }
+            consider(dx, dy, &mut best, &mut best_sad);
         }
     }
-    refine_subpel(best, mode, |cand| {
+    let window = full_pel_window(fcode, mode);
+    if window > SEARCH_RANGE {
+        // Coarse lattice over the wide window, clipped so the block
+        // keeps at least one sample inside the padded reference.
+        let (ref_w, ref_h) = (reference.width() as i32, reference.height() as i32);
+        let dx_lo = (-window).max(-mb_x - 15);
+        let dx_hi = window.min(ref_w - 1 - mb_x);
+        let dy_lo = (-window).max(-mb_y - 15);
+        let dy_hi = window.min(ref_h - 1 - mb_y);
+        let mut coarse = best;
+        let mut coarse_sad = best_sad;
+        let mut dy = dy_lo;
+        while dy <= dy_hi {
+            let mut dx = dx_lo;
+            while dx <= dx_hi {
+                if dx.abs() > SEARCH_RANGE || dy.abs() > SEARCH_RANGE {
+                    consider(dx, dy, &mut coarse, &mut coarse_sad);
+                }
+                dx += 4;
+            }
+            dy += 4;
+        }
+        if coarse != best {
+            // Dense refinement around the lattice winner.
+            for dy in (coarse.1 - 3)..=(coarse.1 + 3) {
+                for dx in (coarse.0 - 3)..=(coarse.0 + 3) {
+                    if dx.abs() <= window && dy.abs() <= window {
+                        consider(dx, dy, &mut coarse, &mut coarse_sad);
+                    }
+                }
+            }
+            best = coarse;
+        }
+    }
+    refine_subpel(best, mode, fcode, |cand| {
         sad_subpel(src, reference, mb_x, mb_y, cand, mode)
     })
 }
@@ -335,7 +421,9 @@ fn estimate_motion_4mv(
     mb_y: i32,
     seed: MotionVector,
     mode: BVopSampleMode,
+    fcode: u8,
 ) -> ([MotionVector; 4], u32) {
+    let window = full_pel_window(fcode, mode);
     // Full-pel part of the 1-MV winner (truncating — the sub-pel
     // refinement recovers the fraction).
     let unit = units_per_pel(mode);
@@ -350,9 +438,7 @@ fn estimate_motion_4mv(
                 if (dx, dy) == (0, 0) {
                     continue;
                 }
-                if !(-SEARCH_RANGE..=SEARCH_RANGE).contains(&dx)
-                    || !(-SEARCH_RANGE..=SEARCH_RANGE).contains(&dy)
-                {
+                if !(-window..=window).contains(&dx) || !(-window..=window).contains(&dy) {
                     continue;
                 }
                 let sad = sad_full_pel_block8(src, reference, mb_x, mb_y, block, dx, dy);
@@ -362,7 +448,7 @@ fn estimate_motion_4mv(
                 }
             }
         }
-        let (best_mv, best_sub) = refine_subpel(best, mode, |cand| {
+        let (best_mv, best_sub) = refine_subpel(best, mode, fcode, |cand| {
             sad_subpel_block8(src, reference, mb_x, mb_y, block, cand, mode)
         });
         *out = best_mv;
@@ -425,6 +511,7 @@ pub fn encode_p_vop(
     let w_inter = nonintra_quant_matrix(vol);
     let use_dc_vlc = use_intra_dc_vlc(0, qp);
     let mode = sample_mode_of(vol);
+    let fcode = cfg.fcode;
     let luma_ref = reference.luma_reference();
     let cb_ref = reference.cb_reference();
     let cr_ref = reference.cr_reference();
@@ -436,6 +523,7 @@ pub fn encode_p_vop(
         modulo_time_base,
         time_increment,
         qp,
+        fcode,
     );
 
     let mut intra_grid = IntraBlockGrid::new(mb_height, mb_width);
@@ -448,7 +536,7 @@ pub fn encode_p_vop(
             let src = source_luma_mb(frame, mb_row, mb_col);
 
             // Motion estimation + mode decision.
-            let (mv, one_mv_sad) = estimate_motion(&src, &luma_ref, mb_x, mb_y, mode);
+            let (mv, one_mv_sad) = estimate_motion(&src, &luma_ref, mb_x, mb_y, mode, fcode);
             // §6.3.7 inter4v: per-block refinement around the 1-MV
             // winner; chosen only when the summed block SADs undercut
             // the 1-MV SAD by a margin covering the three extra
@@ -456,7 +544,7 @@ pub fn encode_p_vop(
             // the (cheaper, prediction-identical on the half-pel grid)
             // 1-MV form.
             let four = if cfg.four_mv {
-                let (mvs, sad4) = estimate_motion_4mv(&src, &luma_ref, mb_x, mb_y, mv, mode);
+                let (mvs, sad4) = estimate_motion_4mv(&src, &luma_ref, mb_x, mb_y, mv, mode, fcode);
                 let distinct = mvs.iter().any(|&m| m != mvs[0]);
                 if distinct && sad4 + 256 < one_mv_sad {
                     Some((mvs, sad4))
@@ -564,7 +652,7 @@ pub fn encode_p_vop(
                             &mut bw,
                             block_mv.x - predictor.x,
                             block_mv.y - predictor.y,
-                            1,
+                            fcode,
                         );
                         recorded[i] = block_mv;
                         mv_grid
@@ -578,12 +666,12 @@ pub fn encode_p_vop(
                     put_cbpy(&mut bw, cbpy, false);
 
                     // §7.6.5 median predictor over the shared grid state,
-                    // then the §7.6.3 differential (fcode 1).
+                    // then the §7.6.3 differential under the VOP's fcode.
                     let candidates = mv_grid
                         .predictor_candidates(mb_row, mb_col, 0)
                         .expect("grid coordinates in range");
                     let predictor = predict_motion_vector(candidates);
-                    put_motion_vector(&mut bw, mv.x - predictor.x, mv.y - predictor.y, 1);
+                    put_motion_vector(&mut bw, mv.x - predictor.x, mv.y - predictor.y, fcode);
                     mv_grid
                         .record_one_mv(mb_row, mb_col, mv)
                         .expect("grid coordinates in range");
@@ -766,7 +854,7 @@ mod tests {
     #[test]
     fn p_vop_header_round_trips() {
         let mut bw = BitWriter::new();
-        write_p_vop_header(&mut bw, 25, 1, 3, 7);
+        write_p_vop_header(&mut bw, 25, 1, 3, 7, 1);
         bw.next_start_code();
         let bytes = bw.into_bytes();
         let mut br = BitReader::new(&bytes);

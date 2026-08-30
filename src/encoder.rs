@@ -63,6 +63,11 @@ pub struct Mpeg4EncoderOptions {
     /// `gop-size` — I-VOP cadence: one keyframe every `gop_size`
     /// frames (`1` = intra-only). Default 12.
     pub gop_size: u32,
+    /// `fcode` — `vop_fcode_forward` / `vop_fcode_backward` (1..=7):
+    /// the Table 7-9 motion-vector range and the motion search
+    /// window (±`16 << (fcode - 1)` pels in half-sample mode,
+    /// ±`8 << (fcode - 1)` in quarter-sample mode). Default 1.
+    pub fcode: u32,
 }
 
 impl Default for Mpeg4EncoderOptions {
@@ -77,6 +82,7 @@ impl Default for Mpeg4EncoderOptions {
             bitrate: 0,
             vbv_buffer: 0,
             gop_size: 12,
+            fcode: 1,
         }
     }
 }
@@ -146,6 +152,13 @@ impl oxideav_core::CodecOptionsStruct for Mpeg4EncoderOptions {
             default: oxideav_core::OptionValue::U32(12),
             help: "keyframe cadence: one I-VOP every gop-size frames (1 = intra-only)",
         },
+        oxideav_core::OptionField {
+            name: "fcode",
+            kind: oxideav_core::OptionKind::U32,
+            default: oxideav_core::OptionValue::U32(1),
+            help: "vop_fcode_forward/backward (1..=7): ISO/IEC 14496-2 Table 7-9 \
+                   motion-vector range and search window (±16<<(fcode-1) pels)",
+        },
     ];
 
     fn apply(&mut self, key: &str, value: &oxideav_core::OptionValue) -> Result<()> {
@@ -182,6 +195,13 @@ impl oxideav_core::CodecOptionsStruct for Mpeg4EncoderOptions {
                     return Err(Error::invalid("gop-size must be >= 1"));
                 }
                 self.gop_size = g;
+            }
+            "fcode" => {
+                let f = value.as_u32()?;
+                if !(1..=7).contains(&f) {
+                    return Err(Error::invalid("fcode must be in 1..=7"));
+                }
+                self.fcode = f;
             }
             _ => unreachable!("guarded by SCHEMA"),
         }
@@ -304,6 +324,7 @@ impl Mpeg4VideoEncoder {
             quarter_sample: options.qpel,
             b_vops: options.bf > 0,
             vbv,
+            fcode: options.fcode as u8,
         };
         let config_headers = write_configuration_headers(&cfg);
         let vol_pos = config_headers

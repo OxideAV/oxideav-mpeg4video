@@ -246,6 +246,34 @@ fn qpel_picture(frame_index: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
 /// One planar 4:2:0 synthetic picture (`(y, cb, cr)` planes).
 type Planes = (Vec<u8>, Vec<u8>, Vec<u8>);
 
+/// A 96×64 textured background translating by (20, 5) pels per frame
+/// — a displacement outside the `fcode == 1` Table 7-9 range, so the
+/// `fcode > 1` `r_size`-bit residual form of `motion_vector()` is
+/// exercised on every P-VOP.
+fn long_motion_picture(frame_index: usize) -> Planes {
+    let (w, h) = (96usize, 64usize);
+    let (cw, ch) = (w / 2, h / 2);
+    let bg = |x: i64, y: i64| -> u8 {
+        let v = (x * 7 + y * 5).rem_euclid(160) + ((x.div_euclid(9) + y.div_euclid(7)) % 13) * 6;
+        (40 + v.rem_euclid(170)) as u8
+    };
+    let (ox, oy) = (frame_index as i64 * 20, frame_index as i64 * 5);
+    let mut y = vec![0u8; w * h];
+    for row in 0..h {
+        for col in 0..w {
+            y[row * w + col] = bg(col as i64 + ox, row as i64 + oy);
+        }
+    }
+    let mut cb = vec![0u8; cw * ch];
+    let cr = vec![128u8; cw * ch];
+    for row in 0..ch {
+        for col in 0..cw {
+            cb[row * cw + col] = bg(col as i64 + ox / 2, row as i64 + oy / 2) / 2 + 64;
+        }
+    }
+    (y, cb, cr)
+}
+
 /// Build an I+4P stream over `picture` with the given tool set.
 fn build_tooled_ip_stream(cfg: &EncoderConfig, picture: fn(usize) -> Planes) -> Vec<u8> {
     let headers = write_configuration_headers(cfg);
@@ -336,10 +364,44 @@ fn build_registry_stream(
     options: oxideav_core::CodecOptions,
     picture: fn(usize) -> Planes,
 ) -> Vec<u8> {
+    build_registry_stream_dims(options, picture, 64, 64)
+}
+
+/// `fcode` 2 half-sample I/P over the 20-pel-per-frame scene.
+fn build_fcode2_stream() -> Vec<u8> {
+    build_registry_stream_dims(
+        oxideav_core::CodecOptions::default().set("fcode", "2"),
+        long_motion_picture,
+        96,
+        64,
+    )
+}
+
+/// `fcode` 3 + quarter-sample + inter4v + B-VOPs over the same scene
+/// (forward/backward B vectors under the wide range too).
+fn build_fcode3_qpel_ipb_stream() -> Vec<u8> {
+    build_registry_stream_dims(
+        oxideav_core::CodecOptions::default()
+            .set("fcode", "3")
+            .set("qpel", "true")
+            .set("four-mv", "true")
+            .set("bf", "2"),
+        long_motion_picture,
+        96,
+        64,
+    )
+}
+
+fn build_registry_stream_dims(
+    options: oxideav_core::CodecOptions,
+    picture: fn(usize) -> Planes,
+    w: usize,
+    h: usize,
+) -> Vec<u8> {
     use oxideav_core::Encoder as _;
     let mut params = oxideav_core::CodecParameters::video(oxideav_core::CodecId::new("mpeg4video"));
-    params.width = Some(64);
-    params.height = Some(64);
+    params.width = Some(w as u32);
+    params.height = Some(h as u32);
     params.pixel_format = Some(oxideav_core::PixelFormat::Yuv420P);
     params.options = options;
     let mut enc = oxideav_mpeg4video::encoder::Mpeg4VideoEncoder::from_params(&params).unwrap();
@@ -348,16 +410,13 @@ fn build_registry_stream(
         let frame = oxideav_core::Frame::Video(oxideav_core::VideoFrame {
             pts: None,
             planes: vec![
+                oxideav_core::VideoPlane { stride: w, data: y },
                 oxideav_core::VideoPlane {
-                    stride: 64,
-                    data: y,
-                },
-                oxideav_core::VideoPlane {
-                    stride: 32,
+                    stride: w / 2,
                     data: cb,
                 },
                 oxideav_core::VideoPlane {
-                    stride: 32,
+                    stride: w / 2,
                     data: cr,
                 },
             ],
@@ -377,12 +436,17 @@ fn build_registry_stream(
 }
 
 fn assert_own_decode_matches_reference(m4v: &str, yuv: &str) {
+    assert_own_decode_matches_reference_dims(m4v, yuv, 64, 64);
+}
+
+fn assert_own_decode_matches_reference_dims(m4v: &str, yuv: &str, w: usize, h: usize) {
     let stream = fixture(m4v);
     let reference = fixture(yuv);
     let mut dec = Mpeg4VideoDecoder::new();
     let mut frames = dec.decode(&stream).expect("committed stream must decode");
     frames.extend(dec.flush());
-    let frame_len = 64 * 64 + 2 * 32 * 32;
+    let (cw, ch) = (w / 2, h / 2);
+    let frame_len = w * h + 2 * cw * ch;
     assert_eq!(
         reference.len(),
         frames.len() * frame_len,
@@ -392,17 +456,17 @@ fn assert_own_decode_matches_reference(m4v: &str, yuv: &str) {
         let base = k * frame_len;
         assert_eq!(
             frame.luma_samples(),
-            &reference[base..base + 64 * 64],
+            &reference[base..base + w * h],
             "{m4v}: frame {k} luma vs reference decode"
         );
         assert_eq!(
             frame.cb_samples(),
-            &reference[base + 64 * 64..base + 64 * 64 + 32 * 32],
+            &reference[base + w * h..base + w * h + cw * ch],
             "{m4v}: frame {k} cb"
         );
         assert_eq!(
             frame.cr_samples(),
-            &reference[base + 64 * 64 + 32 * 32..base + frame_len],
+            &reference[base + w * h + cw * ch..base + frame_len],
             "{m4v}: frame {k} cr"
         );
     }
@@ -595,4 +659,52 @@ fn ipb_qpel_4mv_stream_reproduces_committed_fixture() {
 #[test]
 fn ipb_qpel_4mv_stream_decodes_bit_exact_against_reference_decoder() {
     assert_own_decode_matches_reference("enc_ipb_qpel4mv_64x64.m4v", "enc_ipb_qpel4mv_64x64.yuv");
+}
+
+#[test]
+fn fcode2_stream_reproduces_committed_fixture() {
+    let built = build_fcode2_stream();
+    if maybe_write_fixture("enc_ip_fcode2_96x64.m4v", &built) {
+        return;
+    }
+    assert_eq!(
+        built,
+        fixture("enc_ip_fcode2_96x64.m4v"),
+        "encoder output drifted from the black-box-validated fixture; \
+         regenerate the fixture AND its reference decode"
+    );
+}
+
+#[test]
+fn fcode2_stream_decodes_bit_exact_against_reference_decoder() {
+    assert_own_decode_matches_reference_dims(
+        "enc_ip_fcode2_96x64.m4v",
+        "enc_ip_fcode2_96x64.yuv",
+        96,
+        64,
+    );
+}
+
+#[test]
+fn fcode3_qpel_ipb_stream_reproduces_committed_fixture() {
+    let built = build_fcode3_qpel_ipb_stream();
+    if maybe_write_fixture("enc_ipb_fcode3_qpel4mv_96x64.m4v", &built) {
+        return;
+    }
+    assert_eq!(
+        built,
+        fixture("enc_ipb_fcode3_qpel4mv_96x64.m4v"),
+        "encoder output drifted from the black-box-validated fixture; \
+         regenerate the fixture AND its reference decode"
+    );
+}
+
+#[test]
+fn fcode3_qpel_ipb_stream_decodes_bit_exact_against_reference_decoder() {
+    assert_own_decode_matches_reference_dims(
+        "enc_ipb_fcode3_qpel4mv_96x64.m4v",
+        "enc_ipb_fcode3_qpel4mv_96x64.yuv",
+        96,
+        64,
+    );
 }

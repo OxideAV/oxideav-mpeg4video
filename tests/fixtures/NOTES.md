@@ -226,6 +226,28 @@ ffmpeg -idct faani -i enc_ipb_qpel4mv_64x64.m4v -f rawvideo -pix_fmt yuv420p enc
 All five reference decodes are **bit-exact** against this crate's
 decode of the same streams (asserted in `tests/encoder_blackbox.rs`).
 
+Round 452 added the `fcode > 1` pair (96×64, a textured background
+translating by (20, 5) pels per frame — outside the `fcode == 1`
+Table 7-9 range, so every P/B vector rides the `r_size`-bit residual
+form of §6.2.6.2 `motion_vector()`):
+
+* `enc_ip_fcode2_96x64` — `fcode` 2, half-sample I+P via the registry
+  encoder (`gop-size` 12, qp 4), 6 frames;
+* `enc_ipb_fcode3_qpel4mv_96x64` — `fcode` 3 + `quarter_sample` +
+  inter4v + `bf` 2 (forward / backward / interpolated B vectors under
+  the wide range; direct-mode deltas stay `fcode == 1`), 6 frames.
+
+```
+ffmpeg -idct faani -i enc_ip_fcode2_96x64.m4v -f rawvideo -pix_fmt yuv420p enc_ip_fcode2_96x64.yuv
+ffmpeg -idct faani -i enc_ipb_fcode3_qpel4mv_96x64.m4v -f rawvideo -pix_fmt yuv420p enc_ipb_fcode3_qpel4mv_96x64.yuv
+```
+
+Both are bit-exact. (The `bf` 1 sibling of the second stream at qp 4
+hit one near-tie sample — a single ±1 in one B-VOP, with the qp 3 /
+5 / 6 and `bf` 2 variants all bit-exact — which is the documented
+single-precision oracle caveat above, so the `bf` 2 variant was
+pinned.)
+
 ## SHA-256
 
 ```
@@ -308,6 +330,10 @@ e1e4c9d7fce8198331e805bc6a3743b5839c96b213747e9bd5a84ec438ec894f  enc_ip_qpel_64
 96f18d82ee50631c03daa101d460e00eafeed2643ab36bde90af32de1997b3b2  enc_ipb_64x64.yuv
 5961b4f908f8ed069ac17ac29c8051ae2f51893324417d23fe36ccad27e3972e  enc_ipb_qpel4mv_64x64.m4v
 2bb083df0e8d5a92f041822b026b119be92c0b5384e1170a0ce2ff9b62807c64  enc_ipb_qpel4mv_64x64.yuv
+4fb8ad3bd96556986773058d121112fc479a2237993178a651053451c33c32e1  enc_ip_fcode2_96x64.m4v
+769fc2f8f88c2038b18592649e8aa1bf324a452187533a7b399ee89ea193b1a9  enc_ip_fcode2_96x64.yuv
+7b9ce94a56292b8541b2fabe1927d2ca30f867cd1fb3544f2daeeca4b5791e46  enc_ipb_fcode3_qpel4mv_96x64.m4v
+584711548f66a8f862ce5bee4cc8c5fd48fd78f264c732097956756dbcf73779  enc_ipb_fcode3_qpel4mv_96x64.yuv
 ```
 
 (Note: `aic_ipb_64x64.yuv` and `altscan_ipb_64x64.yuv` are

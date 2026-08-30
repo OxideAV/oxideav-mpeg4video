@@ -80,13 +80,15 @@ const ONE_MV_MODE_BIAS: u32 = 64;
 const INTERP_MODE_BIAS: u32 = 96;
 
 /// Emit a §6.2.5 B-VOP header (`vop_fcode_forward == vop_fcode_backward
-/// == 1`). The writer is left mid-unit — the macroblock walk follows.
+/// == fcode`). The writer is left mid-unit — the macroblock walk
+/// follows.
 pub fn write_b_vop_header(
     bw: &mut BitWriter,
     resolution: u16,
     modulo_time_base: u32,
     time_increment: u16,
     quant: u32,
+    fcode: u8,
 ) {
     bw.write_start_code(VOP_START_CODE);
     bw.write_bits(0b10, 2); // vop_coding_type = B
@@ -104,8 +106,9 @@ pub fn write_b_vop_header(
     bw.write_bits(0, 3); // intra_dc_vlc_thr = 0
     assert!((1..=31).contains(&quant), "vop_quant {quant} out of range");
     bw.write_bits(quant, 5);
-    bw.write_bits(1, 3); // vop_fcode_forward = 1
-    bw.write_bits(1, 3); // vop_fcode_backward = 1
+    assert!((1..=7).contains(&fcode), "vop_fcode {fcode} out of range");
+    bw.write_bits(u32::from(fcode), 3); // vop_fcode_forward
+    bw.write_bits(u32::from(fcode), 3); // vop_fcode_backward
 }
 
 /// Per-VOP B encode statistics (mode-decision observability).
@@ -315,6 +318,7 @@ pub fn encode_b_vop(
         backward_cr: &bwd_cr,
     };
 
+    let fcode = cfg.fcode;
     let mut bw = BitWriter::new();
     write_b_vop_header(
         &mut bw,
@@ -322,6 +326,7 @@ pub fn encode_b_vop(
         modulo_time_base,
         time_increment,
         qp,
+        fcode,
     );
 
     let mut stats = BVopEncodeStats::default();
@@ -375,8 +380,8 @@ pub fn encode_b_vop(
             }
 
             // Forward / backward motion search against each anchor.
-            let (mv_f, _) = estimate_motion(&src, &fwd_luma, mb_x, mb_y, mode);
-            let (mv_b, _) = estimate_motion(&src, &bwd_luma, mb_x, mb_y, mode);
+            let (mv_f, _) = estimate_motion(&src, &fwd_luma, mb_x, mb_y, mode, fcode);
+            let (mv_b, _) = estimate_motion(&src, &bwd_luma, mb_x, mb_y, mode, fcode);
             let zero = MotionVector { x: 0, y: 0 };
             for cand in [
                 one_mv_candidate(BVopMbType::Forward, mv_f, zero, mode),
@@ -461,21 +466,21 @@ pub fn encode_b_vop(
             match mb_type {
                 BVopMbType::Forward => {
                     let mv = best.decode.mvs[0].forward;
-                    put_motion_vector(&mut bw, mv.x - pred_f.x, mv.y - pred_f.y, 1);
+                    put_motion_vector(&mut bw, mv.x - pred_f.x, mv.y - pred_f.y, fcode);
                     pred_f = mv;
                     stats.forward += 1;
                 }
                 BVopMbType::Backward => {
                     let mv = best.decode.mvs[0].backward;
-                    put_motion_vector(&mut bw, mv.x - pred_b.x, mv.y - pred_b.y, 1);
+                    put_motion_vector(&mut bw, mv.x - pred_b.x, mv.y - pred_b.y, fcode);
                     pred_b = mv;
                     stats.backward += 1;
                 }
                 BVopMbType::Interpolated => {
                     let f = best.decode.mvs[0].forward;
                     let b = best.decode.mvs[0].backward;
-                    put_motion_vector(&mut bw, f.x - pred_f.x, f.y - pred_f.y, 1);
-                    put_motion_vector(&mut bw, b.x - pred_b.x, b.y - pred_b.y, 1);
+                    put_motion_vector(&mut bw, f.x - pred_f.x, f.y - pred_f.y, fcode);
+                    put_motion_vector(&mut bw, b.x - pred_b.x, b.y - pred_b.y, fcode);
                     pred_f = f;
                     pred_b = b;
                     stats.interpolated += 1;
@@ -555,7 +560,7 @@ mod tests {
     #[test]
     fn b_vop_header_round_trips() {
         let mut bw = BitWriter::new();
-        write_b_vop_header(&mut bw, 25, 2, 7, 9);
+        write_b_vop_header(&mut bw, 25, 2, 7, 9, 1);
         bw.next_start_code();
         let bytes = bw.into_bytes();
         let mut br = BitReader::new(&bytes);

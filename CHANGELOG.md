@@ -8,6 +8,23 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Encoder `fcode > 1` motion ranges (round 452)** — `EncoderConfig::fcode`
+  / registry option `fcode` (1..=7) emits `vop_fcode_forward` (P) and
+  `vop_fcode_forward` + `vop_fcode_backward` (B) and moves the §7.6
+  motion search onto the Table 7-9 range for that fcode
+  (`[-32·2^(fcode-1), 32·2^(fcode-1) - 1]` in half- or quarter-sample
+  units): a coarse 4-pel lattice over the whole window followed by
+  dense refinement, then the existing half-/quarter-sample ring
+  passes clamped to the range; inter4v block vectors share the
+  window. Differentials ride the §6.2.6.2 `r_size`-bit residual form
+  after the §7.6.3 modulo wrap. `fcode == 1` output is byte-identical
+  to before (every pinned fixture still reproduces). New
+  `tests/encoder_fcode.rs` (20/24-pel translations found at fcode
+  2/3, every fcode × sample mode round-trips sample-exact, registry
+  P+B path) and two black-box pairs (`enc_ip_fcode2_96x64`,
+  `enc_ipb_fcode3_qpel4mv_96x64`) decoded bit-exact by the reference
+  decoder.
+
 - **Encoder robustness sweep for the round-443 tool set (stage 5)** —
   `tests/encoder_stress.rs` gains I/B/P round-trips with inter4v +
   quarter-sample + B-VOPs enabled together over the adversarial

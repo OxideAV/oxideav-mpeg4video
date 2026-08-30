@@ -93,6 +93,12 @@ pub struct EncoderConfig {
     /// `vol_control_parameters` block; see [`VbvSignalling`] /
     /// `crate::rate_control`).
     pub vbv: Option<VbvSignalling>,
+    /// `vop_fcode_forward` / `vop_fcode_backward` (1..=7) for every
+    /// P- and B-VOP: selects the Table 7-9 motion-vector range
+    /// `[-32·2^(fcode-1), 32·2^(fcode-1) - 1]` (half- or
+    /// quarter-sample units per `quarter_sample`) and the matching
+    /// §7.6 search window. Default 1.
+    pub fcode: u8,
 }
 
 /// The §6.2.3 `vbv_parameters` triple (Annex D rate-buffer model).
@@ -118,6 +124,7 @@ impl Default for EncoderConfig {
             quarter_sample: false,
             b_vops: false,
             vbv: None,
+            fcode: 1,
         }
     }
 }
