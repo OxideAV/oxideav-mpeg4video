@@ -6,6 +6,54 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.7](https://github.com/OxideAV/oxideav-mpeg4video/compare/v0.1.6...v0.1.7) - 2026-08-30
+
+### Other
+
+- compat divergence 3 — §7.8.7.3 GMC averaged MV, ecosystem-compat now bit-exact on negative-trajectory S(GMC) streams
+- GMC (sprite trajectory) emission + Table B.34 warping_mv_code decoder fix — S(GMC)-VOP anchors black-box bit-exact
+- round-452 stress sweep over the resilient tool set + README encoder section rewrite
+- mpeg4video encoder: error-resilience emission — video packets (resync + HEC), data partitioning, reversible VLCs; black-box bit-exact
+- mpeg4video encoder: per-macroblock dquant / dbquant quantiser modulation — activity-classed steps, intra+q / inter+q types, black-box bit-exact
+- mpeg4video encoder: fcode > 1 motion ranges — Table 7-9 search window + vop_fcode emission, r_size residual MVDs, black-box bit-exact
+- combined-tools black-box pair — qpel + inter4v + B-VOPs in one stream, reference decode bit-exact
+- adversarial stress sweep over the full encoder tool set — inter4v+qpel+B-VOPs+rate control, sample-exact everywhere
+- mpeg4video CI: drop vestigial system-package installs — no test shells out; fixes the flaky Windows package-feed dependency
+- README — document the round-443 encoder tail (4MV, qpel, B-VOPs, Annex D rate control)
+- Annex D rate control — VBV model + regulated quantiser, vbv_parameters VOL signalling, re-encode admission gate
+- B-VOP encoder — §7.6.9 mode decision + §6.2.6 emission, bf reorder queue in the registry encoder, bit-exact black-box I/P/B pair
+- encoder 4MV + quarter-sample motion — inter4v emission with in-MB predictor threading, verid-2 qpel VOL, three new bit-exact black-box pairs
+- README/manifest — document the round-438 encoder arc (I/P end-to-end, closed loop, black-box bit-exact)
+- encoder robustness sweep — adversarial content x quantiser extremes x edge grids, all sample-exact
+- derive both transform kernels from one correctly-rounded cos(k*pi/16) constant set; regenerate encoder fixtures
+- literal cosine kernels — DCT/IDCT byte-determinism across platforms (fixes fixture pin on non-local CI hosts)
+- P-VOP encoder — motion estimation + §7.6 MC emission, skips, GOP cadence; I+P black-box bit-exact
+- registry-facing encoder — core Encoder impl, options schema, make_encoder dual-API factory
+- black-box cross-check of the I-VOP encoder — reference decoder reproduces our streams bit-exact (m2) / per compat contract (m1)
+- I-VOP encoder end-to-end — header emission + intra walk with DC/AC-prediction emission, closed decode loop
+- encoder VLC emission — inverse Tables B.6-B.17 emitters with exhaustive decode round-trips
+- encoder groundwork — BitWriter + Annex A.1 forward DCT + §7.4.4-dual forward quantisers
+- triple-axis conformance stream — mpeg_quant x interlaced x qpel x B-VOPs
+- §7.6.9.6 AMV substitution — skipped co-located S(GMC) MBs feed direct mode the averaged vector
+- §E.1.4.4 RVLC recovery reaches pixels — DP P-VOP walk recovers corrupted texture partitions
+- interlaced-direct probe arbitration — compat model confirmed with non-zero co-located MVs
+- interlaced-direct MBs honour quarter_sample — new ilaced qpel-IPB conformance axis
+- field-qpel geometry arbitrated — interlaced+qpel stream goes bit-exact
+- doc(hidden) the internal decode plumbing
+- end-to-end registry proof that ecosystem-compat alters the decode
+- method-1 conformance axes — mq × {qpel+4MV, interlaced-B, data-partitioned}
+- README + CHANGELOG — compatibility-modes documentation
+- compat-mode conformance pins — mq + interlaced-direct streams collapse
+- registry surface for the ecosystem-compat option
+- opt-in ecosystem-compat decode mode (spec-literal stays the default)
+- README — bit-exact conformance rollup
+- bit-exact conformance corpus — 11 exact / 4 near-exact / 4 bounded streams
+- quarter-sample §7.6.5 chroma reduction + §7.6.9.5.2 direct grid
+- §7.4.2 scan selection — direction-to-scan mapping was transposed
+- §7.7.2.2 interlaced-direct vertical derivation on the field grid
+- B-VOP MC block geometry — 16×16 explicit modes, quarter-grid direct
+- §4.1 `//` rounding in the §7.4.3.2/§7.4.3.3 DC/AC predictors
+
 ### Added
 
 - **Compat divergence 3 — §7.8.7.3 GMC averaged MV (round 452)** —
