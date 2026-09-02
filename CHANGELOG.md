@@ -32,6 +32,15 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   black-box pairs: our stream decodes bit-exact in the reference
   decoder, a reference-encoder H.263 stream decodes bit-exact in ours.
 
+- GMC with two and three warping points (`gmc-points`): the S(GMC)
+  encoder fits the §7.8.5 similarity / affine model to its motion
+  field (mode-seeded robust least squares, coordinate-descent
+  refinement on the decoder's own warp) and emits the multi-point
+  `sprite_trajectory()`; the GMC-vs-local preference now scales with
+  the quantiser. Black-box pairs: the three-point stream is bit-exact
+  in the reference decoder, the two-point stream exact up to one
+  intra near-tie sample.
+
 ### Fixed
 
 - Decoder: a §7.7.2.1 field motion vector is reconstructed under the

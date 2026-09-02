@@ -98,9 +98,9 @@ pub fn put_warping_mv_code(bw: &mut BitWriter, dmv: i32) {
 }
 
 /// Emit a §6.2.5 S(GMC)-VOP header through `vop_fcode_forward`,
-/// including the one-point `sprite_trajectory()`. The writer is left
-/// mid-unit — the macroblock walk follows.
-#[allow(clippy::too_many_arguments)]
+/// including the `sprite_trajectory()` (`trajectory.count` warping
+/// points, each `du[i]` then `dv[i]` as `warping_mv_code()`). The
+/// writer is left mid-unit — the macroblock walk follows.
 pub fn write_s_vop_header(
     bw: &mut BitWriter,
     resolution: u16,
@@ -108,8 +108,7 @@ pub fn write_s_vop_header(
     time_increment: u16,
     quant: u32,
     fcode: u8,
-    du: i32,
-    dv: i32,
+    trajectory: &SpriteTrajectory,
 ) {
     bw.write_start_code(VOP_START_CODE);
     bw.write_bits(0b11, 2); // vop_coding_type = S
@@ -126,9 +125,15 @@ pub fn write_s_vop_header(
     bw.write_bit(true); // vop_coded = 1
     bw.write_bit(false); // vop_rounding_type = 0 (S(GMC) carries it like P)
     bw.write_bits(0, 3); // intra_dc_vlc_thr = 0
-                         // sprite_trajectory(): one warping point.
-    put_warping_mv_code(bw, du);
-    put_warping_mv_code(bw, dv);
+    assert!(
+        (1..=3).contains(&trajectory.count),
+        "GMC trajectories carry 1..=3 points"
+    );
+    // sprite_trajectory(): no_of_sprite_warping_points (du, dv) pairs.
+    for point in &trajectory.points[..usize::from(trajectory.count)] {
+        put_warping_mv_code(bw, point[0]);
+        put_warping_mv_code(bw, point[1]);
+    }
     assert!((1..=31).contains(&quant), "vop_quant {quant} out of range");
     bw.write_bits(quant, 5);
     assert!((1..=7).contains(&fcode), "vop_fcode_forward out of range");
@@ -154,6 +159,8 @@ pub struct SVopEncodeStats {
     pub packets: usize,
     /// The emitted trajectory `(du[0], dv[0])` in half-sample units.
     pub trajectory: (i32, i32),
+    /// The full emitted `sprite_trajectory()` (`count` points).
+    pub points: SpriteTrajectory,
 }
 
 /// The most common estimated motion vector across the macroblock grid
@@ -169,6 +176,315 @@ fn dominant_motion(mvs: &[(MotionVector, u32)]) -> MotionVector {
         }
     }
     best
+}
+
+/// Solve the `n × n` normal equations `a · x = b` in place by Gaussian
+/// elimination with partial pivoting; `None` when singular.
+fn solve(mut a: Vec<Vec<f64>>, mut b: Vec<f64>) -> Option<Vec<f64>> {
+    let n = b.len();
+    for col in 0..n {
+        let pivot = (col..n).max_by(|&i, &j| a[i][col].abs().total_cmp(&a[j][col].abs()))?;
+        if a[pivot][col].abs() < 1e-9 {
+            return None;
+        }
+        a.swap(col, pivot);
+        b.swap(col, pivot);
+        for row in col + 1..n {
+            let f = a[row][col] / a[col][col];
+            let pivot_row = a[col].clone();
+            for (cell, &p) in a[row][col..].iter_mut().zip(pivot_row[col..].iter()) {
+                *cell -= f * p;
+            }
+            b[row] -= f * b[col];
+        }
+    }
+    let mut x = vec![0.0; n];
+    for col in (0..n).rev() {
+        let mut acc = b[col];
+        for k in col + 1..n {
+            acc -= a[col][k] * x[k];
+        }
+        x[col] = acc / a[col][col];
+    }
+    Some(x)
+}
+
+/// A fitted global-motion model: the displacement (in pels) of the
+/// picture point `(x, y)` is `(a·x + b·y + tx, c·x + d·y + ty)`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct GlobalMotion {
+    a: f64,
+    b: f64,
+    c: f64,
+    d: f64,
+    tx: f64,
+    ty: f64,
+}
+
+impl GlobalMotion {
+    fn displacement(&self, x: f64, y: f64) -> (f64, f64) {
+        (
+            self.a * x + self.b * y + self.tx,
+            self.c * x + self.d * y + self.ty,
+        )
+    }
+}
+
+/// Least-squares fit of the §7.8.5 model with `points` warping points
+/// to the per-macroblock motion field (`samples`: macroblock-centre
+/// coordinates and their displacement, in pels). Two points fit the
+/// similarity `(a·x − b·y + tx, b·x + a·y + ty)`, three the full
+/// affine; one point is the plain mean (the caller uses the mode
+/// instead). `None` when the system is singular.
+fn fit_global_motion(samples: &[(f64, f64, f64, f64)], points: u8) -> Option<GlobalMotion> {
+    if samples.is_empty() {
+        return None;
+    }
+    match points {
+        2 => {
+            // Unknowns (a, b, tx, ty); rows: dx = a x − b y + tx,
+            // dy = b x + a y + ty.
+            let mut ata = vec![vec![0.0; 4]; 4];
+            let mut atb = vec![0.0; 4];
+            for &(x, y, dx, dy) in samples {
+                for (row, rhs) in [([x, -y, 1.0, 0.0], dx), ([y, x, 0.0, 1.0], dy)] {
+                    for i in 0..4 {
+                        for j in 0..4 {
+                            ata[i][j] += row[i] * row[j];
+                        }
+                        atb[i] += row[i] * rhs;
+                    }
+                }
+            }
+            let v = solve(ata, atb)?;
+            Some(GlobalMotion {
+                a: v[0],
+                b: -v[1],
+                c: v[1],
+                d: v[0],
+                tx: v[2],
+                ty: v[3],
+            })
+        }
+        3 => {
+            // Two independent 3-unknown systems over (x, y, 1).
+            let mut ata = vec![vec![0.0; 3]; 3];
+            let mut atx = vec![0.0; 3];
+            let mut aty = vec![0.0; 3];
+            for &(x, y, dx, dy) in samples {
+                let row = [x, y, 1.0];
+                for i in 0..3 {
+                    for j in 0..3 {
+                        ata[i][j] += row[i] * row[j];
+                    }
+                    atx[i] += row[i] * dx;
+                    aty[i] += row[i] * dy;
+                }
+            }
+            let vx = solve(ata.clone(), atx)?;
+            let vy = solve(ata, aty)?;
+            Some(GlobalMotion {
+                a: vx[0],
+                b: vx[1],
+                tx: vx[2],
+                c: vy[0],
+                d: vy[1],
+                ty: vy[2],
+            })
+        }
+        _ => {
+            let n = samples.len() as f64;
+            let (sx, sy) = samples
+                .iter()
+                .fold((0.0, 0.0), |acc, &(_, _, dx, dy)| (acc.0 + dx, acc.1 + dy));
+            Some(GlobalMotion {
+                a: 0.0,
+                b: 0.0,
+                c: 0.0,
+                d: 0.0,
+                tx: sx / n,
+                ty: sy / n,
+            })
+        }
+    }
+}
+
+/// Fit the global motion (one outlier-rejecting refit) and express it
+/// as the §7.8.4 `sprite_trajectory()`: `du[0]/dv[0]` = twice the
+/// displacement of `(0, 0)`, `du[1]/dv[1]` that of `(W, 0)` minus
+/// `du[0]`, `du[2]/dv[2]` that of `(0, H)` minus `du[0]` — all in
+/// half-sample integers (the §7.8.4 reference-point formulas with
+/// `i0 = j0 = 0`). Falls back to the plain translation when the fit is
+/// degenerate.
+fn fit_trajectory(
+    local_mvs: &[(MotionVector, u32)],
+    mb_width: usize,
+    mb_height: usize,
+    units_per_pel: i32,
+    width: u32,
+    height: u32,
+    points: u8,
+) -> SpriteTrajectory {
+    let samples: Vec<(f64, f64, f64, f64)> = local_mvs
+        .iter()
+        .enumerate()
+        .map(|(idx, &(mv, _))| {
+            let (col, row) = (idx % mb_width, idx / mb_width);
+            (
+                (col * 16 + 8) as f64,
+                (row * 16 + 8) as f64,
+                f64::from(mv.x) / f64::from(units_per_pel),
+                f64::from(mv.y) / f64::from(units_per_pel),
+            )
+        })
+        .collect();
+    let _ = mb_height;
+    // Robust fit: the motion field of a block matcher carries alias
+    // vectors (self-similar texture, coarse wide-window lattice hits),
+    // so start from the *mode* of the field — the dominant translation
+    // — keep the macroblocks within a generous band of it, fit the
+    // model there, then tighten to the macroblocks the model explains
+    // within a pel and refit.
+    let mode_mv = dominant_motion(local_mvs);
+    let (mx, my) = (
+        f64::from(mode_mv.x) / f64::from(units_per_pel),
+        f64::from(mode_mv.y) / f64::from(units_per_pel),
+    );
+    let translation = GlobalMotion {
+        a: 0.0,
+        b: 0.0,
+        c: 0.0,
+        d: 0.0,
+        tx: mx,
+        ty: my,
+    };
+    let band: Vec<_> = samples
+        .iter()
+        .copied()
+        .filter(|&(_, _, dx, dy)| (dx - mx).abs() <= 2.5 && (dy - my).abs() <= 2.5)
+        .collect();
+    let min_samples = usize::from(points) + 1;
+    let mut model = translation;
+    if band.len() >= min_samples {
+        if let Some(first) = fit_global_motion(&band, points) {
+            model = first;
+            let inliers: Vec<_> = samples
+                .iter()
+                .copied()
+                .filter(|&(x, y, dx, dy)| {
+                    let (px, py) = first.displacement(x, y);
+                    (px - dx).abs() <= 1.0 && (py - dy).abs() <= 1.0
+                })
+                .collect();
+            if inliers.len() >= min_samples {
+                if let Some(second) = fit_global_motion(&inliers, points) {
+                    model = second;
+                }
+            }
+        }
+    }
+    let half = |v: f64| -> i32 { (2.0 * v).round().clamp(-16000.0, 16000.0) as i32 };
+    let (d0x, d0y) = model.displacement(0.0, 0.0);
+    let du0 = half(d0x);
+    let dv0 = half(d0y);
+    let mut traj = SpriteTrajectory {
+        count: points,
+        points: [[du0, dv0], [0, 0], [0, 0]],
+    };
+    if points >= 2 {
+        let (d1x, d1y) = model.displacement(f64::from(width), 0.0);
+        traj.points[1] = [half(d1x) - du0, half(d1y) - dv0];
+    }
+    if points >= 3 {
+        let (d2x, d2y) = model.displacement(0.0, f64::from(height));
+        traj.points[2] = [half(d2x) - du0, half(d2y) - dv0];
+    }
+    // A warp whose corner displacements differ from the translation by
+    // at most one half-sample is within the motion field's own
+    // resolution — the translation explains it equally; keep the pure
+    // translation (the point count is fixed by the VOL).
+    if traj.points[1..]
+        .iter()
+        .all(|p| p[0].abs() <= 1 && p[1].abs() <= 1)
+    {
+        traj.points[1] = [0, 0];
+        traj.points[2] = [0, 0];
+    }
+    traj
+}
+
+/// Total luminance SAD of the §7.8.7.1 GMC prediction of every
+/// macroblock under `trajectory` — the cost the trajectory refinement
+/// minimises (the decoder's own warp, so what is measured is exactly
+/// the prediction a decoder forms).
+fn total_gmc_sad(
+    trajectory: &SpriteTrajectory,
+    cfg: &EncoderConfig,
+    frame: &FrameView<'_>,
+    planes: &GmcReferencePlanes<'_>,
+) -> u64 {
+    let (mb_width, mb_height) = cfg.mb_dimensions();
+    let geometry = WarpGeometry::decode(
+        trajectory,
+        u32::from(cfg.width),
+        u32::from(cfg.height),
+        SpriteWarpingAccuracy::HalfPel,
+    );
+    let mut total = 0u64;
+    for mb_row in 0..mb_height {
+        for mb_col in 0..mb_width {
+            let src = source_luma_mb(frame, mb_row, mb_col);
+            let pred = gmc_prediction_macroblock(
+                &geometry,
+                planes,
+                (mb_col * 16) as i64,
+                (mb_row * 16) as i64,
+                0,
+                8,
+            );
+            total += u64::from(sad_against(&src, &pred));
+        }
+    }
+    total
+}
+
+/// Refine a fitted multi-point trajectory by coordinate descent on the
+/// decoder's own warp: every active `du[i]` / `dv[i]` is nudged by
+/// ±1 and ±2 half-samples while the total GMC SAD keeps dropping. The
+/// least-squares fit works on a motion field quantised to the MV grid
+/// and can land half a sample off; this closes that gap on the actual
+/// prediction error.
+fn refine_trajectory(
+    mut trajectory: SpriteTrajectory,
+    cfg: &EncoderConfig,
+    frame: &FrameView<'_>,
+    planes: &GmcReferencePlanes<'_>,
+) -> SpriteTrajectory {
+    let count = usize::from(trajectory.count);
+    let mut best = total_gmc_sad(&trajectory, cfg, frame, planes);
+    let bound = (1i32 << 14) - 1;
+    for _pass in 0..8 {
+        let mut improved = false;
+        for point in 0..count {
+            for axis in 0..2 {
+                for step in [-1i32, 1, -2, 2] {
+                    let mut cand = trajectory;
+                    cand.points[point][axis] =
+                        (cand.points[point][axis] + step).clamp(-bound, bound);
+                    let cost = total_gmc_sad(&cand, cfg, frame, planes);
+                    if cost < best {
+                        best = cost;
+                        trajectory = cand;
+                        improved = true;
+                    }
+                }
+            }
+        }
+        if !improved {
+            break;
+        }
+    }
+    trajectory
 }
 
 /// SAD of the source macroblock against an arbitrary prediction.
@@ -221,31 +537,56 @@ pub fn encode_s_vop(
             local_mvs.push(estimate_motion(&src, &luma_ref, mb_x, mb_y, mode, fcode));
         }
     }
-    let global = dominant_motion(&local_mvs);
-    // §7.8.4: du[0]/dv[0] are half-sample units for any s (i0' =
-    // (s/2)·du). Quarter-sample local MVs quantise to the half grid.
-    // The trajectory is kept inside the Table 7-9 range for the VOP's
-    // fcode so the §7.8.7.3 averaged-MV clip can never fire: for a
-    // one-point warp the AMV *is* the translation, and a clipped AMV
-    // would make every neighbour's §7.6.5 median depend on the exact
-    // clip behaviour — the encoder simply never emits that corner.
-    let (low, high) = crate::pvop_encode::mv_range(fcode);
-    let (amv_low, amv_high) = if vol.quarter_sample {
-        // AMV is derived in quarter-sample units (2·du).
-        (low / 2, high / 2)
+    let units_per_pel = if vol.quarter_sample { 4 } else { 2 };
+    let points = cfg.gmc_points.clamp(1, 3);
+    assert_eq!(
+        vol.no_of_sprite_warping_points,
+        Some(points),
+        "VOL and config disagree on no_of_sprite_warping_points"
+    );
+    let trajectory = if points == 1 {
+        let global = dominant_motion(&local_mvs);
+        // §7.8.4: du[0]/dv[0] are half-sample units for any s (i0' =
+        // (s/2)·du). Quarter-sample local MVs quantise to the half grid.
+        // The trajectory is kept inside the Table 7-9 range for the VOP's
+        // fcode so the §7.8.7.3 averaged-MV clip can never fire: for a
+        // one-point warp the AMV *is* the translation, and a clipped AMV
+        // would make every neighbour's §7.6.5 median depend on the exact
+        // clip behaviour — the encoder simply never emits that corner.
+        let (low, high) = crate::pvop_encode::mv_range(fcode);
+        let (amv_low, amv_high) = if vol.quarter_sample {
+            // AMV is derived in quarter-sample units (2·du).
+            (low / 2, high / 2)
+        } else {
+            (low, high)
+        };
+        let (du, dv) = if vol.quarter_sample {
+            (global.x / 2, global.y / 2)
+        } else {
+            (global.x, global.y)
+        };
+        let (du, dv) = (du.clamp(amv_low, amv_high), dv.clamp(amv_low, amv_high));
+        SpriteTrajectory {
+            count: 1,
+            points: [[du, dv], [0, 0], [0, 0]],
+        }
     } else {
-        (low, high)
+        // §7.8.5 similarity (2 points) / affine (3 points): least-squares
+        // fit of the per-macroblock motion field. The per-macroblock
+        // §7.8.7.3 averaged MV now varies across the picture; the
+        // decoder's own derivation (clip included) is mirrored below.
+        let fitted = fit_trajectory(
+            &local_mvs,
+            mb_width,
+            mb_height,
+            units_per_pel,
+            u32::from(cfg.width),
+            u32::from(cfg.height),
+            points,
+        );
+        refine_trajectory(fitted, cfg, frame, &gmc_planes)
     };
-    let (du, dv) = if vol.quarter_sample {
-        (global.x / 2, global.y / 2)
-    } else {
-        (global.x, global.y)
-    };
-    let (du, dv) = (du.clamp(amv_low, amv_high), dv.clamp(amv_low, amv_high));
-    let trajectory = SpriteTrajectory {
-        count: 1,
-        points: [[du, dv], [0, 0], [0, 0]],
-    };
+    let (du, dv) = (trajectory.points[0][0], trajectory.points[0][1]);
     let geometry = WarpGeometry::decode(
         &trajectory,
         u32::from(cfg.width),
@@ -261,8 +602,7 @@ pub fn encode_s_vop(
         time_increment,
         qp,
         fcode,
-        du,
-        dv,
+        &trajectory,
     );
     let mut pw = PacketWriter::new(
         bw,
@@ -285,6 +625,7 @@ pub fn encode_s_vop(
     let mut mv_grid = MvGrid::new(mb_height, mb_width);
     let mut stats = SVopEncodeStats {
         trajectory: (du, dv),
+        points: trajectory,
         ..Default::default()
     };
     let vop_qp = qp;
@@ -324,7 +665,11 @@ pub fn encode_s_vop(
             // Mode decision: GMC saves the motion_vector() body, so it
             // gets a small preference; intra wins on flat-vs-motion
             // activity exactly as in the P walk.
-            let choose_gmc = gmc_sad <= local_sad.saturating_add(64);
+            // The preference grows with the quantiser: the saved
+            // motion_vector() body is worth more distortion at a
+            // coarser step (a plain SAD-per-bit proxy, 8 SAD per
+            // quantiser step on top of the flat 64).
+            let choose_gmc = gmc_sad <= local_sad.saturating_add(64 + 8 * vop_qp);
             let inter_sad = gmc_sad.min(local_sad);
             let choose_intra = activity + 512 < inter_sad;
 
@@ -570,6 +915,70 @@ mod tests {
     use crate::sprite::decode_warping_mv_code;
 
     #[test]
+    fn affine_fit_recovers_exact_models() {
+        // d(x, y) = (0.02 x + 0.01 y + 2, -0.01 x + 0.03 y + 1) sampled
+        // on a 6×4 macroblock grid.
+        let mut samples = Vec::new();
+        for row in 0..4 {
+            for col in 0..6 {
+                let (x, y) = ((col * 16 + 8) as f64, (row * 16 + 8) as f64);
+                samples.push((x, y, 0.02 * x + 0.01 * y + 2.0, -0.01 * x + 0.03 * y + 1.0));
+            }
+        }
+        let m = fit_global_motion(&samples, 3).unwrap();
+        assert!(
+            (m.a - 0.02).abs() < 1e-9 && (m.b - 0.01).abs() < 1e-9,
+            "{m:?}"
+        );
+        assert!(
+            (m.c + 0.01).abs() < 1e-9 && (m.d - 0.03).abs() < 1e-9,
+            "{m:?}"
+        );
+        assert!(
+            (m.tx - 2.0).abs() < 1e-9 && (m.ty - 1.0).abs() < 1e-9,
+            "{m:?}"
+        );
+        // Similarity: d = (a x − b y + tx, b x + a y + ty).
+        let sim: Vec<_> = samples
+            .iter()
+            .map(|&(x, y, _, _)| (x, y, 0.02 * x - 0.03 * y + 2.0, 0.03 * x + 0.02 * y + 1.0))
+            .collect();
+        let m = fit_global_motion(&sim, 2).unwrap();
+        assert!(
+            (m.a - 0.02).abs() < 1e-9 && (m.b + 0.03).abs() < 1e-9,
+            "{m:?}"
+        );
+        assert!(
+            (m.c - 0.03).abs() < 1e-9 && (m.d - 0.02).abs() < 1e-9,
+            "{m:?}"
+        );
+        // Trajectory of the affine model over a 96×64 picture, in
+        // half-samples: (0,0) → (4, 2); (96,0) → (2·(1.92+2), 2·(−0.96+1)).
+        let mvs: Vec<(MotionVector, u32)> = samples
+            .iter()
+            .map(|&(_, _, dx, dy)| {
+                (
+                    MotionVector {
+                        x: (dx * 2.0).round() as i32,
+                        y: (dy * 2.0).round() as i32,
+                    },
+                    0,
+                )
+            })
+            .collect();
+        let t = fit_trajectory(&mvs, 6, 4, 2, 96, 64, 3);
+        assert_eq!(t.points[0], [4, 2], "{t:?}");
+        assert!(
+            (t.points[1][0] - 4).abs() <= 1 && (t.points[1][1] + 2).abs() <= 1,
+            "{t:?}"
+        );
+        assert!(
+            (t.points[2][0] - 1).abs() <= 1 && (t.points[2][1] - 4).abs() <= 1,
+            "{t:?}"
+        );
+    }
+
+    #[test]
     fn warping_mv_codes_round_trip() {
         for v in (-16383..=16383).step_by(7).chain([-16383, -1, 0, 1, 16383]) {
             let mut bw = BitWriter::new();
@@ -600,7 +1009,18 @@ mod tests {
         assert_eq!(vol.no_of_sprite_warping_points, Some(1));
 
         let mut bw = BitWriter::new();
-        write_s_vop_header(&mut bw, 25, 1, 7, 9, 2, -6, 3);
+        write_s_vop_header(
+            &mut bw,
+            25,
+            1,
+            7,
+            9,
+            2,
+            &SpriteTrajectory {
+                count: 1,
+                points: [[-6, 3], [0, 0], [0, 0]],
+            },
+        );
         bw.next_start_code();
         let bytes = bw.into_bytes();
         let mut br = BitReader::new(&bytes);

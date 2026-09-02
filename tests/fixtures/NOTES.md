@@ -298,7 +298,9 @@ The GMC pair (96×64, a background panning by (6, 2) pels per frame):
 ffmpeg -idct faani -i enc_isb_gmc_qpel_96x64.m4v -f rawvideo -pix_fmt yuv420p enc_isb_gmc_qpel_96x64.yuv
 ```
 
-Bit-exact. Two findings from this pair's validation:
+Bit-exact (pair regenerated in round 455 after the GMC-vs-local
+preference became quantiser-scaled — same construction, new
+decisions, still bit-exact). Two findings from this pair's validation:
 
 * **Table B.34 `dmv_length`** — the crate's `warping_mv_code()`
   reader (and the first encoder cut) treated `dmv_length` as a plain
@@ -333,7 +335,9 @@ reference decodes):
   stream whose dominant-motion trajectories go negative and zero
   (fcode 1 against 20-pel-per-frame motion). Ecosystem-compat decode
   is **bit-exact** against all three reference decodes; the
-  spec-literal decode differs exactly where the rule bites.
+  spec-literal decode differs exactly where the rule bites. (Pair
+  regenerated in round 455 after the GMC-vs-local preference became
+  quantiser-scaled — same construction, new decisions, same result.)
 
 ```
 ffmpeg -idct faani -i dec_sgmc_negamv_hp_64x64.m4v -f rawvideo -pix_fmt yuv420p dec_sgmc_negamv_hp_64x64.yuv
@@ -388,6 +392,29 @@ on these pairs, conformance corpus unchanged):
   `mc` routine already did; the quarter-sample field view previously
   clamped within the field.
 
+## Multi-point GMC streams (round 455 — §7.8.4 two / three warping points)
+
+Deterministic builds of `tests/encoder_gmc_affine.rs` over a
+bilinearly-resampled synthetic scene (fixed-point, byte-deterministic),
+reference decodes as above (`ffmpeg -idct faani -i <name>.m4v …`):
+
+* `enc_is_gmc3_zoom_96x64` — I + 3 S(GMC) with
+  `no_of_sprite_warping_points == 3`: a 1/64-per-frame zoom about the
+  origin plus a (2, 1)-pel pan, fitted (mode-seeded robust least
+  squares + coordinate-descent refinement on the decoder's own warp)
+  into the affine trajectory `[[4, 2], [3, 0], [0, 2]]`; every
+  trajectory component and every §7.8.7.3 averaged MV is
+  non-negative. **Bit-exact** — the first black-box confirmation of the
+  §7.8.4 virtual-sprite-point / §7.8.5 three-point affine arithmetic
+  on both sides.
+* `enc_is_gmc2_rot_96x64` — I + 3 S(GMC) with two warping points: a
+  1/32-rad rotation plus a (1, 0)-pel pan → `[[2, 0], [0, 6]]`. The
+  S pictures are bit-exact (the §7.8.5 similarity warp included, with
+  averaged MVs of both signs feeding the §7.6.5 predictors of the local
+  macroblocks); the I picture carries **one** near-tie IDCT sample,
+  which the first S picture copies through its GMC prediction — 2 of
+  36864 samples, ±1.
+
 ## Short-header streams (round 455 — §6.2.5.2 `short_video_header == 1`)
 
 Raw H.263-compatible elementary streams (`.h263`: byte-aligned
@@ -420,6 +447,10 @@ ffmpeg -f lavfi -i "testsrc2=size=176x144:rate=25:duration=0.2" \
 ## SHA-256
 
 ```
+1b3f275670116b291b656d64a6649ebd7bff87a9bb169ac5ea045ce9c5ed1777  enc_is_gmc3_zoom_96x64.m4v
+2f0677e7da0fd2a0b743dc098e6931ebb53dc93c1e49e7e7688adbcd89ab3e1b  enc_is_gmc3_zoom_96x64.yuv
+ef61f2af0ce809fab9332d8fba8419d7751c0ba99f84b7b6bbdc47b28eac6483  enc_is_gmc2_rot_96x64.m4v
+8ee02b80cceda915bd5aa62a577959561f167ff044f4f7f0737e24c940ca8f8c  enc_is_gmc2_rot_96x64.yuv
 d1d2c853300d6c1c13928b47dc1292e8cef810b61d2c94f64b089d0bb516cbea  enc_sh_ippip_176x144.h263
 0966dc1b5fb73a87d6f9ff4c69f434ef6caade843fb658cedd801176da4b0f98  enc_sh_ippip_176x144.yuv
 3860e79a00ab83d886fa7ac9c5873854d5b9a47019abba80dd67c6e4d396e50d  sh_ipp_176x144.h263
@@ -513,14 +544,14 @@ e1e4c9d7fce8198331e805bc6a3743b5839c96b213747e9bd5a84ec438ec894f  enc_ip_qpel_64
 769fc2f8f88c2038b18592649e8aa1bf324a452187533a7b399ee89ea193b1a9  enc_ip_fcode2_96x64.yuv
 7b9ce94a56292b8541b2fabe1927d2ca30f867cd1fb3544f2daeeca4b5791e46  enc_ipb_fcode3_qpel4mv_96x64.m4v
 584711548f66a8f862ce5bee4cc8c5fd48fd78f264c732097956756dbcf73779  enc_ipb_fcode3_qpel4mv_96x64.yuv
-23aacccba29bac9f850ab4729e811dcd531302c3cc61e86c3111add3c3bfce6f  enc_isb_gmc_qpel_96x64.m4v
-f1a65b08166aaab11863c5478cadefc201912db150551c5ed2f88c658900aa28  enc_isb_gmc_qpel_96x64.yuv
+be56a82c48b29ea71da567d70b150a5123cb1b4291a9f331255753938714a07b  enc_isb_gmc_qpel_96x64.m4v
+6a03f7a7fd2a605e5fda34ecf5cba5ad5fe87ad8b41357df2d3b181c1c56b654  enc_isb_gmc_qpel_96x64.yuv
 43ba930a07b45c825b5df81b66331bc1a8cfef066540ef9f22af8cd02a78d844  dec_sgmc_negamv_hp_64x64.m4v
 e560f779d1d598419c80bf30629463fd1e0046834a2d0ac1ecf592ea130c8483  dec_sgmc_negamv_hp_64x64.yuv
 60fd1ec7342131f55276c248c308be9f3c0d4a691d74338c77f9d7f874d31880  dec_sgmc_negamv_qp_64x64.m4v
 69dd677fbcf59914484d3b9f27a67e3f7bbc2c36e45df2c688933de88db31e17  dec_sgmc_negamv_qp_64x64.yuv
-7a8d5a086be97592b96ad1b4f276642df250feec564728637305b78afd44edf2  dec_sgmc_negtraj_96x64.m4v
-fc61e5e5bb934ea9c3894ad9ab6316067307e2aef53f9642ad2a32d3ee6f97c5  dec_sgmc_negtraj_96x64.yuv
+7a65759f1cb5867326230b3977a1c48258a4cc641590262598b7abaa7e3e9a03  dec_sgmc_negtraj_96x64.m4v
+b01b3d5e9211d36a7e8333a6c85bdbe22aa2f9e56811504f2f97f4bd6bfdfcca  dec_sgmc_negtraj_96x64.yuv
 7f200f5e4089ebcc29b8899bc746db11fa5dbd6b0802d5a70998a5bb05ea6a48  enc_ipb_aq4mv_96x48.m4v
 66e3662a5fc4fd1c58068e40ce5b7e722300c6efa02c2f744f308544a454a63a  enc_ipb_aq4mv_96x48.yuv
 81e92c81b778fec93a78607b06fa3000343e58dd137e402227573324cb8b58d3  enc_ipb_vp_fcode2_96x64.m4v

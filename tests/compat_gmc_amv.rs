@@ -76,7 +76,18 @@ fn craft_probe_stream(quarter_sample: bool, du: i32, dv: i32) -> Vec<u8> {
     let mut stream = headers;
     stream.extend_from_slice(&i_unit);
     let mut bw = BitWriter::new();
-    write_s_vop_header(&mut bw, 25, 0, 1, 4, 2, du, dv);
+    write_s_vop_header(
+        &mut bw,
+        25,
+        0,
+        1,
+        4,
+        2,
+        &oxideav_mpeg4video::sprite::SpriteTrajectory {
+            count: 1,
+            points: [[du, dv], [0, 0], [0, 0]],
+        },
+    );
     for i in 0..(w / 16) * (h / 16) {
         if i == 0 {
             bw.write_bit(false); // not_coded = 0

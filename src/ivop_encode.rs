@@ -112,6 +112,12 @@ pub struct EncoderConfig {
     /// are S(GMC)-VOPs. Requires (and selects) the verid-2 VOL and
     /// the ASP profile; incompatible with `data_partitioned`.
     pub gmc: bool,
+    /// `no_of_sprite_warping_points` (1..=3) of a GMC VOL: one point
+    /// codes a pure translation, two a §7.8.5 similarity (rotation +
+    /// isotropic scale + translation), three a full affine warp — the
+    /// encoder fits the model to its per-macroblock motion field.
+    /// Ignored unless `gmc`. Default 1.
+    pub gmc_points: u8,
     /// `interlaced` (§6.3.3): the VOL codes interlaced VOPs — every
     /// VOP header carries `top_field_first` /
     /// `alternate_vertical_scan_flag`, every macroblock the §6.2.6.3
@@ -220,6 +226,7 @@ impl Default for EncoderConfig {
             adaptive_quant: false,
             resilience: crate::packet_encode::ResilienceConfig::default(),
             gmc: false,
+            gmc_points: 1,
             interlaced: false,
             top_field_first: true,
             alternate_scan: false,
@@ -388,7 +395,11 @@ pub fn write_configuration_headers(cfg: &EncoderConfig) -> Vec<u8> {
                 !cfg.resilience.data_partitioned,
                 "GMC S-VOPs use the combined syntax only"
             );
-            bw.write_bits(1, 6); // no_of_sprite_warping_points = 1
+            assert!(
+                (1..=3).contains(&cfg.gmc_points),
+                "GMC needs 1..=3 warping points"
+            );
+            bw.write_bits(u32::from(cfg.gmc_points), 6); // no_of_sprite_warping_points
             bw.write_bits(0b00, 2); // sprite_warping_accuracy = 1/2 pel
             bw.write_bit(false); // sprite_brightness_change = 0 (§6.3.3)
         }

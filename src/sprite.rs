@@ -178,7 +178,7 @@ pub fn decode_warping_mv_code(br: &mut BitReader<'_>) -> Result<i32, SpriteTraje
 ///
 /// `Copy` so it can ride inside the `Copy` [`crate::vop::VopHeader`].
 /// Only `count` entries are valid; the rest are `0`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub struct SpriteTrajectory {
     /// Number of warping points actually decoded (`==

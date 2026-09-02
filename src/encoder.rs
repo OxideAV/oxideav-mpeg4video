@@ -86,6 +86,10 @@ pub struct Mpeg4EncoderOptions {
     /// `mcsel` GMC-vs-local decision). Selects the ASP profile;
     /// incompatible with `data-partitioned`.
     pub gmc: bool,
+    /// `gmc-points` — `no_of_sprite_warping_points` (1..=3): the
+    /// global-motion model the S(GMC)-VOP trajectory carries (1 =
+    /// translation, 2 = similarity, 3 = affine). Default 1.
+    pub gmc_points: u32,
     /// `interlaced` — code an interlaced VOL (§6.3.3): per-macroblock
     /// field DCT (`dct_type`), §7.7.2.1 field-predicted P macroblocks
     /// and §7.7.2.2 field / interlaced-direct B macroblocks, all
@@ -139,6 +143,7 @@ impl Default for Mpeg4EncoderOptions {
             data_partitioned: false,
             rvlc: false,
             gmc: false,
+            gmc_points: 1,
             interlaced: false,
             top_field_first: true,
             alt_scan: false,
@@ -257,6 +262,13 @@ impl oxideav_core::CodecOptionsStruct for Mpeg4EncoderOptions {
                    incompatible with data-partitioned",
         },
         oxideav_core::OptionField {
+            name: "gmc-points",
+            kind: oxideav_core::OptionKind::U32,
+            default: oxideav_core::OptionValue::U32(1),
+            help: "no_of_sprite_warping_points of a gmc stream (1..=3): translation, \
+                   similarity or affine global motion (ISO/IEC 14496-2 §7.8.4)",
+        },
+        oxideav_core::OptionField {
             name: "interlaced",
             kind: oxideav_core::OptionKind::Bool,
             default: oxideav_core::OptionValue::Bool(false),
@@ -349,6 +361,13 @@ impl oxideav_core::CodecOptionsStruct for Mpeg4EncoderOptions {
             "data-partitioned" => self.data_partitioned = value.as_bool()?,
             "rvlc" => self.rvlc = value.as_bool()?,
             "gmc" => self.gmc = value.as_bool()?,
+            "gmc-points" => {
+                let n = value.as_u32()?;
+                if !(1..=3).contains(&n) {
+                    return Err(Error::invalid("gmc-points must be in 1..=3"));
+                }
+                self.gmc_points = n;
+            }
             "interlaced" => self.interlaced = value.as_bool()?,
             "top-field-first" => self.top_field_first = value.as_bool()?,
             "alt-scan" => self.alt_scan = value.as_bool()?,
@@ -529,6 +548,7 @@ impl Mpeg4VideoEncoder {
                 reversible_vlc: options.rvlc,
             },
             gmc: options.gmc,
+            gmc_points: options.gmc_points as u8,
             interlaced: options.interlaced,
             top_field_first: options.top_field_first,
             alternate_scan: options.alt_scan,

@@ -151,13 +151,16 @@ keyframe cadence, **Annex D rate control** (the D.2 VBV rate-buffer
 model simulated on the encoder side with an item-9 admission gate that
 re-encodes an oversized VOP at a coarser quantiser, plus
 bit-budget-regulated per-VOP quantiser adaptation), and the
-**GMC emission** (`svop_encode`: S(GMC)-VOP anchors with one §7.8.4
-warping point at half-pel accuracy — the dominant per-MB motion
-becomes the §6.2.5 `sprite_trajectory()`, clamped into the Table 7-9
-range so the §7.8.7.3 averaged-MV clip never fires; per-MB `mcsel`
-decides GMC vs local prediction, `not_coded` GMC copies included, and
-the averaged MV threads the predictor grid exactly as the decoder's
-`MvDriver` does), the **interlaced tools** (`field_encode` /
+**GMC emission** (`svop_encode`: S(GMC)-VOP anchors with one, two or
+three §7.8.4 warping points at half-pel accuracy — one point carries
+the dominant per-MB translation, clamped into the Table 7-9 range so
+the §7.8.7.3 averaged-MV clip never fires; two / three points carry a
+§7.8.5 similarity / affine model fitted to the motion field
+(mode-seeded robust least squares, then coordinate-descent refinement
+of the `du`/`dv` integers on the decoder's own warp); per-MB `mcsel`
+decides GMC vs local prediction with a quantiser-scaled preference,
+`not_coded` GMC copies included, and the per-MB averaged MV threads
+the predictor grid exactly as the decoder's `MvDriver` does), the **interlaced tools** (`field_encode` /
 `bvop_interlaced_encode`: per-macroblock §7.7.1 `dct_type` elected
 from the same-field vs frame-line vertical correlation of the source
 or residual, with the luminance permuted per Figure 6-12 before the
@@ -197,9 +200,11 @@ decode agreement — the reference decoder's decode of our method-2
 intra, I+P, 4MV, qpel, qpel+4MV, I/P/B, fcode-2 I+P, fcode-3 +
 qpel + 4MV + B, adaptive-quant I/P/B, video-packet I/P/B,
 data-partitioned I+P, data-partitioned + RVLC + packets I/P/B,
-GMC + qpel I/S/B, **interlaced I+P** (field DCT + field prediction)
-and **interlaced I/P/B** (field B modes, compat emission) streams is
-**bit-exact** against our own (seventeen encoder-produced pairs); the
+GMC + qpel I/S/B, **three-point affine GMC** I/S, **interlaced I+P**
+(field DCT + field prediction), **interlaced I/P/B** (field B modes,
+compat emission) and **short-header** I/P streams is **bit-exact**
+against our own (nineteen encoder-produced pairs; the two-point
+similarity-GMC pair is exact up to one intra near-tie sample); the
 spec-literal interlaced I/P/B + qpel stream differs from the reference
 decode *only* inside its §7.7.2.2 interlaced-direct macroblocks, and
 our ecosystem-compat decode of that very stream reproduces the
@@ -212,7 +217,7 @@ the target. The registry entry declares `encode`:
 `encoder::make_encoder` / `Mpeg4VideoEncoder` (options `qp`,
 `mpeg-quant`, `ac-pred`, `four-mv`, `qpel`, `bf`, `bitrate`,
 `vbv-buffer`, `gop-size`, `fcode`, `mb-aq`, `packet-bits`,
-`data-partitioned`, `rvlc`, `gmc`, `interlaced`, `top-field-first`,
+`data-partitioned`, `rvlc`, `gmc`, `gmc-points`, `interlaced`, `top-field-first`,
 `alt-scan`, `ecosystem-compat`, `short-header`, `gob-headers`) is the
 dual-API sibling of `make_decoder`.
 
@@ -469,9 +474,7 @@ both modes' envelopes are pinned).
 
 ## Not yet supported
 
-- Encoder: GMC emission is one
-  warping point (pure translation) — 2-/3-point affine trajectories
-  and the ±2-pel `dbquant`-band rate coupling are encoder headroom;
+- Encoder: the ±2-pel `dbquant`-band rate coupling is encoder headroom;
   interlaced S(GMC)-VOPs (the decoder's S walk is progressive-only,
   so `interlaced` + `gmc` is rejected); rate control adapts per VOP
   (the per-macroblock `dquant` / `dbquant` steps are activity-driven,
