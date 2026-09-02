@@ -94,7 +94,7 @@ pub struct Mpeg4EncoderOptions {
     /// field DCT (`dct_type`), §7.7.2.1 field-predicted P macroblocks
     /// and §7.7.2.2 field / interlaced-direct B macroblocks, all
     /// cost-decided. Selects the ASP profile; incompatible with
-    /// `data-partitioned` and `gmc`.
+    /// `data-partitioned`.
     pub interlaced: bool,
     /// `top-field-first` — the §6.3.5 `top_field_first` flag written
     /// on every VOP of an interlaced VOL. Default true.
@@ -284,8 +284,8 @@ impl oxideav_core::CodecOptionsStruct for Mpeg4EncoderOptions {
             kind: oxideav_core::OptionKind::Bool,
             default: oxideav_core::OptionValue::Bool(false),
             help: "code an interlaced VOL: field DCT, ISO/IEC 14496-2 §7.7.2 field \
-                   motion prediction (P and B); ASP profile; incompatible with \
-                   data-partitioned and gmc",
+                   motion prediction (P, S(GMC) local macroblocks and B); ASP profile; \
+                   incompatible with data-partitioned",
         },
         oxideav_core::OptionField {
             name: "top-field-first",
@@ -490,9 +490,9 @@ impl Mpeg4VideoEncoder {
                 "gmc S-VOPs use the combined syntax (no data-partitioned)",
             ));
         }
-        if options.interlaced && (options.data_partitioned || options.gmc) {
+        if options.interlaced && options.data_partitioned {
             return Err(Error::invalid(
-                "interlaced VOLs use the combined syntax without GMC",
+                "interlaced VOLs use the combined syntax (no data-partitioned)",
             ));
         }
         let width = params
@@ -911,14 +911,12 @@ impl Mpeg4VideoEncoder {
                     break unit;
                 }
             };
-            let (_recon, motion) =
-                crate::svop_encode::reconstruct_own_s_vop_with_motion(&vol, &unit, &mut self.store);
-            self.anchor_motion = Some(
-                motion
-                    .into_iter()
-                    .map(crate::vop_decode::AnchorMbMotion::Frame)
-                    .collect(),
+            let (_recon, motion) = crate::svop_encode::reconstruct_own_s_vop_with_anchor_motion(
+                &vol,
+                &unit,
+                &mut self.store,
             );
+            self.anchor_motion = Some(motion);
             unit
         } else {
             let reference = self

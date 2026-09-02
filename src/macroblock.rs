@@ -666,13 +666,13 @@ pub fn parse_macroblock_header(
                         .map_err(|_| MacroblockParseError::InvalidInterlacedContext)?,
                 ),
                 VopCodingType::P => Some(InterlacedInfoContext::p_vop(mb_type, any_block_coded)),
-                // §6.2.6.3 / line 11715: an S(GMC)-VOP macroblock invokes
-                // `interlaced_information()` only when `mcsel == 0` (local
-                // MC); an `mcsel == 1` GMC macroblock uses frame prediction
-                // and carries no interlaced body. For an inter / inter+q
-                // macroblock the §6.2.6.3 S-disjunct (`derived_mb_type < 2 &&
-                // !mcsel`) governs `field_prediction`; the dedicated
-                // `s_gmc_vop` constructor encodes that. An intra S(GMC)
+                // §6.2.6: the `if (interlaced) interlaced_information()` line
+                // is unconditional. For an inter / inter+q S(GMC) macroblock
+                // the §6.2.6.3 S-disjunct (`derived_mb_type < 2 && !mcsel`)
+                // governs `field_prediction` — an `mcsel == 1` GMC macroblock
+                // is frame-predicted (§7.8.7.2) and carries only the
+                // `cbp != 0`-gated `dct_type`; the dedicated `s_gmc_vop`
+                // constructor encodes both shapes. An intra S(GMC)
                 // macroblock (`mcsel == None`, `derived_mb_type >= 2`) leaves
                 // the field_prediction gate unfired but still takes the
                 // `dct_type` gate, which the PVop context computes identically
@@ -684,8 +684,10 @@ pub fn parse_macroblock_header(
                         } else {
                             McSel::Off
                         };
-                        InterlacedInfoContext::s_gmc_vop(mb_type, mc, any_block_coded)
-                            .map_err(|_| MacroblockParseError::InvalidInterlacedContext)?
+                        Some(
+                            InterlacedInfoContext::s_gmc_vop(mb_type, mc, any_block_coded)
+                                .map_err(|_| MacroblockParseError::InvalidInterlacedContext)?,
+                        )
                     }
                     _ => Some(InterlacedInfoContext::p_vop(mb_type, any_block_coded)),
                 },
@@ -1410,10 +1412,11 @@ mod tests {
     }
 
     #[test]
-    fn s_gmc_interlaced_mcsel_on_suppresses_body() {
-        // §6.2.6.3 / line 11715: an mcsel == 1 S(GMC) macroblock uses
-        // frame prediction; interlaced_information() is NOT invoked, so no
-        // interlaced bits are consumed even when interlaced == 1.
+    fn s_gmc_interlaced_mcsel_on_reads_only_dct_type() {
+        // §6.2.6: `if (interlaced) interlaced_information()` is
+        // unconditional, so an mcsel == 1 (GMC) macroblock still carries
+        // dct_type when cbp != 0 (§6.3.6.3); only the §6.2.6.3
+        // field_prediction gate (`!mcsel`) is off.
         let mut vol = make_gmc_vol();
         vol.interlaced = true;
         let mut w = BitWriter::new();
@@ -1421,14 +1424,18 @@ mod tests {
         w.write_bits(0b1, 1); // mcbpc → mb_type 0 (inter), cbpc 00
         w.write_bits(1, 1); // mcsel = 1 (GMC)
         w.write_bits(0b0011, 4); // cbpy_inter=1111 → cbp != 0
-        w.write_bits(0b1, 1); // sentinel (must NOT be consumed as interlaced)
+        w.write_bits(0b1, 1); // dct_type = 1 → Field
+        w.write_bits(0b0, 1); // sentinel (must NOT be consumed)
         w.align();
         let data = w.buf;
         let mut br = BitReader::new(&data);
         let mb = parse_macroblock_header(&mut br, VopCodingType::S, &vol).unwrap();
         assert_eq!(mb.mcsel, Some(true));
-        // mcsel == 1 ⇒ no interlaced body.
-        assert_eq!(mb.interlaced_info, None);
+        let info = mb.interlaced_info.expect("dct_type gate fires");
+        assert_eq!(info.dct_type, Some(DctType::Field));
+        assert_eq!(info.field_prediction, None);
+        assert!(!info.field_prediction_guard_fired);
+        assert_eq!(br.bit_position(), 8);
     }
 
     #[test]

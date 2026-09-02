@@ -752,6 +752,16 @@ fn motion_of_s_entries(entries: &[SGmcMbContent]) -> Vec<AnchorMbMotion> {
         .iter()
         .map(|e| match e {
             SGmcMbContent::Local { motion, .. } => AnchorMbMotion::Frame(*motion),
+            SGmcMbContent::FieldLocal {
+                mvs,
+                top_field_ref,
+                bottom_field_ref,
+                ..
+            } => AnchorMbMotion::Field {
+                mvs: *mvs,
+                top_ref: *top_field_ref,
+                bottom_ref: *bottom_field_ref,
+            },
             SGmcMbContent::Gmc {
                 amv,
                 not_coded: true,

@@ -122,10 +122,10 @@ pub struct EncoderConfig {
     /// VOP header carries `top_field_first` /
     /// `alternate_vertical_scan_flag`, every macroblock the §6.2.6.3
     /// `interlaced_information()` body (field DCT decided per
-    /// macroblock, §7.7.2.1 field prediction cost-decided per inter
-    /// macroblock). Selects the ASP profile; incompatible with
-    /// `data_partitioned` and `gmc` (the decoder's S(GMC) walk is
-    /// progressive-only).
+    /// macroblock, §7.7.2.1 field prediction cost-decided per inter /
+    /// local-MC macroblock, GMC macroblocks frame-predicted per
+    /// §7.8.7.2). Selects the ASP profile; incompatible with
+    /// `data_partitioned`.
     pub interlaced: bool,
     /// §6.3.5 `top_field_first` written on every VOP of an interlaced
     /// VOL (ignored otherwise).
@@ -387,8 +387,8 @@ pub fn write_configuration_headers(cfg: &EncoderConfig) -> Vec<u8> {
     bw.write_marker();
     if cfg.interlaced {
         assert!(
-            !cfg.resilience.data_partitioned && !cfg.gmc,
-            "interlaced VOLs use the combined syntax without GMC"
+            !cfg.resilience.data_partitioned,
+            "interlaced VOLs use the combined syntax"
         );
     }
     bw.write_bit(cfg.interlaced); // interlaced

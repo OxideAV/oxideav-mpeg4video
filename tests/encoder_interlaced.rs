@@ -18,6 +18,9 @@ use oxideav_mpeg4video::ivop_encode::{
 use oxideav_mpeg4video::pvop_encode::{
     encode_p_vop, reconstruct_own_p_vop_with_anchor_motion, PVopEncodeStats,
 };
+use oxideav_mpeg4video::svop_encode::{
+    encode_s_vop, reconstruct_own_s_vop_with_anchor_motion, SVopEncodeStats,
+};
 use oxideav_mpeg4video::vol::parse_video_object_layer;
 use oxideav_mpeg4video::vop_decode::AnchorMbMotion;
 
@@ -57,6 +60,27 @@ fn picture(w: usize, h: usize, frame_index: usize, top: (i64, i64), bottom: (i64
         for col in 0..cw {
             cb[row * cw + col] = scene(col as i64 + n * shift.0 / 2, row as i64) / 2 + 60;
             cr[row * cw + col] = 128 + ((col as i64 + n) % 7) as u8 * 3;
+        }
+    }
+    (y, cb, cr)
+}
+
+/// [`picture`] with the bottom-field velocity applied only to the
+/// right half of the picture: the left half is frame-coherent (a
+/// global pan the GMC trajectory captures), the right half has the
+/// interlaced signature (field-predicted local macroblocks win).
+fn picture_split(
+    w: usize,
+    h: usize,
+    frame_index: usize,
+    top: (i64, i64),
+    bottom: (i64, i64),
+) -> Planes {
+    let (mut y, cb, cr) = picture(w, h, frame_index, top, top);
+    let (y_right, _, _) = picture(w, h, frame_index, top, bottom);
+    for row in 0..h {
+        for col in w / 2..w {
+            y[row * w + col] = y_right[row * w + col];
         }
     }
     (y, cb, cr)
@@ -465,20 +489,18 @@ fn registry_interlaced_options() {
     assert_eq!(frames.len(), 6);
     assert!(dec.vol().unwrap().interlaced);
 
-    for bad in [("gmc", "true"), ("data-partitioned", "true")] {
-        let mut params =
-            oxideav_core::CodecParameters::video(oxideav_core::CodecId::new("mpeg4video"));
-        params.width = Some(32);
-        params.height = Some(32);
-        params.options = oxideav_core::CodecOptions::default()
-            .set("interlaced", "true")
-            .set(bad.0, bad.1);
-        assert!(
-            oxideav_mpeg4video::encoder::Mpeg4VideoEncoder::from_params(&params).is_err(),
-            "interlaced + {} must be rejected",
-            bad.0
-        );
-    }
+    // interlaced + data-partitioned is rejected (the decoder has no
+    // interlaced data-partitioned walk).
+    let mut params = oxideav_core::CodecParameters::video(oxideav_core::CodecId::new("mpeg4video"));
+    params.width = Some(32);
+    params.height = Some(32);
+    params.options = oxideav_core::CodecOptions::default()
+        .set("interlaced", "true")
+        .set("data-partitioned", "true");
+    assert!(
+        oxideav_mpeg4video::encoder::Mpeg4VideoEncoder::from_params(&params).is_err(),
+        "interlaced + data-partitioned must be rejected"
+    );
 }
 
 /// Black-box pin: the interlaced I+P stream is byte-deterministic and
@@ -617,5 +639,210 @@ fn blackbox_interlaced_ipbb_spec_stream_diverges_only_in_interlaced_direct() {
     assert!(
         divergent_mbs > 0,
         "the stream carries divergent direct macroblocks"
+    );
+}
+
+/// Encode I S B B S with an interlaced GMC VOL: S(GMC) anchors whose
+/// local macroblocks may be §7.7.2.1 field-predicted, GMC macroblocks
+/// frame-predicted per §7.8.7.2 (field DCT on any residual), and
+/// interlaced B-VOPs over the S anchors' field motion.
+fn encode_isbb(
+    cfg: &EncoderConfig,
+    motion: ((i64, i64), (i64, i64)),
+    qp: u32,
+    ecosystem_compat: bool,
+) -> (
+    Vec<u8>,
+    Vec<DecodedFrame>,
+    Vec<SVopEncodeStats>,
+    Vec<BVopInterlacedEncodeStats>,
+) {
+    let (w, h) = (usize::from(cfg.width), usize::from(cfg.height));
+    let (headers, vol) = vol_of(cfg);
+    assert!(
+        vol.interlaced
+            && matches!(
+                vol.sprite_enable,
+                oxideav_mpeg4video::vol::SpriteEnable::Gmc
+            )
+    );
+    let mut stream = headers;
+    let mut recons: Vec<Option<DecodedFrame>> = vec![None; 7];
+    let mut s_stats = Vec::new();
+    let mut b_stats = Vec::new();
+    let mut store = FrameStore::new();
+    let view_of = |k: usize| picture_split(w, h, k, motion.0, motion.1);
+    let (y, cb, cr) = view_of(0);
+    let (unit, recon) = encode_i_vop(
+        &vol,
+        cfg,
+        &FrameView {
+            y: &y,
+            cb: &cb,
+            cr: &cr,
+            width: w,
+            height: h,
+        },
+        0,
+        0,
+        qp,
+    );
+    stream.extend_from_slice(&unit);
+    store.push_anchor(recon.clone());
+    recons[0] = Some(recon);
+    for (anchor, bs) in [(3usize, [1usize, 2usize]), (6, [4, 5])] {
+        let (y, cb, cr) = view_of(anchor);
+        let reference = store.backward().unwrap().clone();
+        let (unit, st) = encode_s_vop(
+            &vol,
+            cfg,
+            &FrameView {
+                y: &y,
+                cb: &cb,
+                cr: &cr,
+                width: w,
+                height: h,
+            },
+            &reference,
+            0,
+            anchor as u16,
+            qp,
+        );
+        let (recon, anchor_motion): (DecodedFrame, Vec<AnchorMbMotion>) =
+            reconstruct_own_s_vop_with_anchor_motion(&vol, &unit, &mut store);
+        stream.extend_from_slice(&unit);
+        recons[anchor] = Some(recon);
+        s_stats.push(st);
+        for b in bs {
+            let (y, cb, cr) = view_of(b);
+            let (unit, recon, st) = encode_b_vop_interlaced(
+                &vol,
+                cfg,
+                &FrameView {
+                    y: &y,
+                    cb: &cb,
+                    cr: &cr,
+                    width: w,
+                    height: h,
+                },
+                &store,
+                Some(&anchor_motion),
+                (b - (anchor - 3)) as i32,
+                3,
+                0,
+                b as u16,
+                qp,
+                ecosystem_compat,
+            );
+            stream.extend_from_slice(&unit);
+            recons[b] = Some(recon);
+            b_stats.push(st);
+        }
+    }
+    let recons: Vec<DecodedFrame> = recons.into_iter().map(|r| r.unwrap()).collect();
+    (stream, recons, s_stats, b_stats)
+}
+
+/// Interlaced S(GMC)-VOPs: the pan the trajectory carries predicts the
+/// field that moves with it (GMC macroblocks), the other field's
+/// macroblocks go field-predicted local (§7.7.2.1 over the GMC
+/// neighbours' averaged-MV candidates), field DCT fires, and the
+/// interlaced B-VOPs over the S anchors decode sample-exact.
+#[test]
+fn interlaced_gmc_isbb_round_trips() {
+    let cfg = EncoderConfig {
+        width: 96,
+        height: 64,
+        interlaced: true,
+        gmc: true,
+        b_vops: true,
+        fcode: 2,
+        ..EncoderConfig::default()
+    };
+    let (stream, recons, s_stats, b_stats) = encode_isbb(&cfg, ((2, 0), (2, 2)), 5, false);
+    let gmc: usize = s_stats.iter().map(|s| s.gmc + s.gmc_skipped).sum();
+    let field: usize = s_stats.iter().map(|s| s.field).sum();
+    let field_dct: usize = s_stats.iter().map(|s| s.field_dct).sum();
+    assert!(gmc > 0, "no GMC macroblock: {s_stats:?}");
+    assert!(
+        field > 0,
+        "no field-predicted local macroblock: {s_stats:?}"
+    );
+    assert!(field_dct > 0, "no field DCT: {s_stats:?}");
+    assert!(
+        b_stats
+            .iter()
+            .map(|s| s.field_forward + s.field_backward + s.field_bidirectional)
+            .sum::<usize>()
+            > 0,
+        "{b_stats:?}"
+    );
+    assert_exact(&decode_all(&stream), &recons);
+}
+
+/// Black-box pin: interlaced GMC I/S/B/B/S/B/B through the registry
+/// (`interlaced` + `gmc` + `bf 2` + `ecosystem-compat`), reference
+/// decode bit-exact.
+#[test]
+fn blackbox_interlaced_gmc_isbb_compat_stream_is_bit_exact() {
+    use oxideav_core::Encoder as _;
+    let (w, h) = (96usize, 64usize);
+    let mut params = oxideav_core::CodecParameters::video(oxideav_core::CodecId::new("mpeg4video"));
+    params.width = Some(w as u32);
+    params.height = Some(h as u32);
+    params.pixel_format = Some(oxideav_core::PixelFormat::Yuv420P);
+    params.options = oxideav_core::CodecOptions::default()
+        .set("interlaced", "true")
+        .set("gmc", "true")
+        .set("fcode", "2")
+        .set("bf", "2")
+        .set("ecosystem-compat", "true")
+        .set("qp", "5");
+    let mut enc = oxideav_mpeg4video::encoder::Mpeg4VideoEncoder::from_params(&params).unwrap();
+    for k in 0..7usize {
+        let (y, cb, cr) = picture_split(w, h, k, (2, 0), (2, 2));
+        let frame = oxideav_core::Frame::Video(oxideav_core::VideoFrame {
+            pts: None,
+            planes: vec![
+                oxideav_core::VideoPlane { stride: w, data: y },
+                oxideav_core::VideoPlane {
+                    stride: w / 2,
+                    data: cb,
+                },
+                oxideav_core::VideoPlane {
+                    stride: w / 2,
+                    data: cr,
+                },
+            ],
+        });
+        enc.send_frame(&frame).unwrap();
+    }
+    enc.flush().unwrap();
+    let mut stream = Vec::new();
+    loop {
+        match enc.receive_packet() {
+            Ok(p) => stream.extend_from_slice(&p.data),
+            Err(oxideav_core::Error::Eof) => break,
+            Err(e) => panic!("{e}"),
+        }
+    }
+    // The stream carries S-VOPs (coding type 0b11 after each VOP start
+    // code).
+    let s_vops = stream
+        .windows(5)
+        .filter(|win| win[..4] == [0, 0, 1, 0xB6] && win[4] >> 6 == 0b11)
+        .count();
+    assert!(s_vops >= 2, "expected S-VOPs in the stream");
+    pin_fixture("enc_isb_ilaced_gmc_compat_96x64.m4v", &stream);
+    if std::env::var_os("OXIDEAV_MPEG4VIDEO_WRITE_FIXTURES").is_some() {
+        return;
+    }
+    let frames = decode_all(&stream);
+    let yuv = std::fs::read(fixture_path("enc_isb_ilaced_gmc_compat_96x64.yuv")).unwrap();
+    let (differing, max, total) = diff_against_yuv(&frames, &yuv, w, h);
+    assert_eq!(
+        (differing, max),
+        (0, 0),
+        "interlaced GMC I/S/B: {differing}/{total} samples differ (max {max})"
     );
 }

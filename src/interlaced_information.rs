@@ -311,10 +311,17 @@ pub enum InterlacedInfoContext {
         /// `cbp` per §6.3.5; collapsed as in `PVop`.
         any_block_coded: bool,
     },
-    /// S(GMC)-VOP macroblock with `mcsel == 0`. The
-    /// `mcsel == 1` case is structurally absent — the `mcsel == 1`
-    /// branch goes to §7.8.5 sprite warping, which does not invoke
-    /// `interlaced_information()`.
+    /// S(GMC)-VOP macroblock with `mcsel == 1` (GMC-predicted): the
+    /// §6.2.6 `if (interlaced) interlaced_information()` line is
+    /// unconditional, so the body is still invoked — only the
+    /// `field_prediction` gate (§6.2.6.3 `!mcsel`) is off; `dct_type`
+    /// keeps its `cbp != 0` gate (§6.3.6.3: "present ... if the
+    /// macroblock is coded ... or intra-coded").
+    SGmcVopGmc {
+        /// `cbp != 0` — collapsed as in `PVop`.
+        any_block_coded: bool,
+    },
+    /// S(GMC)-VOP macroblock with `mcsel == 0` (local MC).
     SGmcVop {
         /// `derived_mb_type`. Only `< 2` triggers the §6.2.6.3
         /// second gate's S-VOP disjunct — the constructor refuses
@@ -387,28 +394,26 @@ impl InterlacedInfoContext {
         }
     }
 
-    /// Construct the S(GMC)-VOP context. Refuses `derived_mb_type >= 2`
-    /// (the §6.2.6.3 S-disjunct's `derived_mb_type < 2` clause) and
-    /// refuses `mcsel == 1` (the same clause's `!mcsel` requirement);
-    /// the `mcsel` discrimination is at the type level via [`McSel`].
+    /// Construct the S(GMC)-VOP context for an inter / inter+q
+    /// macroblock. Refuses `derived_mb_type >= 2` (the §6.2.6.3
+    /// S-disjunct's `derived_mb_type < 2` clause). With `mcsel == 1`
+    /// the body still runs (§6.2.6's `if (interlaced)` line is
+    /// unconditional) but only its `dct_type` gate can fire
+    /// ([`InterlacedInfoContext::SGmcVopGmc`]); the `mcsel`
+    /// discrimination is at the type level via [`McSel`].
     pub fn s_gmc_vop(
         mb_type: DerivedMbType,
         mcsel: McSel,
         any_block_coded: bool,
-    ) -> Result<Option<Self>, InterlacedInfoContextError> {
-        if let McSel::On = mcsel {
-            // The mcsel == 1 macroblock does not invoke
-            // interlaced_information() — callers should skip the
-            // body entirely. Return None so the absence is explicit.
-            return Ok(None);
-        }
+    ) -> Result<Self, InterlacedInfoContextError> {
         match mb_type {
-            DerivedMbType::Inter | DerivedMbType::InterQ => {
-                Ok(Some(InterlacedInfoContext::SGmcVop {
+            DerivedMbType::Inter | DerivedMbType::InterQ => Ok(match mcsel {
+                McSel::On => InterlacedInfoContext::SGmcVopGmc { any_block_coded },
+                McSel::Off => InterlacedInfoContext::SGmcVop {
                     mb_type,
                     any_block_coded,
-                }))
-            }
+                },
+            }),
             _ => Err(InterlacedInfoContextError::SGmcVopWithHighMbType(mb_type)),
         }
     }
@@ -431,6 +436,8 @@ pub fn dct_type_present(ctx: &InterlacedInfoContext) -> bool {
             mb_type,
             any_block_coded,
         } => mb_type.is_intra() || any_block_coded,
+        // A GMC-predicted macroblock is never intra: only `cbp != 0`.
+        InterlacedInfoContext::SGmcVopGmc { any_block_coded } => any_block_coded,
         // B-VOP macroblocks are never intra-coded (Table B.4 / B.5
         // only carry the inter rows). The first clause therefore
         // only fires when any 8x8 block is coded (cbp != 0).
@@ -450,6 +457,8 @@ pub fn dct_type_present(ctx: &InterlacedInfoContext) -> bool {
 pub fn field_prediction_present(ctx: &InterlacedInfoContext) -> bool {
     match *ctx {
         InterlacedInfoContext::IVop { .. } => false,
+        // §6.2.6.3 `!mcsel`: a GMC macroblock is frame-predicted.
+        InterlacedInfoContext::SGmcVopGmc { .. } => false,
         InterlacedInfoContext::PVop { mb_type, .. } => {
             matches!(mb_type, DerivedMbType::Inter | DerivedMbType::InterQ)
         }
@@ -469,7 +478,7 @@ pub fn field_prediction_present(ctx: &InterlacedInfoContext) -> bool {
 ///   backward-only row).
 fn forward_reference_pair_present(ctx: &InterlacedInfoContext) -> bool {
     match *ctx {
-        InterlacedInfoContext::IVop { .. } => false,
+        InterlacedInfoContext::IVop { .. } | InterlacedInfoContext::SGmcVopGmc { .. } => false,
         InterlacedInfoContext::PVop { .. } | InterlacedInfoContext::SGmcVop { .. } => true,
         InterlacedInfoContext::BVop { mb_type, .. } => !matches!(mb_type, BVopMbType::Backward),
     }
@@ -666,11 +675,17 @@ mod tests {
     }
 
     #[test]
-    fn s_gmc_vop_mcsel_on_suppresses_body() {
-        // mcsel == 1 → the §6.2.6.3 S-disjunct is gated off; the
-        // constructor surfaces None so the caller skips the body.
-        let res = InterlacedInfoContext::s_gmc_vop(DerivedMbType::Inter, McSel::On, false).unwrap();
-        assert!(res.is_none());
+    fn s_gmc_vop_mcsel_on_keeps_only_the_dct_type_gate() {
+        // mcsel == 1 → the §6.2.6.3 S-disjunct is gated off (no
+        // field_prediction), but dct_type still follows cbp != 0.
+        let uncoded =
+            InterlacedInfoContext::s_gmc_vop(DerivedMbType::Inter, McSel::On, false).unwrap();
+        assert!(!dct_type_present(&uncoded));
+        assert!(!field_prediction_present(&uncoded));
+        let coded =
+            InterlacedInfoContext::s_gmc_vop(DerivedMbType::InterQ, McSel::On, true).unwrap();
+        assert!(dct_type_present(&coded));
+        assert!(!field_prediction_present(&coded));
     }
 
     #[test]
@@ -691,9 +706,7 @@ mod tests {
     #[test]
     fn s_gmc_vop_low_mb_type_field_prediction_fires() {
         for mb in [DerivedMbType::Inter, DerivedMbType::InterQ] {
-            let ctx = InterlacedInfoContext::s_gmc_vop(mb, McSel::Off, false)
-                .unwrap()
-                .expect("mcsel off should yield a context");
+            let ctx = InterlacedInfoContext::s_gmc_vop(mb, McSel::Off, false).unwrap();
             assert!(field_prediction_present(&ctx));
         }
     }
@@ -912,9 +925,7 @@ mod tests {
         // Bits: dct=0, fp=1, ftop=1, fbot=1. 4 bits.
         let bytes = br_from_bits(&[0, 1, 1, 1]);
         let mut br = BitReader::new(&bytes);
-        let ctx = InterlacedInfoContext::s_gmc_vop(DerivedMbType::Inter, McSel::Off, true)
-            .unwrap()
-            .expect("mcsel off");
+        let ctx = InterlacedInfoContext::s_gmc_vop(DerivedMbType::Inter, McSel::Off, true).unwrap();
         let info = parse_interlaced_information(&mut br, &ctx).unwrap();
         assert_eq!(info.dct_type, Some(DctType::Frame));
         let fp = info.field_prediction.unwrap();
@@ -988,18 +999,10 @@ mod tests {
             InterlacedInfoContext::b_vop(BVopMbType::Backward, true),
             InterlacedInfoContext::b_vop(BVopMbType::Interpolated, false),
             InterlacedInfoContext::b_vop(BVopMbType::Interpolated, true),
-            InterlacedInfoContext::s_gmc_vop(DerivedMbType::Inter, McSel::Off, false)
-                .unwrap()
-                .unwrap(),
-            InterlacedInfoContext::s_gmc_vop(DerivedMbType::Inter, McSel::Off, true)
-                .unwrap()
-                .unwrap(),
-            InterlacedInfoContext::s_gmc_vop(DerivedMbType::InterQ, McSel::Off, false)
-                .unwrap()
-                .unwrap(),
-            InterlacedInfoContext::s_gmc_vop(DerivedMbType::InterQ, McSel::Off, true)
-                .unwrap()
-                .unwrap(),
+            InterlacedInfoContext::s_gmc_vop(DerivedMbType::Inter, McSel::Off, false).unwrap(),
+            InterlacedInfoContext::s_gmc_vop(DerivedMbType::Inter, McSel::Off, true).unwrap(),
+            InterlacedInfoContext::s_gmc_vop(DerivedMbType::InterQ, McSel::Off, false).unwrap(),
+            InterlacedInfoContext::s_gmc_vop(DerivedMbType::InterQ, McSel::Off, true).unwrap(),
         ];
         // A worst-case payload of 6 set bits covers every combination
         // (dct + fp + fwd_top + fwd_bot + bwd_top + bwd_bot).
@@ -1016,12 +1019,22 @@ mod tests {
     }
 
     #[test]
-    fn s_gmc_vop_mcsel_on_constructor_yields_none() {
-        // mcsel == 1 → §6.2.6.3 S-disjunct gated off, the
-        // constructor surfaces None and the caller skips the body
-        // entirely. No bits consumed.
-        let res = InterlacedInfoContext::s_gmc_vop(DerivedMbType::Inter, McSel::On, true).unwrap();
-        assert!(res.is_none());
+    fn s_gmc_vop_mcsel_on_parses_exactly_the_dct_type_bit() {
+        // mcsel == 1, cbp != 0: one dct_type bit, nothing else.
+        let ctx = InterlacedInfoContext::s_gmc_vop(DerivedMbType::Inter, McSel::On, true).unwrap();
+        let bytes = br_from_bits(&[1, 1, 1]);
+        let mut br = BitReader::new(&bytes);
+        let info = parse_interlaced_information(&mut br, &ctx).unwrap();
+        assert_eq!(info.dct_type, Some(DctType::Field));
+        assert!(info.field_prediction.is_none());
+        assert!(!info.field_prediction_guard_fired);
+        assert_eq!(br.bit_position(), 1);
+        // mcsel == 1, cbp == 0: no bits at all.
+        let ctx = InterlacedInfoContext::s_gmc_vop(DerivedMbType::Inter, McSel::On, false).unwrap();
+        let mut br = BitReader::new(&bytes);
+        let info = parse_interlaced_information(&mut br, &ctx).unwrap();
+        assert!(info.dct_type.is_none());
+        assert_eq!(br.bit_position(), 0);
     }
 
     #[test]

@@ -1569,7 +1569,6 @@ pub fn decode_s_gmc_vop_macroblocks(
 ) -> Result<(Vec<SGmcMbContent>, WarpGeometry), VopDecodeError> {
     check_vol_supported(vol)?;
     check_combined_syntax(vol)?;
-    check_progressive(vol)?;
     if !matches!(vop.coding_type, VopCodingType::S) {
         return Err(VopDecodeError::Unsupported("not an S-VOP"));
     }
@@ -1683,16 +1682,41 @@ pub fn decode_s_gmc_vop_macroblocks(
                     opts.ecosystem_compat,
                 )?;
                 driver.record_gmc_macroblock(mb_row, mb_col, amv)?;
-                let residual = decode_inter_macroblock(br, &header, ctx, &inter_matrix)?;
+                let mut residual = decode_inter_macroblock(br, &header, ctx, &inter_matrix)?;
+                // §7.8.7.2: a GMC macroblock of an interlaced VOL is
+                // frame-predicted, but its residual may still be
+                // field-DCT coded (§7.7.1).
+                if header_field_dct(&header) {
+                    residual.luma = inverse_field_dct_luma(&residual.luma);
+                }
                 out.push(SGmcMbContent::Gmc {
                     amv,
                     not_coded: false,
                     residual,
                 });
+            } else if let Some((top_ref, bottom_ref)) = header_forward_field_refs(&header) {
+                // §7.7.2.1 field-predicted local macroblock (mcsel == 0
+                // in an interlaced VOL): two field MV bodies against the
+                // shared CASE 1/2/3 predictor, the GMC neighbours'
+                // averaged MVs counting as frame candidates.
+                let mvs = driver.decode_field_macroblock(br, mb_row, mb_col)?;
+                let mut residual = decode_inter_macroblock(br, &header, ctx, &inter_matrix)?;
+                if header_field_dct(&header) {
+                    residual.luma = inverse_field_dct_luma(&residual.luma);
+                }
+                out.push(SGmcMbContent::FieldLocal {
+                    mvs,
+                    top_field_ref: top_ref,
+                    bottom_field_ref: bottom_ref,
+                    residual,
+                });
             } else {
                 // mcsel == 0 (or inter4v): the plain P-VOP local path.
                 let motion = driver.decode_macroblock(br, mb_row, mb_col, false, header.mb_type)?;
-                let residual = decode_inter_macroblock(br, &header, ctx, &inter_matrix)?;
+                let mut residual = decode_inter_macroblock(br, &header, ctx, &inter_matrix)?;
+                if header_field_dct(&header) {
+                    residual.luma = inverse_field_dct_luma(&residual.luma);
+                }
                 out.push(SGmcMbContent::Local { motion, residual });
             }
         }

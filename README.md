@@ -178,8 +178,12 @@ to the Table 7-9 range; §7.7.2.2 **interlaced B modes** — field
 forward / backward / bidirectional through the Table 7-14 four-PMV
 bank shared with the frame modes, and **interlaced direct** over a
 field-predicted co-located anchor with its Table 7-16 δ-corrected
-field-period scaling and an `MVD[0]` search; §6.2.6.3
-`interlaced_information()` emitted between `dquant` / `dbquant` and
+field-period scaling and an `MVD[0]` search; **interlaced
+S(GMC)-VOPs** — GMC macroblocks frame-predicted per §7.8.7.2 with
+field DCT on their residuals, local macroblocks field-predicted
+against the GMC neighbours' averaged-MV candidates, both ways;
+§6.2.6.3 `interlaced_information()` emitted between `dquant` /
+`dbquant` and
 the motion bodies with the exact decoder gates; an `ecosystem-compat`
 emission that never codes direct mode over a field-predicted
 co-located macroblock, keeping the stream inside the subset the
@@ -209,10 +213,10 @@ qpel + 4MV + B, adaptive-quant I/P/B, video-packet I/P/B,
 data-partitioned I+P, data-partitioned + RVLC + packets I/P/B,
 GMC + qpel I/S/B, **three-point affine GMC** I/S, **interlaced I+P**
 (field DCT + field prediction), **interlaced I/P/B** (field B modes,
-compat emission), **short-header** I/P and **AC-VLC intra DC + S-VOP
-packet HEC** I/S/B streams is **bit-exact** against our own (twenty
-encoder-produced pairs; the two-point similarity-GMC pair is exact up
-to one intra near-tie sample); the
+compat emission), **interlaced GMC** I/S/B, **short-header** I/P and
+**AC-VLC intra DC + S-VOP packet HEC** I/S/B streams is **bit-exact**
+against our own (twenty-one encoder-produced pairs; the two-point
+similarity-GMC pair is exact up to one intra near-tie sample); the
 spec-literal interlaced I/P/B + qpel stream differs from the reference
 decode *only* inside its §7.7.2.2 interlaced-direct macroblocks, and
 our ecosystem-compat decode of that very stream reproduces the
@@ -484,8 +488,7 @@ both modes' envelopes are pinned).
 ## Not yet supported
 
 - Encoder: the ±2-pel `dbquant`-band rate coupling is encoder headroom;
-  interlaced S(GMC)-VOPs (the decoder's S walk is progressive-only,
-  so `interlaced` + `gmc` is rejected); rate control adapts per VOP
+  rate control adapts per VOP
   (the per-macroblock `dquant` / `dbquant` steps are activity-driven,
   not budget-driven); the `intra_dc_vlc_thr` election measures the two
   Table 6-25 extremes only (the mid-table thresholds are available as

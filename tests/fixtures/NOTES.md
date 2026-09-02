@@ -396,6 +396,24 @@ on these pairs, conformance corpus unchanged):
   `mc` routine already did; the quarter-sample field view previously
   clamped within the field.
 
+## Interlaced S(GMC) stream (round 455)
+
+* `enc_isb_ilaced_gmc_compat_96x64` — registry build (`interlaced`,
+  `gmc`, `fcode 2`, `bf 2`, `ecosystem-compat`, qp 5; deterministic
+  from `tests/encoder_interlaced.rs`) over a split scene: the left half
+  pans coherently (GMC macroblocks, frame-predicted per §7.8.7.2, field
+  DCT on their residuals), the right half has independent field
+  velocities (§7.7.2.1 field-predicted `mcsel == 0` macroblocks against
+  the GMC neighbours' averaged-MV candidates); interlaced B-VOPs over
+  the S anchors' field motion (compat emission — no interlaced direct).
+  The reference decode is **bit-exact**, log clean — the reference
+  decoder also reads `dct_type` on a coded `mcsel == 1` macroblock, the
+  §6.3.6.3 reading this crate's parser now follows.
+
+```
+ffmpeg -idct faani -i enc_isb_ilaced_gmc_compat_96x64.m4v -f rawvideo -pix_fmt yuv420p enc_isb_ilaced_gmc_compat_96x64.yuv
+```
+
 ## Multi-point GMC streams (round 455 — §7.8.4 two / three warping points)
 
 Deterministic builds of `tests/encoder_gmc_affine.rs` over a
@@ -469,6 +487,8 @@ ffmpeg -f lavfi -i "testsrc2=size=176x144:rate=25:duration=0.2" \
 ## SHA-256
 
 ```
+3a5d76db248dd883f83483583021b81b232a874cefd7291f193cf5960bf76eb2  enc_isb_ilaced_gmc_compat_96x64.m4v
+d53ad223d6821207ddfb50d4dcce23153f93b4c640158cf1a74e2f1f28fa1674  enc_isb_ilaced_gmc_compat_96x64.yuv
 c0b9105c0f423dc536f4808600836c4aad64bbcafcf65691da41b826ead2eee1  enc_isb_dcvlc7_hec_96x64.m4v
 e5174ea5ec489b9dae7fd9043294bf06585dbd0763b6bc9d0cdc1d9c2f3aa10b  enc_isb_dcvlc7_hec_96x64.yuv
 1b3f275670116b291b656d64a6649ebd7bff87a9bb169ac5ea045ce9c5ed1777  enc_is_gmc3_zoom_96x64.m4v

@@ -691,6 +691,18 @@ pub enum SGmcMbContent {
         /// §7.4 inter residual.
         residual: InterMacroblock,
     },
+    /// `mcsel == 0` with §7.7.2.1 field prediction (interlaced VOL):
+    /// the P-VOP [`PVopMbContent::FieldInter`] shape.
+    FieldLocal {
+        /// The reconstructed top/bottom field motion vectors.
+        mvs: crate::field_motion::FieldMotionVectors,
+        /// `forward_top_field_reference` raw bit.
+        top_field_ref: bool,
+        /// `forward_bottom_field_reference` raw bit.
+        bottom_field_ref: bool,
+        /// §7.4 inter residual.
+        residual: InterMacroblock,
+    },
     /// An intra macroblock already reconstructed to pixels.
     Intra(ReconstructedMacroblock),
 }
@@ -776,6 +788,43 @@ pub fn assemble_s_gmc_vop_frame(
                     sample_mode,
                 )
                 .ok_or(FrameDecodeError::InterPredictionFailed { mb_col, mb_row })?;
+                reconstruct_inter_macroblock(&prediction, residual, bits_per_pixel)
+            }
+            SGmcMbContent::FieldLocal {
+                mvs,
+                top_field_ref,
+                bottom_field_ref,
+                residual,
+            } => {
+                let prediction = match sample_mode {
+                    BVopSampleMode::HalfPel => {
+                        crate::field_motion::field_motion_compensate_one_reference(
+                            &gmc_planes.luma,
+                            &gmc_planes.cb,
+                            &gmc_planes.cr,
+                            *mvs,
+                            *top_field_ref,
+                            *bottom_field_ref,
+                            mb_x,
+                            mb_y,
+                            vop_rounding_type,
+                        )
+                    }
+                    BVopSampleMode::QuarterPel { bits_per_pixel } => {
+                        crate::field_motion::field_motion_compensate_one_reference_qpel(
+                            &gmc_planes.luma,
+                            &gmc_planes.cb,
+                            &gmc_planes.cr,
+                            *mvs,
+                            *top_field_ref,
+                            *bottom_field_ref,
+                            mb_x,
+                            mb_y,
+                            vop_rounding_type,
+                            bits_per_pixel,
+                        )
+                    }
+                };
                 reconstruct_inter_macroblock(&prediction, residual, bits_per_pixel)
             }
         };

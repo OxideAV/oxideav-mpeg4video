@@ -57,8 +57,23 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   and behind a fixed VOS/VOL prefix) — plus the `Fuzz` workflow shim
   over the org reusable fuzz job.
 
+- Interlaced S(GMC)-VOPs both ways: the decoder's S walk accepts
+  interlaced VOLs (field-predicted `mcsel == 0` macroblocks, field DCT
+  on any coded residual, `SGmcMbContent::FieldLocal`), the encoder's
+  `interlaced` + `gmc` combination is accepted (field-local candidates
+  against the GMC neighbours' averaged MVs, `dct_type` election on GMC
+  residuals), and interlaced B-VOPs consume the S anchors' field
+  motion. New black-box pair `enc_isb_ilaced_gmc_compat_96x64`,
+  bit-exact.
+
 ### Fixed
 
+- Decoder: an `mcsel == 1` macroblock of an interlaced S(GMC)-VOP now
+  reads its §6.2.6.3 `dct_type` bit when `cbp != 0` (§6.2.6's
+  `interlaced_information()` line is unconditional; only the
+  `field_prediction` gate carries the `!mcsel` clause) — the parser
+  used to skip the whole body, mis-parsing every coded GMC macroblock
+  of an interlaced stream; the reference decoder reads the bit too.
 - Decoder: the §6.2.5.3 data-partitioned I-/P-VOP parsers evaluate
   `use_intra_dc_vlc` per macroblock against the running quantiser
   after that macroblock's `dquant` (§6.3.5 "the DCT quantiser"),

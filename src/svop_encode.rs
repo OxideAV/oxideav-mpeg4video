@@ -46,8 +46,8 @@ use crate::mv_predictor_grid::MvGrid;
 use crate::neighbour::IntraBlockGrid;
 use crate::packet_encode::{Layout, MbFields, PacketVopInfo, PacketWriter};
 use crate::pvop_encode::{
-    estimate_motion, intra_activity, intra_mb_in_p_fields, quantise_inter_block, sample_mode_of,
-    source_luma_mb, PVopEncodeStats,
+    estimate_motion, intra_activity, intra_mb_in_p_fields, sample_mode_of, source_luma_mb,
+    PVopEncodeStats,
 };
 use crate::pvop_mv::PvopMbMotion;
 use crate::s_gmc_recon::{gmc_prediction_macroblock, GmcReferencePlanes};
@@ -55,7 +55,7 @@ use crate::sprite::SpriteTrajectory;
 use crate::texture::AcEvent;
 use crate::vol::SpriteWarpingAccuracy;
 use crate::vop::{parse_vop_header_body, vop_time_increment_bits, VopCodingType, VopContext};
-use crate::vop_decode::gmc_averaged_mv;
+use crate::vop_decode::{gmc_averaged_mv, AnchorMbMotion};
 use crate::warp::WarpGeometry;
 
 const VOP_START_CODE: u32 = 0x0000_01B6;
@@ -111,6 +111,7 @@ pub fn write_s_vop_header(
     fcode: u8,
     trajectory: &SpriteTrajectory,
     intra_dc_vlc_thr: u8,
+    interlace: Option<crate::ivop_encode::VopInterlaceFlags>,
 ) {
     bw.write_start_code(VOP_START_CODE);
     bw.write_bits(0b11, 2); // vop_coding_type = S
@@ -128,6 +129,9 @@ pub fn write_s_vop_header(
     bw.write_bit(false); // vop_rounding_type = 0 (S(GMC) carries it like P)
     assert!(intra_dc_vlc_thr <= 7, "intra_dc_vlc_thr is a 3-bit field");
     bw.write_bits(u32::from(intra_dc_vlc_thr), 3); // intra_dc_vlc_thr (Table 6-25)
+    if let Some(flags) = interlace {
+        flags.write(bw); // top_field_first + alternate_vertical_scan_flag
+    }
     assert!(
         (1..=3).contains(&trajectory.count),
         "GMC trajectories carry 1..=3 points"
@@ -156,6 +160,10 @@ pub struct SVopEncodeStats {
     pub inter4v: usize,
     /// Intra macroblocks.
     pub intra: usize,
+    /// §7.7.2.1 field-predicted local macroblocks (interlaced VOLs).
+    pub field: usize,
+    /// Macroblocks coded with the §7.7.1 field DCT.
+    pub field_dct: usize,
     /// Macroblocks that carried a `dquant`.
     pub dquant: usize,
     /// Video packets cut inside the VOP.
@@ -515,7 +523,6 @@ pub fn encode_s_vop(
 ) -> (Vec<u8>, SVopEncodeStats) {
     assert!((1..=31).contains(&qp), "vop_quant {qp} out of range");
     assert!(cfg.gmc, "encode_s_vop needs a GMC VOL");
-    assert!(!cfg.interlaced, "S(GMC)-VOPs are progressive-only");
     let (mb_width, mb_height) = cfg.mb_dimensions();
     let w_intra = crate::block::intra_quant_matrix(vol);
     let w_inter = nonintra_quant_matrix(vol);
@@ -606,6 +613,7 @@ pub fn encode_s_vop(
         fcode,
         &trajectory,
         cfg.intra_dc_vlc_thr,
+        cfg.vop_interlace(),
     );
     let mut pw = PacketWriter::new(
         bw,
@@ -619,7 +627,7 @@ pub fn encode_s_vop(
             time_increment_bits: vop_time_increment_bits(cfg.time_increment_resolution),
             intra_dc_vlc_thr: cfg.intra_dc_vlc_thr,
             total_macroblocks: (mb_width * mb_height) as u32,
-            interlaced: false,
+            interlaced: cfg.interlaced,
             sprite_trajectory: Some(trajectory),
         },
         Layout::Combined,
@@ -664,7 +672,27 @@ pub fn encode_s_vop(
                 8,
             );
             let gmc_sad = sad_against(&src, &gmc_pred);
-            let (local_mv, local_sad) = local_mvs[idx];
+            let (local_mv, frame_local_sad) = local_mvs[idx];
+            // §7.7.2.1 field-predicted local candidate (interlaced VOL):
+            // the GMC neighbours' averaged MVs count as frame candidates
+            // of the shared predictor.
+            let field_local = if cfg.interlaced {
+                let candidates = mv_grid
+                    .field_predictor_candidates(mb_row, mb_col)
+                    .expect("grid coordinates in range");
+                let predictor = crate::motion::predict_field_motion_vector(candidates);
+                let top = crate::field_encode::estimate_field_motion(
+                    &src, &luma_ref, mb_x, mb_y, false, predictor, mode, fcode,
+                );
+                let bottom = crate::field_encode::estimate_field_motion(
+                    &src, &luma_ref, mb_x, mb_y, true, predictor, mode, fcode,
+                );
+                (top.sad + bottom.sad + crate::pvop_encode::FIELD_MODE_BIAS < frame_local_sad)
+                    .then_some((predictor, top, bottom))
+            } else {
+                None
+            };
+            let local_sad = field_local.map_or(frame_local_sad, |(_, t, b)| t.sad + b.sad);
 
             // Mode decision: GMC saves the motion_vector() body, so it
             // gets a small preference; intra wins on flat-vs-motion
@@ -708,6 +736,40 @@ pub fn encode_s_vop(
             // Build the chosen prediction + quantise the residual.
             let prediction = if choose_gmc {
                 gmc_pred
+            } else if let Some((_, top, bottom)) = field_local {
+                let mvs = crate::field_motion::FieldMotionVectors {
+                    top: top.mv,
+                    bottom: bottom.mv,
+                };
+                match mode {
+                    crate::bvop_prediction::BVopSampleMode::HalfPel => {
+                        crate::field_motion::field_motion_compensate_one_reference(
+                            &luma_ref,
+                            &cb_ref,
+                            &cr_ref,
+                            mvs,
+                            top.ref_field,
+                            bottom.ref_field,
+                            mb_x,
+                            mb_y,
+                            0,
+                        )
+                    }
+                    crate::bvop_prediction::BVopSampleMode::QuarterPel { bits_per_pixel } => {
+                        crate::field_motion::field_motion_compensate_one_reference_qpel(
+                            &luma_ref,
+                            &cb_ref,
+                            &cr_ref,
+                            mvs,
+                            top.ref_field,
+                            bottom.ref_field,
+                            mb_x,
+                            mb_y,
+                            0,
+                            bits_per_pixel,
+                        )
+                    }
+                }
             } else {
                 crate::pvop_mv::predict_inter_macroblock(
                     PvopMbMotion::OneMv(local_mv),
@@ -721,30 +783,28 @@ pub fn encode_s_vop(
                 )
                 .expect("inter motion always yields a prediction")
             };
-            let mut events: Vec<Vec<AcEvent>> = Vec::with_capacity(6);
-            for i in 0..6 {
-                let src_block = frame.block(mb_row, mb_col, i);
-                let mut residual = [[0i32; 8]; 8];
-                for y in 0..8 {
-                    for x in 0..8 {
-                        let p = match i {
-                            0..=3 => prediction.luma[y + 8 * (i / 2)][x + 8 * (i % 2)],
-                            4 => prediction.cb[y][x],
-                            _ => prediction.cr[y][x],
-                        };
-                        residual[y][x] = src_block[y][x] - p;
-                    }
-                }
-                let (ev, _qf) = quantise_inter_block(
-                    &residual,
-                    qp,
-                    cfg.quant_type,
-                    &w_inter,
-                    crate::scan::ScanType::Zigzag,
-                );
-                events.push(ev);
-            }
+            let (res_luma, res_cb, res_cr) =
+                crate::pvop_encode::macroblock_residual(frame, mb_row, mb_col, &prediction);
+            // §7.7.1 dct_type election (interlaced VOL; GMC macroblocks
+            // included — §7.8.7.2 fixes only their *prediction* to the
+            // frame warp).
+            let field_dct = cfg.interlaced && crate::ivop_encode::elect_field_dct(&res_luma);
+            let res_luma = if field_dct {
+                crate::ivop_encode::field_dct_luma(&res_luma)
+            } else {
+                res_luma
+            };
+            let events = crate::pvop_encode::quantise_inter_residual(
+                &res_luma,
+                &res_cb,
+                &res_cr,
+                qp,
+                cfg.quant_type,
+                &w_inter,
+                crate::pvop_encode::inter_scan(cfg),
+            );
             let all_zero = events.iter().all(|e| e.is_empty());
+            let field_dct = field_dct && !all_zero;
 
             if choose_gmc {
                 // The decoder records the §7.8.7.3 averaged MV for the
@@ -798,8 +858,22 @@ pub fn encode_s_vop(
                 | (u8::from(!events[2].is_empty()) << 1)
                 | u8::from(!events[3].is_empty());
             let cbpc = (u8::from(!events[4].is_empty()) << 1) | u8::from(!events[5].is_empty());
+            if field_dct {
+                stats.field_dct += 1;
+            }
+            let mut field_refs = None;
             let mvds = if choose_gmc {
                 Vec::new()
+            } else if let Some((predictor, top, bottom)) = field_local {
+                stats.field += 1;
+                mv_grid
+                    .record_field(mb_row, mb_col, top.mv, bottom.mv)
+                    .expect("grid coordinates in range");
+                field_refs = Some((top.ref_field, bottom.ref_field));
+                vec![
+                    crate::field_encode::field_mv_differential(top.mv, predictor),
+                    crate::field_encode::field_mv_differential(bottom.mv, predictor),
+                ]
             } else {
                 let candidates = mv_grid
                     .predictor_candidates(mb_row, mb_col, 0)
@@ -825,7 +899,12 @@ pub fn encode_s_vop(
                 fcode,
                 intra_dc: None,
                 blocks,
-                interlaced: None,
+                interlaced: cfg
+                    .interlaced
+                    .then_some(crate::packet_encode::InterlacedMbInfo {
+                        field_dct,
+                        field_refs,
+                    }),
             });
         }
     }
@@ -845,6 +924,19 @@ pub fn reconstruct_own_s_vop_with_motion(
     unit: &[u8],
     store: &mut FrameStore,
 ) -> (DecodedFrame, Vec<PvopMbMotion>) {
+    let (frame, motion) = reconstruct_own_s_vop_with_anchor_motion(vol, unit, store);
+    (frame, motion.iter().map(|m| m.progressive()).collect())
+}
+
+/// [`reconstruct_own_s_vop_with_motion`] keeping the interlaced shape
+/// of the decoded motion: a §7.7.2.1 field-predicted local macroblock
+/// surfaces as [`AnchorMbMotion::Field`] (the §7.7.2.2 interlaced-direct
+/// source of a following interlaced B-VOP).
+pub fn reconstruct_own_s_vop_with_anchor_motion(
+    vol: &crate::vol::VolHeader,
+    unit: &[u8],
+    store: &mut FrameStore,
+) -> (DecodedFrame, Vec<AnchorMbMotion>) {
     let (mb_width, mb_height) = (
         usize::from(vol.width).div_ceil(16),
         usize::from(vol.height).div_ceil(16),
@@ -869,16 +961,30 @@ pub fn reconstruct_own_s_vop_with_motion(
     let motion = entries
         .iter()
         .map(|e| match e {
-            crate::frame_decode::SGmcMbContent::Local { motion, .. } => *motion,
+            crate::frame_decode::SGmcMbContent::Local { motion, .. } => {
+                AnchorMbMotion::Frame(*motion)
+            }
+            crate::frame_decode::SGmcMbContent::FieldLocal {
+                mvs,
+                top_field_ref,
+                bottom_field_ref,
+                ..
+            } => AnchorMbMotion::Field {
+                mvs: *mvs,
+                top_ref: *top_field_ref,
+                bottom_ref: *bottom_field_ref,
+            },
             crate::frame_decode::SGmcMbContent::Gmc {
                 amv,
                 not_coded: true,
                 ..
-            } => PvopMbMotion::OneMv(*amv),
+            } => AnchorMbMotion::Frame(PvopMbMotion::OneMv(*amv)),
             crate::frame_decode::SGmcMbContent::Gmc {
                 not_coded: false, ..
             }
-            | crate::frame_decode::SGmcMbContent::Intra(_) => PvopMbMotion::Intra,
+            | crate::frame_decode::SGmcMbContent::Intra(_) => {
+                AnchorMbMotion::Frame(PvopMbMotion::Intra)
+            }
         })
         .collect();
     let frame = crate::frame_decode::assemble_s_gmc_vop_frame(
@@ -905,8 +1011,8 @@ pub fn as_p_stats(stats: &SVopEncodeStats) -> PVopEncodeStats {
         skipped: stats.gmc_skipped,
         inter: stats.gmc + stats.local,
         inter4v: stats.inter4v,
-        field: 0,
-        field_dct: 0,
+        field: stats.field,
+        field_dct: stats.field_dct,
         intra: stats.intra,
         dquant: stats.dquant,
         packets: stats.packets,
@@ -1025,6 +1131,7 @@ mod tests {
                 points: [[-6, 3], [0, 0], [0, 0]],
             },
             0,
+            None,
         );
         bw.next_start_code();
         let bytes = bw.into_bytes();
