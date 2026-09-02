@@ -123,6 +123,15 @@ pub struct Mpeg4EncoderOptions {
     /// (`gob_resync_marker`, `gob_number`, `gob_frame_id`,
     /// `quant_scale`) on every GOB after the first. Default true.
     pub gob_headers: bool,
+    /// `dc-vlc-thr` — the §6.3.5 `intra_dc_vlc_thr` (Table 6-25,
+    /// 0..=7) written on every VOP: the running quantiser at which an
+    /// intra macroblock's DC differentials switch from the DC VLC to
+    /// the AC VLC. Default 0 (DC VLC throughout).
+    pub dc_vlc_thr: u32,
+    /// `auto-dc-vlc` — elect `intra_dc_vlc_thr` per I-VOP by measured
+    /// cost (the VOP is coded under 0 and 7, the smaller kept) and
+    /// carry the winner to the following P/S-VOPs. Default off.
+    pub auto_dc_vlc: bool,
 }
 
 impl Default for Mpeg4EncoderOptions {
@@ -150,6 +159,8 @@ impl Default for Mpeg4EncoderOptions {
             ecosystem_compat: false,
             short_header: false,
             gob_headers: true,
+            dc_vlc_thr: 0,
+            auto_dc_vlc: false,
         }
     }
 }
@@ -312,6 +323,20 @@ impl oxideav_core::CodecOptionsStruct for Mpeg4EncoderOptions {
             help: "short header only: emit a GOB header (gob_resync_marker) on every \
                    GOB after the first",
         },
+        oxideav_core::OptionField {
+            name: "dc-vlc-thr",
+            kind: oxideav_core::OptionKind::U32,
+            default: oxideav_core::OptionValue::U32(0),
+            help: "ISO/IEC 14496-2 Table 6-25 intra_dc_vlc_thr (0..=7): running quantiser \
+                   above which intra DC differentials ride the AC VLC (0 = DC VLC always)",
+        },
+        oxideav_core::OptionField {
+            name: "auto-dc-vlc",
+            kind: oxideav_core::OptionKind::Bool,
+            default: oxideav_core::OptionValue::Bool(false),
+            help: "elect intra_dc_vlc_thr per I-VOP by measured cost (0 vs 7) and carry \
+                   the winner to the following P/S-VOPs",
+        },
     ];
 
     fn apply(&mut self, key: &str, value: &oxideav_core::OptionValue) -> Result<()> {
@@ -374,6 +399,14 @@ impl oxideav_core::CodecOptionsStruct for Mpeg4EncoderOptions {
             "ecosystem-compat" => self.ecosystem_compat = value.as_bool()?,
             "short-header" => self.short_header = value.as_bool()?,
             "gob-headers" => self.gob_headers = value.as_bool()?,
+            "dc-vlc-thr" => {
+                let t = value.as_u32()?;
+                if t > 7 {
+                    return Err(Error::invalid("dc-vlc-thr must be in 0..=7"));
+                }
+                self.dc_vlc_thr = t;
+            }
+            "auto-dc-vlc" => self.auto_dc_vlc = value.as_bool()?,
             _ => unreachable!("guarded by SCHEMA"),
         }
         Ok(())
@@ -554,6 +587,7 @@ impl Mpeg4VideoEncoder {
             alternate_scan: options.alt_scan,
             short_header: options.short_header,
             gob_headers: options.gob_headers,
+            intra_dc_vlc_thr: options.dc_vlc_thr as u8,
         };
         let (config_headers, vol) = if cfg.short_header {
             // §6.2.5.2: no configuration headers at all.
@@ -843,7 +877,17 @@ impl Mpeg4VideoEncoder {
         let unit = if force_i {
             let (unit, recon) = loop {
                 let qp = self.current_qp();
-                let produced = encode_i_vop(&vol, &self.cfg, &view, modulo, increment, qp);
+                let produced = if self.options.auto_dc_vlc {
+                    // Elect intra_dc_vlc_thr by measured cost and carry
+                    // it to the following P/S-VOP headers.
+                    let (unit, recon, thr) = crate::ivop_encode::encode_i_vop_elect_thr(
+                        &vol, &self.cfg, &view, modulo, increment, qp,
+                    );
+                    self.cfg.intra_dc_vlc_thr = thr;
+                    (unit, recon)
+                } else {
+                    encode_i_vop(&vol, &self.cfg, &view, modulo, increment, qp)
+                };
                 if self.rc_admit(produced.0.len()) {
                     break produced;
                 }

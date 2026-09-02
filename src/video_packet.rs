@@ -180,6 +180,10 @@ pub struct VideoPacketContext {
     /// `true`, the parser refuses the extension body (the
     /// `vop_reduced_resolution` bit is out of scope).
     pub reduced_resolution_vop_enable: bool,
+    /// `no_of_sprite_warping_points` of a GMC VOL (0 otherwise): the
+    /// S(GMC)-VOP extension body restates `sprite_trajectory()` with
+    /// that many `(du, dv)` pairs.
+    pub no_of_sprite_warping_points: u8,
     /// Whether the enclosing VOL declares `sprite_enable ==
     /// GMC`. When `true` and `vop_coding_type == S`, the extension
     /// body would also carry `sprite_trajectory()` — out of round-18
@@ -228,6 +232,9 @@ pub struct VideoPacketHeader {
     /// Re-stated `vop_fcode_backward` (1..=7; absent unless
     /// `vop_coding_type == B`).
     pub vop_fcode_backward: Option<u8>,
+    /// Re-stated `sprite_trajectory()` of an S(GMC)-VOP extension body
+    /// (`sprite_enable == "GMC"`, `no_of_sprite_warping_points > 0`).
+    pub sprite_trajectory: Option<crate::sprite::SpriteTrajectory>,
 }
 
 /// Number of bits used to encode `macroblock_number` per Table 6-27.
@@ -512,6 +519,7 @@ pub fn parse_video_packet_header(
             intra_dc_vlc_thr: None,
             vop_fcode_forward: None,
             vop_fcode_backward: None,
+            sprite_trajectory: None,
         });
     }
 
@@ -533,15 +541,20 @@ pub fn parse_video_packet_header(
 
     let intra_dc_vlc_thr = br.read_bits(3)? as u8;
 
-    // sprite_trajectory() body — out of round-18 scope when
-    // (sprite_enable == "GMC" && coding_type == S &&
-    // no_of_sprite_warping_points > 0). Reject the entire S-coded
-    // path under GMC up front so we never under-read the body.
-    if matches!(vop_coding_type, VopCodingType::S) && ctx.sprite_gmc {
-        return Err(VideoPacketParseError::UnsupportedBranch(
-            "sprite_trajectory in video_packet_header extension",
-        ));
-    }
+    // §6.2.5: an S(GMC)-VOP extension body restates sprite_trajectory()
+    // (no_of_sprite_warping_points (du, dv) pairs) right after
+    // intra_dc_vlc_thr.
+    let sprite_trajectory = if matches!(vop_coding_type, VopCodingType::S)
+        && ctx.sprite_gmc
+        && ctx.no_of_sprite_warping_points > 0
+    {
+        Some(
+            crate::sprite::decode_sprite_trajectory(br, ctx.no_of_sprite_warping_points)
+                .map_err(|_| VideoPacketParseError::UnsupportedBranch("sprite_trajectory"))?,
+        )
+    } else {
+        None
+    };
 
     // vop_reduced_resolution — also out of scope.
     if ctx.reduced_resolution_vop_enable {
@@ -587,6 +600,7 @@ pub fn parse_video_packet_header(
         intra_dc_vlc_thr: Some(intra_dc_vlc_thr),
         vop_fcode_forward,
         vop_fcode_backward,
+        sprite_trajectory,
     })
 }
 
@@ -833,6 +847,7 @@ mod tests {
             resync_marker_disable: false,
             newpred_enable: false,
             reduced_resolution_vop_enable: false,
+            no_of_sprite_warping_points: 0,
             sprite_gmc: false,
             total_macroblocks: 99, // QCIF
         }
@@ -1094,7 +1109,7 @@ mod tests {
     }
 
     #[test]
-    fn parser_rejects_sprite_gmc_extension() {
+    fn parser_reads_the_sprite_gmc_extension_trajectory() {
         let mut w = BitWriter::new();
         w.write_bool(false);
         for _ in 0..7 {
@@ -1104,21 +1119,36 @@ mod tests {
         w.write_bits(1, 17);
         w.write_bits(0, 7);
         w.write_bits(5, 5);
-        w.write_bool(true);
-        w.write_bool(false);
-        w.write_bool(true);
-        w.write_bits(0, 5);
-        w.write_bool(true);
+        w.write_bool(true); // header_extension_code
+        w.write_bool(false); // modulo_time_base terminator
+        w.write_bool(true); // marker
+        w.write_bits(0, 5); // vop_time_increment
+        w.write_bool(true); // marker
         w.write_bits(0b11, 2); // S
-        w.write_bits(0, 3);
+        w.write_bits(0, 3); // intra_dc_vlc_thr
+                            // §6.2.5 sprite_trajectory(), one point: du = 3 (Table B.34
+                            // dmv_length "011" = 2 bits, dmv_code "11", marker), dv = 0
+                            // (dmv_length "00", marker).
+        w.write_bits(0b011, 3);
+        w.write_bits(0b11, 2);
+        w.write_bool(true);
+        w.write_bits(0b00, 2);
+        w.write_bool(true);
+        w.write_bits(1, 3); // vop_fcode_forward
         let data = w.finish();
         let mut ctx = default_ctx();
         ctx.coding_type = VopCodingType::S;
         ctx.fcode_fwd = 1;
         ctx.sprite_gmc = true;
+        ctx.no_of_sprite_warping_points = 1;
         let mut br = BitReader::new(&data);
-        let err = parse_video_packet_header(&mut br, &ctx).unwrap_err();
-        assert!(matches!(err, VideoPacketParseError::UnsupportedBranch(_)));
+        let hdr = parse_video_packet_header(&mut br, &ctx).unwrap();
+        assert!(hdr.header_extension_code);
+        assert_eq!(hdr.vop_coding_type, Some(VopCodingType::S));
+        let traj = hdr.sprite_trajectory.expect("trajectory restated");
+        assert_eq!(traj.count, 1);
+        assert_eq!(traj.points[0], [3, 0]);
+        assert_eq!(hdr.vop_fcode_forward, Some(1));
     }
 
     #[test]

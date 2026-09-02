@@ -280,6 +280,7 @@ pub fn encode_b_vop_interlaced(
         qp,
         fcode,
         Some(interlace),
+        cfg.intra_dc_vlc_thr,
     );
     let mut pw = crate::packet_encode::PacketWriter::new(
         header,
@@ -291,9 +292,10 @@ pub fn encode_b_vop_interlaced(
             modulo_time_base,
             time_increment,
             time_increment_bits: vop_time_increment_bits(cfg.time_increment_resolution),
-            intra_dc_vlc_thr: 0,
+            intra_dc_vlc_thr: cfg.intra_dc_vlc_thr,
             total_macroblocks: (mb_width * mb_height) as u32,
             interlaced: true,
+            sprite_trajectory: None,
         },
         crate::packet_encode::Layout::Combined,
     );

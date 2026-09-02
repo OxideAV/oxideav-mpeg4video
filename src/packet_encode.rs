@@ -330,6 +330,9 @@ pub(crate) struct PacketVopInfo {
     /// The VOL's `interlaced` flag: every pushed [`MbFields`] must
     /// carry (or omit) its `interlaced_information()` accordingly.
     pub interlaced: bool,
+    /// The S(GMC)-VOP's `sprite_trajectory()`, restated by every HEC
+    /// body (`None` for the other VOP types).
+    pub sprite_trajectory: Option<crate::sprite::SpriteTrajectory>,
 }
 
 /// Serialises a VOP's macroblock layer into video packets under a
@@ -432,10 +435,7 @@ impl PacketWriter {
         bw.write_bits(macroblock_number, usize::from(mb_bits));
         assert!((1..=31).contains(&quant_scale));
         bw.write_bits(quant_scale, 5); // quant_precision 5
-                                       // The HEC body of an S(GMC) packet would also restate
-                                       // sprite_trajectory() (§6.2.5), which this crate's packet-header
-                                       // parser does not consume yet — S-VOP packets carry no HEC.
-        let hec = self.packets_cut % 2 == 1 && !matches!(self.info.coding_type, VopCodingType::S);
+        let hec = self.packets_cut % 2 == 1;
         bw.write_bit(hec); // header_extension_code
         if hec {
             for _ in 0..self.info.modulo_time_base {
@@ -450,6 +450,17 @@ impl PacketWriter {
             bw.write_marker();
             bw.write_bits(self.info.coding_type.to_bits(), 2);
             bw.write_bits(u32::from(self.info.intra_dc_vlc_thr), 3);
+            // §6.2.5: an S(GMC)-VOP body restates sprite_trajectory().
+            if matches!(self.info.coding_type, VopCodingType::S) {
+                let traj = self
+                    .info
+                    .sprite_trajectory
+                    .expect("S(GMC)-VOP packets restate the trajectory");
+                for point in &traj.points[..usize::from(traj.count)] {
+                    crate::svop_encode::put_warping_mv_code(bw, point[0]);
+                    crate::svop_encode::put_warping_mv_code(bw, point[1]);
+                }
+            }
             if !matches!(self.info.coding_type, VopCodingType::I) {
                 bw.write_bits(u32::from(self.info.fcode_fwd), 3);
             }
@@ -533,6 +544,7 @@ mod tests {
             intra_dc_vlc_thr: 0,
             total_macroblocks: 12,
             interlaced: false,
+            sprite_trajectory: None,
         }
     }
 
@@ -548,6 +560,7 @@ mod tests {
             newpred_enable: false,
             reduced_resolution_vop_enable: false,
             sprite_gmc: false,
+            no_of_sprite_warping_points: 0,
             total_macroblocks: 12,
         }
     }

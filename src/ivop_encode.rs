@@ -144,6 +144,11 @@ pub struct EncoderConfig {
     /// `gob_number`, `gob_frame_id`, `quant_scale`) on every GOB after
     /// the first. Default on.
     pub gob_headers: bool,
+    /// §6.3.5 `intra_dc_vlc_thr` (Table 6-25, 0..=7) written on every
+    /// VOP header: the running-quantiser threshold above which an intra
+    /// macroblock's DC differentials ride the AC (Table B.16) VLC
+    /// instead of the DC VLC. Default 0 (DC VLC for the whole VOP).
+    pub intra_dc_vlc_thr: u8,
 }
 
 /// The two §6.3.5 interlaced VOP-header flags, written right after
@@ -232,6 +237,7 @@ impl Default for EncoderConfig {
             alternate_scan: false,
             short_header: false,
             gob_headers: true,
+            intra_dc_vlc_thr: 0,
         }
     }
 }
@@ -447,6 +453,7 @@ pub fn write_i_vop_header(
     time_increment: u16,
     quant: u32,
     interlace: Option<VopInterlaceFlags>,
+    intra_dc_vlc_thr: u8,
 ) {
     bw.write_start_code(VOP_START_CODE);
     bw.write_bits(0b00, 2); // vop_coding_type = I
@@ -461,7 +468,8 @@ pub fn write_i_vop_header(
     );
     bw.write_marker();
     bw.write_bit(true); // vop_coded = 1
-    bw.write_bits(0, 3); // intra_dc_vlc_thr = 0 (DC VLC for the whole VOP)
+    assert!(intra_dc_vlc_thr <= 7, "intra_dc_vlc_thr is a 3-bit field");
+    bw.write_bits(u32::from(intra_dc_vlc_thr), 3); // intra_dc_vlc_thr (Table 6-25)
     if let Some(flags) = interlace {
         flags.write(bw); // top_field_first + alternate_vertical_scan_flag
     }
@@ -655,6 +663,7 @@ pub(crate) fn plan_block(
     qp: u32,
     ac_pred: bool,
     forced_scan: Option<ScanType>,
+    use_dc_vlc: bool,
 ) -> Option<BlockPlan> {
     let qf = &prepared.qf;
     let scaler = dc_scaler(component, qp);
@@ -666,7 +675,10 @@ pub(crate) fn plan_block(
 
     // §7.4.3.3 inverse on the first row / column when predicting.
     let mut pqf = *qf;
-    pqf[0][0] = 0; // DC rides the DC VLC; scan position 0 stays empty.
+    // Table 6-25: with the DC VLC the differential rides the block
+    // prologue and scan position 0 stays empty; otherwise it is the
+    // first coefficient of the AC EVENT stream (§6.2.7 / §7.4.1).
+    pqf[0][0] = if use_dc_vlc { 0 } else { dc_differential };
     if ac_pred {
         match direction {
             DcPredictionDirection::FromLeft => {
@@ -699,7 +711,10 @@ pub(crate) fn plan_block(
     // overrides the §7.4.2 per-block selection.
     let scan_type = forced_scan.unwrap_or_else(|| select_scan_type(true, ac_pred, direction));
     let qfs = forward_scan(&pqf, scan_type);
-    let events = qfs_to_events(&qfs, 1);
+    if !use_dc_vlc && !(-2047..=2047).contains(&dc_differential) {
+        return None;
+    }
+    let events = qfs_to_events(&qfs, usize::from(use_dc_vlc));
     Some(BlockPlan {
         dc_differential,
         events,
@@ -731,10 +746,6 @@ pub(crate) fn intra_mb_fields(
     interlaced: Option<InterlacedMbInfo>,
 ) -> MbFields {
     let (cbpy, cbpc) = intra_mb_cbp(plans);
-    assert!(
-        use_dc_vlc,
-        "intra_dc_vlc_thr == 0: the DC always rides the DC VLC"
-    );
     let mut dc = [0i32; 6];
     for (slot, plan) in dc.iter_mut().zip(plans.iter()) {
         *slot = plan.dc_differential;
@@ -749,7 +760,7 @@ pub(crate) fn intra_mb_fields(
         mcsel: None,
         mvds: Vec::new(),
         fcode: 1,
-        intra_dc: Some(dc),
+        intra_dc: use_dc_vlc.then_some(dc),
         blocks: std::array::from_fn(|i| plans[i].events.clone()),
         interlaced,
     }
@@ -785,10 +796,59 @@ pub fn encode_i_vop(
     time_increment: u16,
     qp: u32,
 ) -> (Vec<u8>, DecodedFrame) {
+    encode_i_vop_with_thr(
+        vol,
+        cfg,
+        frame,
+        modulo_time_base,
+        time_increment,
+        qp,
+        cfg.intra_dc_vlc_thr,
+    )
+}
+
+/// [`encode_i_vop`] with the §6.3.5 `intra_dc_vlc_thr` **elected by
+/// measured cost**: the VOP is coded under the two extreme Table 6-25
+/// settings (0 — DC VLC throughout, 7 — AC VLC throughout) and the
+/// smaller unit is kept. Returns the unit, its reconstruction and the
+/// winning threshold (the caller carries it to the following P/S
+/// VOPs' headers). Ties keep the DC VLC.
+pub fn encode_i_vop_elect_thr(
+    vol: &crate::vol::VolHeader,
+    cfg: &EncoderConfig,
+    frame: &FrameView<'_>,
+    modulo_time_base: u32,
+    time_increment: u16,
+    qp: u32,
+) -> (Vec<u8>, DecodedFrame, u8) {
+    let dc = encode_i_vop_with_thr(vol, cfg, frame, modulo_time_base, time_increment, qp, 0);
+    let ac = encode_i_vop_with_thr(vol, cfg, frame, modulo_time_base, time_increment, qp, 7);
+    if ac.0.len() < dc.0.len() {
+        (ac.0, ac.1, 7)
+    } else {
+        (dc.0, dc.1, 0)
+    }
+}
+
+/// [`encode_i_vop`] with an explicit `intra_dc_vlc_thr` (Table 6-25):
+/// each intra macroblock's DC differentials ride the DC VLC while its
+/// running quantiser stays below the threshold, and the AC EVENT
+/// stream (scan position 0) otherwise — exactly the decoder's
+/// `use_intra_dc_vlc` rule.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_i_vop_with_thr(
+    vol: &crate::vol::VolHeader,
+    cfg: &EncoderConfig,
+    frame: &FrameView<'_>,
+    modulo_time_base: u32,
+    time_increment: u16,
+    qp: u32,
+    thr: u8,
+) -> (Vec<u8>, DecodedFrame) {
     assert!((1..=31).contains(&qp), "vop_quant {qp} out of range");
+    assert!(thr <= 7, "intra_dc_vlc_thr {thr} out of range");
     let (mb_width, mb_height) = cfg.mb_dimensions();
     let w_intra = intra_quant_matrix(vol);
-    let use_dc_vlc = use_intra_dc_vlc(0, qp);
 
     let mut bw = BitWriter::new();
     write_i_vop_header(
@@ -798,6 +858,7 @@ pub fn encode_i_vop(
         time_increment,
         qp,
         cfg.vop_interlace(),
+        thr,
     );
     let forced_scan = cfg.forced_scan();
     let layout = if cfg.resilience.data_partitioned {
@@ -815,9 +876,10 @@ pub fn encode_i_vop(
             modulo_time_base,
             time_increment,
             time_increment_bits: vop_time_increment_bits(cfg.time_increment_resolution),
-            intra_dc_vlc_thr: 0,
+            intra_dc_vlc_thr: thr,
             total_macroblocks: (mb_width * mb_height) as u32,
             interlaced: cfg.interlaced,
+            sprite_trajectory: None,
         },
         layout,
     );
@@ -843,6 +905,8 @@ pub fn encode_i_vop(
                 (qp, None)
             };
             running_qp = qp;
+            // Table 6-25 against the running quantiser of this MB.
+            let use_dc_vlc = use_intra_dc_vlc(thr, qp);
             // §7.7.1 dct_type election (interlaced VOL only): field DCT
             // permutes the luminance lines before the blocks are cut.
             let field_dct = cfg.interlaced
@@ -887,6 +951,7 @@ pub fn encode_i_vop(
                     qp,
                     false,
                     forced_scan,
+                    use_dc_vlc,
                 )
                 .expect("no-prediction differentials are always codable");
                 plans_off.push(off);
@@ -899,6 +964,7 @@ pub fn encode_i_vop(
                         qp,
                         true,
                         forced_scan,
+                        use_dc_vlc,
                     ) {
                         Some(p) => on.push(p),
                         None => plans_on = None, // fall back for the whole MB

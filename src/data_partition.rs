@@ -375,17 +375,22 @@ pub fn mb_block_layout(
 /// macroblocks — `derived_mb_type == 5` in `mcbpc` — are consumed
 /// transparently and do *not* count toward the limit, per NOTE 1.)
 ///
-/// `intra_dc_vlc_thr` + `running_qp` derive `use_intra_dc_vlc`
+/// `intra_dc_vlc_thr` + the running quantiser derive `use_intra_dc_vlc`
 /// (Table 6-25) which gates whether partition 1 also carries the six
-/// intra-DC differentials per macroblock.
+/// intra-DC differentials per macroblock. §6.3.5 ties the flag to "the
+/// DCT quantiser", i.e. the running quantiser *of that macroblock*:
+/// `running_qp` seeds the packet and each `dquant` (which precedes the
+/// DC in partition 1) moves it before the decision, clipped to
+/// `[1, max_qp]` (§6.3.6).
 #[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn parse_data_partitioned_i_vop(
     br: &mut BitReader<'_>,
     mb_in_video_packet: usize,
     intra_dc_vlc_thr: u8,
     running_qp: u32,
+    max_qp: u32,
 ) -> Result<DataPartitionedIVop, DataPartitionError> {
-    let dc_vlc = use_intra_dc_vlc(intra_dc_vlc_thr, running_qp);
+    let mut qp = running_qp;
 
     // ---- Partition 1: mcbpc (+ dquant + intra-DC), until dc_marker ----
     let mut mbs: Vec<DataPartitionedMb> = Vec::new();
@@ -416,9 +421,13 @@ pub fn parse_data_partitioned_i_vop(
         } else {
             None
         };
+        if let Some(d) = dquant_delta {
+            qp = (i64::from(qp) + i64::from(d)).clamp(1, i64::from(max_qp)) as u32;
+        }
 
-        // use_intra_dc_vlc → the six intra-DC differentials.
-        let intra_dc = if dc_vlc {
+        // use_intra_dc_vlc (against this macroblock's quantiser) → the
+        // six intra-DC differentials.
+        let intra_dc = if use_intra_dc_vlc(intra_dc_vlc_thr, qp) {
             Some(decode_intra_dc_six(br)?)
         } else {
             None
@@ -473,8 +482,10 @@ pub fn parse_data_partitioned_i_vop(
 /// state the caller maintains) outside this structural parser.
 ///
 /// `is_s_gmc` selects the §6.3.6 `mcsel` syntax (`sprite_enable ==
-/// "GMC"` S-VOP). `intra_dc_vlc_thr` + `running_qp` derive
-/// `use_intra_dc_vlc` for the partition-2 intra-DC of intra MBs.
+/// "GMC"` S-VOP). `intra_dc_vlc_thr` + the running quantiser derive
+/// `use_intra_dc_vlc` for the partition-2 intra-DC of intra MBs — per
+/// macroblock, after its own `dquant` (which precedes the DC in
+/// partition 2), clipped to `[1, max_qp]`.
 #[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn parse_data_partitioned_p_vop<F>(
     br: &mut BitReader<'_>,
@@ -482,12 +493,13 @@ pub fn parse_data_partitioned_p_vop<F>(
     is_s_gmc: bool,
     intra_dc_vlc_thr: u8,
     running_qp: u32,
+    max_qp: u32,
     mut decode_motion: F,
 ) -> Result<DataPartitionedPVop, DataPartitionError>
 where
     F: FnMut(&mut BitReader<'_>, DpMbEvent) -> Result<(), DataPartitionError>,
 {
-    let dc_vlc = use_intra_dc_vlc(intra_dc_vlc_thr, running_qp);
+    let mut qp = running_qp;
 
     // ---- Partition 1: not_coded + mcbpc + mcsel + motion, until marker ----
     let mut mbs: Vec<DataPartitionedMb> = Vec::new();
@@ -588,9 +600,13 @@ where
         } else {
             None
         };
+        if let Some(d) = dquant_delta {
+            qp = (i64::from(qp) + i64::from(d)).clamp(1, i64::from(max_qp)) as u32;
+        }
 
-        // intra-DC — derived_mb_type >= 3 && use_intra_dc_vlc.
-        let intra_dc = if raw >= 3 && dc_vlc {
+        // intra-DC — derived_mb_type >= 3 && use_intra_dc_vlc (against
+        // this macroblock's quantiser).
+        let intra_dc = if raw >= 3 && use_intra_dc_vlc(intra_dc_vlc_thr, qp) {
             Some(decode_intra_dc_six(br)?)
         } else {
             None
@@ -704,7 +720,7 @@ mod tests {
             "0000"
         ));
         let mut br = BitReader::new(&stream);
-        let out = parse_data_partitioned_i_vop(&mut br, 4, 7, 31).unwrap();
+        let out = parse_data_partitioned_i_vop(&mut br, 4, 7, 31, 31).unwrap();
         assert_eq!(out.mbs.len(), 2);
         assert_eq!(out.tex_headers.len(), 2);
         for mb in &out.mbs {
@@ -726,7 +742,7 @@ mod tests {
         // Partition 1 never reaches a dc_marker within mb_in_video_packet.
         let stream = bits("1 1 1 1 0000 0000");
         let mut br = BitReader::new(&stream);
-        let err = parse_data_partitioned_i_vop(&mut br, 2, 7, 31).unwrap_err();
+        let err = parse_data_partitioned_i_vop(&mut br, 2, 7, 31, 31).unwrap_err();
         assert!(matches!(
             err,
             DataPartitionError::MarkerNotFound { decoded: 2 }
@@ -752,7 +768,7 @@ mod tests {
         ));
         let mut br = BitReader::new(&stream);
         let mut captured = Vec::new();
-        let out = parse_data_partitioned_p_vop(&mut br, 4, false, 7, 31, |b, ev| {
+        let out = parse_data_partitioned_p_vop(&mut br, 4, false, 7, 31, 31, |b, ev| {
             let DpMbEvent::Motion(ty) = ev else {
                 return Ok(());
             };
@@ -813,7 +829,7 @@ mod tests {
             "1011 0",
         ));
         let mut br = BitReader::new(&stream);
-        let parsed = parse_data_partitioned_i_vop(&mut br, 4, 7, 31).unwrap();
+        let parsed = parse_data_partitioned_i_vop(&mut br, 4, 7, 31, 31).unwrap();
         assert_eq!(parsed.mbs.len(), 2);
         // Each MB has cbpy 1000 (block 0 coded).
         for th in &parsed.tex_headers {
@@ -924,7 +940,7 @@ mod tests {
         ));
         let mut br = BitReader::new(&stream);
         let mut motion_calls = 0;
-        let out = parse_data_partitioned_p_vop(&mut br, 4, false, 7, 31, |b, ev| {
+        let out = parse_data_partitioned_p_vop(&mut br, 4, false, 7, 31, 31, |b, ev| {
             let DpMbEvent::Motion(ty) = ev else {
                 return Ok(());
             };

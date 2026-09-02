@@ -91,6 +91,7 @@ pub const FIELD_MODE_BIAS: u32 = 96;
 
 /// Emit a §6.2.5 P-VOP header (through `vop_fcode_forward`). The
 /// writer is left mid-unit — the macroblock walk follows.
+#[allow(clippy::too_many_arguments)]
 pub fn write_p_vop_header(
     bw: &mut BitWriter,
     resolution: u16,
@@ -99,6 +100,7 @@ pub fn write_p_vop_header(
     quant: u32,
     fcode: u8,
     interlace: Option<VopInterlaceFlags>,
+    intra_dc_vlc_thr: u8,
 ) {
     bw.write_start_code(VOP_START_CODE);
     bw.write_bits(0b01, 2); // vop_coding_type = P
@@ -114,7 +116,8 @@ pub fn write_p_vop_header(
     bw.write_marker();
     bw.write_bit(true); // vop_coded = 1
     bw.write_bit(false); // vop_rounding_type = 0
-    bw.write_bits(0, 3); // intra_dc_vlc_thr = 0
+    assert!(intra_dc_vlc_thr <= 7, "intra_dc_vlc_thr is a 3-bit field");
+    bw.write_bits(u32::from(intra_dc_vlc_thr), 3); // intra_dc_vlc_thr (Table 6-25)
     if let Some(flags) = interlace {
         flags.write(bw); // top_field_first + alternate_vertical_scan_flag
     }
@@ -605,7 +608,6 @@ pub fn encode_p_vop(
     let (mb_width, mb_height) = cfg.mb_dimensions();
     let w_intra = crate::block::intra_quant_matrix(vol);
     let w_inter = nonintra_quant_matrix(vol);
-    let use_dc_vlc = use_intra_dc_vlc(0, qp);
     let mode = sample_mode_of(vol);
     let fcode = cfg.fcode;
     let luma_ref = reference.luma_reference();
@@ -621,6 +623,7 @@ pub fn encode_p_vop(
         qp,
         fcode,
         cfg.vop_interlace(),
+        cfg.intra_dc_vlc_thr,
     );
     let scan = inter_scan(cfg);
 
@@ -639,9 +642,10 @@ pub fn encode_p_vop(
             modulo_time_base,
             time_increment,
             time_increment_bits: vop_time_increment_bits(cfg.time_increment_resolution),
-            intra_dc_vlc_thr: 0,
+            intra_dc_vlc_thr: cfg.intra_dc_vlc_thr,
             total_macroblocks: (mb_width * mb_height) as u32,
             interlaced: cfg.interlaced,
+            sprite_trajectory: None,
         },
         layout,
     );
@@ -741,7 +745,7 @@ pub fn encode_p_vop(
                     qp,
                     cfg,
                     &w_intra,
-                    use_dc_vlc,
+                    use_intra_dc_vlc(cfg.intra_dc_vlc_thr, qp),
                     dquant,
                 );
                 if fields.interlaced.is_some_and(|i| i.field_dct) {
@@ -993,6 +997,7 @@ pub(crate) fn intra_mb_in_p_fields(
             qp,
             false,
             forced_scan,
+            use_dc_vlc,
         )
         .expect("no-prediction differentials are always codable");
         plans_off.push(off);
@@ -1005,6 +1010,7 @@ pub(crate) fn intra_mb_in_p_fields(
                 qp,
                 true,
                 forced_scan,
+                use_dc_vlc,
             ) {
                 Some(p) => on.push(p),
                 None => plans_on = None,
@@ -1153,7 +1159,7 @@ mod tests {
     #[test]
     fn p_vop_header_round_trips() {
         let mut bw = BitWriter::new();
-        write_p_vop_header(&mut bw, 25, 1, 3, 7, 1, None);
+        write_p_vop_header(&mut bw, 25, 1, 3, 7, 1, None, 0);
         bw.next_start_code();
         let bytes = bw.into_bytes();
         let mut br = BitReader::new(&bytes);

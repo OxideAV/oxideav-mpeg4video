@@ -238,6 +238,7 @@ fn video_packet_context(vol: &VolHeader, vop: &VopHeader) -> VideoPacketContext 
         newpred_enable: vol.newpred_enable,
         reduced_resolution_vop_enable: vol.reduced_resolution_vop_enable,
         sprite_gmc: matches!(vol.sprite_enable, SpriteEnable::Gmc),
+        no_of_sprite_warping_points: vol.no_of_sprite_warping_points.unwrap_or(0),
         total_macroblocks: crate::video_packet::total_macroblocks(
             u32::from(vol.width),
             u32::from(vol.height),
@@ -609,6 +610,7 @@ pub fn decode_i_vop_macroblocks_dp(
             total - mb_index,
             dc_thr,
             running_qp,
+            max_qp,
         )
         .map_err(VopDecodeError::DataPartition)?;
 
@@ -708,6 +710,7 @@ pub fn decode_p_vop_macroblocks_dp(
             false,
             dc_thr,
             running_qp,
+            max_qp,
             |b, ev| {
                 let idx = base + motions.len();
                 let (row, col) = (idx / mb_width, idx % mb_width);

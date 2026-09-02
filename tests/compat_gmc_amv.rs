@@ -87,6 +87,7 @@ fn craft_probe_stream(quarter_sample: bool, du: i32, dv: i32) -> Vec<u8> {
             count: 1,
             points: [[du, dv], [0, 0], [0, 0]],
         },
+        0,
     );
     for i in 0..(w / 16) * (h / 16) {
         if i == 0 {

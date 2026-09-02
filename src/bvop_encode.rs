@@ -82,6 +82,7 @@ pub(crate) const INTERP_MODE_BIAS: u32 = 96;
 /// Emit a §6.2.5 B-VOP header (`vop_fcode_forward == vop_fcode_backward
 /// == fcode`). The writer is left mid-unit — the macroblock walk
 /// follows.
+#[allow(clippy::too_many_arguments)]
 pub fn write_b_vop_header(
     bw: &mut BitWriter,
     resolution: u16,
@@ -90,6 +91,7 @@ pub fn write_b_vop_header(
     quant: u32,
     fcode: u8,
     interlace: Option<crate::ivop_encode::VopInterlaceFlags>,
+    intra_dc_vlc_thr: u8,
 ) {
     bw.write_start_code(VOP_START_CODE);
     bw.write_bits(0b10, 2); // vop_coding_type = B
@@ -104,7 +106,8 @@ pub fn write_b_vop_header(
     );
     bw.write_marker();
     bw.write_bit(true); // vop_coded = 1 (no vop_rounding_type for B)
-    bw.write_bits(0, 3); // intra_dc_vlc_thr = 0
+    assert!(intra_dc_vlc_thr <= 7, "intra_dc_vlc_thr is a 3-bit field");
+    bw.write_bits(u32::from(intra_dc_vlc_thr), 3); // intra_dc_vlc_thr (no intra MBs in B)
     if let Some(flags) = interlace {
         flags.write(bw); // top_field_first + alternate_vertical_scan_flag
     }
@@ -340,6 +343,7 @@ pub fn encode_b_vop(
         qp,
         fcode,
         None,
+        cfg.intra_dc_vlc_thr,
     );
     // B-VOPs always use the combined syntax (§6.2.5.3 NOTE), video
     // packets included.
@@ -353,9 +357,10 @@ pub fn encode_b_vop(
             modulo_time_base,
             time_increment,
             time_increment_bits: vop_time_increment_bits(cfg.time_increment_resolution),
-            intra_dc_vlc_thr: 0,
+            intra_dc_vlc_thr: cfg.intra_dc_vlc_thr,
             total_macroblocks: (mb_width * mb_height) as u32,
             interlaced: false,
+            sprite_trajectory: None,
         },
         crate::packet_encode::Layout::Combined,
     );
@@ -624,7 +629,7 @@ mod tests {
     #[test]
     fn b_vop_header_round_trips() {
         let mut bw = BitWriter::new();
-        write_b_vop_header(&mut bw, 25, 2, 7, 9, 1, None);
+        write_b_vop_header(&mut bw, 25, 2, 7, 9, 1, None, 0);
         bw.next_start_code();
         let bytes = bw.into_bytes();
         let mut br = BitReader::new(&bytes);

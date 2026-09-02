@@ -41,8 +41,23 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   in the reference decoder, the two-point stream exact up to one
   intra near-tie sample.
 
+- Encoder `intra_dc_vlc_thr` (Table 6-25): explicit `dc-vlc-thr` 0..=7
+  (intra DC differentials on the AC VLC above the running-quantiser
+  threshold, combined and data-partitioned layouts) and `auto-dc-vlc`
+  (per-I-VOP election by measured cost, carried to the following
+  P/S-VOPs).
+- S(GMC)-VOP video-packet HEC bodies: the encoder restates
+  `sprite_trajectory()` and the decoder's `video_packet_header()`
+  parser consumes it (`VideoPacketHeader::sprite_trajectory`). New
+  black-box pair `enc_isb_dcvlc7_hec_96x64`, bit-exact.
+
 ### Fixed
 
+- Decoder: the §6.2.5.3 data-partitioned I-/P-VOP parsers evaluate
+  `use_intra_dc_vlc` per macroblock against the running quantiser
+  after that macroblock's `dquant` (§6.3.5 "the DCT quantiser"),
+  instead of once per video packet — an `intra_dc_vlc_thr` in 1..=6
+  with `dquant` moves mis-parsed the partition.
 - Decoder: a §7.7.2.1 field motion vector is reconstructed under the
   §7.6.3 `[low:high]` modulo wrap on its own grid (horizontal in frame
   units, vertical in field units), as §7.6.3 declares its process valid

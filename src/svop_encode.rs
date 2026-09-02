@@ -101,6 +101,7 @@ pub fn put_warping_mv_code(bw: &mut BitWriter, dmv: i32) {
 /// including the `sprite_trajectory()` (`trajectory.count` warping
 /// points, each `du[i]` then `dv[i]` as `warping_mv_code()`). The
 /// writer is left mid-unit — the macroblock walk follows.
+#[allow(clippy::too_many_arguments)]
 pub fn write_s_vop_header(
     bw: &mut BitWriter,
     resolution: u16,
@@ -109,6 +110,7 @@ pub fn write_s_vop_header(
     quant: u32,
     fcode: u8,
     trajectory: &SpriteTrajectory,
+    intra_dc_vlc_thr: u8,
 ) {
     bw.write_start_code(VOP_START_CODE);
     bw.write_bits(0b11, 2); // vop_coding_type = S
@@ -124,7 +126,8 @@ pub fn write_s_vop_header(
     bw.write_marker();
     bw.write_bit(true); // vop_coded = 1
     bw.write_bit(false); // vop_rounding_type = 0 (S(GMC) carries it like P)
-    bw.write_bits(0, 3); // intra_dc_vlc_thr = 0
+    assert!(intra_dc_vlc_thr <= 7, "intra_dc_vlc_thr is a 3-bit field");
+    bw.write_bits(u32::from(intra_dc_vlc_thr), 3); // intra_dc_vlc_thr (Table 6-25)
     assert!(
         (1..=3).contains(&trajectory.count),
         "GMC trajectories carry 1..=3 points"
@@ -516,7 +519,6 @@ pub fn encode_s_vop(
     let (mb_width, mb_height) = cfg.mb_dimensions();
     let w_intra = crate::block::intra_quant_matrix(vol);
     let w_inter = nonintra_quant_matrix(vol);
-    let use_dc_vlc = use_intra_dc_vlc(0, qp);
     let mode = sample_mode_of(vol);
     let fcode = cfg.fcode;
     let luma_ref = reference.luma_reference();
@@ -603,6 +605,7 @@ pub fn encode_s_vop(
         qp,
         fcode,
         &trajectory,
+        cfg.intra_dc_vlc_thr,
     );
     let mut pw = PacketWriter::new(
         bw,
@@ -614,9 +617,10 @@ pub fn encode_s_vop(
             modulo_time_base,
             time_increment,
             time_increment_bits: vop_time_increment_bits(cfg.time_increment_resolution),
-            intra_dc_vlc_thr: 0,
+            intra_dc_vlc_thr: cfg.intra_dc_vlc_thr,
             total_macroblocks: (mb_width * mb_height) as u32,
             interlaced: false,
+            sprite_trajectory: Some(trajectory),
         },
         Layout::Combined,
     );
@@ -692,7 +696,7 @@ pub fn encode_s_vop(
                     qp,
                     cfg,
                     &w_intra,
-                    use_dc_vlc,
+                    use_intra_dc_vlc(cfg.intra_dc_vlc_thr, qp),
                     dquant,
                 );
                 pw.push(&fields);
@@ -1020,6 +1024,7 @@ mod tests {
                 count: 1,
                 points: [[-6, 3], [0, 0], [0, 0]],
             },
+            0,
         );
         bw.next_start_code();
         let bytes = bw.into_bytes();

@@ -298,9 +298,13 @@ The GMC pair (96×64, a background panning by (6, 2) pels per frame):
 ffmpeg -idct faani -i enc_isb_gmc_qpel_96x64.m4v -f rawvideo -pix_fmt yuv420p enc_isb_gmc_qpel_96x64.yuv
 ```
 
-Bit-exact (pair regenerated in round 455 after the GMC-vs-local
-preference became quantiser-scaled — same construction, new
-decisions, still bit-exact). Two findings from this pair's validation:
+Bit-exact (stream regenerated twice in round 455: after the
+GMC-vs-local preference became quantiser-scaled, and again once the
+S(GMC)-VOP video packets started carrying `header_extension_code`
+bodies with the `sprite_trajectory()` restatement — the reference
+decode is byte-identical across both, and the reference decoder's
+`untested` remark on those HEC bodies is its own path-coverage note).
+Two findings from this pair's validation:
 
 * **Table B.34 `dmv_length`** — the crate's `warping_mv_code()`
   reader (and the first encoder cut) treated `dmv_length` as a plain
@@ -415,6 +419,24 @@ reference decodes as above (`ffmpeg -idct faani -i <name>.m4v …`):
   which the first S picture copies through its GMC prediction — 2 of
   36864 samples, ±1.
 
+## AC-VLC intra DC + S(GMC) packet HEC (round 455)
+
+* `enc_isb_dcvlc7_hec_96x64` — registry build (`gmc`, `fcode 2`, `bf 1`,
+  `dc-vlc-thr 7`, `mb-aq`, `packet-bits 500`, qp 6; deterministic from
+  `tests/encoder_dc_vlc_hec.rs`): every intra DC differential rides the
+  AC VLC (`intra_dc_vlc_thr == 7`, Table 6-25), the S(GMC)-VOP video
+  packets alternate `header_extension_code` bodies that restate
+  `sprite_trajectory()` (§6.2.5), B-VOPs between the S anchors. The
+  reference decode is **bit-exact**. Black-box observation: the
+  reference decoder logs an `untested` notice while consuming the
+  S-VOP packet HEC bodies (its own path-coverage remark — the pair
+  without S-VOP HEC bodies decodes silently), yet reconstructs every
+  sample identically.
+
+```
+ffmpeg -idct faani -i enc_isb_dcvlc7_hec_96x64.m4v -f rawvideo -pix_fmt yuv420p enc_isb_dcvlc7_hec_96x64.yuv
+```
+
 ## Short-header streams (round 455 — §6.2.5.2 `short_video_header == 1`)
 
 Raw H.263-compatible elementary streams (`.h263`: byte-aligned
@@ -447,6 +469,8 @@ ffmpeg -f lavfi -i "testsrc2=size=176x144:rate=25:duration=0.2" \
 ## SHA-256
 
 ```
+c0b9105c0f423dc536f4808600836c4aad64bbcafcf65691da41b826ead2eee1  enc_isb_dcvlc7_hec_96x64.m4v
+e5174ea5ec489b9dae7fd9043294bf06585dbd0763b6bc9d0cdc1d9c2f3aa10b  enc_isb_dcvlc7_hec_96x64.yuv
 1b3f275670116b291b656d64a6649ebd7bff87a9bb169ac5ea045ce9c5ed1777  enc_is_gmc3_zoom_96x64.m4v
 2f0677e7da0fd2a0b743dc098e6931ebb53dc93c1e49e7e7688adbcd89ab3e1b  enc_is_gmc3_zoom_96x64.yuv
 ef61f2af0ce809fab9332d8fba8419d7751c0ba99f84b7b6bbdc47b28eac6483  enc_is_gmc2_rot_96x64.m4v
@@ -544,7 +568,7 @@ e1e4c9d7fce8198331e805bc6a3743b5839c96b213747e9bd5a84ec438ec894f  enc_ip_qpel_64
 769fc2f8f88c2038b18592649e8aa1bf324a452187533a7b399ee89ea193b1a9  enc_ip_fcode2_96x64.yuv
 7b9ce94a56292b8541b2fabe1927d2ca30f867cd1fb3544f2daeeca4b5791e46  enc_ipb_fcode3_qpel4mv_96x64.m4v
 584711548f66a8f862ce5bee4cc8c5fd48fd78f264c732097956756dbcf73779  enc_ipb_fcode3_qpel4mv_96x64.yuv
-be56a82c48b29ea71da567d70b150a5123cb1b4291a9f331255753938714a07b  enc_isb_gmc_qpel_96x64.m4v
+c3b72f23ad712971366ea2ce023ac232619a2d70421733a8c32b25ac346261ef  enc_isb_gmc_qpel_96x64.m4v
 6a03f7a7fd2a605e5fda34ecf5cba5ad5fe87ad8b41357df2d3b181c1c56b654  enc_isb_gmc_qpel_96x64.yuv
 43ba930a07b45c825b5df81b66331bc1a8cfef066540ef9f22af8cd02a78d844  dec_sgmc_negamv_hp_64x64.m4v
 e560f779d1d598419c80bf30629463fd1e0046834a2d0ac1ecf592ea130c8483  dec_sgmc_negamv_hp_64x64.yuv
