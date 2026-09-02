@@ -1,0 +1,30 @@
+[package]
+name = "oxideav-mpeg4video-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.oxideav-mpeg4video]
+path = ".."
+
+[[bin]]
+name = "short_header"
+path = "fuzz_targets/short_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "stream_decode"
+path = "fuzz_targets/stream_decode.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

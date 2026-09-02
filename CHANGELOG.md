@@ -51,6 +51,12 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   parser consumes it (`VideoPacketHeader::sprite_trajectory`). New
   black-box pair `enc_isb_dcvlc7_hec_96x64`, bit-exact.
 
+- `fuzz/` sub-crate (cargo-fuzz) with two targets — `short_header`
+  (§6.2.5.2 picture parser + macroblock walk + VOL-less stream
+  auto-detection) and `stream_decode` (whole elementary streams, raw
+  and behind a fixed VOS/VOL prefix) — plus the `Fuzz` workflow shim
+  over the org reusable fuzz job.
+
 ### Fixed
 
 - Decoder: the §6.2.5.3 data-partitioned I-/P-VOP parsers evaluate

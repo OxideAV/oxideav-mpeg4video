@@ -543,6 +543,16 @@ both modes' envelopes are pinned).
   / `sprite_brightness_change == 1`) — typed-rejected, since the spec
   mandates `sprite_brightness_change == 0` under GMC.
 
+## Fuzzing
+
+`fuzz/` is a `cargo-fuzz` sub-crate (nightly): `short_header` drives
+the §6.2.5.2 picture parser, the GOB / macroblock walk and the stream
+decoder's VOL-less auto-detection on arbitrary bytes; `stream_decode`
+feeds whole elementary streams to `Mpeg4VideoDecoder`, raw and behind
+a fixed VOS/VOL prefix so the VOP headers, video-packet HEC bodies,
+data partitioning and every macroblock walk get exercised. The `Fuzz`
+workflow runs both daily through the org-level reusable job.
+
 ## Provenance
 
 Every numeric value and bit layout traces to ISO/IEC 14496-2:2004 (3rd
