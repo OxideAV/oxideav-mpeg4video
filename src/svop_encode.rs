@@ -196,6 +196,7 @@ pub fn encode_s_vop(
 ) -> (Vec<u8>, SVopEncodeStats) {
     assert!((1..=31).contains(&qp), "vop_quant {qp} out of range");
     assert!(cfg.gmc, "encode_s_vop needs a GMC VOL");
+    assert!(!cfg.interlaced, "S(GMC)-VOPs are progressive-only");
     let (mb_width, mb_height) = cfg.mb_dimensions();
     let w_intra = crate::block::intra_quant_matrix(vol);
     let w_inter = nonintra_quant_matrix(vol);
@@ -275,6 +276,7 @@ pub fn encode_s_vop(
             time_increment_bits: vop_time_increment_bits(cfg.time_increment_resolution),
             intra_dc_vlc_thr: 0,
             total_macroblocks: (mb_width * mb_height) as u32,
+            interlaced: false,
         },
         Layout::Combined,
     );
@@ -384,7 +386,13 @@ pub fn encode_s_vop(
                         residual[y][x] = src_block[y][x] - p;
                     }
                 }
-                let (ev, _qf) = quantise_inter_block(&residual, qp, cfg.quant_type, &w_inter);
+                let (ev, _qf) = quantise_inter_block(
+                    &residual,
+                    qp,
+                    cfg.quant_type,
+                    &w_inter,
+                    crate::scan::ScanType::Zigzag,
+                );
                 events.push(ev);
             }
             let all_zero = events.iter().all(|e| e.is_empty());
@@ -419,6 +427,7 @@ pub fn encode_s_vop(
                         fcode,
                         intra_dc: None,
                         blocks: Default::default(),
+                        interlaced: None,
                     });
                     continue;
                 }
@@ -467,6 +476,7 @@ pub fn encode_s_vop(
                 fcode,
                 intra_dc: None,
                 blocks,
+                interlaced: None,
             });
         }
     }
@@ -546,6 +556,8 @@ pub fn as_p_stats(stats: &SVopEncodeStats) -> PVopEncodeStats {
         skipped: stats.gmc_skipped,
         inter: stats.gmc + stats.local,
         inter4v: stats.inter4v,
+        field: 0,
+        field_dct: 0,
         intra: stats.intra,
         dquant: stats.dquant,
         packets: stats.packets,

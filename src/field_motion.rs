@@ -152,6 +152,45 @@ pub fn reconstruct_field_motion_vectors(pair: FieldMvPair, px: i32, py: i32) -> 
     FieldMotionVectors { top, bottom }
 }
 
+/// [`reconstruct_field_motion_vectors`] with the §7.6.3 modulo wrap
+/// applied to each reconstructed component on its own grid — the
+/// horizontal in frame units, the vertical in **field** units before
+/// the doubling (`MVy = 2 * wrap(MVDy + Py / 2)`). §7.6.3 declares its
+/// general decoding process (which includes the `[low:high]` wrap)
+/// "valid for the motion vector decoding in interlaced/progressive
+/// P-, S(GMC)- and B-VOPs except that the generation of the predictor
+/// (Px, Py) may be different"; §7.7.2.1 supplies that predictor and
+/// the field-grid halving/doubling. For a conformant stream every
+/// component is already inside `[low:high]` and the wrap is a no-op.
+pub fn reconstruct_field_motion_vectors_wrapped(
+    pair: FieldMvPair,
+    px: i32,
+    py: i32,
+    vop_fcode: u8,
+) -> FieldMotionVectors {
+    let f = 1i32 << (vop_fcode.clamp(1, 7) - 1);
+    let (low, high, range) = (-32 * f, 32 * f - 1, 64 * f);
+    let wrap = |mut v: i32| {
+        if v < low {
+            v += range;
+        }
+        if v > high {
+            v -= range;
+        }
+        v
+    };
+    let py_half = py / 2;
+    let top = MotionVector {
+        x: wrap(pair.top.dx + px),
+        y: 2 * wrap(pair.top.dy + py_half),
+    };
+    let bottom = MotionVector {
+        x: wrap(pair.bottom.dx + px),
+        y: 2 * wrap(pair.bottom.dy + py_half),
+    };
+    FieldMotionVectors { top, bottom }
+}
+
 /// The §7.7.2.1 / §7.6.2 half-sample motion-compensation routine `mc`.
 ///
 /// Fills the `width × height` block of `pred` (a row-major plane of
@@ -202,6 +241,12 @@ pub fn mc(
     let half_x = (dx_halfpel & 1) != 0;
     let half_y = (dy_halfpel & y_incr) != 0;
     let y_incr_u = y_incr as usize;
+    // §7.6.4 edge clamp: the last full-pel position inside the decoded
+    // VOP area, on the *frame* grid for both field parities (the
+    // §7.6.1.5 per-field rule governs arbitrary-shape padding inside
+    // the bounding rectangle, not the rectangular-VOP edge read) —
+    // black-box-confirmed on the interlaced conformance corpus.
+    let fetch = |xr: i32, yr: i32| -> i32 { i32::from(reference.fetch_clamped(xr, yr)) };
 
     let mut iy: usize = 0;
     while iy < height {
@@ -210,29 +255,17 @@ pub fn mc(
             let y_ref = y + dy + iy as i32 + ref_y0;
             let value: i32 = match (half_y, half_x) {
                 (true, true) => {
-                    (reference.fetch_clamped(x_ref, y_ref) as i32
-                        + reference.fetch_clamped(x_ref + 1, y_ref) as i32
-                        + reference.fetch_clamped(x_ref, y_ref + y_incr) as i32
-                        + reference.fetch_clamped(x_ref + 1, y_ref + y_incr) as i32
+                    (fetch(x_ref, y_ref)
+                        + fetch(x_ref + 1, y_ref)
+                        + fetch(x_ref, y_ref + y_incr)
+                        + fetch(x_ref + 1, y_ref + y_incr)
                         + 2
                         - rc)
                         >> 2
                 }
-                (true, false) => {
-                    (reference.fetch_clamped(x_ref, y_ref) as i32
-                        + reference.fetch_clamped(x_ref, y_ref + y_incr) as i32
-                        + 1
-                        - rc)
-                        >> 1
-                }
-                (false, true) => {
-                    (reference.fetch_clamped(x_ref, y_ref) as i32
-                        + reference.fetch_clamped(x_ref + 1, y_ref) as i32
-                        + 1
-                        - rc)
-                        >> 1
-                }
-                (false, false) => reference.fetch_clamped(x_ref, y_ref) as i32,
+                (true, false) => (fetch(x_ref, y_ref) + fetch(x_ref, y_ref + y_incr) + 1 - rc) >> 1,
+                (false, true) => (fetch(x_ref, y_ref) + fetch(x_ref + 1, y_ref) + 1 - rc) >> 1,
+                (false, false) => fetch(x_ref, y_ref),
             };
             let dst_row = iy + pred_y0;
             pred[dst_row * pred_stride + ix] = value as u8;

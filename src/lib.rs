@@ -329,6 +329,7 @@ pub mod bvop_field_direct;
 pub mod bvop_field_motion;
 #[doc(hidden)]
 pub mod bvop_field_predictor;
+pub mod bvop_interlaced_encode;
 pub mod bvop_mv; // mixed: `BVopMvDriverError` stays visible
 #[doc(hidden)]
 pub mod bvop_prediction;
@@ -342,6 +343,7 @@ pub mod decoder;
 pub mod encoder;
 pub mod extended_padding;
 pub mod fdct;
+pub mod field_encode;
 #[doc(hidden)]
 pub mod field_motion;
 pub mod frame_decode; // mixed: `FrameDecodeError` stays visible

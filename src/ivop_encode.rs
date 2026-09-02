@@ -45,7 +45,7 @@ use crate::fdct::forward_dct_8x8;
 use crate::framestore::DecodedFrame;
 use crate::inverse_quant::{inverse_quant_intra_dc, saturate_fprime};
 use crate::neighbour::{BlockNeighbour, IntraBlockGrid};
-use crate::packet_encode::{Layout, MbFields, PacketVopInfo, PacketWriter};
+use crate::packet_encode::{InterlacedMbInfo, Layout, MbFields, PacketVopInfo, PacketWriter};
 use crate::predictor::{dc_scaler, predict_intra_dc, select_dc_direction};
 use crate::quantise::{quantise_intra_dc, quantise_method1_intra, quantise_method2_intra};
 use crate::scan::{inverse_scan, select_scan_type, DcPredictionDirection, ScanType};
@@ -112,6 +112,75 @@ pub struct EncoderConfig {
     /// are S(GMC)-VOPs. Requires (and selects) the verid-2 VOL and
     /// the ASP profile; incompatible with `data_partitioned`.
     pub gmc: bool,
+    /// `interlaced` (§6.3.3): the VOL codes interlaced VOPs — every
+    /// VOP header carries `top_field_first` /
+    /// `alternate_vertical_scan_flag`, every macroblock the §6.2.6.3
+    /// `interlaced_information()` body (field DCT decided per
+    /// macroblock, §7.7.2.1 field prediction cost-decided per inter
+    /// macroblock). Selects the ASP profile; incompatible with
+    /// `data_partitioned` and `gmc` (the decoder's S(GMC) walk is
+    /// progressive-only).
+    pub interlaced: bool,
+    /// §6.3.5 `top_field_first` written on every VOP of an interlaced
+    /// VOL (ignored otherwise).
+    pub top_field_first: bool,
+    /// §6.3.5 `alternate_vertical_scan_flag`: code every block of an
+    /// interlaced VOP with the Figure 7-4 (b) alternate-vertical scan
+    /// (ignored on a progressive VOL).
+    pub alternate_scan: bool,
+}
+
+/// The two §6.3.5 interlaced VOP-header flags, written right after
+/// `intra_dc_vlc_thr` when the VOL codes `interlaced == 1`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct VopInterlaceFlags {
+    /// `top_field_first`.
+    pub top_field_first: bool,
+    /// `alternate_vertical_scan_flag`.
+    pub alternate_vertical_scan: bool,
+}
+
+impl VopInterlaceFlags {
+    /// Emit the two flags (call only on an interlaced VOL).
+    pub(crate) fn write(self, bw: &mut BitWriter) {
+        bw.write_bit(self.top_field_first);
+        bw.write_bit(self.alternate_vertical_scan);
+    }
+}
+
+/// The §6.2.6.3 forward field-DCT permutation (Figure 6-12): the four
+/// luminance blocks of a `dct_type == 1` macroblock carry the top
+/// field's lines (blocks 0/1, rows `0, 2, …, 14`) and the bottom
+/// field's lines (blocks 2/3, rows `1, 3, …, 15`). Exact inverse of
+/// [`crate::reconstruct::inverse_field_dct_luma`].
+pub fn field_dct_luma(luma: &[[i32; 16]; 16]) -> [[i32; 16]; 16] {
+    let mut out = [[0i32; 16]; 16];
+    for k in 0..8 {
+        out[k] = luma[2 * k];
+        out[8 + k] = luma[2 * k + 1];
+    }
+    out
+}
+
+/// The encoder's `dct_type` election for one 16×16 luminance block
+/// (source samples for an intra macroblock, the prediction residual
+/// for an inter one): field DCT when adjacent same-field lines
+/// correlate better than adjacent frame lines — the mean absolute
+/// vertical difference over the 14 same-field line pairs against the
+/// 15 frame line pairs. The spec leaves the decision to the encoder;
+/// this is a pure content statistic, independent of any predictor
+/// state, so it can be taken before the blocks are quantised.
+pub fn elect_field_dct(luma: &[[i32; 16]; 16]) -> bool {
+    let row_diff = |a: &[i32; 16], b: &[i32; 16]| -> u64 {
+        a.iter()
+            .zip(b.iter())
+            .map(|(&p, &q)| u64::from((p - q).unsigned_abs()))
+            .sum()
+    };
+    let frame: u64 = luma.windows(2).map(|w| row_diff(&w[0], &w[1])).sum();
+    let field: u64 = luma.windows(3).map(|w| row_diff(&w[0], &w[2])).sum();
+    // Compare per-pair means: field / 14 < frame / 15.
+    field * 15 < frame * 14
 }
 
 /// The §6.2.3 `vbv_parameters` triple (Annex D rate-buffer model).
@@ -141,6 +210,9 @@ impl Default for EncoderConfig {
             adaptive_quant: false,
             resilience: crate::packet_encode::ResilienceConfig::default(),
             gmc: false,
+            interlaced: false,
+            top_field_first: true,
+            alternate_scan: false,
         }
     }
 }
@@ -149,7 +221,23 @@ impl EncoderConfig {
     /// Whether the configuration uses any Advanced-Simple-profile
     /// tool (method-1 quantisation, quarter-sample MC, B-VOPs).
     fn uses_asp_tools(&self) -> bool {
-        self.quant_type || self.quarter_sample || self.b_vops || self.gmc
+        self.quant_type || self.quarter_sample || self.b_vops || self.gmc || self.interlaced
+    }
+
+    /// The §6.3.5 VOP-header interlace flags for this configuration
+    /// (`None` on a progressive VOL).
+    pub fn vop_interlace(&self) -> Option<VopInterlaceFlags> {
+        self.interlaced.then_some(VopInterlaceFlags {
+            top_field_first: self.top_field_first,
+            alternate_vertical_scan: self.alternate_scan,
+        })
+    }
+
+    /// The scan every block of a VOP uses when the §6.3.5
+    /// `alternate_vertical_scan_flag` overrides the §7.4.2 per-block
+    /// selection (`None` = the per-block rule).
+    pub(crate) fn forced_scan(&self) -> Option<ScanType> {
+        (self.interlaced && self.alternate_scan).then_some(ScanType::AlternateVertical)
     }
 
     /// Whether the VOL needs `video_object_layer_verid == 2` (the
@@ -268,7 +356,13 @@ pub fn write_configuration_headers(cfg: &EncoderConfig) -> Vec<u8> {
     bw.write_marker();
     bw.write_bits(u32::from(cfg.height), 13);
     bw.write_marker();
-    bw.write_bit(false); // interlaced = 0
+    if cfg.interlaced {
+        assert!(
+            !cfg.resilience.data_partitioned && !cfg.gmc,
+            "interlaced VOLs use the combined syntax without GMC"
+        );
+    }
+    bw.write_bit(cfg.interlaced); // interlaced
     bw.write_bit(true); // obmc_disable = 1
     if cfg.verid2() {
         // sprite_enable (verid 2 → 2 bits): 10 = GMC, 00 = not used.
@@ -325,6 +419,7 @@ pub fn write_i_vop_header(
     modulo_time_base: u32,
     time_increment: u16,
     quant: u32,
+    interlace: Option<VopInterlaceFlags>,
 ) {
     bw.write_start_code(VOP_START_CODE);
     bw.write_bits(0b00, 2); // vop_coding_type = I
@@ -340,6 +435,9 @@ pub fn write_i_vop_header(
     bw.write_marker();
     bw.write_bit(true); // vop_coded = 1
     bw.write_bits(0, 3); // intra_dc_vlc_thr = 0 (DC VLC for the whole VOP)
+    if let Some(flags) = interlace {
+        flags.write(bw); // top_field_first + alternate_vertical_scan_flag
+    }
     assert!((1..=31).contains(&quant), "vop_quant {quant} out of range");
     bw.write_bits(quant, 5);
 }
@@ -377,6 +475,29 @@ impl<'a> FrameView<'a> {
                 let sx = (x0 + dx).min(pw.saturating_sub(1));
                 *cell = i32::from(plane[sy * pw + sx]);
             }
+        }
+        out
+    }
+
+    /// [`FrameView::block`] with the §7.7.1 field-DCT permutation
+    /// applied to the luminance blocks when `field_dct` (blocks 0/1 =
+    /// the top field's 16 lines, 2/3 = the bottom field's); chroma is
+    /// untouched by `dct_type`.
+    pub(crate) fn block_with_field_dct(
+        &self,
+        mb_row: usize,
+        mb_col: usize,
+        i: usize,
+        field_dct: bool,
+    ) -> [[i32; 8]; 8] {
+        if !field_dct || i >= 4 {
+            return self.block(mb_row, mb_col, i);
+        }
+        let permuted = field_dct_luma(&crate::pvop_encode::source_luma_mb(self, mb_row, mb_col));
+        let (row0, col0) = (8 * (i / 2), 8 * (i % 2));
+        let mut out = [[0i32; 8]; 8];
+        for (y, row) in out.iter_mut().enumerate() {
+            row.copy_from_slice(&permuted[row0 + y][col0..col0 + 8]);
         }
         out
     }
@@ -506,6 +627,7 @@ pub(crate) fn plan_block(
     component: DcComponent,
     qp: u32,
     ac_pred: bool,
+    forced_scan: Option<ScanType>,
 ) -> Option<BlockPlan> {
     let qf = &prepared.qf;
     let scaler = dc_scaler(component, qp);
@@ -546,7 +668,9 @@ pub(crate) fn plan_block(
         }
     }
 
-    let scan_type = select_scan_type(true, ac_pred, direction);
+    // §6.3.5: an interlaced VOP's alternate_vertical_scan_flag
+    // overrides the §7.4.2 per-block selection.
+    let scan_type = forced_scan.unwrap_or_else(|| select_scan_type(true, ac_pred, direction));
     let qfs = forward_scan(&pqf, scan_type);
     let events = qfs_to_events(&qfs, 1);
     Some(BlockPlan {
@@ -577,6 +701,7 @@ pub(crate) fn intra_mb_fields(
     ac_pred_flag: bool,
     use_dc_vlc: bool,
     dquant: Option<i8>,
+    interlaced: Option<InterlacedMbInfo>,
 ) -> MbFields {
     let (cbpy, cbpc) = intra_mb_cbp(plans);
     assert!(
@@ -599,6 +724,7 @@ pub(crate) fn intra_mb_fields(
         fcode: 1,
         intra_dc: Some(dc),
         blocks: std::array::from_fn(|i| plans[i].events.clone()),
+        interlaced,
     }
 }
 
@@ -644,7 +770,9 @@ pub fn encode_i_vop(
         modulo_time_base,
         time_increment,
         qp,
+        cfg.vop_interlace(),
     );
+    let forced_scan = cfg.forced_scan();
     let layout = if cfg.resilience.data_partitioned {
         Layout::PartitionedI
     } else {
@@ -662,6 +790,7 @@ pub fn encode_i_vop(
             time_increment_bits: vop_time_increment_bits(cfg.time_increment_resolution),
             intra_dc_vlc_thr: 0,
             total_macroblocks: (mb_width * mb_height) as u32,
+            interlaced: cfg.interlaced,
         },
         layout,
     );
@@ -687,11 +816,15 @@ pub fn encode_i_vop(
                 (qp, None)
             };
             running_qp = qp;
+            // §7.7.1 dct_type election (interlaced VOL only): field DCT
+            // permutes the luminance lines before the blocks are cut.
+            let field_dct = cfg.interlaced
+                && elect_field_dct(&crate::pvop_encode::source_luma_mb(frame, mb_row, mb_col));
             // Quantise the six blocks first (grid state is variant-
             // independent — the decoder records post-prediction QF).
             let mut prepared: Vec<PreparedBlock> = Vec::with_capacity(6);
             for i in 0..6 {
-                let samples = frame.block(mb_row, mb_col, i);
+                let samples = frame.block_with_field_dct(mb_row, mb_col, i, field_dct);
                 let f = forward_dct_8x8(&samples, 8);
                 prepared.push(quantise_intra_block(
                     &f,
@@ -719,11 +852,27 @@ pub fn encode_i_vop(
                 let predictors = grid.predictors_for(mb_row, mb_col, i, 8, qp);
                 let direction =
                     select_dc_direction(predictors.fa_dc, predictors.fb_dc, predictors.fc_dc);
-                let off = plan_block(prep, &predictors, direction, component, qp, false)
-                    .expect("no-prediction differentials are always codable");
+                let off = plan_block(
+                    prep,
+                    &predictors,
+                    direction,
+                    component,
+                    qp,
+                    false,
+                    forced_scan,
+                )
+                .expect("no-prediction differentials are always codable");
                 plans_off.push(off);
                 if let Some(on) = plans_on.as_mut() {
-                    match plan_block(prep, &predictors, direction, component, qp, true) {
+                    match plan_block(
+                        prep,
+                        &predictors,
+                        direction,
+                        component,
+                        qp,
+                        true,
+                        forced_scan,
+                    ) {
                         Some(p) => on.push(p),
                         None => plans_on = None, // fall back for the whole MB
                     }
@@ -740,13 +889,17 @@ pub fn encode_i_vop(
                 .unwrap_or_else(|_| unreachable!("six blocks per macroblock"));
 
             // Measured-cost ac_pred decision.
-            let fields_off = intra_mb_fields(&plans_off, false, use_dc_vlc, dquant);
+            let interlaced = cfg.interlaced.then_some(InterlacedMbInfo {
+                field_dct,
+                field_refs: None,
+            });
+            let fields_off = intra_mb_fields(&plans_off, false, use_dc_vlc, dquant, interlaced);
             let chosen = plans_on
                 .and_then(|on| {
                     let on: [BlockPlan; 6] = on
                         .try_into()
                         .unwrap_or_else(|_| unreachable!("six blocks per macroblock"));
-                    let fields_on = intra_mb_fields(&on, true, use_dc_vlc, dquant);
+                    let fields_on = intra_mb_fields(&on, true, use_dc_vlc, dquant, interlaced);
                     (pw.cost_of(&fields_on) < pw.cost_of(&fields_off)).then_some(fields_on)
                 })
                 .unwrap_or(fields_off);

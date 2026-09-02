@@ -315,8 +315,12 @@ impl MvDriver {
             MvMode::Forward,
             self.vop_fcode_forward,
         )?;
-        let mvs =
-            crate::field_motion::reconstruct_field_motion_vectors(pair, predictor.x, predictor.y);
+        let mvs = crate::field_motion::reconstruct_field_motion_vectors_wrapped(
+            pair,
+            predictor.x,
+            predictor.y,
+            self.vop_fcode_forward,
+        );
         self.grid
             .record_field(mb_row, mb_col, mvs.top, mvs.bottom)?;
         Ok(mvs)

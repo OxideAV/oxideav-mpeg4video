@@ -38,22 +38,23 @@ use crate::block::nonintra_quant_matrix;
 use crate::bvop_prediction::BVopSampleMode;
 use crate::data_partition::use_intra_dc_vlc;
 use crate::fdct::forward_dct_8x8;
+use crate::field_encode::{estimate_field_motion, field_mv_differential, FieldEstimate};
 use crate::framestore::{DecodedFrame, FrameStore};
 use crate::ivop_encode::{
-    forward_scan, intra_mb_fields, plan_block, qfs_to_events, quantise_intra_block, BlockPlan,
-    EncoderConfig, FrameView, PreparedBlock,
+    elect_field_dct, field_dct_luma, forward_scan, intra_mb_fields, plan_block, qfs_to_events,
+    quantise_intra_block, BlockPlan, EncoderConfig, FrameView, PreparedBlock, VopInterlaceFlags,
 };
 use crate::motion::{predict_motion_vector, MotionVector};
 use crate::mv_predictor_grid::MvGrid;
 use crate::neighbour::{BlockNeighbour, IntraBlockGrid};
-use crate::packet_encode::{Layout, MbFields, PacketVopInfo, PacketWriter};
+use crate::packet_encode::{InterlacedMbInfo, Layout, MbFields, PacketVopInfo, PacketWriter};
 use crate::predictor::select_dc_direction;
 use crate::pvop_mv::{predict_inter_macroblock, PvopMbMotion};
 use crate::quantise::{quantise_method1_inter, quantise_method2_inter};
 use crate::scan::ScanType;
 use crate::texture::{AcEvent, DcComponent};
 use crate::vop::{parse_vop_header_body, vop_time_increment_bits, VopCodingType, VopContext};
-use crate::vop_decode::decode_p_vop_macroblocks;
+use crate::vop_decode::{decode_p_vop_macroblocks, AnchorMbMotion};
 
 /// Dense full-pel motion search radius in pels (each direction) —
 /// the `fcode == 1` window, whose refined half-pel vector stays inside
@@ -83,6 +84,11 @@ pub(crate) fn search_window_pels(fcode: u8, mode: BVopSampleMode) -> i32 {
 
 const VOP_START_CODE: u32 = 0x0000_01B6;
 
+/// SAD margin a §7.7.2.1 field-predicted macroblock must beat the
+/// frame prediction by (the second motion body + the two
+/// reference-field bits it costs).
+pub const FIELD_MODE_BIAS: u32 = 96;
+
 /// Emit a §6.2.5 P-VOP header (through `vop_fcode_forward`). The
 /// writer is left mid-unit — the macroblock walk follows.
 pub fn write_p_vop_header(
@@ -92,6 +98,7 @@ pub fn write_p_vop_header(
     time_increment: u16,
     quant: u32,
     fcode: u8,
+    interlace: Option<VopInterlaceFlags>,
 ) {
     bw.write_start_code(VOP_START_CODE);
     bw.write_bits(0b01, 2); // vop_coding_type = P
@@ -108,6 +115,9 @@ pub fn write_p_vop_header(
     bw.write_bit(true); // vop_coded = 1
     bw.write_bit(false); // vop_rounding_type = 0
     bw.write_bits(0, 3); // intra_dc_vlc_thr = 0
+    if let Some(flags) = interlace {
+        flags.write(bw); // top_field_first + alternate_vertical_scan_flag
+    }
     assert!((1..=31).contains(&quant), "vop_quant {quant} out of range");
     bw.write_bits(quant, 5);
     assert!(
@@ -126,6 +136,10 @@ pub struct PVopEncodeStats {
     pub inter: usize,
     /// inter4v (4-MV) macroblocks.
     pub inter4v: usize,
+    /// §7.7.2.1 field-predicted macroblocks (interlaced VOLs).
+    pub field: usize,
+    /// Macroblocks coded with the §7.7.1 field DCT (`dct_type == 1`).
+    pub field_dct: usize,
     /// Intra macroblocks.
     pub intra: usize,
     /// Macroblocks that carried a `dquant` (`inter+q` / `intra+q`).
@@ -480,6 +494,7 @@ pub(crate) fn quantise_inter_block(
     qp: u32,
     quant_type: bool,
     w_inter: &[[u8; 8]; 8],
+    scan: ScanType,
 ) -> (Vec<AcEvent>, [[i32; 8]; 8]) {
     let f = forward_dct_8x8(residual, 8);
     let mut qf = [[0i32; 8]; 8];
@@ -492,8 +507,84 @@ pub(crate) fn quantise_inter_block(
             };
         }
     }
-    let qfs = forward_scan(&qf, ScanType::Zigzag);
+    let qfs = forward_scan(&qf, scan);
     (qfs_to_events(&qfs, 0), qf)
+}
+
+/// The inter-block scan of a VOP: zigzag, or the §6.3.5 alternate
+/// vertical scan when the interlaced VOP header forces it.
+pub(crate) fn inter_scan(cfg: &EncoderConfig) -> ScanType {
+    cfg.forced_scan().unwrap_or(ScanType::Zigzag)
+}
+
+/// The six quantised residual blocks of an inter macroblock from a
+/// 16×16 luminance prediction residual (already field-permuted when
+/// the macroblock codes `dct_type == 1`) plus the two chroma
+/// residuals.
+pub(crate) fn quantise_inter_residual(
+    luma: &[[i32; 16]; 16],
+    cb: &[[i32; 8]; 8],
+    cr: &[[i32; 8]; 8],
+    qp: u32,
+    quant_type: bool,
+    w_inter: &[[u8; 8]; 8],
+    scan: ScanType,
+) -> Vec<Vec<AcEvent>> {
+    let mut events: Vec<Vec<AcEvent>> = Vec::with_capacity(6);
+    for i in 0..4 {
+        let (row0, col0) = (8 * (i / 2), 8 * (i % 2));
+        let mut block = [[0i32; 8]; 8];
+        for (y, row) in block.iter_mut().enumerate() {
+            row.copy_from_slice(&luma[row0 + y][col0..col0 + 8]);
+        }
+        events.push(quantise_inter_block(&block, qp, quant_type, w_inter, scan).0);
+    }
+    events.push(quantise_inter_block(cb, qp, quant_type, w_inter, scan).0);
+    events.push(quantise_inter_block(cr, qp, quant_type, w_inter, scan).0);
+    events
+}
+
+/// One macroblock's prediction residual: the 16×16 luminance plus the
+/// two 8×8 chroma residuals.
+pub(crate) type MacroblockResidual = ([[i32; 16]; 16], [[i32; 8]; 8], [[i32; 8]; 8]);
+
+/// Source-minus-prediction residual of one macroblock: the 16×16
+/// luminance plus the two 8×8 chroma residuals.
+pub(crate) fn macroblock_residual(
+    frame: &FrameView<'_>,
+    mb_row: usize,
+    mb_col: usize,
+    prediction: &crate::reconstruct::InterPredictionMacroblock,
+) -> MacroblockResidual {
+    let src = source_luma_mb(frame, mb_row, mb_col);
+    let mut luma = [[0i32; 16]; 16];
+    for y in 0..16 {
+        for x in 0..16 {
+            luma[y][x] = src[y][x] - prediction.luma[y][x];
+        }
+    }
+    let src_cb = frame.block(mb_row, mb_col, 4);
+    let src_cr = frame.block(mb_row, mb_col, 5);
+    let mut cb = [[0i32; 8]; 8];
+    let mut cr = [[0i32; 8]; 8];
+    for y in 0..8 {
+        for x in 0..8 {
+            cb[y][x] = src_cb[y][x] - prediction.cb[y][x];
+            cr[y][x] = src_cr[y][x] - prediction.cr[y][x];
+        }
+    }
+    (luma, cb, cr)
+}
+
+/// The `(cbpy, cbpc)` pattern of six inter EVENT lists (§6.3.7
+/// "1 = coded", Figure 6-8 order).
+pub(crate) fn inter_cbp(events: &[Vec<AcEvent>]) -> (u8, u8) {
+    let cbpy = (u8::from(!events[0].is_empty()) << 3)
+        | (u8::from(!events[1].is_empty()) << 2)
+        | (u8::from(!events[2].is_empty()) << 1)
+        | u8::from(!events[3].is_empty());
+    let cbpc = (u8::from(!events[4].is_empty()) << 1) | u8::from(!events[5].is_empty());
+    (cbpy, cbpc)
 }
 
 /// Encode one rectangular progressive P-VOP against `reference` (the
@@ -529,7 +620,9 @@ pub fn encode_p_vop(
         time_increment,
         qp,
         fcode,
+        cfg.vop_interlace(),
     );
+    let scan = inter_scan(cfg);
 
     let layout = if cfg.resilience.data_partitioned {
         Layout::PartitionedP
@@ -548,6 +641,7 @@ pub fn encode_p_vop(
             time_increment_bits: vop_time_increment_bits(cfg.time_increment_resolution),
             intra_dc_vlc_thr: 0,
             total_macroblocks: (mb_width * mb_height) as u32,
+            interlaced: cfg.interlaced,
         },
         layout,
     );
@@ -600,7 +694,30 @@ pub fn encode_p_vop(
             } else {
                 None
             };
-            let inter_sad = four.map_or(one_mv_sad, |(_, s)| s);
+            let frame_sad = four.map_or(one_mv_sad, |(_, s)| s);
+            // §7.7.2.1 field prediction (interlaced VOL): one vector per
+            // output field against the better reference field parity,
+            // coded against the shared CASE 1/2/3 predictor the grid
+            // resolves for this macroblock. Chosen when the two field
+            // SADs undercut the frame prediction by a margin covering
+            // the extra motion body + reference bits.
+            let field: Option<(MotionVector, FieldEstimate, FieldEstimate)> = if cfg.interlaced {
+                let candidates = mv_grid
+                    .field_predictor_candidates(mb_row, mb_col)
+                    .expect("grid coordinates in range");
+                let predictor = crate::motion::predict_field_motion_vector(candidates);
+                let top = estimate_field_motion(
+                    &src, &luma_ref, mb_x, mb_y, false, predictor, mode, fcode,
+                );
+                let bottom = estimate_field_motion(
+                    &src, &luma_ref, mb_x, mb_y, true, predictor, mode, fcode,
+                );
+                (top.sad + bottom.sad + FIELD_MODE_BIAS < frame_sad)
+                    .then_some((predictor, top, bottom))
+            } else {
+                None
+            };
+            let inter_sad = field.map_or(frame_sad, |(_, t, b)| t.sad + b.sad);
             let choose_intra = activity + 512 < inter_sad;
 
             if choose_intra {
@@ -627,6 +744,9 @@ pub fn encode_p_vop(
                     use_dc_vlc,
                     dquant,
                 );
+                if fields.interlaced.is_some_and(|i| i.field_dct) {
+                    stats.field_dct += 1;
+                }
                 pw.push(&fields);
                 continue;
             }
@@ -644,34 +764,70 @@ pub fn encode_p_vop(
                 Some((mvs, _)) => PvopMbMotion::FourMv(mvs),
                 None => PvopMbMotion::OneMv(mv),
             };
-            let prediction =
-                predict_inter_macroblock(motion, &luma_ref, &cb_ref, &cr_ref, mb_x, mb_y, 0, mode)
-                    .expect("inter motion always yields a prediction");
-
-            let mut events: Vec<Vec<AcEvent>> = Vec::with_capacity(6);
-            for i in 0..6 {
-                let src_block = frame.block(mb_row, mb_col, i);
-                let mut residual = [[0i32; 8]; 8];
-                for y in 0..8 {
-                    for x in 0..8 {
-                        let p = match i {
-                            0..=3 => {
-                                let ry = y + 8 * (i / 2);
-                                let rx = x + 8 * (i % 2);
-                                prediction.luma[ry][rx]
-                            }
-                            4 => prediction.cb[y][x],
-                            _ => prediction.cr[y][x],
-                        };
-                        residual[y][x] = src_block[y][x] - p;
+            let prediction = match field {
+                Some((_, top, bottom)) => {
+                    let mvs = crate::field_motion::FieldMotionVectors {
+                        top: top.mv,
+                        bottom: bottom.mv,
+                    };
+                    match mode {
+                        BVopSampleMode::HalfPel => {
+                            crate::field_motion::field_motion_compensate_one_reference(
+                                &luma_ref,
+                                &cb_ref,
+                                &cr_ref,
+                                mvs,
+                                top.ref_field,
+                                bottom.ref_field,
+                                mb_x,
+                                mb_y,
+                                0,
+                            )
+                        }
+                        BVopSampleMode::QuarterPel { bits_per_pixel } => {
+                            crate::field_motion::field_motion_compensate_one_reference_qpel(
+                                &luma_ref,
+                                &cb_ref,
+                                &cr_ref,
+                                mvs,
+                                top.ref_field,
+                                bottom.ref_field,
+                                mb_x,
+                                mb_y,
+                                0,
+                                bits_per_pixel,
+                            )
+                        }
                     }
                 }
-                let (ev, _qf) = quantise_inter_block(&residual, qp, cfg.quant_type, &w_inter);
-                events.push(ev);
-            }
+                None => predict_inter_macroblock(
+                    motion, &luma_ref, &cb_ref, &cr_ref, mb_x, mb_y, 0, mode,
+                )
+                .expect("inter motion always yields a prediction"),
+            };
+
+            let (res_luma, res_cb, res_cr) =
+                macroblock_residual(frame, mb_row, mb_col, &prediction);
+            // §7.7.1 dct_type election on the residual (interlaced VOL).
+            let field_dct = cfg.interlaced && elect_field_dct(&res_luma);
+            let res_luma = if field_dct {
+                field_dct_luma(&res_luma)
+            } else {
+                res_luma
+            };
+            let events = quantise_inter_residual(
+                &res_luma,
+                &res_cb,
+                &res_cr,
+                qp,
+                cfg.quant_type,
+                &w_inter,
+                scan,
+            );
             let all_zero = events.iter().all(|e| e.is_empty());
 
             if all_zero
+                && field.is_none()
                 && matches!(motion, PvopMbMotion::OneMv(m) if m == (MotionVector { x: 0, y: 0 }))
             {
                 // §6.3.6 skip: not_coded = 1, zero MV, no residual (the
@@ -689,6 +845,7 @@ pub fn encode_p_vop(
                     fcode,
                     intra_dc: None,
                     blocks: Default::default(),
+                    interlaced: None,
                 });
                 mv_grid
                     .record_one_mv(mb_row, mb_col, MotionVector { x: 0, y: 0 })
@@ -700,14 +857,30 @@ pub fn encode_p_vop(
                 stats.dquant += 1;
             }
 
-            let cbpy = (u8::from(!events[0].is_empty()) << 3)
-                | (u8::from(!events[1].is_empty()) << 2)
-                | (u8::from(!events[2].is_empty()) << 1)
-                | u8::from(!events[3].is_empty());
-            let cbpc = (u8::from(!events[4].is_empty()) << 1) | u8::from(!events[5].is_empty());
+            let (cbpy, cbpc) = inter_cbp(&events);
+            // dct_type is only carried by a macroblock with a coded
+            // block; an all-zero residual has no luminance to permute.
+            let field_dct = field_dct && !all_zero;
+            if field_dct {
+                stats.field_dct += 1;
+            }
 
-            let (mb_type, mvds) = match motion {
-                PvopMbMotion::FourMv(mvs) => {
+            let (mb_type, mvds) = match (field, motion) {
+                (Some((predictor, top, bottom)), _) => {
+                    stats.field += 1;
+                    // Two §6.2.6.2 bodies (top then bottom field),
+                    // each against the shared §7.7.2.1 predictor —
+                    // mirroring MvDriver::decode_field_macroblock.
+                    let mvds = vec![
+                        field_mv_differential(top.mv, predictor),
+                        field_mv_differential(bottom.mv, predictor),
+                    ];
+                    mv_grid
+                        .record_field(mb_row, mb_col, top.mv, bottom.mv)
+                        .expect("grid coordinates in range");
+                    (if dquant.is_some() { 1u8 } else { 0u8 }, mvds)
+                }
+                (None, PvopMbMotion::FourMv(mvs)) => {
                     stats.inter4v += 1;
                     // Four §6.2.6.2 motion_vector() bodies, each against
                     // the §7.6.5 median for *that* block index, with the
@@ -731,7 +904,7 @@ pub fn encode_p_vop(
                     }
                     (2u8, mvds) // derived_mb_type 2 = inter4v
                 }
-                _ => {
+                (None, _) => {
                     stats.inter += 1;
                     // §7.6.5 median predictor over the shared grid state,
                     // then the §7.6.3 differential under the VOP's fcode.
@@ -764,6 +937,10 @@ pub fn encode_p_vop(
                 fcode,
                 intra_dc: None,
                 blocks,
+                interlaced: cfg.interlaced.then_some(InterlacedMbInfo {
+                    field_dct,
+                    field_refs: field.map(|(_, t, b)| (t.ref_field, b.ref_field)),
+                }),
             });
         }
     }
@@ -794,18 +971,41 @@ pub(crate) fn intra_mb_in_p_fields(
     } else {
         None
     };
+    let forced_scan = cfg.forced_scan();
+    // §7.7.1 dct_type election (interlaced VOL only).
+    let field_dct = cfg.interlaced && elect_field_dct(&source_luma_mb(frame, mb_row, mb_col));
+    let interlaced = cfg.interlaced.then_some(InterlacedMbInfo {
+        field_dct,
+        field_refs: None,
+    });
     for i in 0..6 {
         let component = DcComponent::from_block_index(i);
-        let samples = frame.block(mb_row, mb_col, i);
+        let samples = frame.block_with_field_dct(mb_row, mb_col, i, field_dct);
         let f = forward_dct_8x8(&samples, 8);
         let prep: PreparedBlock = quantise_intra_block(&f, component, qp, cfg.quant_type, w_intra);
         let predictors = grid.predictors_for(mb_row, mb_col, i, 8, qp);
         let direction = select_dc_direction(predictors.fa_dc, predictors.fb_dc, predictors.fc_dc);
-        let off = plan_block(&prep, &predictors, direction, component, qp, false)
-            .expect("no-prediction differentials are always codable");
+        let off = plan_block(
+            &prep,
+            &predictors,
+            direction,
+            component,
+            qp,
+            false,
+            forced_scan,
+        )
+        .expect("no-prediction differentials are always codable");
         plans_off.push(off);
         if let Some(on) = plans_on.as_mut() {
-            match plan_block(&prep, &predictors, direction, component, qp, true) {
+            match plan_block(
+                &prep,
+                &predictors,
+                direction,
+                component,
+                qp,
+                true,
+                forced_scan,
+            ) {
                 Some(p) => on.push(p),
                 None => plans_on = None,
             }
@@ -820,13 +1020,13 @@ pub(crate) fn intra_mb_in_p_fields(
     let plans_off: [BlockPlan; 6] = plans_off
         .try_into()
         .unwrap_or_else(|_| unreachable!("six blocks per macroblock"));
-    let fields_off = intra_mb_fields(&plans_off, false, use_dc_vlc, dquant);
+    let fields_off = intra_mb_fields(&plans_off, false, use_dc_vlc, dquant, interlaced);
     plans_on
         .and_then(|on| {
             let on: [BlockPlan; 6] = on
                 .try_into()
                 .unwrap_or_else(|_| unreachable!("six blocks per macroblock"));
-            let fields_on = intra_mb_fields(&on, true, use_dc_vlc, dquant);
+            let fields_on = intra_mb_fields(&on, true, use_dc_vlc, dquant, interlaced);
             (pw.cost_of(&fields_on) < pw.cost_of(&fields_off)).then_some(fields_on)
         })
         .unwrap_or(fields_off)
@@ -851,6 +1051,21 @@ pub fn reconstruct_own_p_vop_with_motion(
     unit: &[u8],
     store: &mut FrameStore,
 ) -> (DecodedFrame, Vec<PvopMbMotion>) {
+    let (frame, motion) = reconstruct_own_p_vop_with_anchor_motion(vol, unit, store);
+    (frame, motion.iter().map(|m| m.progressive()).collect())
+}
+
+/// [`reconstruct_own_p_vop_with_motion`] keeping the interlaced shape
+/// of the decoded motion: a §7.7.2.1 field-predicted macroblock
+/// surfaces as [`AnchorMbMotion::Field`] (its field MV pair +
+/// reference selections — the §7.7.2.2 interlaced-direct source an
+/// interlaced B-VOP needs), everything else as
+/// [`AnchorMbMotion::Frame`].
+pub fn reconstruct_own_p_vop_with_anchor_motion(
+    vol: &crate::vol::VolHeader,
+    unit: &[u8],
+    store: &mut FrameStore,
+) -> (DecodedFrame, Vec<AnchorMbMotion>) {
     let (mb_width, mb_height) = (
         usize::from(vol.width).div_ceil(16),
         usize::from(vol.height).div_ceil(16),
@@ -879,12 +1094,22 @@ pub fn reconstruct_own_p_vop_with_motion(
     let motion = entries
         .iter()
         .map(|e| match e {
-            crate::frame_decode::PVopMbContent::Inter { motion, .. } => *motion,
-            crate::frame_decode::PVopMbContent::Intra(_) => PvopMbMotion::Intra,
-            // The progressive encoder never emits field-predicted MBs.
-            crate::frame_decode::PVopMbContent::FieldInter { .. } => {
-                unreachable!("progressive encoder emitted a field-predicted macroblock")
+            crate::frame_decode::PVopMbContent::Inter { motion, .. } => {
+                AnchorMbMotion::Frame(*motion)
             }
+            crate::frame_decode::PVopMbContent::Intra(_) => {
+                AnchorMbMotion::Frame(PvopMbMotion::Intra)
+            }
+            crate::frame_decode::PVopMbContent::FieldInter {
+                mvs,
+                top_field_ref,
+                bottom_field_ref,
+                ..
+            } => AnchorMbMotion::Field {
+                mvs: *mvs,
+                top_ref: *top_field_ref,
+                bottom_ref: *bottom_field_ref,
+            },
         })
         .collect();
     let frame = crate::frame_decode::decode_p_vop(
@@ -928,7 +1153,7 @@ mod tests {
     #[test]
     fn p_vop_header_round_trips() {
         let mut bw = BitWriter::new();
-        write_p_vop_header(&mut bw, 25, 1, 3, 7, 1);
+        write_p_vop_header(&mut bw, 25, 1, 3, 7, 1, None);
         bw.next_start_code();
         let bytes = bw.into_bytes();
         let mut br = BitReader::new(&bytes);

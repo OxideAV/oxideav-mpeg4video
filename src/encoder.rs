@@ -26,7 +26,7 @@ use oxideav_core::{
 use crate::bvop_encode::encode_b_vop;
 use crate::framestore::FrameStore;
 use crate::ivop_encode::{encode_i_vop, write_configuration_headers, EncoderConfig, FrameView};
-use crate::pvop_encode::{encode_p_vop, reconstruct_own_p_vop_with_motion};
+use crate::pvop_encode::{encode_p_vop, reconstruct_own_p_vop_with_anchor_motion};
 use crate::vol::{parse_video_object_layer, VolHeader};
 
 /// Typed options struct for the registry / options-bag construction
@@ -86,6 +86,27 @@ pub struct Mpeg4EncoderOptions {
     /// `mcsel` GMC-vs-local decision). Selects the ASP profile;
     /// incompatible with `data-partitioned`.
     pub gmc: bool,
+    /// `interlaced` — code an interlaced VOL (§6.3.3): per-macroblock
+    /// field DCT (`dct_type`), §7.7.2.1 field-predicted P macroblocks
+    /// and §7.7.2.2 field / interlaced-direct B macroblocks, all
+    /// cost-decided. Selects the ASP profile; incompatible with
+    /// `data-partitioned` and `gmc`.
+    pub interlaced: bool,
+    /// `top-field-first` — the §6.3.5 `top_field_first` flag written
+    /// on every VOP of an interlaced VOL. Default true.
+    pub top_field_first: bool,
+    /// `alt-scan` — set the §6.3.5 `alternate_vertical_scan_flag` on
+    /// every VOP of an interlaced VOL (all blocks use the Figure 7-4
+    /// (b) scan). Default off.
+    pub alt_scan: bool,
+    /// `ecosystem-compat` — keep the emitted syntax inside the subset
+    /// the deployed decoder ecosystem reads exactly as this crate
+    /// does (see `crate::compat`): an interlaced B macroblock whose
+    /// co-located future macroblock is field-predicted is never coded
+    /// in direct mode (the §7.7.2.2 interlaced-direct derivation is
+    /// the one clause where the ecosystem's reading diverges from the
+    /// printed text). Default off (the spec-literal tool set).
+    pub ecosystem_compat: bool,
 }
 
 impl Default for Mpeg4EncoderOptions {
@@ -106,6 +127,10 @@ impl Default for Mpeg4EncoderOptions {
             data_partitioned: false,
             rvlc: false,
             gmc: false,
+            interlaced: false,
+            top_field_first: true,
+            alt_scan: false,
+            ecosystem_compat: false,
         }
     }
 }
@@ -217,6 +242,35 @@ impl oxideav_core::CodecOptionsStruct for Mpeg4EncoderOptions {
                    warping point (ISO/IEC 14496-2 §7.8; ASP profile); \
                    incompatible with data-partitioned",
         },
+        oxideav_core::OptionField {
+            name: "interlaced",
+            kind: oxideav_core::OptionKind::Bool,
+            default: oxideav_core::OptionValue::Bool(false),
+            help: "code an interlaced VOL: field DCT, ISO/IEC 14496-2 §7.7.2 field \
+                   motion prediction (P and B); ASP profile; incompatible with \
+                   data-partitioned and gmc",
+        },
+        oxideav_core::OptionField {
+            name: "top-field-first",
+            kind: oxideav_core::OptionKind::Bool,
+            default: oxideav_core::OptionValue::Bool(true),
+            help: "§6.3.5 top_field_first flag of every interlaced VOP",
+        },
+        oxideav_core::OptionField {
+            name: "alt-scan",
+            kind: oxideav_core::OptionKind::Bool,
+            default: oxideav_core::OptionValue::Bool(false),
+            help: "§6.3.5 alternate_vertical_scan_flag on every interlaced VOP \
+                   (alternate-vertical coefficient scan for every block)",
+        },
+        oxideav_core::OptionField {
+            name: "ecosystem-compat",
+            kind: oxideav_core::OptionKind::Bool,
+            default: oxideav_core::OptionValue::Bool(false),
+            help: "avoid the syntax whose deployed-decoder reading diverges from \
+                   ISO/IEC 14496-2 (interlaced direct mode over a field-predicted \
+                   co-located macroblock)",
+        },
     ];
 
     fn apply(&mut self, key: &str, value: &oxideav_core::OptionValue) -> Result<()> {
@@ -266,6 +320,10 @@ impl oxideav_core::CodecOptionsStruct for Mpeg4EncoderOptions {
             "data-partitioned" => self.data_partitioned = value.as_bool()?,
             "rvlc" => self.rvlc = value.as_bool()?,
             "gmc" => self.gmc = value.as_bool()?,
+            "interlaced" => self.interlaced = value.as_bool()?,
+            "top-field-first" => self.top_field_first = value.as_bool()?,
+            "alt-scan" => self.alt_scan = value.as_bool()?,
+            "ecosystem-compat" => self.ecosystem_compat = value.as_bool()?,
             _ => unreachable!("guarded by SCHEMA"),
         }
         Ok(())
@@ -318,8 +376,9 @@ pub struct Mpeg4VideoEncoder {
     pending_bs: Vec<PendingFrame>,
     /// The future anchor's per-macroblock decoded motion — the
     /// §7.6.9.5.1 / §6.2.6 co-located source for the B-VOPs it
-    /// brackets (`None` after an intra anchor).
-    anchor_motion: Option<Vec<crate::pvop_mv::PvopMbMotion>>,
+    /// brackets (`None` after an intra anchor); field-predicted
+    /// anchors keep their §7.7.2.2 field shape.
+    anchor_motion: Option<Vec<crate::vop_decode::AnchorMbMotion>>,
     /// The Annex D VBV-regulated quantiser controller (`Some` when a
     /// bitrate target is set).
     rc: Option<crate::rate_control::RateController>,
@@ -340,6 +399,11 @@ impl Mpeg4VideoEncoder {
         if options.gmc && options.data_partitioned {
             return Err(Error::invalid(
                 "gmc S-VOPs use the combined syntax (no data-partitioned)",
+            ));
+        }
+        if options.interlaced && (options.data_partitioned || options.gmc) {
+            return Err(Error::invalid(
+                "interlaced VOLs use the combined syntax without GMC",
             ));
         }
         let width = params
@@ -403,6 +467,9 @@ impl Mpeg4VideoEncoder {
                 reversible_vlc: options.rvlc,
             },
             gmc: options.gmc,
+            interlaced: options.interlaced,
+            top_field_first: options.top_field_first,
+            alternate_scan: options.alt_scan,
         };
         let config_headers = write_configuration_headers(&cfg);
         let vol_pos = config_headers
@@ -669,7 +736,12 @@ impl Mpeg4VideoEncoder {
                 &unit,
                 &mut self.store,
             );
-            self.anchor_motion = Some(motion);
+            self.anchor_motion = Some(
+                motion
+                    .into_iter()
+                    .map(crate::vop_decode::AnchorMbMotion::Frame)
+                    .collect(),
+            );
             unit
         } else {
             let reference = self
@@ -687,7 +759,7 @@ impl Mpeg4VideoEncoder {
                 }
             };
             let (_recon, motion) =
-                reconstruct_own_p_vop_with_motion(&self.vol, &unit, &mut self.store);
+                reconstruct_own_p_vop_with_anchor_motion(&self.vol, &unit, &mut self.store);
             self.anchor_motion = Some(motion);
             unit
         };
@@ -726,6 +798,11 @@ impl Mpeg4VideoEncoder {
         let res = u64::from(self.cfg.time_increment_resolution);
         let (w, h) = (usize::from(self.cfg.width), usize::from(self.cfg.height));
         let pending = std::mem::take(&mut self.pending_bs);
+        // Progressive B-VOPs consume the §7.6.9.5.1 co-located shape.
+        let progressive: Option<Vec<crate::pvop_mv::PvopMbMotion>> = self
+            .anchor_motion
+            .as_deref()
+            .map(|m| m.iter().map(|a| a.progressive()).collect());
         for b in &pending {
             let view = FrameView {
                 y: &b.y,
@@ -740,18 +817,37 @@ impl Mpeg4VideoEncoder {
             let increment = (b.ticks % res) as u16;
             let unit = loop {
                 let qp = self.current_qp();
-                let (unit, _recon, _stats) = encode_b_vop(
-                    &self.vol,
-                    &self.cfg,
-                    &view,
-                    &self.store,
-                    self.anchor_motion.as_deref(),
-                    trb,
-                    trd,
-                    modulo,
-                    increment,
-                    qp,
-                );
+                let unit = if self.cfg.interlaced {
+                    let (unit, _recon, _stats) =
+                        crate::bvop_interlaced_encode::encode_b_vop_interlaced(
+                            &self.vol,
+                            &self.cfg,
+                            &view,
+                            &self.store,
+                            self.anchor_motion.as_deref(),
+                            trb,
+                            trd,
+                            modulo,
+                            increment,
+                            qp,
+                            self.options.ecosystem_compat,
+                        );
+                    unit
+                } else {
+                    let (unit, _recon, _stats) = encode_b_vop(
+                        &self.vol,
+                        &self.cfg,
+                        &view,
+                        &self.store,
+                        progressive.as_deref(),
+                        trb,
+                        trd,
+                        modulo,
+                        increment,
+                        qp,
+                    );
+                    unit
+                };
                 if self.rc_admit(unit.len()) {
                     break unit;
                 }

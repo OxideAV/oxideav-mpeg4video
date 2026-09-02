@@ -218,11 +218,7 @@ fn static_scene_collapses_to_skips() {
         stats,
         PVopEncodeStats {
             skipped: 9,
-            inter: 0,
-            inter4v: 0,
-            intra: 0,
-            dquant: 0,
-            packets: 0,
+            ..Default::default()
         }
     );
     // A fully-skipped P-VOP is tiny (header + 9 bits + stuffing).

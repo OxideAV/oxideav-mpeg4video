@@ -6,6 +6,33 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Encoder: interlaced tools — `interlaced` VOL with per-VOP
+  `top_field_first` / `alternate_vertical_scan_flag`, per-macroblock
+  §7.7.1 field DCT (`dct_type`) election, §7.7.2.1 field-predicted P
+  macroblocks (per-field estimation against both reference parities,
+  CASE 1/2/3 predictor on the field grid), §7.7.2.2 interlaced B-VOPs
+  (field forward / backward / bidirectional through the four-PMV bank,
+  interlaced direct with the Table 7-16 field-period scaling), §6.2.6.3
+  `interlaced_information()` emission; registry options `interlaced`,
+  `top-field-first`, `alt-scan`, `ecosystem-compat` (the latter avoids
+  the interlaced-direct syntax whose deployed reading diverges from the
+  text). Three new black-box fixture pairs: interlaced I+P and compat
+  I/P/B bit-exact; the spec-literal I/P/B + qpel stream diverges only
+  inside interlaced-direct macroblocks and is bit-exact under the
+  crate's ecosystem-compat decode.
+
+### Fixed
+
+- Decoder: a §7.7.2.1 field motion vector is reconstructed under the
+  §7.6.3 `[low:high]` modulo wrap on its own grid (horizontal in frame
+  units, vertical in field units), as §7.6.3 declares its process valid
+  for interlaced VOPs — black-box-arbitrated on encoder-produced streams.
+- Decoder: a quarter-sample field read past the plane edge clamps to
+  the VOP's edge line on the frame grid (§7.6.4), matching the
+  half-sample field `mc` routine — previously clamped within the field.
+
 ## [0.1.7](https://github.com/OxideAV/oxideav-mpeg4video/compare/v0.1.6...v0.1.7) - 2026-08-30
 
 ### Other

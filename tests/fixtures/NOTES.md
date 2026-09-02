@@ -341,9 +341,62 @@ ffmpeg -idct faani -i dec_sgmc_negamv_qp_64x64.m4v -f rawvideo -pix_fmt yuv420p 
 ffmpeg -idct faani -i dec_sgmc_negtraj_96x64.m4v -f rawvideo -pix_fmt yuv420p dec_sgmc_negtraj_96x64.yuv
 ```
 
+## Encoder-produced streams (round 455 — interlaced tools)
+
+Deterministic builds of `tests/encoder_interlaced.rs` (the `.m4v`
+sides; `OXIDEAV_MPEG4VIDEO_WRITE_FIXTURES=1` regenerates them) over a
+synthetic scene whose two fields translate independently, with the
+reference decodes produced as above:
+
+* `enc_ilaced_ip_64x64` — interlaced VOL, I + 3 P: per-macroblock
+  §7.7.1 field DCT (`dct_type`), §7.7.2.1 field-predicted macroblocks
+  (both reference-field parities, CASE 1/2/3 predictors), half-sample,
+  fcode 1, qp 4. **Bit-exact.**
+* `enc_ilaced_ipbb_compat_96x64` — interlaced I P B B P B B (coding
+  order I0 P3 B1 B2 P6 B4 B5) with the ecosystem-compat emission (no
+  direct mode over a field-predicted co-located macroblock): field
+  forward / backward / bidirectional B macroblocks through the Table
+  7-14 four-PMV bank, frame B modes, progressive direct, field DCT on
+  B residuals. **Bit-exact.**
+* `enc_ilaced_ipbb_spec_qpel_96x64` — the spec-literal emission with
+  quarter-sample motion: §7.7.2.2 interlaced-direct macroblocks over
+  field-predicted anchors. Anchors bit-exact; every differing sample
+  lies inside an interlaced-direct macroblock, and the crate's
+  ecosystem-compat decode (`DecodeOptions::ecosystem`) of this stream
+  reproduces the reference decode **bit-exactly** — compat divergence
+  1 confirmed on encoder-produced content.
+
+```
+ffmpeg -idct faani -i enc_ilaced_ip_64x64.m4v -f rawvideo -pix_fmt yuv420p enc_ilaced_ip_64x64.yuv
+ffmpeg -idct faani -i enc_ilaced_ipbb_compat_96x64.m4v -f rawvideo -pix_fmt yuv420p enc_ilaced_ipbb_compat_96x64.yuv
+ffmpeg -idct faani -i enc_ilaced_ipbb_spec_qpel_96x64.m4v -f rawvideo -pix_fmt yuv420p enc_ilaced_ipbb_spec_qpel_96x64.yuv
+```
+
+Two decoder findings from this validation (both black-box-arbitrated
+on these pairs, conformance corpus unchanged):
+
+* **§7.6.3 wrap on field vectors** — the reference decoder applies the
+  §7.6.3 `[low:high]` modulo wrap to a §7.7.2.1 field vector on its
+  own grid (horizontal in frame units, vertical in *field* units before
+  the doubling); the crate's P-VOP field reconstruction now does the
+  same (`reconstruct_field_motion_vectors_wrapped`), and the encoder
+  keeps every field component inside the range so the wrap never
+  fires on its own streams.
+* **§7.6.4 clamp of a quarter-sample field read** — a field block whose
+  vector reaches past the bottom edge clamps to the VOP's edge line on
+  the *frame* grid (whatever its parity), as the half-sample field
+  `mc` routine already did; the quarter-sample field view previously
+  clamped within the field.
+
 ## SHA-256
 
 ```
+b164f0899ed06c42d17c9f401ff73ad551de36e51c2834377ddf08073feb784a  enc_ilaced_ip_64x64.m4v
+558dddc1e6308df876704546b4fab28d63170e547bb19768793f905541c62c31  enc_ilaced_ip_64x64.yuv
+94191bce28ecc0146014ce725c653f7de13f239330885ba9e9dfdf3cf59ce1aa  enc_ilaced_ipbb_compat_96x64.m4v
+08fb2a3fd201286775c6909a9c7fd27f75100ca9918834be206617d97dc7aa4d  enc_ilaced_ipbb_compat_96x64.yuv
+da3cc9c84b4ae41e279d0cb70e45df4dc02488dfe580d07564b008bffe9ee5ab  enc_ilaced_ipbb_spec_qpel_96x64.m4v
+9e95fa2f33cf8d17977e512b09a585a9ae4a2d15733845e77de0eda306aa605d  enc_ilaced_ipbb_spec_qpel_96x64.yuv
 026fcd2048c0d2a09be9fbcfd686f0596a8f55b9b67d5658be896f961d20301c  intra_64x64.m4v
 c1e893305b462feedbeeced8979ae1b05084c514558a22a6aac6ef7350d261f0  intra_64x64.yuv
 4fa229741f6c20b0e59b45d2955c55c33ca7c34c2e98bd5f2218ed7463229f5c  ip_64x64.m4v

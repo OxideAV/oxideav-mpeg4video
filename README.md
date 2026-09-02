@@ -95,9 +95,11 @@ over seven constructed single-macroblock field-prediction probe
 streams, now committed as regression pins
 (`tests/field_qpel_probes.rs`).
 
-**The encoder** covers rectangular progressive **I-, P- and B-VOPs**
-end-to-end: §6.2 configuration-header emission (VOS/VO/VOL, SP/L3 or
-ASP/L3 per the tool set; verid-2 VOL for quarter-sample;
+**The encoder** covers rectangular **progressive and interlaced I-,
+P- and B-VOPs** end-to-end: §6.2 configuration-header emission
+(VOS/VO/VOL, SP/L3 or ASP/L3 per the tool set; verid-2 VOL for
+quarter-sample; `interlaced` with per-VOP `top_field_first` /
+`alternate_vertical_scan_flag`;
 `vol_control_parameters` with `low_delay` and the Annex D
 `vbv_parameters` when applicable; `resync_marker_disable` /
 `data_partitioned` / `reversible_vlc` per the resilience tools), Annex
@@ -140,7 +142,24 @@ becomes the §6.2.5 `sprite_trajectory()`, clamped into the Table 7-9
 range so the §7.8.7.3 averaged-MV clip never fires; per-MB `mcsel`
 decides GMC vs local prediction, `not_coded` GMC copies included, and
 the averaged MV threads the predictor grid exactly as the decoder's
-`MvDriver` does), and the
+`MvDriver` does), the **interlaced tools** (`field_encode` /
+`bvop_interlaced_encode`: per-macroblock §7.7.1 `dct_type` elected
+from the same-field vs frame-line vertical correlation of the source
+or residual, with the luminance permuted per Figure 6-12 before the
+transform; §7.7.2.1 **field-predicted P macroblocks** — one vector per
+output field against the better reference-field parity, estimated
+through the decoder's own field `mc` / §7.6.2.2 field cascade, coded
+against the shared CASE 1/2/3 predictor on the field grid and confined
+to the Table 7-9 range; §7.7.2.2 **interlaced B modes** — field
+forward / backward / bidirectional through the Table 7-14 four-PMV
+bank shared with the frame modes, and **interlaced direct** over a
+field-predicted co-located anchor with its Table 7-16 δ-corrected
+field-period scaling and an `MVD[0]` search; §6.2.6.3
+`interlaced_information()` emitted between `dquant` / `dbquant` and
+the motion bodies with the exact decoder gates; an `ecosystem-compat`
+emission that never codes direct mode over a field-predicted
+co-located macroblock, keeping the stream inside the subset the
+deployed decoders read as the spec does), and the
 **error-resilience tools** (`packet_encode`: §6.2.5 video packets cut
 at the first macroblock boundary past a bit target — §5.2.5 stuffing,
 the §6.3.3 `resync_marker` of the VOP type / fcode, Table 6-27
@@ -162,9 +181,15 @@ set, and a corrupted RVLC texture partition still decoding through the
 decode agreement — the reference decoder's decode of our method-2
 intra, I+P, 4MV, qpel, qpel+4MV, I/P/B, fcode-2 I+P, fcode-3 +
 qpel + 4MV + B, adaptive-quant I/P/B, video-packet I/P/B,
-data-partitioned I+P, data-partitioned + RVLC + packets I/P/B and
-GMC + qpel I/S/B streams is **bit-exact** against our own (fifteen
-encoder-produced pairs), and the method-1 stream lands exactly on the documented
+data-partitioned I+P, data-partitioned + RVLC + packets I/P/B,
+GMC + qpel I/S/B, **interlaced I+P** (field DCT + field prediction)
+and **interlaced I/P/B** (field B modes, compat emission) streams is
+**bit-exact** against our own (seventeen encoder-produced pairs); the
+spec-literal interlaced I/P/B + qpel stream differs from the reference
+decode *only* inside its §7.7.2.2 interlaced-direct macroblocks, and
+our ecosystem-compat decode of that very stream reproduces the
+reference bit-exactly (compat divergence 1 confirmed on
+encoder-produced content); and the method-1 stream lands exactly on the documented
 §7.4.4.5 compat contract (ecosystem mode bit-exact, literal-spec ±1 on
 834 samples); rate-controlled streams satisfy an independent Annex D
 re-simulation (no underflow, `d_i < B`) and land within [0.6, 1.1]× of
@@ -172,7 +197,8 @@ the target. The registry entry declares `encode`:
 `encoder::make_encoder` / `Mpeg4VideoEncoder` (options `qp`,
 `mpeg-quant`, `ac-pred`, `four-mv`, `qpel`, `bf`, `bitrate`,
 `vbv-buffer`, `gop-size`, `fcode`, `mb-aq`, `packet-bits`,
-`data-partitioned`, `rvlc`, `gmc`) is the dual-API sibling of
+`data-partitioned`, `rvlc`, `gmc`, `interlaced`, `top-field-first`,
+`alt-scan`, `ecosystem-compat`) is the dual-API sibling of
 `make_decoder`.
 
 ## Compatibility modes
@@ -428,19 +454,17 @@ both modes' envelopes are pinned).
 
 ## Not yet supported
 
-- Encoder: interlaced tools (field DCT / field motion /
-  `interlaced_information()`) and short-header (H.263-compatible)
-  syntax emission (the decoder has no short-header read side either);
-  GMC emission is one warping point (pure translation) — 2-/3-point
-  affine trajectories and the ±2-pel `dbquant`-band rate coupling are
-  encoder headroom; rate control adapts per VOP (the per-macroblock
-  `dquant` / `dbquant` steps are activity-driven, not budget-driven);
-  `intra_dc_vlc_thr` is always 0 (DC VLC for the whole VOP); an S-VOP
-  video-packet header never carries the HEC body (its
-  `sprite_trajectory()` restatement is unimplemented on the parse
-  side). The encoder emits progressive VOPs only — the §7.7.2.2
-  interlaced-direct compat divergence cannot arise in its output. The
-  decoder-side feature set below is unchanged.
+- Encoder: short-header (H.263-compatible) syntax emission (the
+  decoder has no short-header read side either); GMC emission is one
+  warping point (pure translation) — 2-/3-point affine trajectories
+  and the ±2-pel `dbquant`-band rate coupling are encoder headroom;
+  interlaced S(GMC)-VOPs (the decoder's S walk is progressive-only,
+  so `interlaced` + `gmc` is rejected); rate control adapts per VOP
+  (the per-macroblock `dquant` / `dbquant` steps are activity-driven,
+  not budget-driven); `intra_dc_vlc_thr` is always 0 (DC VLC for the
+  whole VOP); an S-VOP video-packet header never carries the HEC body
+  (its `sprite_trajectory()` restatement is unimplemented on the parse
+  side). The decoder-side feature set below is unchanged.
 
 - §E.1.4.4 recovery on **I-VOP** texture partitions (an I-VOP texture
   error still propagates: §E.1.4.4.2.2 conceals every INTRA macroblock

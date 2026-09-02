@@ -148,17 +148,16 @@ impl QpelSource for ReferenceVop<'_> {
 
 /// View of one interlaced field within a progressive reference plane
 /// (§7.6.2 / §7.7.2.1). Field-line `n` is frame line `field_y0 + 2 n`;
-/// the §7.6.4 last-full-pel clamp is applied to the field-line index so
-/// vertical interpolation never crosses into the other field or off the
-/// plane.
+/// the §7.6.4 last-full-pel clamp is applied on the frame grid (the
+/// VOP's edge line, whichever field it belongs to), so a read past the
+/// plane lands on the edge sample exactly as in the half-sample field
+/// `mc` routine.
 #[derive(Debug, Clone, Copy)]
 pub struct FieldRefView<'a, 'b> {
     vop: &'b ReferenceVop<'a>,
     /// Frame-line offset of this field's first line: 0 = top field
     /// (even frame lines), 1 = bottom field (odd frame lines).
     field_y0: i32,
-    /// Number of lines in this field = `ceil((height - field_y0) / 2)`.
-    field_lines: i32,
 }
 
 impl<'a, 'b> FieldRefView<'a, 'b> {
@@ -167,16 +166,9 @@ impl<'a, 'b> FieldRefView<'a, 'b> {
     /// bit.
     #[inline]
     pub fn new(vop: &'b ReferenceVop<'a>, field_y0: i32) -> Self {
-        let field_y0 = field_y0 & 1;
-        let height = vop.height() as i32;
-        // ceil((height - field_y0) / 2): number of frame lines with the
-        // given parity. For field_y0 = 0 this is ceil(h/2); for
-        // field_y0 = 1 it is floor(h/2).
-        let field_lines = (height - field_y0 + 1) / 2;
         Self {
             vop,
-            field_y0,
-            field_lines: field_lines.max(1),
+            field_y0: field_y0 & 1,
         }
     }
 }
@@ -184,11 +176,15 @@ impl<'a, 'b> FieldRefView<'a, 'b> {
 impl QpelSource for FieldRefView<'_, '_> {
     #[inline]
     fn fetch(&self, x: i32, y_field: i32) -> u8 {
-        // Clamp the field-line index to [0, field_lines - 1] (§7.6.4
-        // last-full-pel, in field-line space), then map to the frame
-        // line. Horizontal clamping is handled by the underlying VOP.
-        let cy = y_field.clamp(0, self.field_lines - 1);
-        let frame_y = self.field_y0 + 2 * cy;
+        // Map the field line to its frame line, then apply the §7.6.4
+        // last-full-pel clamp on the *frame* grid (the rectangular-VOP
+        // edge sample, whatever its parity) — the same clamp the
+        // half-sample field `mc` routine applies, black-box-confirmed
+        // on the encoder's interlaced+qpel streams whose field vectors
+        // reach past the bottom edge. (A per-field clamp — the
+        // §7.6.1.5 arbitrary-shape padding rule — mispredicts the last
+        // rows of such macroblocks.)
+        let frame_y = self.field_y0 + 2 * y_field;
         self.vop.fetch_clamped(x, frame_y)
     }
 }
@@ -1430,19 +1426,25 @@ mod tests {
     }
 
     #[test]
-    fn field_ref_view_clamps_in_field_line_space() {
+    fn field_ref_view_clamps_on_the_frame_grid() {
         let side = 16; // 8 top-field lines, 8 bottom-field lines.
         let plane = striped_plane(side);
         let vop = ReferenceVop::new(&plane, side, side).unwrap();
         let top = FieldRefView::new(&vop, 0);
-        // Negative field-line clamps to field-line 0 (frame line 0).
+        // A negative field line maps to a negative frame line and
+        // clamps to frame line 0 (§7.6.4 edge sample).
         assert_eq!(top.fetch(0, -5), 0);
-        // Past-the-end field-line clamps to the last top-field line
-        // (field-line 7 → frame line 14).
-        assert_eq!(top.fetch(0, 100), 14);
+        // Past the end, the read clamps to the VOP's last line (frame
+        // line 15 — a bottom-field line, exactly as the half-sample
+        // field `mc` routine's frame-grid clamp does).
+        assert_eq!(top.fetch(0, 100), 15);
         let bot = FieldRefView::new(&vop, 1);
-        // Last bottom-field line is field-line 7 → frame line 15.
         assert_eq!(bot.fetch(0, 100), 15);
+        // A negative bottom-field line clamps to frame line 0 too.
+        assert_eq!(bot.fetch(0, -1), 0);
+        // Inside the plane the parity is preserved: field-line 7 of the
+        // top field is frame line 14.
+        assert_eq!(top.fetch(0, 7), 14);
     }
 
     // ──────────────── interpolate_block_qpel_field ───────────────────
@@ -1527,13 +1529,16 @@ mod tests {
             }
         }
         let vop = ReferenceVop::new(&plane, side, side).unwrap();
-        // Top reference (ref_field_y0 = 0), MVy = 4 (field half-pel).
-        let block = interpolate_block_qpel_field(&vop, 0, 4, 0, 16, 16, 8, 0, 0, 8);
+        // Top reference (ref_field_y0 = 0), MVy = 4 (field half-pel),
+        // read away from the plane edges (the §7.6.4 edge clamp lands
+        // on the frame's edge line whatever its parity, so only an
+        // interior block isolates the same-field FIR rule).
+        let block = interpolate_block_qpel_field(&vop, 0, 4, 0, 8, 16, 8, 0, 0, 8);
         for v in &block {
             assert_eq!(*v, 100, "bottom-field value 200 must not leak in");
         }
         // Bottom reference (ref_field_y0 = 1) → all 200, symmetrically.
-        let block_bot = interpolate_block_qpel_field(&vop, 0, 4, 0, 16, 16, 8, 1, 0, 8);
+        let block_bot = interpolate_block_qpel_field(&vop, 0, 4, 0, 8, 16, 8, 1, 0, 8);
         for v in &block_bot {
             assert_eq!(*v, 200, "top-field value 100 must not leak in");
         }

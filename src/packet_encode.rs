@@ -52,6 +52,26 @@ use crate::vlc_encode::{
 };
 use crate::vop::VopCodingType;
 
+/// The §6.2.6.3 `interlaced_information()` body of one I-/P-/S(GMC)-VOP
+/// macroblock, as the encoder decided it. Present on every
+/// [`MbFields`] of an interlaced VOL (the syntax fires per macroblock;
+/// which bits actually land is decided by the §6.2.6.3 gates from the
+/// macroblock type / `cbp` / `mcsel`, see
+/// [`MbFields::write_interlaced_information`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct InterlacedMbInfo {
+    /// `dct_type` — `true` = field DCT (the luminance blocks carry
+    /// field lines, §7.7.1). Written only when the macroblock is intra
+    /// or codes at least one block.
+    pub field_dct: bool,
+    /// `field_prediction` — `Some((forward_top_field_reference,
+    /// forward_bottom_field_reference))` for a §7.7.2.1 field-predicted
+    /// inter macroblock (two `motion_vector()` bodies follow, top then
+    /// bottom), `None` for frame prediction. Written only when the
+    /// §6.2.6.3 second gate fires (`derived_mb_type < 2`, local MC).
+    pub field_refs: Option<(bool, bool)>,
+}
+
 /// The VOL-level error-resilience tool selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ResilienceConfig {
@@ -108,6 +128,9 @@ pub(crate) struct MbFields {
     /// Per-block AC EVENT lists (DC excluded when `intra_dc` carries
     /// it).
     pub blocks: [Vec<AcEvent>; 6],
+    /// §6.2.6.3 `interlaced_information()` — `Some` on every
+    /// macroblock of an interlaced VOL, `None` on a progressive one.
+    pub interlaced: Option<InterlacedMbInfo>,
 }
 
 impl MbFields {
@@ -142,6 +165,45 @@ impl MbFields {
     fn write_mvs(&self, bw: &mut BitWriter) {
         for &(dx, dy) in &self.mvds {
             put_motion_vector(bw, dx, dy, self.fcode);
+        }
+    }
+
+    /// §6.2.6.3 `interlaced_information()` for an I-/P-/S(GMC)-VOP
+    /// macroblock: `dct_type` when the macroblock is intra or codes a
+    /// block (`cbp != 0`), then — for a `derived_mb_type < 2` local-MC
+    /// inter macroblock — `field_prediction` and, when set, the two
+    /// forward reference-field bits. Mirrors the crate's
+    /// `parse_interlaced_information` gates exactly.
+    fn write_interlaced_information(&self, bw: &mut BitWriter, info: &InterlacedMbInfo) {
+        let any_coded = self.cbpy != 0 || self.cbpc != 0;
+        if self.is_intra() || any_coded {
+            bw.write_bit(info.field_dct);
+        } else {
+            assert!(
+                !info.field_dct,
+                "field DCT on a macroblock without coded blocks"
+            );
+        }
+        let field_gate = self.mb_type < 2 && self.mcsel != Some(true);
+        if field_gate {
+            match info.field_refs {
+                Some((top, bottom)) => {
+                    bw.write_bit(true);
+                    bw.write_bit(top);
+                    bw.write_bit(bottom);
+                    assert_eq!(
+                        self.mvds.len(),
+                        2,
+                        "a field-predicted MB carries two MV bodies"
+                    );
+                }
+                None => bw.write_bit(false),
+            }
+        } else {
+            assert!(
+                info.field_refs.is_none(),
+                "field_prediction is only codable on inter / inter+q local-MC macroblocks"
+            );
         }
     }
 
@@ -180,6 +242,9 @@ impl MbFields {
         if let Some(d) = self.dquant {
             put_dquant(bw, d);
         }
+        if let Some(info) = &self.interlaced {
+            self.write_interlaced_information(bw, info);
+        }
         self.write_mvs(bw);
         // §6.2.7 block(): the DC prologue rides inside each block.
         let table = self.table();
@@ -212,6 +277,10 @@ impl MbFields {
                 unreachable!("combined layout is written by PacketWriter::push")
             }
             Layout::PartitionedI => {
+                assert!(
+                    self.interlaced.is_none(),
+                    "interlaced_information() has no data-partitioned layout"
+                );
                 self.write_mcbpc(&mut p[0], true);
                 if let Some(d) = self.dquant {
                     put_dquant(&mut p[0], d);
@@ -222,6 +291,10 @@ impl MbFields {
                 self.write_ac(&mut p[2], rvlc);
             }
             Layout::PartitionedP => {
+                assert!(
+                    self.interlaced.is_none(),
+                    "interlaced_information() has no data-partitioned layout"
+                );
                 p[0].write_bit(self.not_coded);
                 if self.not_coded {
                     return;
@@ -254,6 +327,9 @@ pub(crate) struct PacketVopInfo {
     pub time_increment_bits: u8,
     pub intra_dc_vlc_thr: u8,
     pub total_macroblocks: u32,
+    /// The VOL's `interlaced` flag: every pushed [`MbFields`] must
+    /// carry (or omit) its `interlaced_information()` accordingly.
+    pub interlaced: bool,
 }
 
 /// Serialises a VOP's macroblock layer into video packets under a
@@ -385,6 +461,10 @@ impl PacketWriter {
 
     /// Append one macroblock to the open packet.
     pub(crate) fn push(&mut self, fields: &MbFields) {
+        assert!(
+            fields.not_coded || fields.interlaced.is_some() == self.info.interlaced,
+            "interlaced_information() presence must follow the VOL"
+        );
         match self.layout {
             Layout::Combined => {
                 let intra_vop = matches!(self.info.coding_type, VopCodingType::I);
@@ -452,6 +532,7 @@ mod tests {
             time_increment_bits: 5,
             intra_dc_vlc_thr: 0,
             total_macroblocks: 12,
+            interlaced: false,
         }
     }
 
