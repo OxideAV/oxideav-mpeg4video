@@ -107,6 +107,18 @@ pub struct Mpeg4EncoderOptions {
     /// the one clause where the ecosystem's reading diverges from the
     /// printed text). Default off (the spec-literal tool set).
     pub ecosystem_compat: bool,
+    /// `short-header` — emit the §6.2.5.2 H.263-compatible short
+    /// header syntax (`short_video_header == 1`) instead of the
+    /// VOS/VOL/VOP stream: no configuration headers, one of the Table
+    /// 6-29 picture sizes (128×96, 176×144, 352×288, 704×576,
+    /// 1408×1152), the Table 6-28 fixed tool set (every other tool
+    /// option must stay at its default; `qp`, `mb-aq`, `gop-size`,
+    /// `bitrate` / `vbv-buffer` remain available). Default off.
+    pub short_header: bool,
+    /// `gob-headers` — short header only: emit a GOB header
+    /// (`gob_resync_marker`, `gob_number`, `gob_frame_id`,
+    /// `quant_scale`) on every GOB after the first. Default true.
+    pub gob_headers: bool,
 }
 
 impl Default for Mpeg4EncoderOptions {
@@ -131,6 +143,8 @@ impl Default for Mpeg4EncoderOptions {
             top_field_first: true,
             alt_scan: false,
             ecosystem_compat: false,
+            short_header: false,
+            gob_headers: true,
         }
     }
 }
@@ -271,6 +285,21 @@ impl oxideav_core::CodecOptionsStruct for Mpeg4EncoderOptions {
                    ISO/IEC 14496-2 (interlaced direct mode over a field-predicted \
                    co-located macroblock)",
         },
+        oxideav_core::OptionField {
+            name: "short-header",
+            kind: oxideav_core::OptionKind::Bool,
+            default: oxideav_core::OptionValue::Bool(false),
+            help: "emit the ISO/IEC 14496-2 §6.2.5.2 short header (H.263-compatible) \
+                   syntax: no VOS/VOL, sub-QCIF/QCIF/CIF/4CIF/16CIF sizes only, \
+                   I/P pictures with the Table 6-28 fixed tool set",
+        },
+        oxideav_core::OptionField {
+            name: "gob-headers",
+            kind: oxideav_core::OptionKind::Bool,
+            default: oxideav_core::OptionValue::Bool(true),
+            help: "short header only: emit a GOB header (gob_resync_marker) on every \
+                   GOB after the first",
+        },
     ];
 
     fn apply(&mut self, key: &str, value: &oxideav_core::OptionValue) -> Result<()> {
@@ -324,6 +353,8 @@ impl oxideav_core::CodecOptionsStruct for Mpeg4EncoderOptions {
             "top-field-first" => self.top_field_first = value.as_bool()?,
             "alt-scan" => self.alt_scan = value.as_bool()?,
             "ecosystem-compat" => self.ecosystem_compat = value.as_bool()?,
+            "short-header" => self.short_header = value.as_bool()?,
+            "gob-headers" => self.gob_headers = value.as_bool()?,
             _ => unreachable!("guarded by SCHEMA"),
         }
         Ok(())
@@ -349,8 +380,14 @@ pub struct Mpeg4VideoEncoder {
     codec_id: CodecId,
     output_params: CodecParameters,
     cfg: EncoderConfig,
-    vol: VolHeader,
+    /// The parsed form of the emitted VOL (`None` for a short-header
+    /// stream, which carries no VOL).
+    vol: Option<VolHeader>,
     options: Mpeg4EncoderOptions,
+    /// Short header: the `temporal_reference` of the next picture and
+    /// its per-frame increment.
+    short_tr: u8,
+    short_tr_step: u8,
     /// Configuration-header run, prepended to the first packet.
     config_headers: Vec<u8>,
     /// Ticks the clock advances per input frame (the frame-rate
@@ -415,6 +452,31 @@ impl Mpeg4VideoEncoder {
         if width == 0 || height == 0 || width > 8191 || height > 8191 {
             return Err(Error::invalid("dimensions out of the 13-bit VOL range"));
         }
+        if options.short_header {
+            if crate::short_header::SourceFormat::from_dimensions(width, height).is_none() {
+                return Err(Error::invalid(
+                    "short-header pictures must be 128x96, 176x144, 352x288, 704x576 \
+                     or 1408x1152 (ISO/IEC 14496-2 Table 6-29)",
+                ));
+            }
+            let fixed_tools_only = !options.mpeg_quant
+                && !options.four_mv
+                && !options.qpel
+                && options.bf == 0
+                && options.fcode == 1
+                && options.packet_bits == 0
+                && !options.data_partitioned
+                && !options.rvlc
+                && !options.gmc
+                && !options.interlaced;
+            if !fixed_tools_only {
+                return Err(Error::invalid(
+                    "short-header uses the Table 6-28 fixed tool set (no mpeg-quant, \
+                     four-mv, qpel, bf, fcode > 1, packets, data-partitioned, rvlc, gmc \
+                     or interlaced)",
+                ));
+            }
+        }
         if let Some(pf) = params.pixel_format {
             if pf != PixelFormat::Yuv420P {
                 return Err(Error::unsupported(
@@ -470,14 +532,22 @@ impl Mpeg4VideoEncoder {
             interlaced: options.interlaced,
             top_field_first: options.top_field_first,
             alternate_scan: options.alt_scan,
+            short_header: options.short_header,
+            gob_headers: options.gob_headers,
         };
-        let config_headers = write_configuration_headers(&cfg);
-        let vol_pos = config_headers
-            .windows(4)
-            .position(|w| w == [0, 0, 1, 0x20])
-            .expect("emitted headers contain the VOL start code");
-        let vol = parse_video_object_layer(&config_headers[vol_pos..], cfg.profile_and_level())
-            .map_err(|e| Error::invalid(format!("emitted VOL failed to re-parse: {e}")))?;
+        let (config_headers, vol) = if cfg.short_header {
+            // §6.2.5.2: no configuration headers at all.
+            (Vec::new(), None)
+        } else {
+            let headers = write_configuration_headers(&cfg);
+            let vol_pos = headers
+                .windows(4)
+                .position(|w| w == [0, 0, 1, 0x20])
+                .expect("emitted headers contain the VOL start code");
+            let vol = parse_video_object_layer(&headers[vol_pos..], cfg.profile_and_level())
+                .map_err(|e| Error::invalid(format!("emitted VOL failed to re-parse: {e}")))?;
+            (headers, Some(vol))
+        };
 
         let mut output_params = CodecParameters::video(params.codec_id.clone());
         output_params.width = Some(width);
@@ -485,7 +555,19 @@ impl Mpeg4VideoEncoder {
         output_params.pixel_format = Some(PixelFormat::Yuv420P);
         output_params.frame_rate = Some(frame_rate);
         output_params.extradata = config_headers.clone();
-        output_params.tag = Some(oxideav_core::CodecTag::fourcc(b"FMP4"));
+        output_params.tag = Some(oxideav_core::CodecTag::fourcc(if cfg.short_header {
+            b"H263"
+        } else {
+            b"FMP4"
+        }));
+        // §6.3.5.2: temporal_reference counts 30000/1001 Hz ticks; one
+        // input frame advances it by the nearest whole tick count.
+        let tr_step = if cfg.short_header {
+            let per_frame = (30000.0 / 1001.0) * frame_rate.den as f64 / frame_rate.num as f64;
+            per_frame.round().clamp(1.0, 255.0) as u8
+        } else {
+            0
+        };
 
         let rc = vbv.map(|v| {
             crate::rate_control::RateController::new(
@@ -506,6 +588,8 @@ impl Mpeg4VideoEncoder {
             cfg,
             vol,
             options,
+            short_tr: 0,
+            short_tr_step: tr_step,
             config_headers,
             ticks_per_frame: frame_rate.den as u64,
             next_ticks: 0,
@@ -704,10 +788,42 @@ impl Mpeg4VideoEncoder {
         let modulo = (seconds - self.sync_sec) as u32;
         let increment = (frame.ticks % res) as u16;
 
+        if self.cfg.short_header {
+            // §6.2.5.2: I or P picture at the running temporal_reference.
+            let reference = if force_i {
+                None
+            } else {
+                self.store.backward().cloned()
+            };
+            let tr = self.short_tr;
+            let (unit, recon) = loop {
+                let qp = self.current_qp();
+                let (unit, recon, _stats) = crate::short_header_encode::encode_short_header_picture(
+                    &self.cfg,
+                    &view,
+                    reference.as_ref(),
+                    tr,
+                    qp,
+                );
+                if self.rc_admit(unit.len()) {
+                    break (unit, recon);
+                }
+            };
+            self.short_tr = self.short_tr.wrapping_add(self.short_tr_step);
+            self.store.push_anchor(recon);
+            self.anchor_motion = None;
+            self.prev_anchor_ticks = self.last_anchor_ticks;
+            self.last_anchor_ticks = Some(frame.ticks);
+            let dts = frame.pts.unwrap_or(frame.ticks as i64);
+            self.push_packet(unit, frame.ticks, frame.pts, force_i, dts);
+            return;
+        }
+        let vol = self.vol.expect("long-header streams carry a VOL");
+
         let unit = if force_i {
             let (unit, recon) = loop {
                 let qp = self.current_qp();
-                let produced = encode_i_vop(&self.vol, &self.cfg, &view, modulo, increment, qp);
+                let produced = encode_i_vop(&vol, &self.cfg, &view, modulo, increment, qp);
                 if self.rc_admit(produced.0.len()) {
                     break produced;
                 }
@@ -725,17 +841,14 @@ impl Mpeg4VideoEncoder {
             let unit = loop {
                 let qp = self.current_qp();
                 let (unit, _stats) = crate::svop_encode::encode_s_vop(
-                    &self.vol, &self.cfg, &view, &reference, modulo, increment, qp,
+                    &vol, &self.cfg, &view, &reference, modulo, increment, qp,
                 );
                 if self.rc_admit(unit.len()) {
                     break unit;
                 }
             };
-            let (_recon, motion) = crate::svop_encode::reconstruct_own_s_vop_with_motion(
-                &self.vol,
-                &unit,
-                &mut self.store,
-            );
+            let (_recon, motion) =
+                crate::svop_encode::reconstruct_own_s_vop_with_motion(&vol, &unit, &mut self.store);
             self.anchor_motion = Some(
                 motion
                     .into_iter()
@@ -751,15 +864,14 @@ impl Mpeg4VideoEncoder {
                 .clone();
             let unit = loop {
                 let qp = self.current_qp();
-                let (unit, _stats) = encode_p_vop(
-                    &self.vol, &self.cfg, &view, &reference, modulo, increment, qp,
-                );
+                let (unit, _stats) =
+                    encode_p_vop(&vol, &self.cfg, &view, &reference, modulo, increment, qp);
                 if self.rc_admit(unit.len()) {
                     break unit;
                 }
             };
             let (_recon, motion) =
-                reconstruct_own_p_vop_with_anchor_motion(&self.vol, &unit, &mut self.store);
+                reconstruct_own_p_vop_with_anchor_motion(&vol, &unit, &mut self.store);
             self.anchor_motion = Some(motion);
             unit
         };
@@ -798,6 +910,7 @@ impl Mpeg4VideoEncoder {
         let res = u64::from(self.cfg.time_increment_resolution);
         let (w, h) = (usize::from(self.cfg.width), usize::from(self.cfg.height));
         let pending = std::mem::take(&mut self.pending_bs);
+        let vol = self.vol.expect("B-VOPs need a VOL");
         // Progressive B-VOPs consume the §7.6.9.5.1 co-located shape.
         let progressive: Option<Vec<crate::pvop_mv::PvopMbMotion>> = self
             .anchor_motion
@@ -820,7 +933,7 @@ impl Mpeg4VideoEncoder {
                 let unit = if self.cfg.interlaced {
                     let (unit, _recon, _stats) =
                         crate::bvop_interlaced_encode::encode_b_vop_interlaced(
-                            &self.vol,
+                            &vol,
                             &self.cfg,
                             &view,
                             &self.store,
@@ -835,7 +948,7 @@ impl Mpeg4VideoEncoder {
                     unit
                 } else {
                     let (unit, _recon, _stats) = encode_b_vop(
-                        &self.vol,
+                        &vol,
                         &self.cfg,
                         &view,
                         &self.store,
@@ -974,7 +1087,7 @@ mod tests {
         let mut p = base_params();
         p.options = oxideav_core::CodecOptions::default().set("mpeg-quant", "true");
         let enc = Mpeg4VideoEncoder::from_params(&p).unwrap();
-        assert!(enc.vol.quant_type);
+        assert!(enc.vol.as_ref().unwrap().quant_type);
         assert_eq!(enc.cfg.profile_and_level(), 0xF3);
     }
 }

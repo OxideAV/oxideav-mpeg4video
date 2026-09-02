@@ -106,6 +106,17 @@ impl BitWriter {
         }
     }
 
+    /// Pad with **zero** bits to the next byte boundary (a no-op when
+    /// already aligned) — the §6.2.5.2 short-header alignment rule
+    /// ("zero to seven zero-valued bits") before
+    /// `short_video_start_marker`, `gob_resync_marker` and
+    /// `short_video_end_marker`.
+    pub fn align_zero(&mut self) {
+        while !self.is_byte_aligned() {
+            self.write_bits(0, 1);
+        }
+    }
+
     /// Append a 32-bit start code (`0x000001xx`) — caller must be
     /// byte-aligned (emit [`Self::next_start_code`] first).
     ///

@@ -128,6 +128,16 @@ pub struct EncoderConfig {
     /// interlaced VOP with the Figure 7-4 (b) alternate-vertical scan
     /// (ignored on a progressive VOL).
     pub alternate_scan: bool,
+    /// `short_video_header == 1` (§6.2.5.2): emit H.263-compatible
+    /// short-header pictures instead of the VOS/VOL/VOP syntax
+    /// (`crate::short_header_encode`). The dimensions must be one of
+    /// the Table 6-29 source formats; the Table 6-28 fixed tool set
+    /// applies (every other tool flag must be at its default).
+    pub short_header: bool,
+    /// Short header only: emit a GOB header (`gob_resync_marker`,
+    /// `gob_number`, `gob_frame_id`, `quant_scale`) on every GOB after
+    /// the first. Default on.
+    pub gob_headers: bool,
 }
 
 /// The two §6.3.5 interlaced VOP-header flags, written right after
@@ -213,6 +223,8 @@ impl Default for EncoderConfig {
             interlaced: false,
             top_field_first: true,
             alternate_scan: false,
+            short_header: false,
+            gob_headers: true,
         }
     }
 }
@@ -287,6 +299,10 @@ impl EncoderConfig {
 /// Every unit ends with the §5.2.4 stuffing so the next start code is
 /// byte-aligned.
 pub fn write_configuration_headers(cfg: &EncoderConfig) -> Vec<u8> {
+    assert!(
+        !cfg.short_header,
+        "a short-header stream carries no configuration headers"
+    );
     let mut bw = BitWriter::new();
     // VisualObjectSequence() — §6.2.2.
     bw.write_start_code(VISUAL_OBJECT_SEQUENCE_START_CODE);

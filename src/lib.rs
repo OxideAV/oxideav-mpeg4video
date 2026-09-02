@@ -395,6 +395,8 @@ pub mod sample_padding;
 pub mod scan; // mixed: `InverseScanError` stays visible
 #[doc(hidden)]
 pub mod sequence;
+pub mod short_header;
+pub mod short_header_encode;
 pub mod sprite; // mixed: `SpriteTrajectoryError` stays visible
 #[doc(hidden)]
 pub mod sprite_piece;

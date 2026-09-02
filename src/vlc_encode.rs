@@ -194,6 +194,44 @@ pub fn put_ac_event(bw: &mut BitWriter, kind: TcoefTable, event: AcEvent) {
     bw.write_marker();
 }
 
+/// Emit one EVENT under `short_video_header == 1`: the Table B.17
+/// (inter) VLC for every block, else the §7.4.1.3 **Type-4** escape —
+/// `ESC` + `LAST(1) RUN(6) LEVEL(8)` (two's complement, no marker
+/// bits). Exact inverse of
+/// [`crate::texture::decode_ac_event_short_video_header`].
+///
+/// # Panics
+///
+/// Panics when `level` is 0 or outside `-127..=127` (the reserved
+/// `-128` included), or `run > 63`.
+pub fn put_ac_event_short_video_header(bw: &mut BitWriter, event: AcEvent) {
+    let AcEvent { last, run, level } = event;
+    assert!(level != 0, "AC EVENT level must be non-zero");
+    assert!(
+        (-127..=127).contains(&level),
+        "AC EVENT level {level} outside the Type-4 escape domain"
+    );
+    assert!(
+        run <= 63,
+        "AC EVENT run {run} exceeds the 6-bit escape field"
+    );
+    if try_put_tcoef_vlc(bw, TcoefTable::Inter, last, run, level) {
+        return;
+    }
+    let (esc_code, esc_len) = ESCAPE;
+    bw.write_bits(esc_code, usize::from(esc_len));
+    bw.write_bit(last);
+    bw.write_bits(run, 6);
+    bw.write_bits((level & 0xFF) as u32, 8);
+}
+
+/// Emit every EVENT of one block under `short_video_header == 1`.
+pub fn put_ac_events_short_video_header(bw: &mut BitWriter, events: &[AcEvent]) {
+    for ev in events {
+        put_ac_event_short_video_header(bw, *ev);
+    }
+}
+
 /// Emit every EVENT of one block's §6.2.7 `while (!last)` loop.
 pub fn put_ac_events(bw: &mut BitWriter, kind: TcoefTable, events: &[AcEvent]) {
     for ev in events {

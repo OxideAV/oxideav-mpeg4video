@@ -388,9 +388,42 @@ on these pairs, conformance corpus unchanged):
   `mc` routine already did; the quarter-sample field view previously
   clamped within the field.
 
+## Short-header streams (round 455 — §6.2.5.2 `short_video_header == 1`)
+
+Raw H.263-compatible elementary streams (`.h263`: byte-aligned
+`short_video_start_marker` pictures, no VOS/VOL), decoded with the
+reference binary's raw short-header demuxer selected:
+
+```
+ffmpeg -idct faani -f h263 -i <name>.h263 -f rawvideo -pix_fmt yuv420p <name>.yuv
+```
+
+* `enc_sh_ippip_176x144` — deterministic build of
+  `tests/encoder_short_header.rs` (`OXIDEAV_MPEG4VIDEO_WRITE_FIXTURES=1`
+  regenerates it): QCIF I P P I P, GOB headers on every GOB after the
+  first, adaptive `dquant`, 8-bit `intra_dc_coefficient` FLC, Table
+  B.17 + Type-4 escapes, picture-restricted half-sample vectors, end
+  marker. The reference decode is **bit-exact** against our closed
+  loop.
+* `sh_ipp_176x144` — reference-encoder-produced QCIF I P P I P
+  (`-c:v h263 -qscale:v 4 -g 3`, the H.263 baseline the short header
+  encapsulates):
+
+```
+ffmpeg -f lavfi -i "testsrc2=size=176x144:rate=25:duration=0.2" \
+  -c:v h263 -qscale:v 4 -g 3 -f h263 sh_ipp_176x144.h263
+```
+
+  Our short-header decode is **bit-exact** against the reference
+  decode (no near-tie samples on this stream).
+
 ## SHA-256
 
 ```
+d1d2c853300d6c1c13928b47dc1292e8cef810b61d2c94f64b089d0bb516cbea  enc_sh_ippip_176x144.h263
+0966dc1b5fb73a87d6f9ff4c69f434ef6caade843fb658cedd801176da4b0f98  enc_sh_ippip_176x144.yuv
+3860e79a00ab83d886fa7ac9c5873854d5b9a47019abba80dd67c6e4d396e50d  sh_ipp_176x144.h263
+6942702085ec90a51652c86418bc3af86f432062d629d48f491964dfcb051729  sh_ipp_176x144.yuv
 b164f0899ed06c42d17c9f401ff73ad551de36e51c2834377ddf08073feb784a  enc_ilaced_ip_64x64.m4v
 558dddc1e6308df876704546b4fab28d63170e547bb19768793f905541c62c31  enc_ilaced_ip_64x64.yuv
 94191bce28ecc0146014ce725c653f7de13f239330885ba9e9dfdf3cf59ce1aa  enc_ilaced_ipbb_compat_96x64.m4v

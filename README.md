@@ -95,6 +95,21 @@ over seven constructed single-macroblock field-prediction probe
 streams, now committed as regression pins
 (`tests/field_qpel_probes.rs`).
 
+**Short header** (`short_video_header == 1`, §6.2.5.2 — the
+H.263-compatible syntax): both directions. The stream decoder
+recognises a VOL-less stream opening with `short_video_start_marker`
+and decodes its pictures (`short_header`: Table 6-28 fixed tools,
+Table 6-29 source formats sub-QCIF … 16CIF, optional byte-aligned GOB
+headers with the §7.6.5 GOB predictor rule and `quant_scale` restart,
+8-bit `intra_dc_coefficient` with `dc_scaler = 8`, no DC/AC
+prediction, Table B.17 + Type-4 escapes, `f_code == 1` vectors, the
+30000/1001 Hz `temporal_reference` clock); a reference-encoder-produced
+H.263 stream decodes **bit-exact**. The encoder's `short-header` option
+emits I/P pictures of the same syntax (`short_header_encode`: DC
+clamped into the FLC domain, levels into the Type-4 range, vectors
+restricted to the picture per §7.6.4, GOB headers on request) — the
+reference decoder reproduces our stream **bit-exact**.
+
 **The encoder** covers rectangular **progressive and interlaced I-,
 P- and B-VOPs** end-to-end: §6.2 configuration-header emission
 (VOS/VO/VOL, SP/L3 or ASP/L3 per the tool set; verid-2 VOL for
@@ -198,8 +213,8 @@ the target. The registry entry declares `encode`:
 `mpeg-quant`, `ac-pred`, `four-mv`, `qpel`, `bf`, `bitrate`,
 `vbv-buffer`, `gop-size`, `fcode`, `mb-aq`, `packet-bits`,
 `data-partitioned`, `rvlc`, `gmc`, `interlaced`, `top-field-first`,
-`alt-scan`, `ecosystem-compat`) is the dual-API sibling of
-`make_decoder`.
+`alt-scan`, `ecosystem-compat`, `short-header`, `gob-headers`) is the
+dual-API sibling of `make_decoder`.
 
 ## Compatibility modes
 
@@ -454,8 +469,7 @@ both modes' envelopes are pinned).
 
 ## Not yet supported
 
-- Encoder: short-header (H.263-compatible) syntax emission (the
-  decoder has no short-header read side either); GMC emission is one
+- Encoder: GMC emission is one
   warping point (pure translation) — 2-/3-point affine trajectories
   and the ±2-pel `dbquant`-band rate coupling are encoder headroom;
   interlaced S(GMC)-VOPs (the decoder's S walk is progressive-only,

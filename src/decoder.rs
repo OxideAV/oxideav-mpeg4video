@@ -78,6 +78,8 @@ pub enum StreamDecodeError {
     Frame(FrameDecodeError),
     /// A VOP arrived before any `video_object_layer` header.
     MissingVol,
+    /// A §6.2.5.2 short-header picture failed to parse or decode.
+    ShortHeader(crate::short_header::ShortHeaderError),
     /// A P-/S(GMC)-/B-VOP (or an uncoded VOP) arrived without the
     /// anchor frame(s) it references.
     MissingAnchor,
@@ -99,6 +101,7 @@ impl core::fmt::Display for StreamDecodeError {
             StreamDecodeError::Vop(e) => write!(f, "stream decode: VOP header: {e}"),
             StreamDecodeError::VopDecode(e) => write!(f, "stream decode: macroblock layer: {e}"),
             StreamDecodeError::Frame(e) => write!(f, "stream decode: frame assembly: {e:?}"),
+            StreamDecodeError::ShortHeader(e) => write!(f, "stream decode: {e}"),
             StreamDecodeError::MissingVol => {
                 write!(f, "stream decode: VOP before any video_object_layer header")
             }
@@ -114,6 +117,12 @@ impl core::fmt::Display for StreamDecodeError {
 }
 
 impl std::error::Error for StreamDecodeError {}
+
+impl From<crate::short_header::ShortHeaderError> for StreamDecodeError {
+    fn from(e: crate::short_header::ShortHeaderError) -> Self {
+        StreamDecodeError::ShortHeader(e)
+    }
+}
 
 impl From<VolParseError> for StreamDecodeError {
     fn from(e: VolParseError) -> Self {
@@ -174,6 +183,22 @@ pub struct Mpeg4VideoDecoder {
     prev_anchor_ticks: Option<i64>,
     /// Absolute time (ticks) of the most recent (backward) anchor.
     last_anchor_ticks: Option<i64>,
+    /// §6.2.5.2 short-header mode, entered when the first unit of a
+    /// VOL-less stream is a `video_plane_with_short_header()`: the
+    /// running 30000/1001 Hz tick clock and the previous
+    /// `temporal_reference` (modulo-256 arithmetic, §6.3.5.2).
+    short_header: Option<ShortHeaderClock>,
+}
+
+/// The short-header picture clock (see
+/// [`Mpeg4VideoDecoder::decode_with_pts`]).
+#[derive(Debug, Clone, Copy, Default)]
+struct ShortHeaderClock {
+    /// Ticks of the most recent picture (30000/1001 Hz units, starting
+    /// at the first picture's `temporal_reference`).
+    ticks: i64,
+    /// `temporal_reference` of the most recent picture.
+    last_tr: Option<u8>,
 }
 
 impl Mpeg4VideoDecoder {
@@ -239,6 +264,29 @@ impl Mpeg4VideoDecoder {
         container_pts: Option<i64>,
     ) -> Result<Vec<DecodedFrame>, StreamDecodeError> {
         let mut out = Vec::new();
+        // §6.2.1 / §6.2.5.2: a stream whose first unit is a
+        // `short_video_start_marker` (no VOL ever seen) is a
+        // short-header stream; every subsequent picture follows the
+        // abbreviated syntax.
+        if self.vol.is_none() && self.short_header.is_none() {
+            let first_sc = scan_start_codes(data).first().copied();
+            let first_sh = crate::short_header::scan_short_header_pictures(data)
+                .first()
+                .copied();
+            if let Some(sh) = first_sh {
+                if first_sc.map_or(true, |sc| sh < sc) {
+                    self.short_header = Some(ShortHeaderClock::default());
+                }
+            }
+        }
+        if self.short_header.is_some() {
+            let starts = crate::short_header::scan_short_header_pictures(data);
+            for (idx, &start) in starts.iter().enumerate() {
+                let end = starts.get(idx + 1).copied().unwrap_or(data.len());
+                self.decode_short_header_unit(&data[start..end], container_pts, &mut out)?;
+            }
+            return Ok(out);
+        }
         let starts = scan_start_codes(data);
         for (idx, &start) in starts.iter().enumerate() {
             let end = starts.get(idx + 1).copied().unwrap_or(data.len());
@@ -251,6 +299,61 @@ impl Mpeg4VideoDecoder {
     /// Release the final held anchor at end-of-stream (§6.1.3.8).
     pub fn flush(&mut self) -> Vec<DecodedFrame> {
         self.sequence.flush()
+    }
+
+    /// Decode one `video_plane_with_short_header()` picture
+    /// (§6.2.5.2): I pictures enter the chain as intra anchors, P
+    /// pictures predict from the previous picture with the Table 6-28
+    /// fixed tools (half-sample, `vop_rounding_type == 0`). The frame's
+    /// tick time counts `temporal_reference` at 30000/1001 Hz from the
+    /// first picture.
+    fn decode_short_header_unit(
+        &mut self,
+        unit: &[u8],
+        container_pts: Option<i64>,
+        out: &mut Vec<DecodedFrame>,
+    ) -> Result<(), StreamDecodeError> {
+        let mut br = BitReader::new(unit);
+        let pic = crate::short_header::parse_short_header_picture(&mut br)?;
+        let entries = crate::short_header::decode_short_header_macroblocks(&mut br, &pic)?;
+        let (mb_width, mb_height) = pic.source_format.mb_dimensions();
+        match pic.coding_type {
+            VopCodingType::I => {
+                let mbs = crate::short_header::intra_macroblocks(&entries)
+                    .expect("an I picture decodes to intra macroblocks only");
+                out.extend(self.sequence.push_i_vop(mb_width, mb_height, &mbs)?);
+            }
+            _ => {
+                if self.sequence.store().p_vop_reference().is_none() {
+                    return Err(StreamDecodeError::MissingAnchor);
+                }
+                out.extend(self.sequence.push_p_vop(
+                    mb_width,
+                    mb_height,
+                    &entries,
+                    0,
+                    BVopSampleMode::HalfPel,
+                    8,
+                )?);
+            }
+        }
+        self.anchor_motion = None;
+        // §6.3.5.2 temporal_reference: modulo-256 increments at
+        // 30000/1001 Hz.
+        let clock = self
+            .short_header
+            .get_or_insert_with(ShortHeaderClock::default);
+        let ticks = match clock.last_tr {
+            None => i64::from(pic.temporal_reference),
+            Some(prev) => clock.ticks + i64::from(pic.temporal_reference.wrapping_sub(prev)),
+        };
+        clock.ticks = ticks;
+        clock.last_tr = Some(pic.temporal_reference);
+        if let Some(pending) = self.sequence.pending_anchor_mut() {
+            pending.set_pts(container_pts);
+            pending.set_pts_ticks(Some(ticks));
+        }
+        Ok(())
     }
 
     /// Dispatch one start-code-delimited unit.

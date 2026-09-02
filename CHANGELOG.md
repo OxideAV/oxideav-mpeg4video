@@ -23,6 +23,15 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   inside interlaced-direct macroblocks and is bit-exact under the
   crate's ecosystem-compat decode.
 
+- Short header (§6.2.5.2, `short_video_header == 1`) both ways: the
+  stream decoder auto-detects a VOL-less `short_video_start_marker`
+  stream and decodes its I/P pictures (Table 6-28 fixed tools, Table
+  6-29 source formats, GOB headers with the §7.6.5 GOB predictor rule,
+  8-bit intra DC, Table B.17 + Type-4 escapes); the encoder's
+  `short-header` / `gob-headers` options emit the same syntax. Two
+  black-box pairs: our stream decodes bit-exact in the reference
+  decoder, a reference-encoder H.263 stream decodes bit-exact in ours.
+
 ### Fixed
 
 - Decoder: a §7.7.2.1 field motion vector is reconstructed under the
