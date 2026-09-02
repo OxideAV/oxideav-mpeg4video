@@ -21,7 +21,7 @@
 //!   δ-corrected field-period `TRB[i]` / `TRD[i]`.
 //!
 //! Every candidate is scored by the SAD of the prediction the crate's
-//! own decoder machinery forms for it ([`BVopMbDecode::reconstruct`],
+//! own decoder machinery forms for it ([`crate::bvop_mv::BVopMbDecode::reconstruct`],
 //! the `bvop_field_motion` predictors over a copy of the bank,
 //! [`interlaced_direct_prediction`]), so the decision measures exactly
 //! what a conformant decoder reconstructs. The residual takes the
@@ -30,7 +30,7 @@
 //! `interlaced_information()` body between `dbquant` and the motion
 //! bodies. The finished VOP decodes back through
 //! [`decode_b_vop_interlaced_macroblocks`] +
-//! [`assemble_b_vop_interlaced_frame`], closing the loop.
+//! [`crate::frame_decode::assemble_b_vop_interlaced_frame`], closing the loop.
 //!
 //! **Ecosystem-compat emission** (`ecosystem_compat == true`): the
 //! §7.7.2.2 interlaced-direct derivation is the one clause the
