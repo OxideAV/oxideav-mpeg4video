@@ -6,6 +6,18 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.8](https://github.com/OxideAV/oxideav-mpeg4video/compare/v0.1.7...v0.1.8) - 2026-09-02
+
+### Other
+
+- fix two intra-doc links in bvop_interlaced_encode
+- interlaced S(GMC)-VOPs both ways — decoder S walk on interlaced VOLs (field-predicted local MBs, field DCT on GMC residuals, §6.2.6.3 dct_type read on coded mcsel==1 MBs), encoder interlaced+gmc with field-local candidates over the AMV predictors; black-box bit-exact pair
+- cargo-fuzz harness — short_header (§6.2.5.2 parser + walk + VOL-less auto-detect) and stream_decode (raw + VOS/VOL-prefixed elementary streams) targets, 240 s each clean locally; Fuzz workflow shim over the org reusable job
+- Table 6-25 intra_dc_vlc_thr on the encoder (explicit + measured election, combined and data-partitioned layouts) + S(GMC)-VOP packet HEC bodies restating sprite_trajectory() both ways; data-partitioned parsers decide use_intra_dc_vlc per macroblock after dquant; black-box bit-exact pair
+- mpeg4video encoder: GMC with two / three warping points — §7.8.5 similarity / affine trajectory fitting (mode-seeded robust least squares + coordinate-descent refinement on the decoder's warp), gmc-points option, quantiser-scaled GMC preference; three-point stream black-box bit-exact, two-point exact up to one intra near-tie
+- §6.2.5.2 short header (H.263-compatible) both ways — VOL-less stream auto-detect + I/P picture decode (GOB headers, 8-bit intra DC, Table B.17 + Type-4 escapes, §7.6.5 GOB predictor rule), short-header / gob-headers encoder options; black-box bit-exact in both directions
+- mpeg4video encoder: interlaced tools — field DCT, §7.7.2.1 field-predicted P macroblocks, §7.7.2.2 field / interlaced-direct B modes, interlaced_information() emission; black-box bit-exact I+P and compat I/P/B pairs; decoder §7.6.3 field-vector wrap + §7.6.4 frame-grid qpel field clamp
+
 ### Added
 
 - Encoder: interlaced tools — `interlaced` VOL with per-VOP
