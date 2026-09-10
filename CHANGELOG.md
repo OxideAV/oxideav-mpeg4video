@@ -8,6 +8,29 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Encoder: budget-driven rate control (`rc-mode=budget`, the new
+  default under `bitrate`): `rate_control::BudgetPlanner` allots a bit
+  budget per GOP and splits it over the GOP's remaining I/P/B-VOPs by
+  a per-class `bits × qp` complexity model (trailing B-VOPs charged to
+  their own GOP, surplus / deficit carried at one second's worth per
+  second, first VOP of each class re-encoded once when it misses its
+  target by more than a quarter), clamps every target against the
+  Annex D VBV occupancy and hands it to the macroblock loop as an
+  `mb_quant::MbBudget`; `mb_quant::MbRegulator` then drives the
+  per-macroblock `dquant` / `dbquant` steps from the spend against an
+  activity-weighted expected-spend curve (`rc-band` half-width around
+  `vop_quant`, `mb-aq` activity classes stack on top). Two-pass:
+  `pass=1` writes `rate_control::FirstPassStats` (`stats-file`, a
+  line-oriented text form) at flush, `pass=2` plans each VOP's share
+  of the sequence budget from the measured complexities;
+  `Mpeg4VideoEncoder::first_pass_stats` / `with_first_pass_stats` for
+  the direct API. `rc-mode=vop` keeps the previous per-VOP reactive
+  controller. Measured over 50 frames: budget mode within 0.2 % of
+  the target on intra-only / GOP-25 shapes and within 4 % on GOP-12
+  IPB (reactive mode: up to 8 %); two-pass 1.000. Encode statistics
+  (`IVopEncodeStats`, the P/S/B stats) now carry the coded
+  macroblocks' quantiser sum.
+
 - Encoder: interlaced tools — `interlaced` VOL with per-VOP
   `top_field_first` / `alternate_vertical_scan_flag`, per-macroblock
   §7.7.1 field DCT (`dct_type`) election, §7.7.2.1 field-predicted P

@@ -121,6 +121,22 @@ pub struct BVopInterlacedEncodeStats {
     pub packets: usize,
     /// Direct candidates suppressed by the ecosystem-compat emission.
     pub compat_direct_suppressed: usize,
+    /// Sum of the quantisers the `cbpb != 0` macroblocks used.
+    pub qp_sum: u32,
+    /// Number of macroblocks behind `qp_sum`.
+    pub qp_mbs: u32,
+}
+
+impl BVopInterlacedEncodeStats {
+    /// Mean quantiser of the residual-carrying macroblocks
+    /// (`vop_quant` when none was coded).
+    pub fn mean_qp_or(&self, vop_qp: u32) -> f64 {
+        if self.qp_mbs == 0 {
+            f64::from(vop_qp)
+        } else {
+            f64::from(self.qp_sum) / f64::from(self.qp_mbs)
+        }
+    }
 }
 
 /// The chosen prediction mode of one macroblock, with everything the
@@ -303,6 +319,10 @@ pub fn encode_b_vop_interlaced(
     let mut stats = BVopInterlacedEncodeStats::default();
     let vop_qp = qp;
     let mut running_qp = vop_qp;
+    let regulator = cfg.mb_budget.map(|budget| {
+        let activities = crate::pvop_encode::activity_profile(frame, mb_width, mb_height);
+        crate::mb_quant::MbRegulator::new(budget, vop_qp, &activities, cfg.adaptive_quant)
+    });
     for mb_row in 0..mb_height {
         // §7.6.8 / Table 7-14: the four-PMV bank resets at each row
         // start (mirrors BVopMvDriver::start_row).
@@ -629,13 +649,20 @@ pub fn encode_b_vop_interlaced(
             };
 
             // ---- Quantiser -------------------------------------------
-            let (qp, dbquant) = if cfg.adaptive_quant && mb_type != BVopMbType::Direct {
-                let class =
-                    crate::mb_quant::activity_class(crate::pvop_encode::intra_activity(&src));
-                crate::mb_quant::plan_dbquant(running_qp, crate::mb_quant::target_qp(vop_qp, class))
-            } else {
-                (running_qp, None)
-            };
+            let (qp, dbquant) =
+                if (regulator.is_some() || cfg.adaptive_quant) && mb_type != BVopMbType::Direct {
+                    crate::mb_quant::plan_mb_dbquant(
+                        regulator.as_ref(),
+                        cfg.adaptive_quant,
+                        running_qp,
+                        vop_qp,
+                        mb_row * mb_width + mb_col,
+                        pw.total_bits(),
+                        crate::pvop_encode::intra_activity(&src),
+                    )
+                } else {
+                    (running_qp, None)
+                };
 
             // ---- Residual + dct_type ---------------------------------
             let (res_luma, res_cb, res_cr) = macroblock_residual(frame, mb_row, mb_col, &pred_view);
@@ -692,6 +719,8 @@ pub fn encode_b_vop_interlaced(
             if mb_type != BVopMbType::Direct && !all_zero {
                 crate::vlc_encode::put_dbquant(pw.writer(), dbquant.unwrap_or(0));
                 running_qp = qp;
+                stats.qp_sum += qp;
+                stats.qp_mbs += 1;
                 if dbquant.is_some() {
                     stats.dbquant += 1;
                 }

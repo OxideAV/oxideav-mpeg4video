@@ -25,13 +25,32 @@ use oxideav_core::{
 
 use crate::bvop_encode::encode_b_vop;
 use crate::framestore::FrameStore;
-use crate::ivop_encode::{encode_i_vop, write_configuration_headers, EncoderConfig, FrameView};
+use crate::ivop_encode::{
+    encode_i_vop_elect_thr_full, encode_i_vop_full, write_configuration_headers, EncoderConfig,
+    FrameView,
+};
+use crate::mb_quant::MbBudget;
 use crate::pvop_encode::{encode_p_vop, reconstruct_own_p_vop_with_anchor_motion};
+use crate::rate_control::{BudgetPlanner, FirstPassStats, FrameStat, RateController, VopClass};
 use crate::vol::{parse_video_object_layer, VolHeader};
+
+/// The quantiser-adaptation mode of the rate control (`rc-mode`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RcMode {
+    /// Budget-driven (`crate::rate_control::BudgetPlanner`): GOP bit
+    /// budgets split by a per-class complexity model, each VOP's
+    /// target regulated inside the macroblock loop through `dquant` /
+    /// `dbquant` (`crate::mb_quant::MbRegulator`); two-pass capable.
+    #[default]
+    Budget,
+    /// Per-VOP reactive (`crate::rate_control::RateController`): one
+    /// quantiser per VOP, scaled by the previous VOP's overspend.
+    Vop,
+}
 
 /// Typed options struct for the registry / options-bag construction
 /// path ([`oxideav_core::CodecParameters::options`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Mpeg4EncoderOptions {
     /// `qp` — the VOP quantiser scale (1..=31). Default 4.
     pub qp: u32,
@@ -132,6 +151,23 @@ pub struct Mpeg4EncoderOptions {
     /// cost (the VOP is coded under 0 and 7, the smaller kept) and
     /// carry the winner to the following P/S-VOPs. Default off.
     pub auto_dc_vlc: bool,
+    /// `rc-mode` — how the rate control (active under `bitrate`)
+    /// adapts the quantiser: `budget` (default; GOP budgets + per-
+    /// macroblock regulation) or `vop` (one reactive quantiser per
+    /// VOP).
+    pub rc_mode: RcMode,
+    /// `rc-band` — budget mode: the half-width of the quantiser band
+    /// the per-macroblock regulator may roam around `vop_quant`
+    /// (0..=30). Default 6.
+    pub rc_band: u32,
+    /// `pass` — `0` (single pass, default), `1` (analysis pass:
+    /// writes the per-VOP statistics to `stats-file` at flush) or `2`
+    /// (final pass: plans the sequence budget from `stats-file`).
+    pub pass: u32,
+    /// `stats-file` — path of the first-pass statistics
+    /// (`crate::rate_control::FirstPassStats` text form) written by
+    /// `pass=1` and read by `pass=2`.
+    pub stats_file: String,
 }
 
 impl Default for Mpeg4EncoderOptions {
@@ -161,6 +197,10 @@ impl Default for Mpeg4EncoderOptions {
             gob_headers: true,
             dc_vlc_thr: 0,
             auto_dc_vlc: false,
+            rc_mode: RcMode::Budget,
+            rc_band: 6,
+            pass: 0,
+            stats_file: String::new(),
         }
     }
 }
@@ -337,6 +377,35 @@ impl oxideav_core::CodecOptionsStruct for Mpeg4EncoderOptions {
             help: "elect intra_dc_vlc_thr per I-VOP by measured cost (0 vs 7) and carry \
                    the winner to the following P/S-VOPs",
         },
+        oxideav_core::OptionField {
+            name: "rc-mode",
+            kind: oxideav_core::OptionKind::Enum(&["budget", "vop"]),
+            default: oxideav_core::OptionValue::String(String::new()),
+            help: "rate-control quantiser adaptation under bitrate: budget (GOP bit \
+                   budgets, per-macroblock dquant/dbquant regulation, two-pass capable; \
+                   default) or vop (one reactive quantiser per VOP)",
+        },
+        oxideav_core::OptionField {
+            name: "rc-band",
+            kind: oxideav_core::OptionKind::U32,
+            default: oxideav_core::OptionValue::U32(6),
+            help: "budget rate control: half-width (0..=30) of the quantiser band the \
+                   per-macroblock regulator may roam around vop_quant",
+        },
+        oxideav_core::OptionField {
+            name: "pass",
+            kind: oxideav_core::OptionKind::U32,
+            default: oxideav_core::OptionValue::U32(0),
+            help: "two-pass rate control: 1 = analysis pass (writes stats-file at \
+                   flush), 2 = final pass (plans the sequence budget from stats-file); \
+                   0 = single pass",
+        },
+        oxideav_core::OptionField {
+            name: "stats-file",
+            kind: oxideav_core::OptionKind::String,
+            default: oxideav_core::OptionValue::String(String::new()),
+            help: "path of the first-pass statistics written by pass=1 and read by pass=2",
+        },
     ];
 
     fn apply(&mut self, key: &str, value: &oxideav_core::OptionValue) -> Result<()> {
@@ -407,6 +476,28 @@ impl oxideav_core::CodecOptionsStruct for Mpeg4EncoderOptions {
                 self.dc_vlc_thr = t;
             }
             "auto-dc-vlc" => self.auto_dc_vlc = value.as_bool()?,
+            "rc-mode" => {
+                self.rc_mode = match value.as_str()? {
+                    "budget" => RcMode::Budget,
+                    "vop" => RcMode::Vop,
+                    other => return Err(Error::invalid(format!("unknown rc-mode {other}"))),
+                }
+            }
+            "rc-band" => {
+                let b = value.as_u32()?;
+                if b > 30 {
+                    return Err(Error::invalid("rc-band must be in 0..=30"));
+                }
+                self.rc_band = b;
+            }
+            "pass" => {
+                let p = value.as_u32()?;
+                if p > 2 {
+                    return Err(Error::invalid("pass must be 0, 1 or 2"));
+                }
+                self.pass = p;
+            }
+            "stats-file" => self.stats_file = value.as_str()?.to_owned(),
             _ => unreachable!("guarded by SCHEMA"),
         }
         Ok(())
@@ -468,9 +559,17 @@ pub struct Mpeg4VideoEncoder {
     /// brackets (`None` after an intra anchor); field-predicted
     /// anchors keep their §7.7.2.2 field shape.
     anchor_motion: Option<Vec<crate::vop_decode::AnchorMbMotion>>,
-    /// The Annex D VBV-regulated quantiser controller (`Some` when a
-    /// bitrate target is set).
-    rc: Option<crate::rate_control::RateController>,
+    /// The Annex D VBV model + (in `vop` mode) the reactive quantiser
+    /// controller (`Some` when a bitrate target is set).
+    rc: Option<RateController>,
+    /// The budget-driven allocator (`Some` under `bitrate` in `budget`
+    /// mode).
+    planner: Option<BudgetPlanner>,
+    /// Per-VOP records of this encode in bitstream order (the
+    /// first-pass statistics of a `pass=1` run; kept on every run).
+    stats_log: FirstPassStats,
+    /// Configuration-run size in bits (part of `d_0`).
+    config_bits: u64,
     /// §7.6.1 anchor chain — the closed-loop references produced by
     /// decoding our own emitted units.
     store: FrameStore,
@@ -482,6 +581,25 @@ impl Mpeg4VideoEncoder {
     /// Construct from codec parameters (see [`make_encoder`]).
     pub fn from_params(params: &CodecParameters) -> Result<Self> {
         let options: Mpeg4EncoderOptions = oxideav_core::parse_options(&params.options)?;
+        if options.pass > 0 && options.bitrate == 0 {
+            return Err(Error::invalid("pass 1/2 need a bitrate target"));
+        }
+        if options.pass > 0 && options.stats_file.is_empty() {
+            return Err(Error::invalid("pass 1/2 need a stats-file"));
+        }
+        if options.pass == 2 && options.rc_mode != RcMode::Budget {
+            return Err(Error::invalid("pass 2 is a budget rc-mode feature"));
+        }
+        let first_pass = if options.pass == 2 {
+            let text = std::fs::read_to_string(&options.stats_file)
+                .map_err(|e| Error::invalid(format!("stats-file {}: {e}", options.stats_file)))?;
+            Some(
+                FirstPassStats::parse(&text)
+                    .map_err(|e| Error::invalid(format!("stats-file: {e}")))?,
+            )
+        } else {
+            None
+        };
         if options.rvlc && !options.data_partitioned {
             return Err(Error::invalid("rvlc requires data-partitioned"));
         }
@@ -575,6 +693,7 @@ impl Mpeg4VideoEncoder {
             vbv,
             fcode: options.fcode as u8,
             adaptive_quant: options.mb_aq,
+            mb_budget: None,
             resilience: crate::packet_encode::ResilienceConfig {
                 packet_bits: options.packet_bits,
                 data_partitioned: options.data_partitioned,
@@ -623,18 +742,33 @@ impl Mpeg4VideoEncoder {
             0
         };
 
+        let seconds_per_vop = frame_rate.den as f64 / frame_rate.num as f64;
         let rc = vbv.map(|v| {
-            crate::rate_control::RateController::new(
+            RateController::new(
                 crate::rate_control::RateControlConfig {
                     bit_rate: u64::from(options.bitrate),
                     vbv_buffer_units: v.buffer_units,
                     occupancy_64: v.occupancy_64,
-                    seconds_per_vop: frame_rate.den as f64 / frame_rate.num as f64,
+                    seconds_per_vop,
                     initial_qp: options.qp,
                 },
                 config_headers.len() as u64 * 8,
             )
         });
+        let planner = (vbv.is_some() && options.rc_mode == RcMode::Budget).then(|| {
+            let planner = BudgetPlanner::new(
+                u64::from(options.bitrate),
+                seconds_per_vop,
+                options.gop_size,
+                options.bf,
+                options.qp,
+            );
+            match first_pass {
+                Some(stats) => planner.with_first_pass(stats),
+                None => planner,
+            }
+        });
+        let config_bits = config_headers.len() as u64 * 8;
 
         Ok(Self {
             codec_id: params.codec_id.clone(),
@@ -656,6 +790,9 @@ impl Mpeg4VideoEncoder {
             pending_bs: Vec::new(),
             anchor_motion: None,
             rc,
+            planner,
+            stats_log: FirstPassStats::default(),
+            config_bits,
             store: FrameStore::new(),
             ready: VecDeque::new(),
             flushed: false,
@@ -760,6 +897,11 @@ impl oxideav_core::Encoder for Mpeg4VideoEncoder {
             self.drain_pending_bs();
         }
         self.flushed = true;
+        if self.options.pass == 1 {
+            std::fs::write(&self.options.stats_file, self.stats_log.to_text()).map_err(|e| {
+                Error::invalid(format!("stats-file {}: {e}", self.options.stats_file))
+            })?;
+        }
         Ok(())
     }
 }
@@ -793,29 +935,66 @@ impl Mpeg4VideoEncoder {
         self.frames_coded += 1;
     }
 
-    /// The quantiser for the next VOP: the VBV controller's when rate
-    /// control is active, else the constant `qp` option.
-    fn current_qp(&self) -> u32 {
-        self.rc
-            .as_ref()
-            .map(|rc| rc.qp())
-            .unwrap_or(self.options.qp)
+    /// The quantiser for the next VOP: the budget planner's (with the
+    /// VOP's [`MbBudget`] installed in the configuration), else the
+    /// VBV controller's reactive value, else the constant `qp` option.
+    fn plan_vop(&mut self, class: VopClass) -> u32 {
+        match (&mut self.planner, &self.rc) {
+            (Some(planner), Some(rc)) => {
+                let plan = planner.plan(class, rc.occupancy(), rc.buffer_bits());
+                // The configuration run rides inside the first packet
+                // (Annex D item 5): the unit budget excludes it.
+                let extra = if self.frames_coded == 0 {
+                    self.config_bits
+                } else {
+                    0
+                };
+                self.cfg.mb_budget = Some(MbBudget {
+                    target_bits: (u64::from(plan.target_bits).saturating_sub(extra)).max(64) as u32,
+                    band: self.options.rc_band as u8,
+                });
+                plan.qp
+            }
+            (None, Some(rc)) => rc.qp(),
+            _ => self.options.qp,
+        }
+    }
+
+    /// First-VOP-of-class calibration (`BudgetPlanner::calibrate`):
+    /// `Some(qp)` asks for one re-encode at that quantiser.
+    fn calibrate_vop(&mut self, class: VopClass, unit_bytes: usize, mean_qp: f64) -> Option<u32> {
+        let planner = self.planner.as_mut()?;
+        let qp = planner.calibrate(class, unit_bytes as u64 * 8, mean_qp)?;
+        Some(qp)
+    }
+
+    /// The quantiser to re-encode the rejected VOP with (after
+    /// [`Self::admit_vop`] returned `false`).
+    fn escalated_qp(&self) -> u32 {
+        match (&self.planner, &self.rc) {
+            (Some(planner), _) => planner.current_plan().map_or(self.options.qp, |p| p.qp),
+            (None, Some(rc)) => rc.qp(),
+            _ => self.options.qp,
+        }
     }
 
     /// Annex D item-9 admission for a freshly encoded VOP of
     /// `unit_bytes` (plus the configuration run on the first packet):
-    /// `true` accepts the unit (occupancy committed); `false` asks the
-    /// caller to re-encode at the controller's coarsened quantiser.
-    fn rc_admit(&mut self, unit_bytes: usize) -> bool {
+    /// `true` accepts the unit (occupancy committed, the rate model
+    /// updated with the VOP's `mean_qp`, the per-VOP record logged);
+    /// `false` asks the caller to re-encode at the coarsened
+    /// quantiser ([`Self::escalated_qp`]).
+    fn admit_vop(&mut self, class: VopClass, unit_bytes: usize, mean_qp: f64) -> bool {
         let extra = if self.frames_coded == 0 {
-            self.config_headers.len()
+            self.config_bits
         } else {
             0
         };
-        let d_bits = (unit_bytes + extra) as u64 * 8;
-        match &mut self.rc {
-            None => true,
-            Some(rc) => {
+        let unit_bits = unit_bytes as u64 * 8;
+        let d_bits = unit_bits + extra;
+        let accepted = match (&mut self.rc, &mut self.planner) {
+            (None, _) => true,
+            (Some(rc), None) => {
                 if rc.accepts(d_bits) || !rc.escalate() {
                     rc.commit(d_bits);
                     true
@@ -823,6 +1002,46 @@ impl Mpeg4VideoEncoder {
                     false
                 }
             }
+            (Some(rc), Some(planner)) => {
+                if rc.accepts(d_bits) || planner.escalate().is_none() {
+                    rc.commit_buffer(d_bits);
+                    planner.commit(class, unit_bits, mean_qp);
+                    true
+                } else {
+                    false
+                }
+            }
+        };
+        if accepted {
+            self.stats_log.frames.push(FrameStat {
+                class,
+                bits: unit_bits,
+                mean_qp,
+            });
+        }
+        accepted
+    }
+
+    /// The per-VOP records of everything encoded so far (bitstream
+    /// order) — the first-pass statistics a `pass=2` run consumes
+    /// ([`Mpeg4VideoEncoder::with_first_pass_stats`] for the direct
+    /// path, `stats-file` for the registry path).
+    pub fn first_pass_stats(&self) -> &FirstPassStats {
+        &self.stats_log
+    }
+
+    /// Attach first-pass statistics to a budget-mode encoder (the
+    /// direct-API equivalent of `pass=2` + `stats-file`). Errors when
+    /// no budget planner is active (no `bitrate`, or `rc-mode=vop`).
+    pub fn with_first_pass_stats(mut self, stats: FirstPassStats) -> Result<Self> {
+        match self.planner.take() {
+            Some(planner) => {
+                self.planner = Some(planner.with_first_pass(stats));
+                Ok(self)
+            }
+            None => Err(Error::invalid(
+                "first-pass statistics need bitrate + rc-mode=budget",
+            )),
         }
     }
 
@@ -850,18 +1069,25 @@ impl Mpeg4VideoEncoder {
                 self.store.backward().cloned()
             };
             let tr = self.short_tr;
+            let class = if force_i { VopClass::I } else { VopClass::P };
+            let mut qp = self.plan_vop(class);
             let (unit, recon) = loop {
-                let qp = self.current_qp();
-                let (unit, recon, _stats) = crate::short_header_encode::encode_short_header_picture(
+                let (unit, recon, stats) = crate::short_header_encode::encode_short_header_picture(
                     &self.cfg,
                     &view,
                     reference.as_ref(),
                     tr,
                     qp,
                 );
-                if self.rc_admit(unit.len()) {
+                let mean_qp = stats.mean_qp_or(qp);
+                if let Some(q) = self.calibrate_vop(class, unit.len(), mean_qp) {
+                    qp = q;
+                    continue;
+                }
+                if self.admit_vop(class, unit.len(), mean_qp) {
                     break (unit, recon);
                 }
+                qp = self.escalated_qp();
             };
             self.short_tr = self.short_tr.wrapping_add(self.short_tr_step);
             self.store.push_anchor(recon);
@@ -875,22 +1101,39 @@ impl Mpeg4VideoEncoder {
         let vol = self.vol.expect("long-header streams carry a VOL");
 
         let unit = if force_i {
+            let mut qp = self.plan_vop(VopClass::I);
             let (unit, recon) = loop {
-                let qp = self.current_qp();
-                let produced = if self.options.auto_dc_vlc {
+                let (unit, recon, stats) = if self.options.auto_dc_vlc {
                     // Elect intra_dc_vlc_thr by measured cost and carry
                     // it to the following P/S-VOP headers.
-                    let (unit, recon, thr) = crate::ivop_encode::encode_i_vop_elect_thr(
-                        &vol, &self.cfg, &view, modulo, increment, qp,
-                    );
+                    let (unit, recon, thr, stats) =
+                        encode_i_vop_elect_thr_full(&vol, &self.cfg, &view, modulo, increment, qp);
                     self.cfg.intra_dc_vlc_thr = thr;
-                    (unit, recon)
+                    (unit, recon, stats)
                 } else {
-                    encode_i_vop(&vol, &self.cfg, &view, modulo, increment, qp)
+                    encode_i_vop_full(
+                        &vol,
+                        &self.cfg,
+                        &view,
+                        modulo,
+                        increment,
+                        qp,
+                        self.cfg.intra_dc_vlc_thr,
+                    )
                 };
-                if self.rc_admit(produced.0.len()) {
-                    break produced;
+                let mean_qp = if stats.qp_mbs == 0 {
+                    f64::from(qp)
+                } else {
+                    stats.mean_qp()
+                };
+                if let Some(q) = self.calibrate_vop(VopClass::I, unit.len(), mean_qp) {
+                    qp = q;
+                    continue;
                 }
+                if self.admit_vop(VopClass::I, unit.len(), mean_qp) {
+                    break (unit, recon);
+                }
+                qp = self.escalated_qp();
             };
             self.store.push_anchor(recon);
             self.anchor_motion = None;
@@ -902,14 +1145,20 @@ impl Mpeg4VideoEncoder {
                 .backward()
                 .expect("anchor present on the S path")
                 .clone();
+            let mut qp = self.plan_vop(VopClass::P);
             let unit = loop {
-                let qp = self.current_qp();
-                let (unit, _stats) = crate::svop_encode::encode_s_vop(
+                let (unit, stats) = crate::svop_encode::encode_s_vop(
                     &vol, &self.cfg, &view, &reference, modulo, increment, qp,
                 );
-                if self.rc_admit(unit.len()) {
+                let mean_qp = crate::svop_encode::as_p_stats(&stats).mean_qp_or(qp);
+                if let Some(q) = self.calibrate_vop(VopClass::P, unit.len(), mean_qp) {
+                    qp = q;
+                    continue;
+                }
+                if self.admit_vop(VopClass::P, unit.len(), mean_qp) {
                     break unit;
                 }
+                qp = self.escalated_qp();
             };
             let (_recon, motion) = crate::svop_encode::reconstruct_own_s_vop_with_anchor_motion(
                 &vol,
@@ -924,13 +1173,19 @@ impl Mpeg4VideoEncoder {
                 .backward()
                 .expect("anchor present on the P path")
                 .clone();
+            let mut qp = self.plan_vop(VopClass::P);
             let unit = loop {
-                let qp = self.current_qp();
-                let (unit, _stats) =
+                let (unit, stats) =
                     encode_p_vop(&vol, &self.cfg, &view, &reference, modulo, increment, qp);
-                if self.rc_admit(unit.len()) {
+                let mean_qp = stats.mean_qp_or(qp);
+                if let Some(q) = self.calibrate_vop(VopClass::P, unit.len(), mean_qp) {
+                    qp = q;
+                    continue;
+                }
+                if self.admit_vop(VopClass::P, unit.len(), mean_qp) {
                     break unit;
                 }
+                qp = self.escalated_qp();
             };
             let (_recon, motion) =
                 reconstruct_own_p_vop_with_anchor_motion(&vol, &unit, &mut self.store);
@@ -990,10 +1245,10 @@ impl Mpeg4VideoEncoder {
             let seconds = b.ticks / res;
             let modulo = (seconds - self.b_base_sec) as u32;
             let increment = (b.ticks % res) as u16;
+            let mut qp = self.plan_vop(VopClass::B);
             let unit = loop {
-                let qp = self.current_qp();
-                let unit = if self.cfg.interlaced {
-                    let (unit, _recon, _stats) =
+                let (unit, mean_qp) = if self.cfg.interlaced {
+                    let (unit, _recon, stats) =
                         crate::bvop_interlaced_encode::encode_b_vop_interlaced(
                             &vol,
                             &self.cfg,
@@ -1007,9 +1262,9 @@ impl Mpeg4VideoEncoder {
                             qp,
                             self.options.ecosystem_compat,
                         );
-                    unit
+                    (unit, stats.mean_qp_or(qp))
                 } else {
-                    let (unit, _recon, _stats) = encode_b_vop(
+                    let (unit, _recon, stats) = encode_b_vop(
                         &vol,
                         &self.cfg,
                         &view,
@@ -1021,11 +1276,16 @@ impl Mpeg4VideoEncoder {
                         increment,
                         qp,
                     );
-                    unit
+                    (unit, stats.mean_qp_or(qp))
                 };
-                if self.rc_admit(unit.len()) {
+                if let Some(q) = self.calibrate_vop(VopClass::B, unit.len(), mean_qp) {
+                    qp = q;
+                    continue;
+                }
+                if self.admit_vop(VopClass::B, unit.len(), mean_qp) {
                     break unit;
                 }
+                qp = self.escalated_qp();
             };
             // Annex D item 7: a B-VOP's decode time is its own
             // composition time.

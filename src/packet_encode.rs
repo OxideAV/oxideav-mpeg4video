@@ -400,6 +400,13 @@ impl PacketWriter {
         self.packets_cut
     }
 
+    /// Bits emitted so far for the whole unit: the VOP header, every
+    /// closed packet and the open packet's partitions (the spend the
+    /// `crate::mb_quant::MbRegulator` measures).
+    pub(crate) fn total_bits(&self) -> usize {
+        self.main.bit_position() + self.open_bits()
+    }
+
     /// Before macroblock `mb_index`: cut a new video packet when the
     /// open one has reached the size target. `quant_scale` is the
     /// running quantiser the new packet re-seeds (§6.3.5). Returns

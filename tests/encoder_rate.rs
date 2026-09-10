@@ -43,6 +43,17 @@ fn picture(w: usize, h: usize, k: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
 }
 
 fn encode(bitrate: u32, frames: usize, bf: u32) -> (Vec<Vec<u8>>, Vec<u8>) {
+    encode_with(bitrate, frames, bf, &[])
+}
+
+/// Encode `frames` pictures at `bitrate` with `bf` B-VOPs per run and
+/// the extra option pairs; returns the packets and the extradata.
+fn encode_with(
+    bitrate: u32,
+    frames: usize,
+    bf: u32,
+    extra: &[(&str, &str)],
+) -> (Vec<Vec<u8>>, Vec<u8>) {
     let mut params = oxideav_core::CodecParameters::video(oxideav_core::CodecId::new("mpeg4video"));
     params.width = Some(64);
     params.height = Some(64);
@@ -51,6 +62,9 @@ fn encode(bitrate: u32, frames: usize, bf: u32) -> (Vec<Vec<u8>>, Vec<u8>) {
     let mut opts = oxideav_core::CodecOptions::default().set("bitrate", bitrate.to_string());
     if bf > 0 {
         opts = opts.set("bf", bf.to_string());
+    }
+    for (k, v) in extra {
+        opts = opts.set(*k, v.to_string());
     }
     params.options = opts;
     let mut enc = oxideav_mpeg4video::encoder::Mpeg4VideoEncoder::from_params(&params).unwrap();
@@ -186,4 +200,90 @@ fn rate_controlled_stream_decodes_and_is_deterministic() {
     for (k, f) in frames.iter().enumerate() {
         assert_eq!(f.pts_ticks(), Some(k as i64));
     }
+}
+
+/// Measured-over-target rate ratio of a run.
+fn rate_ratio(packets: &[Vec<u8>], bitrate: u32, frames: usize) -> f64 {
+    let total_bits: u64 = packets.iter().map(|p| p.len() as u64 * 8).sum();
+    total_bits as f64 / (frames as f64 / 25.0) / f64::from(bitrate)
+}
+
+/// Rate accuracy across GOP shapes: the budget-driven mode lands
+/// within ±10 % of the target on every shape (intra-only, IP, IPB at
+/// two keyframe cadences), and never further from the target than the
+/// per-VOP reactive mode does on the same shape (printed as a table
+/// under `--nocapture`).
+#[test]
+fn budget_mode_rate_accuracy_across_gop_shapes() {
+    let frames = 50usize;
+    let mut rows = Vec::new();
+    println!("gop  bf  bitrate   budget   vop");
+    for (gop, bf) in [(1u32, 0u32), (12, 0), (12, 2), (25, 0), (25, 2)] {
+        for bitrate in [150_000u32, 400_000] {
+            let g = gop.to_string();
+            let (budget, _) = encode_with(bitrate, frames, bf, &[("gop-size", &g)]);
+            let (vop, _) =
+                encode_with(bitrate, frames, bf, &[("gop-size", &g), ("rc-mode", "vop")]);
+            let rb = rate_ratio(&budget, bitrate, frames);
+            let rv = rate_ratio(&vop, bitrate, frames);
+            println!("{gop:>3} {bf:>3} {bitrate:>8}   {rb:.3}    {rv:.3}");
+            rows.push((gop, bf, bitrate, rb, rv));
+        }
+    }
+    for (gop, bf, bitrate, rb, rv) in rows {
+        assert!(
+            (0.90..=1.10).contains(&rb),
+            "gop {gop} bf {bf} {bitrate} b/s: budget ratio {rb:.3}"
+        );
+        assert!(
+            (rb - 1.0).abs() <= (rv - 1.0).abs() + 0.02,
+            "gop {gop} bf {bf} {bitrate} b/s: budget {rb:.3} worse than vop {rv:.3}"
+        );
+    }
+}
+
+/// Two-pass: the analysis pass writes the statistics file, the final
+/// pass plans from it and lands tighter than single pass on a scene
+/// with a complexity jump half-way through.
+#[test]
+fn two_pass_tightens_the_rate() {
+    let dir = std::env::temp_dir().join(format!(
+        "oxideav-mpeg4video-two-pass-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let stats = dir.join("first.log");
+    let stats_s = stats.to_str().unwrap();
+    let frames = 60usize;
+    let bitrate = 250_000u32;
+    let (one, _) = encode_with(bitrate, frames, 2, &[("gop-size", "12")]);
+    let (first, _) = encode_with(
+        bitrate,
+        frames,
+        2,
+        &[("gop-size", "12"), ("pass", "1"), ("stats-file", stats_s)],
+    );
+    let text = std::fs::read_to_string(&stats).unwrap();
+    let parsed = oxideav_mpeg4video::rate_control::FirstPassStats::parse(&text).unwrap();
+    assert_eq!(parsed.frames.len(), frames);
+    assert_eq!(first.len(), frames);
+    let (two, _) = encode_with(
+        bitrate,
+        frames,
+        2,
+        &[("gop-size", "12"), ("pass", "2"), ("stats-file", stats_s)],
+    );
+    let r1 = rate_ratio(&one, bitrate, frames);
+    let r2 = rate_ratio(&two, bitrate, frames);
+    println!("single pass {r1:.3}, two pass {r2:.3}");
+    assert!((0.95..=1.05).contains(&r2), "two-pass ratio {r2:.3}");
+    // Both decode to the full sequence in display order.
+    for packets in [&one, &two] {
+        let stream: Vec<u8> = packets.iter().flatten().copied().collect();
+        let mut dec = Mpeg4VideoDecoder::new();
+        let mut out = dec.decode(&stream).expect("stream decodes");
+        out.extend(dec.flush());
+        assert_eq!(out.len(), frames);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -104,6 +104,12 @@ pub struct EncoderConfig {
     /// macroblock types) and `dbquant` (B-VOPs) steps around the VOP
     /// quantiser. Default off.
     pub adaptive_quant: bool,
+    /// Bit budget of the VOP being encoded (`crate::mb_quant::MbBudget`,
+    /// set per VOP by the budget-driven rate control): the macroblock
+    /// loop regulates its `dquant` / `dbquant` steps against it (with
+    /// the activity classes on top when `adaptive_quant`). `None` =
+    /// no budget regulation.
+    pub mb_budget: Option<crate::mb_quant::MbBudget>,
     /// Error-resilience tools (`crate::packet_encode`): video packets,
     /// data partitioning, reversible VLCs. Default: none.
     pub resilience: crate::packet_encode::ResilienceConfig,
@@ -229,6 +235,7 @@ impl Default for EncoderConfig {
             vbv: None,
             fcode: 1,
             adaptive_quant: false,
+            mb_budget: None,
             resilience: crate::packet_encode::ResilienceConfig::default(),
             gmc: false,
             gmc_points: 1,
@@ -821,12 +828,54 @@ pub fn encode_i_vop_elect_thr(
     time_increment: u16,
     qp: u32,
 ) -> (Vec<u8>, DecodedFrame, u8) {
-    let dc = encode_i_vop_with_thr(vol, cfg, frame, modulo_time_base, time_increment, qp, 0);
-    let ac = encode_i_vop_with_thr(vol, cfg, frame, modulo_time_base, time_increment, qp, 7);
+    let (unit, recon, thr, _stats) =
+        encode_i_vop_elect_thr_full(vol, cfg, frame, modulo_time_base, time_increment, qp);
+    (unit, recon, thr)
+}
+
+/// [`encode_i_vop_elect_thr`] returning the encode statistics as well.
+pub fn encode_i_vop_elect_thr_full(
+    vol: &crate::vol::VolHeader,
+    cfg: &EncoderConfig,
+    frame: &FrameView<'_>,
+    modulo_time_base: u32,
+    time_increment: u16,
+    qp: u32,
+) -> (Vec<u8>, DecodedFrame, u8, IVopEncodeStats) {
+    let dc = encode_i_vop_full(vol, cfg, frame, modulo_time_base, time_increment, qp, 0);
+    let ac = encode_i_vop_full(vol, cfg, frame, modulo_time_base, time_increment, qp, 7);
     if ac.0.len() < dc.0.len() {
-        (ac.0, ac.1, 7)
+        (ac.0, ac.1, 7, ac.2)
     } else {
-        (dc.0, dc.1, 0)
+        (dc.0, dc.1, 0, dc.2)
+    }
+}
+
+/// Per-VOP I encode statistics (observability for tests and the rate
+/// model).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IVopEncodeStats {
+    /// Macroblocks that carried a `dquant` (`intra+q`).
+    pub dquant: usize,
+    /// Macroblocks coded with the §7.7.1 field DCT (`dct_type == 1`).
+    pub field_dct: usize,
+    /// Video packets cut inside the VOP (resync markers emitted).
+    pub packets: usize,
+    /// Sum of the quantisers the macroblocks were coded with.
+    pub qp_sum: u32,
+    /// Number of macroblocks behind `qp_sum`.
+    pub qp_mbs: u32,
+}
+
+impl IVopEncodeStats {
+    /// Mean quantiser of the coded macroblocks (`vop_quant`'s
+    /// effective value under `dquant` modulation).
+    pub fn mean_qp(&self) -> f64 {
+        if self.qp_mbs == 0 {
+            0.0
+        } else {
+            f64::from(self.qp_sum) / f64::from(self.qp_mbs)
+        }
     }
 }
 
@@ -845,6 +894,22 @@ pub fn encode_i_vop_with_thr(
     qp: u32,
     thr: u8,
 ) -> (Vec<u8>, DecodedFrame) {
+    let (unit, recon, _stats) =
+        encode_i_vop_full(vol, cfg, frame, modulo_time_base, time_increment, qp, thr);
+    (unit, recon)
+}
+
+/// [`encode_i_vop_with_thr`] returning the encode statistics as well.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_i_vop_full(
+    vol: &crate::vol::VolHeader,
+    cfg: &EncoderConfig,
+    frame: &FrameView<'_>,
+    modulo_time_base: u32,
+    time_increment: u16,
+    qp: u32,
+    thr: u8,
+) -> (Vec<u8>, DecodedFrame, IVopEncodeStats) {
     assert!((1..=31).contains(&qp), "vop_quant {qp} out of range");
     assert!(thr <= 7, "intra_dc_vlc_thr {thr} out of range");
     let (mb_width, mb_height) = cfg.mb_dimensions();
@@ -885,32 +950,65 @@ pub fn encode_i_vop_with_thr(
     );
 
     let mut grid = IntraBlockGrid::new(mb_height, mb_width);
+    let mut stats = IVopEncodeStats::default();
+    // Budget regulation (`crate::mb_quant::MbRegulator`): the
+    // activity profile of the whole VOP fixes the expected spend
+    // curve; the activity classes only when adaptive_quant asks.
+    let vop_qp = qp;
+    let regulator = cfg.mb_budget.map(|budget| {
+        let activities: Vec<u32> = (0..mb_height * mb_width)
+            .map(|i| {
+                crate::pvop_encode::intra_activity(&crate::pvop_encode::source_luma_mb(
+                    frame,
+                    i / mb_width,
+                    i % mb_width,
+                ))
+            })
+            .collect();
+        crate::mb_quant::MbRegulator::new(budget, vop_qp, &activities, cfg.adaptive_quant)
+    });
     // §6.3.7 running quantiser (seeded by vop_quant, moved by dquant,
     // re-seeded by each video packet's quant_scale).
     let mut running_qp = qp;
     for mb_row in 0..mb_height {
         for mb_col in 0..mb_width {
-            if pw.maybe_cut(mb_row * mb_width + mb_col, running_qp) {
+            let mb_index = mb_row * mb_width + mb_col;
+            if pw.maybe_cut(mb_index, running_qp) {
                 // §E.1.2: no prediction crosses a packet boundary.
                 grid = IntraBlockGrid::new(mb_height, mb_width);
             }
-            // Per-macroblock quantiser: the activity-classed dquant
-            // step from the running value (or the VOP quantiser).
-            let (qp, dquant) = if cfg.adaptive_quant {
+            // Per-macroblock quantiser: the budget / activity-classed
+            // dquant step from the running value (or the VOP
+            // quantiser).
+            let (qp, dquant) = if regulator.is_some() || cfg.adaptive_quant {
                 let src = crate::pvop_encode::source_luma_mb(frame, mb_row, mb_col);
-                let class =
-                    crate::mb_quant::activity_class(crate::pvop_encode::intra_activity(&src));
-                crate::mb_quant::plan_dquant(running_qp, crate::mb_quant::target_qp(qp, class))
+                crate::mb_quant::plan_mb_dquant(
+                    regulator.as_ref(),
+                    cfg.adaptive_quant,
+                    running_qp,
+                    vop_qp,
+                    mb_index,
+                    pw.total_bits(),
+                    crate::pvop_encode::intra_activity(&src),
+                )
             } else {
                 (qp, None)
             };
             running_qp = qp;
+            stats.qp_sum += qp;
+            stats.qp_mbs += 1;
+            if dquant.is_some() {
+                stats.dquant += 1;
+            }
             // Table 6-25 against the running quantiser of this MB.
             let use_dc_vlc = use_intra_dc_vlc(thr, qp);
             // §7.7.1 dct_type election (interlaced VOL only): field DCT
             // permutes the luminance lines before the blocks are cut.
             let field_dct = cfg.interlaced
                 && elect_field_dct(&crate::pvop_encode::source_luma_mb(frame, mb_row, mb_col));
+            if field_dct {
+                stats.field_dct += 1;
+            }
             // Quantise the six blocks first (grid state is variant-
             // independent — the decoder records post-prediction QF).
             let mut prepared: Vec<PreparedBlock> = Vec::with_capacity(6);
@@ -999,12 +1097,13 @@ pub fn encode_i_vop_with_thr(
             pw.push(&chosen);
         }
     }
+    stats.packets = pw.packets_cut();
     let bytes = pw.finish();
 
     // Closed decode loop: run the crate's own decoder walk over the
     // freshly emitted unit and blit the reconstruction.
     let recon = decode_own_i_vop(vol, &bytes, mb_width, mb_height);
-    (bytes, recon)
+    (bytes, recon, stats)
 }
 
 /// Decode an emitted I-VOP unit through the crate's decoder walk into

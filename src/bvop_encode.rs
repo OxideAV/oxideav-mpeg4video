@@ -137,6 +137,22 @@ pub struct BVopEncodeStats {
     pub backward: usize,
     /// Interpolated (bidirectional) macroblocks.
     pub interpolated: usize,
+    /// Sum of the quantisers the `cbpb != 0` macroblocks used.
+    pub qp_sum: u32,
+    /// Number of macroblocks behind `qp_sum`.
+    pub qp_mbs: u32,
+}
+
+impl BVopEncodeStats {
+    /// Mean quantiser of the residual-carrying macroblocks
+    /// (`vop_quant` when none was coded).
+    pub fn mean_qp_or(&self, vop_qp: u32) -> f64 {
+        if self.qp_mbs == 0 {
+            f64::from(vop_qp)
+        } else {
+            f64::from(self.qp_sum) / f64::from(self.qp_mbs)
+        }
+    }
 }
 
 /// Emit a Table B.4 B-VOP `mb_type` codeword.
@@ -370,6 +386,10 @@ pub fn encode_b_vop(
     // on the macroblocks whose syntax carries it).
     let vop_qp = qp;
     let mut running_qp = vop_qp;
+    let regulator = cfg.mb_budget.map(|budget| {
+        let activities = crate::pvop_encode::activity_profile(frame, mb_width, mb_height);
+        crate::mb_quant::MbRegulator::new(budget, vop_qp, &activities, cfg.adaptive_quant)
+    });
     for mb_row in 0..mb_height {
         // §7.6.8: the running per-direction predictors reset at each
         // row start (mirrors BVopMvDriver::start_row).
@@ -452,10 +472,18 @@ pub fn encode_b_vop(
             // dbquant rides only non-direct macroblocks with cbpb != 0;
             // plan the step now, commit it below once the syntax is
             // known to carry it.
-            let (qp, dbquant) = if cfg.adaptive_quant && best.decode.mb_type != BVopMbType::Direct {
-                let class =
-                    crate::mb_quant::activity_class(crate::pvop_encode::intra_activity(&src));
-                crate::mb_quant::plan_dbquant(running_qp, crate::mb_quant::target_qp(vop_qp, class))
+            let (qp, dbquant) = if (regulator.is_some() || cfg.adaptive_quant)
+                && best.decode.mb_type != BVopMbType::Direct
+            {
+                crate::mb_quant::plan_mb_dbquant(
+                    regulator.as_ref(),
+                    cfg.adaptive_quant,
+                    running_qp,
+                    vop_qp,
+                    mb_row * mb_width + mb_col,
+                    pw.total_bits(),
+                    crate::pvop_encode::intra_activity(&src),
+                )
             } else {
                 (running_qp, None)
             };
@@ -526,6 +554,8 @@ pub fn encode_b_vop(
             if mb_type != BVopMbType::Direct && !all_zero && cbpb != 0 {
                 crate::vlc_encode::put_dbquant(pw.writer(), dbquant.unwrap_or(0));
                 running_qp = qp;
+                stats.qp_sum += qp;
+                stats.qp_mbs += 1;
                 if dbquant.is_some() {
                     stats.dbquant += 1;
                 }

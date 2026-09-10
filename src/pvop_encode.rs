@@ -149,6 +149,34 @@ pub struct PVopEncodeStats {
     pub dquant: usize,
     /// Video packets cut inside the VOP (resync markers emitted).
     pub packets: usize,
+    /// Sum of the quantisers the coded macroblocks used.
+    pub qp_sum: u32,
+    /// Number of coded macroblocks behind `qp_sum`.
+    pub qp_mbs: u32,
+}
+
+impl PVopEncodeStats {
+    /// Mean quantiser of the coded macroblocks (`vop_quant` when none
+    /// was coded).
+    pub fn mean_qp_or(&self, vop_qp: u32) -> f64 {
+        if self.qp_mbs == 0 {
+            f64::from(vop_qp)
+        } else {
+            f64::from(self.qp_sum) / f64::from(self.qp_mbs)
+        }
+    }
+}
+
+/// The activity profile of every macroblock of `frame` (row-major),
+/// the `crate::mb_quant::MbRegulator` expected-spend input.
+pub(crate) fn activity_profile(
+    frame: &FrameView<'_>,
+    mb_width: usize,
+    mb_height: usize,
+) -> Vec<u32> {
+    (0..mb_height * mb_width)
+        .map(|i| intra_activity(&source_luma_mb(frame, i / mb_width, i % mb_width)))
+        .collect()
 }
 
 /// 16×16 source luma of one macroblock (edge-replicated), as rows.
@@ -658,10 +686,15 @@ pub fn encode_p_vop(
     // macroblock leaves it untouched).
     let vop_qp = qp;
     let mut running_qp = vop_qp;
+    let regulator = cfg.mb_budget.map(|budget| {
+        let activities = activity_profile(frame, mb_width, mb_height);
+        crate::mb_quant::MbRegulator::new(budget, vop_qp, &activities, cfg.adaptive_quant)
+    });
 
     for mb_row in 0..mb_height {
         for mb_col in 0..mb_width {
-            if pw.maybe_cut(mb_row * mb_width + mb_col, running_qp) {
+            let mb_index = mb_row * mb_width + mb_col;
+            if pw.maybe_cut(mb_index, running_qp) {
                 // §E.1.2: no prediction crosses a packet boundary —
                 // the decoder rebuilds both grids at the header.
                 intra_grid = IntraBlockGrid::new(mb_height, mb_width);
@@ -670,13 +703,17 @@ pub fn encode_p_vop(
             let (mb_x, mb_y) = ((mb_col * 16) as i32, (mb_row * 16) as i32);
             let src = source_luma_mb(frame, mb_row, mb_col);
             let activity = intra_activity(&src);
+            let bits_spent = pw.total_bits();
             let plan_quant = |running: u32| -> (u32, Option<i8>) {
-                if cfg.adaptive_quant {
-                    let class = crate::mb_quant::activity_class(activity);
-                    crate::mb_quant::plan_dquant(running, crate::mb_quant::target_qp(vop_qp, class))
-                } else {
-                    (running, None)
-                }
+                crate::mb_quant::plan_mb_dquant(
+                    regulator.as_ref(),
+                    cfg.adaptive_quant,
+                    running,
+                    vop_qp,
+                    mb_index,
+                    bits_spent,
+                    activity,
+                )
             };
 
             // Motion estimation + mode decision.
@@ -728,6 +765,8 @@ pub fn encode_p_vop(
                 stats.intra += 1;
                 let (qp, dquant) = plan_quant(running_qp);
                 running_qp = qp;
+                stats.qp_sum += qp;
+                stats.qp_mbs += 1;
                 if dquant.is_some() {
                     stats.dquant += 1;
                 }
@@ -857,6 +896,8 @@ pub fn encode_p_vop(
                 continue;
             }
             running_qp = qp;
+            stats.qp_sum += qp;
+            stats.qp_mbs += 1;
             if dquant.is_some() {
                 stats.dquant += 1;
             }

@@ -168,6 +168,10 @@ pub struct SVopEncodeStats {
     pub dquant: usize,
     /// Video packets cut inside the VOP.
     pub packets: usize,
+    /// Sum of the quantisers the coded macroblocks used.
+    pub qp_sum: u32,
+    /// Number of coded macroblocks behind `qp_sum`.
+    pub qp_mbs: u32,
     /// The emitted trajectory `(du[0], dv[0])` in half-sample units.
     pub trajectory: (i32, i32),
     /// The full emitted `sprite_trajectory()` (`count` points).
@@ -642,6 +646,10 @@ pub fn encode_s_vop(
     };
     let vop_qp = qp;
     let mut running_qp = vop_qp;
+    let regulator = cfg.mb_budget.map(|budget| {
+        let activities = crate::pvop_encode::activity_profile(frame, mb_width, mb_height);
+        crate::mb_quant::MbRegulator::new(budget, vop_qp, &activities, cfg.adaptive_quant)
+    });
 
     for mb_row in 0..mb_height {
         for mb_col in 0..mb_width {
@@ -653,13 +661,17 @@ pub fn encode_s_vop(
             let (mb_x, mb_y) = ((mb_col * 16) as i32, (mb_row * 16) as i32);
             let src = source_luma_mb(frame, mb_row, mb_col);
             let activity = intra_activity(&src);
+            let bits_spent = pw.total_bits();
             let plan_quant = |running: u32| -> (u32, Option<i8>) {
-                if cfg.adaptive_quant {
-                    let class = crate::mb_quant::activity_class(activity);
-                    crate::mb_quant::plan_dquant(running, crate::mb_quant::target_qp(vop_qp, class))
-                } else {
-                    (running, None)
-                }
+                crate::mb_quant::plan_mb_dquant(
+                    regulator.as_ref(),
+                    cfg.adaptive_quant,
+                    running,
+                    vop_qp,
+                    idx,
+                    bits_spent,
+                    activity,
+                )
             };
 
             // GMC candidate: the decoder's own §7.8.7.1 prediction.
@@ -709,6 +721,8 @@ pub fn encode_s_vop(
                 stats.intra += 1;
                 let (qp, dquant) = plan_quant(running_qp);
                 running_qp = qp;
+                stats.qp_sum += qp;
+                stats.qp_mbs += 1;
                 if dquant.is_some() {
                     stats.dquant += 1;
                 }
@@ -842,12 +856,16 @@ pub fn encode_s_vop(
                 }
                 stats.gmc += 1;
                 running_qp = qp;
+                stats.qp_sum += qp;
+                stats.qp_mbs += 1;
                 if dquant.is_some() {
                     stats.dquant += 1;
                 }
             } else {
                 stats.local += 1;
                 running_qp = qp;
+                stats.qp_sum += qp;
+                stats.qp_mbs += 1;
                 if dquant.is_some() {
                     stats.dquant += 1;
                 }
@@ -1016,6 +1034,8 @@ pub fn as_p_stats(stats: &SVopEncodeStats) -> PVopEncodeStats {
         intra: stats.intra,
         dquant: stats.dquant,
         packets: stats.packets,
+        qp_sum: stats.qp_sum,
+        qp_mbs: stats.qp_mbs,
     }
 }
 

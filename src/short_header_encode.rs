@@ -324,6 +324,10 @@ pub fn encode_short_header_picture(
     let mut stats = PVopEncodeStats::default();
     let vop_qp = qp;
     let mut running_qp = vop_qp;
+    let regulator = cfg.mb_budget.map(|budget| {
+        let activities = crate::pvop_encode::activity_profile(frame, mb_width, mb_height);
+        crate::mb_quant::MbRegulator::new(budget, vop_qp, &activities, cfg.adaptive_quant)
+    });
     let no_matrix = [[0u8; 8]; 8];
 
     for gob in 0..gobs {
@@ -348,18 +352,24 @@ pub fn encode_short_header_picture(
             let (mb_x, mb_y) = ((mb_col * 16) as i32, (mb_row * 16) as i32);
             let src = source_luma_mb(frame, mb_row, mb_col);
             let activity = intra_activity(&src);
+            let bits_spent = bw.bit_position();
             let plan_quant = |running: u32| -> (u32, Option<i8>) {
-                if cfg.adaptive_quant {
-                    let class = crate::mb_quant::activity_class(activity);
-                    crate::mb_quant::plan_dquant(running, crate::mb_quant::target_qp(vop_qp, class))
-                } else {
-                    (running, None)
-                }
+                crate::mb_quant::plan_mb_dquant(
+                    regulator.as_ref(),
+                    cfg.adaptive_quant,
+                    running,
+                    vop_qp,
+                    idx,
+                    bits_spent,
+                    activity,
+                )
             };
 
             if !is_p {
                 let (qp, dquant) = plan_quant(running_qp);
                 running_qp = qp;
+                stats.qp_sum += qp;
+                stats.qp_mbs += 1;
                 if dquant.is_some() {
                     stats.dquant += 1;
                 }
@@ -375,6 +385,8 @@ pub fn encode_short_header_picture(
             if choose_intra {
                 let (qp, dquant) = plan_quant(running_qp);
                 running_qp = qp;
+                stats.qp_sum += qp;
+                stats.qp_mbs += 1;
                 if dquant.is_some() {
                     stats.dquant += 1;
                 }
@@ -429,6 +441,8 @@ pub fn encode_short_header_picture(
                 continue;
             }
             running_qp = qp;
+            stats.qp_sum += qp;
+            stats.qp_mbs += 1;
             if dquant.is_some() {
                 stats.dquant += 1;
             }

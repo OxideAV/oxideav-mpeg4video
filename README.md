@@ -149,8 +149,21 @@ form, and the §7.6.8 running per-direction predictors; a `bf`-deep
 reorder queue with Annex D item-7 decode-time stamps), a `gop-size`
 keyframe cadence, **Annex D rate control** (the D.2 VBV rate-buffer
 model simulated on the encoder side with an item-9 admission gate that
-re-encodes an oversized VOP at a coarser quantiser, plus
-bit-budget-regulated per-VOP quantiser adaptation), and the
+re-encodes an oversized VOP at a coarser quantiser; the default
+**budget-driven** mode — `rate_control::BudgetPlanner` — allots a bit
+budget per GOP, splits it over the GOP's remaining I/P/B-VOPs by a
+per-class `bits × qp` complexity model (trailing B-VOPs charged to the
+GOP they belong to, surplus / deficit carried between GOPs at one
+second's worth per second, first VOP of each class calibrated by a
+re-encode when it misses its target by more than a quarter), clamps
+each VOP's target against the VBV occupancy and hands it to the
+macroblock loop as an `mb_quant::MbBudget` — the `dquant` / `dbquant`
+steps then regulate the spend inside the VOP against an
+activity-weighted expected-spend curve (`mb_quant::MbRegulator`, band
+`rc-band` around `vop_quant`); an optional **two-pass** plan
+(`pass=1` writes `rate_control::FirstPassStats` to `stats-file`,
+`pass=2` plans every VOP's share from the measured complexities);
+`rc-mode=vop` keeps the earlier per-VOP reactive controller), and the
 **GMC emission** (`svop_encode`: S(GMC)-VOP anchors with one, two or
 three §7.8.4 warping points at half-pel accuracy — one point carries
 the dominant per-MB translation, clamped into the Table 7-9 range so
@@ -224,15 +237,29 @@ reference bit-exactly (compat divergence 1 confirmed on
 encoder-produced content); and the method-1 stream lands exactly on the documented
 §7.4.4.5 compat contract (ecosystem mode bit-exact, literal-spec ±1 on
 834 samples); rate-controlled streams satisfy an independent Annex D
-re-simulation (no underflow, `d_i < B`) and land within [0.6, 1.1]× of
-the target. The registry entry declares `encode`:
+re-simulation (no underflow, `d_i < B`). Rate accuracy (measured /
+target over 50 frames of a 64×64 moving-texture scene, 25 fps,
+`tests/encoder_rate.rs`):
+
+| GOP | bf | 150 kb/s budget | 150 kb/s vop | 400 kb/s budget | 400 kb/s vop |
+|----:|---:|---:|---:|---:|---:|
+| 1 | 0 | 1.002 | 0.989 | 1.003 | 0.989 |
+| 12 | 0 | 1.021 | 1.016 | 1.012 | 0.996 |
+| 12 | 2 | 1.038 | 1.083 | 1.022 | 1.051 |
+| 25 | 0 | 1.002 | 0.987 | 1.001 | 0.980 |
+| 25 | 2 | 1.001 | 1.050 | 1.001 | 1.033 |
+
+Two-pass on a 60-frame GOP-12 / bf-2 run at 250 kb/s lands at 1.000
+(single pass 1.009). The registry entry declares `encode`:
 `encoder::make_encoder` / `Mpeg4VideoEncoder` (options `qp`,
 `mpeg-quant`, `ac-pred`, `four-mv`, `qpel`, `bf`, `bitrate`,
 `vbv-buffer`, `gop-size`, `fcode`, `mb-aq`, `packet-bits`,
 `data-partitioned`, `rvlc`, `gmc`, `gmc-points`, `interlaced`, `top-field-first`,
 `alt-scan`, `ecosystem-compat`, `short-header`, `gob-headers`,
-`dc-vlc-thr`, `auto-dc-vlc`) is the dual-API sibling of
-`make_decoder`.
+`dc-vlc-thr`, `auto-dc-vlc`, `rc-mode`, `rc-band`, `pass`,
+`stats-file`) is the dual-API sibling of `make_decoder`;
+`Mpeg4VideoEncoder::first_pass_stats` / `with_first_pass_stats` are the
+direct-API two-pass round trip.
 
 ## Compatibility modes
 
@@ -487,12 +514,11 @@ both modes' envelopes are pinned).
 
 ## Not yet supported
 
-- Encoder: the ±2-pel `dbquant`-band rate coupling is encoder headroom;
-  rate control adapts per VOP
-  (the per-macroblock `dquant` / `dbquant` steps are activity-driven,
-  not budget-driven); the `intra_dc_vlc_thr` election measures the two
-  Table 6-25 extremes only (the mid-table thresholds are available as
-  explicit settings). The decoder-side feature set below is
+- Encoder: the `intra_dc_vlc_thr` election measures the two Table
+  6-25 extremes only (the mid-table thresholds are available as
+  explicit settings); the two-pass statistics are per VOP (no
+  per-macroblock first-pass profile — the second pass allots inside
+  a VOP by source activity). The decoder-side feature set below is
   unchanged.
 
 - §E.1.4.4 recovery on **I-VOP** texture partitions (an I-VOP texture
