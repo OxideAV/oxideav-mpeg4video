@@ -29,7 +29,12 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   the target on intra-only / GOP-25 shapes and within 4 % on GOP-12
   IPB (reactive mode: up to 8 %); two-pass 1.000. Encode statistics
   (`IVopEncodeStats`, the P/S/B stats) now carry the coded
-  macroblocks' quantiser sum.
+  macroblocks' quantiser sum. Two new black-box pairs
+  (`enc_ipb_rcbudget_96x64` one-pass ×1.006 of the target at 33.49 dB,
+  `enc_ipb_rc2pass_96x64` two-pass ×1.000 at 33.62 dB), both
+  bit-exact in the reference decoder.
+- Manifest: `tests/` and `fuzz/` are excluded from the published
+  package.
 
 - Encoder: interlaced tools — `interlaced` VOL with per-VOP
   `top_field_first` / `alternate_vertical_scan_flag`, per-macroblock

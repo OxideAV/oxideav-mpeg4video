@@ -484,6 +484,28 @@ ffmpeg -f lavfi -i "testsrc2=size=176x144:rate=25:duration=0.2" \
   Our short-header decode is **bit-exact** against the reference
   decode (no near-tie samples on this stream).
 
+## Budget-driven rate control (round 458)
+
+Registry builds from `tests/encoder_rate_blackbox.rs` (96×64, 25 fps,
+`bitrate 300000`, `gop-size 12`, `bf 2`, `mb-aq`, `four-mv`, seed qp
+6; a panning texture whose second half gains a second texture layer):
+every I/P macroblock's `dquant` and every coded non-direct B
+macroblock's `dbquant` is driven by the GOP budget through the
+per-macroblock regulator, so the running quantiser moves in both
+directions inside every VOP.
+
+* `enc_ipb_rcbudget_96x64` — one-pass budget mode: 301 692 b/s
+  (×1.006 of the target), luma PSNR 33.49 dB. **Bit-exact** reference
+  decode.
+* `enc_ipb_rc2pass_96x64` — two-pass (the first run's per-VOP
+  statistics fed back through `with_first_pass_stats`): 299 875 b/s
+  (×1.000), luma PSNR 33.62 dB. **Bit-exact** reference decode.
+
+```
+ffmpeg -idct faani -i enc_ipb_rcbudget_96x64.m4v -f rawvideo -pix_fmt yuv420p enc_ipb_rcbudget_96x64.yuv
+ffmpeg -idct faani -i enc_ipb_rc2pass_96x64.m4v -f rawvideo -pix_fmt yuv420p enc_ipb_rc2pass_96x64.yuv
+```
+
 ## SHA-256
 
 ```
@@ -604,6 +626,10 @@ ea4de652b9352b4ebadec471d53b71435a1bb36101d636e8c504c57dc5a7e409  enc_ip_dp_aq_9
 f958498a6b00db8595f0be1c28f77e042f8e7c4ef8fc863bb0b05537d76c30a0  enc_ip_dp_aq_96x48.yuv
 498b14b46e2aa39f720f1c085bd62280ca52e00561529e30373034c268340d79  enc_ipb_dprvlc_aq4mv_96x48.m4v
 57305ad87ed09378b0b41fe56cab77636e43d4bba0a62615caa2faa86604e2a8  enc_ipb_dprvlc_aq4mv_96x48.yuv
+6de050020c1ee63a0c77a851cc6266c8c24c62232dce28195c4520de7674fc76  enc_ipb_rcbudget_96x64.m4v
+466c091493690e78ea864774f940cc4425c7a0c0fc1be06fafd364dcf0080f6b  enc_ipb_rcbudget_96x64.yuv
+22b82d3e4bd90eaf6a22b52cdcca8f1da04f49edabb638af5b3cae680bd3f1ec  enc_ipb_rc2pass_96x64.m4v
+ff158355952caa09f49da26d6cd2921047cc978e6d8f15bbd4f1fccc413bcd7c  enc_ipb_rc2pass_96x64.yuv
 ```
 
 (Note: `aic_ipb_64x64.yuv` and `altscan_ipb_64x64.yuv` are

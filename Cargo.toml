@@ -9,6 +9,9 @@ authors = ["Mark Karpeles"]
 description = "Pure-Rust MPEG-4 Part 2 Video (ISO/IEC 14496-2) decoder and encoder for oxideav"
 
 readme = "README.md"
+# The black-box fixtures under tests/ and the fuzz corpus are not part
+# of the published package (crates.io caps uploads at 10 MiB).
+exclude = ["/tests", "/fuzz"]
 homepage = "https://github.com/OxideAV/oxideav-mpeg4video"
 keywords = ["multimedia", "video", "mpeg4", "codec", "pure-rust"]
 categories = ["multimedia::encoding", "multimedia::video"]
