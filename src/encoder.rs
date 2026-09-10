@@ -112,8 +112,9 @@ pub struct Mpeg4EncoderOptions {
     /// `interlaced` — code an interlaced VOL (§6.3.3): per-macroblock
     /// field DCT (`dct_type`), §7.7.2.1 field-predicted P macroblocks
     /// and §7.7.2.2 field / interlaced-direct B macroblocks, all
-    /// cost-decided. Selects the ASP profile; incompatible with
-    /// `data-partitioned`.
+    /// cost-decided. Selects the ASP profile; `data-partitioned` is
+    /// not codable alongside it (ISO/IEC 14496-2 Table G.2 note e),
+    /// §6.2.5.3 carries no `interlaced_information()`).
     pub interlaced: bool,
     /// `top-field-first` — the §6.3.5 `top_field_first` flag written
     /// on every VOP of an interlaced VOL. Default true.
@@ -325,7 +326,7 @@ impl oxideav_core::CodecOptionsStruct for Mpeg4EncoderOptions {
             default: oxideav_core::OptionValue::Bool(false),
             help: "code an interlaced VOL: field DCT, ISO/IEC 14496-2 §7.7.2 field \
                    motion prediction (P, S(GMC) local macroblocks and B); ASP profile; \
-                   incompatible with data-partitioned",
+                   not codable with data-partitioned (Table G.2 note e)",
         },
         oxideav_core::OptionField {
             name: "top-field-first",
@@ -609,8 +610,15 @@ impl Mpeg4VideoEncoder {
             ));
         }
         if options.interlaced && options.data_partitioned {
+            // ISO/IEC 14496-2 Annex G Table G.2 note e): "Interlace does
+            // not support Data Partitioning nor RVLC" — and the
+            // §6.2.5.3 data_partitioned_i_vop() / data_partitioned_p_vop()
+            // syntax carries no interlaced_information() (no dct_type,
+            // no field_prediction), so the combination is not codable.
             return Err(Error::invalid(
-                "interlaced VOLs use the combined syntax (no data-partitioned)",
+                "interlaced + data-partitioned is not codable: ISO/IEC 14496-2 Table G.2 \
+                 note e) bars data partitioning / RVLC under interlace and the §6.2.5.3 \
+                 partitioned syntax carries no interlaced_information()",
             ));
         }
         let width = params

@@ -516,6 +516,14 @@ both modes' envelopes are pinned).
 
 ## Not yet supported
 
+- Interlaced data partitioning / RVLC — **not codable by the
+  standard**, not a gap: ISO/IEC 14496-2 Annex G Table G.2 note e)
+  ("Interlace does not support Data Partitioning nor RVLC") and the
+  §6.2.5.3 `data_partitioned_i_vop()` / `data_partitioned_p_vop()`
+  syntax, which carries no `interlaced_information()` (no `dct_type`,
+  no `field_prediction`). The encoder rejects the combination with a
+  typed error citing the note; the decoder's data-partitioned walks
+  reject an `interlaced == 1` VOL the same way.
 - Encoder: the two-pass statistics are per VOP (no per-macroblock
   first-pass profile — the second pass allots inside a VOP by source
   activity); the `intra_dc_vlc_thr` election under budget regulation

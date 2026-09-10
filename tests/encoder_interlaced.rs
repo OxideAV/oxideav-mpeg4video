@@ -489,18 +489,21 @@ fn registry_interlaced_options() {
     assert_eq!(frames.len(), 6);
     assert!(dec.vol().unwrap().interlaced);
 
-    // interlaced + data-partitioned is rejected (the decoder has no
-    // interlaced data-partitioned walk).
+    // interlaced + data-partitioned is rejected: ISO/IEC 14496-2 Table
+    // G.2 note e) bars data partitioning / RVLC under interlace, and
+    // the §6.2.5.3 partitioned syntax carries no
+    // interlaced_information() — the combination is not codable.
     let mut params = oxideav_core::CodecParameters::video(oxideav_core::CodecId::new("mpeg4video"));
     params.width = Some(32);
     params.height = Some(32);
     params.options = oxideav_core::CodecOptions::default()
         .set("interlaced", "true")
         .set("data-partitioned", "true");
-    assert!(
-        oxideav_mpeg4video::encoder::Mpeg4VideoEncoder::from_params(&params).is_err(),
-        "interlaced + data-partitioned must be rejected"
-    );
+    let err = match oxideav_mpeg4video::encoder::Mpeg4VideoEncoder::from_params(&params) {
+        Err(e) => e,
+        Ok(_) => panic!("interlaced + data-partitioned must be rejected"),
+    };
+    assert!(err.to_string().contains("Table G.2"), "{err}");
 }
 
 /// Black-box pin: the interlaced I+P stream is byte-deterministic and

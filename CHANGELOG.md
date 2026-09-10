@@ -101,6 +101,14 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   motion. New black-box pair `enc_isb_ilaced_gmc_compat_96x64`,
   bit-exact.
 
+### Changed
+
+- Interlaced + data-partitioned is documented as not codable by the
+  standard (ISO/IEC 14496-2 Table G.2 note e); §6.2.5.3 carries no
+  `interlaced_information()`): the encoder's rejection now cites the
+  note and the README lists it under the spec rulings rather than the
+  gaps.
+
 ### Fixed
 
 - Decoder: an `mcsel == 1` macroblock of an interlaced S(GMC)-VOP now
