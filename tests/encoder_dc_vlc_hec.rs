@@ -324,6 +324,105 @@ fn registry_dc_vlc_options() {
     assert!(oxideav_mpeg4video::encoder::Mpeg4VideoEncoder::from_params(&p).is_err());
 }
 
+/// The Table 6-25 election is exact: with the activity-classed
+/// quantisers straddling the mid-table switch points, the elected
+/// threshold's unit is never larger than any of the eight explicit
+/// encodes, and it is the lowest threshold reaching that size (a
+/// mid-table winner appears at the straddling quantisers).
+#[test]
+fn election_is_optimal_over_the_whole_table() {
+    let cfg = EncoderConfig {
+        width: 96,
+        height: 64,
+        adaptive_quant: true,
+        ..EncoderConfig::default()
+    };
+    let (_, vol) = vol_of(&cfg);
+    let (y, cb, cr) = picture(96, 64, 1, (0, 0));
+    let view = FrameView {
+        y: &y,
+        cb: &cb,
+        cr: &cr,
+        width: 96,
+        height: 64,
+    };
+    let mut winners = Vec::new();
+    for qp in [6u32, 14, 16, 18, 20, 22, 28] {
+        let sizes: Vec<usize> = (0u8..=7)
+            .map(|thr| {
+                encode_i_vop_with_thr(&vol, &cfg, &view, 0, 0, qp, thr)
+                    .0
+                    .len()
+            })
+            .collect();
+        let (unit, _recon, thr) = encode_i_vop_elect_thr(&vol, &cfg, &view, 0, 0, qp);
+        let best = *sizes.iter().min().unwrap();
+        let lowest_best = sizes.iter().position(|&s| s == best).unwrap() as u8;
+        assert_eq!(unit.len(), best, "qp {qp}: elected {thr} {sizes:?}");
+        assert_eq!(thr, lowest_best, "qp {qp}: {sizes:?}");
+        assert_eq!(
+            unit,
+            encode_i_vop_with_thr(&vol, &cfg, &view, 0, 0, qp, thr).0
+        );
+        winners.push(thr);
+    }
+    // Activity-classed quantisers put the coarse steps on the busy
+    // macroblocks — exactly where the DC VLC stays cheaper — so the
+    // table's extremes win here.
+    assert!(winners.iter().all(|&t| t == 0 || t == 7), "{winners:?}");
+
+    // A mid-table winner needs flat macroblocks at a coarse quantiser:
+    // a budget-regulated VOP whose busy top half overspends drives the
+    // running quantiser up before the flat bottom half, where the
+    // AC-VLC form (nothing coded for a zero differential) is cheaper.
+    let mut y = y.clone();
+    for row in 32..64 {
+        for col in 0..96 {
+            y[row * 96 + col] = 90 + (row as u8 - 32) / 4;
+        }
+    }
+    let view = FrameView {
+        y: &y,
+        cb: &cb,
+        cr: &cr,
+        width: 96,
+        height: 64,
+    };
+    let mut mid = None;
+    for target_bits in [3_000u32, 4_000, 5_000, 6_000, 8_000, 10_000] {
+        let cfg = EncoderConfig {
+            width: 96,
+            height: 64,
+            mb_budget: Some(oxideav_mpeg4video::mb_quant::MbBudget {
+                target_bits,
+                band: 14,
+            }),
+            ..EncoderConfig::default()
+        };
+        let (_, vol) = vol_of(&cfg);
+        let (unit, _recon, thr) = encode_i_vop_elect_thr(&vol, &cfg, &view, 0, 0, 8);
+        let extremes =
+            [0u8, 7].map(|t| encode_i_vop_with_thr(&vol, &cfg, &view, 0, 0, 8, t).0.len());
+        println!(
+            "budget {target_bits}: elected {thr} ({} bytes), extremes {extremes:?}",
+            unit.len()
+        );
+        if (1..=6).contains(&thr) {
+            // Under budget regulation the re-encode's quantiser
+            // sequence drifts from the probe's, so the guarantee is
+            // against the probe baseline (threshold 0) only.
+            assert!(
+                unit.len() <= extremes[0],
+                "budget {target_bits}: elected {thr} at {} bytes vs threshold 0 {}",
+                unit.len(),
+                extremes[0]
+            );
+            mid.get_or_insert((target_bits, thr));
+        }
+    }
+    assert!(mid.is_some(), "no budget produced a mid-table winner");
+}
+
 /// S(GMC)-VOP video packets now carry the HEC body with its
 /// `sprite_trajectory()` restatement (one and three warping points)
 /// — the decoder's packet-header parser consumes it and the stream

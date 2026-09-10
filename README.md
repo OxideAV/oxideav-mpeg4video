@@ -177,9 +177,11 @@ the predictor grid exactly as the decoder's `MvDriver` does), the
 **Table 6-25 `intra_dc_vlc_thr`** (explicit 0..=7 — intra DC
 differentials ride the AC VLC at scan position 0 once the
 macroblock's running quantiser reaches the threshold, in the combined
-and the data-partitioned layouts — or elected per I-VOP by measured
-cost between the two extremes and carried to the following
-P/S-VOPs), the **interlaced tools** (`field_encode` /
+and the data-partitioned layouts — or elected per I-VOP over the
+whole table by measured cost: one probe encode costs every
+macroblock under both DC-differential VLCs, the eight thresholds are
+scored against the per-macroblock running quantisers, and the winner
+is carried to the following P/S-VOPs), the **interlaced tools** (`field_encode` /
 `bvop_interlaced_encode`: per-macroblock §7.7.1 `dct_type` elected
 from the same-field vs frame-line vertical correlation of the source
 or residual, with the luminance permuted per Figure 6-12 before the
@@ -514,12 +516,11 @@ both modes' envelopes are pinned).
 
 ## Not yet supported
 
-- Encoder: the `intra_dc_vlc_thr` election measures the two Table
-  6-25 extremes only (the mid-table thresholds are available as
-  explicit settings); the two-pass statistics are per VOP (no
-  per-macroblock first-pass profile — the second pass allots inside
-  a VOP by source activity). The decoder-side feature set below is
-  unchanged.
+- Encoder: the two-pass statistics are per VOP (no per-macroblock
+  first-pass profile — the second pass allots inside a VOP by source
+  activity); the `intra_dc_vlc_thr` election under budget regulation
+  is a measured estimate (the probe's quantiser sequence is the
+  threshold-0 one). The decoder-side feature set below is unchanged.
 
 - §E.1.4.4 recovery on **I-VOP** texture partitions (an I-VOP texture
   error still propagates: §E.1.4.4.2.2 conceals every INTRA macroblock

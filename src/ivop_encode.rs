@@ -815,11 +815,21 @@ pub fn encode_i_vop(
 }
 
 /// [`encode_i_vop`] with the §6.3.5 `intra_dc_vlc_thr` **elected by
-/// measured cost**: the VOP is coded under the two extreme Table 6-25
-/// settings (0 — DC VLC throughout, 7 — AC VLC throughout) and the
-/// smaller unit is kept. Returns the unit, its reconstruction and the
-/// winning threshold (the caller carries it to the following P/S
-/// VOPs' headers). Ties keep the DC VLC.
+/// measured cost over the whole Table 6-25**: the VOP is coded once
+/// under threshold 0 while every macroblock's DC differentials are
+/// costed under *both* VLCs (the DC VLC of Table B.13/B.14 and the AC
+/// VLC of Table B.16 with the DC as scan position 0 — the coded-block
+/// pattern and `cbpy` / `cbpc` costs included), the per-macroblock
+/// running quantisers are matched against each of the eight
+/// thresholds, and the cheapest threshold wins (ties keep the lower
+/// setting). When the winner is not 0 the VOP is coded again under
+/// it. Returns the unit, its reconstruction and the winning threshold
+/// (the caller carries it to the following P/S VOPs' headers).
+///
+/// The election is exact whenever the macroblock quantisers do not
+/// depend on the spend (constant / activity-classed quantisers);
+/// under budget regulation the probe's quantiser sequence is the
+/// threshold-0 one, so the winner is a measured estimate.
 pub fn encode_i_vop_elect_thr(
     vol: &crate::vol::VolHeader,
     cfg: &EncoderConfig,
@@ -842,13 +852,62 @@ pub fn encode_i_vop_elect_thr_full(
     time_increment: u16,
     qp: u32,
 ) -> (Vec<u8>, DecodedFrame, u8, IVopEncodeStats) {
-    let dc = encode_i_vop_full(vol, cfg, frame, modulo_time_base, time_increment, qp, 0);
-    let ac = encode_i_vop_full(vol, cfg, frame, modulo_time_base, time_increment, qp, 7);
-    if ac.0.len() < dc.0.len() {
-        (ac.0, ac.1, 7, ac.2)
-    } else {
-        (dc.0, dc.1, 0, dc.2)
+    let mut probe = Vec::new();
+    let dc = encode_i_vop_probe(
+        vol,
+        cfg,
+        frame,
+        modulo_time_base,
+        time_increment,
+        qp,
+        0,
+        Some(&mut probe),
+    );
+    let thr = elect_intra_dc_vlc_thr(&probe);
+    if thr == 0 {
+        return (dc.0, dc.1, 0, dc.2);
     }
+    let (unit, recon, stats) =
+        encode_i_vop_full(vol, cfg, frame, modulo_time_base, time_increment, qp, thr);
+    (unit, recon, thr, stats)
+}
+
+/// One macroblock's contribution to the Table 6-25 election: its
+/// running quantiser and its measured cost under the DC VLC and under
+/// the AC VLC (both with the macroblock's own `ac_pred` decision).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DcVlcProbe {
+    /// The quantiser the macroblock was coded with.
+    pub qp: u32,
+    /// Bits of the macroblock with the DC differentials on the DC VLC.
+    pub dc_vlc_bits: usize,
+    /// Bits of the macroblock with the DC differentials on the AC VLC.
+    pub ac_vlc_bits: usize,
+}
+
+/// Elect the `intra_dc_vlc_thr` (Table 6-25) that minimises the
+/// summed macroblock cost of `probe`: for each threshold every
+/// macroblock contributes its DC-VLC cost while `use_intra_dc_vlc`
+/// holds at its quantiser and its AC-VLC cost otherwise. Ties keep
+/// the lower threshold.
+pub fn elect_intra_dc_vlc_thr(probe: &[DcVlcProbe]) -> u8 {
+    let mut best = (0u8, usize::MAX);
+    for thr in 0u8..=7 {
+        let total: usize = probe
+            .iter()
+            .map(|m| {
+                if use_intra_dc_vlc(thr, m.qp) {
+                    m.dc_vlc_bits
+                } else {
+                    m.ac_vlc_bits
+                }
+            })
+            .sum();
+        if total < best.1 {
+            best = (thr, total);
+        }
+    }
+    best.0
 }
 
 /// Per-VOP I encode statistics (observability for tests and the rate
@@ -909,6 +968,32 @@ pub fn encode_i_vop_full(
     time_increment: u16,
     qp: u32,
     thr: u8,
+) -> (Vec<u8>, DecodedFrame, IVopEncodeStats) {
+    encode_i_vop_probe(
+        vol,
+        cfg,
+        frame,
+        modulo_time_base,
+        time_increment,
+        qp,
+        thr,
+        None,
+    )
+}
+
+/// [`encode_i_vop_full`] optionally recording, per macroblock, the
+/// [`DcVlcProbe`] costs under both DC-differential VLCs (the Table
+/// 6-25 election input).
+#[allow(clippy::too_many_arguments)]
+fn encode_i_vop_probe(
+    vol: &crate::vol::VolHeader,
+    cfg: &EncoderConfig,
+    frame: &FrameView<'_>,
+    modulo_time_base: u32,
+    time_increment: u16,
+    qp: u32,
+    thr: u8,
+    mut probe: Option<&mut Vec<DcVlcProbe>>,
 ) -> (Vec<u8>, DecodedFrame, IVopEncodeStats) {
     assert!((1..=31).contains(&qp), "vop_quant {qp} out of range");
     assert!(thr <= 7, "intra_dc_vlc_thr {thr} out of range");
@@ -1036,6 +1121,14 @@ pub fn encode_i_vop_full(
             } else {
                 None
             };
+            // The probe's alternative: the same blocks planned under
+            // the other DC VLC (both ac_pred variants).
+            let mut alt_off: Vec<BlockPlan> = Vec::with_capacity(6);
+            let mut alt_on: Option<Vec<BlockPlan>> = if probe.is_some() && cfg.ac_prediction {
+                Some(Vec::with_capacity(6))
+            } else {
+                None
+            };
             for (i, prep) in prepared.iter().enumerate() {
                 let component = DcComponent::from_block_index(i);
                 let predictors = grid.predictors_for(mb_row, mb_col, i, 8, qp);
@@ -1068,6 +1161,36 @@ pub fn encode_i_vop_full(
                         None => plans_on = None, // fall back for the whole MB
                     }
                 }
+                if probe.is_some() {
+                    alt_off.push(
+                        plan_block(
+                            prep,
+                            &predictors,
+                            direction,
+                            component,
+                            qp,
+                            false,
+                            forced_scan,
+                            !use_dc_vlc,
+                        )
+                        .expect("no-prediction differentials are always codable"),
+                    );
+                    if let Some(on) = alt_on.as_mut() {
+                        match plan_block(
+                            prep,
+                            &predictors,
+                            direction,
+                            component,
+                            qp,
+                            true,
+                            forced_scan,
+                            !use_dc_vlc,
+                        ) {
+                            Some(p) => on.push(p),
+                            None => alt_on = None,
+                        }
+                    }
+                }
                 grid.record(
                     mb_row,
                     mb_col,
@@ -1094,6 +1217,39 @@ pub fn encode_i_vop_full(
                     (pw.cost_of(&fields_on) < pw.cost_of(&fields_off)).then_some(fields_on)
                 })
                 .unwrap_or(fields_off);
+            if let Some(probe) = probe.as_deref_mut() {
+                // Cost of this macroblock under the other DC VLC, with
+                // its own ac_pred decision.
+                let alt_off: [BlockPlan; 6] = alt_off
+                    .try_into()
+                    .unwrap_or_else(|_| unreachable!("six blocks per macroblock"));
+                let alt_fields_off =
+                    intra_mb_fields(&alt_off, false, !use_dc_vlc, dquant, interlaced);
+                let mut alt_cost = pw.cost_of(&alt_fields_off);
+                if let Some(on) = alt_on {
+                    let on: [BlockPlan; 6] = on
+                        .try_into()
+                        .unwrap_or_else(|_| unreachable!("six blocks per macroblock"));
+                    alt_cost = alt_cost.min(pw.cost_of(&intra_mb_fields(
+                        &on,
+                        true,
+                        !use_dc_vlc,
+                        dquant,
+                        interlaced,
+                    )));
+                }
+                let own_cost = pw.cost_of(&chosen);
+                let (dc_vlc_bits, ac_vlc_bits) = if use_dc_vlc {
+                    (own_cost, alt_cost)
+                } else {
+                    (alt_cost, own_cost)
+                };
+                probe.push(DcVlcProbe {
+                    qp,
+                    dc_vlc_bits,
+                    ac_vlc_bits,
+                });
+            }
             pw.push(&chosen);
         }
     }

@@ -35,6 +35,13 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   bit-exact in the reference decoder.
 - Manifest: `tests/` and `fuzz/` are excluded from the published
   package.
+- Encoder `auto-dc-vlc`: the `intra_dc_vlc_thr` election now covers
+  the whole Table 6-25 — one probe encode costs every macroblock
+  under both DC-differential VLCs (`ivop_encode::DcVlcProbe`), the
+  eight thresholds are scored against the per-macroblock running
+  quantisers (`elect_intra_dc_vlc_thr`) and the cheapest is coded
+  (previously only 0 and 7 were compared); the election is exact
+  under constant / activity-classed quantisers.
 
 - Encoder: interlaced tools — `interlaced` VOL with per-VOP
   `top_field_first` / `alternate_vertical_scan_flag`, per-macroblock
