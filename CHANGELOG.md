@@ -129,6 +129,11 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- §E.1.4.4 RVLC recovery: a backward pass whose first EVENT is not a
+  `LAST` (the region's own tail truncated or corrupted) is now a
+  detected backward-direction error — the stitch falls back to the
+  forward decode — instead of a debug-build assertion failure.
+
 - Decoder: an `mcsel == 1` macroblock of an interlaced S(GMC)-VOP now
   reads its §6.2.6.3 `dct_type` bit when `cbp != 0` (§6.2.6's
   `interlaced_information()` line is unconditional; only the

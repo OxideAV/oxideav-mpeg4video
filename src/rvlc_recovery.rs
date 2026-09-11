@@ -275,10 +275,17 @@ pub fn recover_video_packet_dct(
             let mut run_rev: Vec<AcEvent> = Vec::new();
             // First EVENT of the block (backward) must be a LAST.
             match backward_event(&mut back, layout_block_table(layout, &mb_blocks_rev)) {
-                Ok(ev) => {
-                    debug_assert!(ev.last, "backward block must start with a LAST event");
-                    run_rev.push(ev);
+                // A block read backward must open with the forward
+                // `LAST` EVENT; anything else means the region's tail
+                // is itself damaged (a truncated or corrupted last
+                // block) — §E.1.4.4.1's "error detected in the backward
+                // direction": the backward pass stops here and the
+                // stitch falls back to the forward decode.
+                Ok(ev) if !ev.last => {
+                    backward_error = Some(TextureParseError::Truncated);
+                    break 'mbs;
                 }
+                Ok(ev) => run_rev.push(ev),
                 Err(e) => {
                     backward_error = Some(e);
                     break 'mbs;
