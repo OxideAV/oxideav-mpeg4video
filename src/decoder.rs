@@ -508,8 +508,16 @@ impl Mpeg4VideoDecoder {
                 if self.sequence.store().p_vop_reference().is_none() {
                     return Err(StreamDecodeError::MissingAnchor);
                 }
-                let (entries, geometry) =
-                    decode_s_gmc_vop_macroblocks(&mut br, &vol, &vop, self.options)?;
+                let (entries, geometry) = if vol.data_partitioned {
+                    crate::vop_decode::decode_s_gmc_vop_macroblocks_dp(
+                        &mut br,
+                        &vol,
+                        &vop,
+                        self.options,
+                    )?
+                } else {
+                    decode_s_gmc_vop_macroblocks(&mut br, &vol, &vop, self.options)?
+                };
                 self.anchor_motion = Some(motion_of_s_entries(&entries));
                 out.extend(self.sequence.push_s_gmc_vop(
                     mb_width,

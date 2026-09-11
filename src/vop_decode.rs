@@ -829,6 +829,221 @@ pub fn decode_p_vop_macroblocks_dp(
     Ok(out)
 }
 
+/// Decode a complete rectangular progressive **S(GMC)-VOP** coded with
+/// §6.2.5.3 **data partitioning** (`data_partitioned_p_vop()` with the
+/// `sprite_enable == "GMC"` clauses: `mcsel` after `mcbpc` on
+/// `derived_mb_type < 2` macroblocks, `motion_coding()` only when
+/// `mcsel == 0`), returning the same per-macroblock content as
+/// [`decode_s_gmc_vop_macroblocks`]. Partition 1 drives the §7.6.5
+/// [`MvDriver`] exactly as the combined S walk does (a not-coded or
+/// `mcsel == 1` macroblock records its §7.8.7.3 averaged MV), then
+/// partition 2 and the texture partition follow the P-VOP layout
+/// (RVLC forward decode when `reversible_vlc == 1`; the §E.1.4.4
+/// two-way recovery is not applied on S(GMC) packets — a texture error
+/// surfaces as an error).
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
+pub fn decode_s_gmc_vop_macroblocks_dp(
+    br: &mut BitReader<'_>,
+    vol: &VolHeader,
+    vop: &VopHeader,
+    opts: DecodeOptions,
+) -> Result<(Vec<SGmcMbContent>, WarpGeometry), VopDecodeError> {
+    use crate::data_partition::DpMbEvent;
+    use crate::macroblock::DerivedMbType;
+
+    check_dp_supported(vol)?;
+    if !matches!(vop.coding_type, VopCodingType::S) {
+        return Err(VopDecodeError::Unsupported("not an S-VOP"));
+    }
+    if !matches!(vol.sprite_enable, SpriteEnable::Gmc) {
+        return Err(VopDecodeError::Unsupported("sprite_enable != GMC"));
+    }
+    if !vop.coded {
+        return Err(VopDecodeError::Unsupported("vop_coded == 0"));
+    }
+    if !vol.obmc_disable {
+        return Err(VopDecodeError::Unsupported("data_partitioned + obmc"));
+    }
+
+    let stationary = SpriteTrajectory::stationary();
+    let trajectory = vop.sprite_trajectory.as_ref().unwrap_or(&stationary);
+    let accuracy = vol
+        .sprite_warping_accuracy
+        .unwrap_or(SpriteWarpingAccuracy::HalfPel);
+    let geometry = WarpGeometry::decode(
+        trajectory,
+        u32::from(vol.width),
+        u32::from(vol.height),
+        accuracy,
+    );
+
+    /// Partition-1 outcome of one macroblock.
+    #[derive(Clone, Copy)]
+    enum SMotion {
+        /// GMC-predicted (not coded, or `mcsel == 1`) with its AMV.
+        Gmc(MotionVector),
+        /// Local motion (`mcsel == 0` / inter4v).
+        Local(PvopMbMotion),
+        /// Intra.
+        Intra,
+    }
+
+    let (mb_width, mb_height) = vop_mb_dimensions(vol);
+    let total = mb_width * mb_height;
+    let bpp = u32::from(vol.bits_per_pixel);
+    let max_qp = max_quantiser_scale(vol);
+    let intra_matrix = intra_quant_matrix(vol);
+    let inter_matrix = nonintra_quant_matrix(vol);
+    let vp_ctx = video_packet_context(vol, vop);
+    let mut running_qp = u32::from(vop.quant).clamp(1, max_qp);
+    let mut dc_thr = vop.intra_dc_vlc_thr;
+    let mut out: Vec<SGmcMbContent> = Vec::with_capacity(total);
+    let mut mb_index = 0usize;
+
+    while mb_index < total {
+        if mb_index > 0 {
+            let packet = enter_video_packet(br, &vp_ctx, mb_index as u32)?;
+            running_qp = u32::from(packet.quant_scale).clamp(1, max_qp);
+            if let Some(thr) = packet.intra_dc_vlc_thr {
+                dc_thr = thr;
+            }
+        }
+        // §E.1.2 packet boundary: fresh §7.6.5 / §7.4.3 state.
+        let mut driver = MvDriver::new(mb_height, mb_width, vop.fcode_fwd);
+        let mut grid = IntraBlockGrid::new(mb_height, mb_width);
+        let base = mb_index;
+        let mut motions: Vec<SMotion> = Vec::new();
+        let mut amv_error: Option<VopDecodeError> = None;
+
+        let parsed = crate::data_partition::parse_data_partitioned_p_vop(
+            br,
+            total - base,
+            true,
+            dc_thr,
+            running_qp,
+            max_qp,
+            |b, ev| {
+                let idx = base + motions.len();
+                let (row, col) = (idx / mb_width, idx % mb_width);
+                let truncated = |_| crate::data_partition::DataPartitionError::Truncated;
+                let m = match ev {
+                    // §6.3.6: a not-coded S(GMC) macroblock is
+                    // GMC-predicted (implied mcsel == 1); so is an
+                    // explicit mcsel == 1 one — both record the AMV.
+                    DpMbEvent::NotCoded | DpMbEvent::Gmc => {
+                        let amv = gmc_averaged_mv(
+                            &geometry,
+                            (col * 16) as i64,
+                            (row * 16) as i64,
+                            vol.quarter_sample,
+                            vop.fcode_fwd,
+                            opts.ecosystem_compat,
+                        )
+                        .map_err(|e| {
+                            amv_error = Some(e);
+                            crate::data_partition::DataPartitionError::Truncated
+                        })?;
+                        driver
+                            .record_gmc_macroblock(row, col, amv)
+                            .map_err(truncated)?;
+                        SMotion::Gmc(amv)
+                    }
+                    DpMbEvent::Intra => {
+                        driver
+                            .decode_macroblock(b, row, col, false, Some(DerivedMbType::Intra))
+                            .map_err(truncated)?;
+                        SMotion::Intra
+                    }
+                    DpMbEvent::Motion(ty) => SMotion::Local(
+                        driver
+                            .decode_macroblock(b, row, col, false, Some(ty))
+                            .map_err(truncated)?,
+                    ),
+                };
+                motions.push(m);
+                Ok(())
+            },
+        )
+        .map_err(|e| amv_error.take().unwrap_or(VopDecodeError::DataPartition(e)))?;
+
+        for (k, (mb, tex)) in parsed.mbs.iter().zip(parsed.tex_headers.iter()).enumerate() {
+            let idx = base + k;
+            let (mb_row, mb_col) = (idx / mb_width, idx % mb_width);
+            if mb.not_coded {
+                let SMotion::Gmc(amv) = motions[k] else {
+                    unreachable!("not-coded S macroblocks record their AMV")
+                };
+                out.push(SGmcMbContent::Gmc {
+                    amv,
+                    not_coded: true,
+                    residual: crate::block::InterMacroblock::zero(),
+                });
+                continue;
+            }
+            running_qp = apply_dquant(running_qp, tex.dquant_delta, max_qp);
+            let coded = pattern_code(tex.cbpy, mb.cbpc);
+            let ctx = MacroblockTextureContext {
+                quantiser_scale: running_qp,
+                bits_per_pixel: bpp,
+                quant_type: vol.quant_type,
+                ac_pred_flag: tex.ac_pred_flag,
+                alternate_vertical_scan: vop.alternate_vertical_scan,
+                intra_mismatch_exempt: opts.ecosystem_compat,
+            };
+            match motions[k] {
+                SMotion::Intra => {
+                    let imb = decode_intra_mb_partitioned(
+                        br,
+                        &mut grid,
+                        mb_row,
+                        mb_col,
+                        coded,
+                        tex.intra_dc,
+                        vol.reversible_vlc,
+                        ctx,
+                        &intra_matrix,
+                    )?;
+                    out.push(SGmcMbContent::Intra(reconstruct_intra_macroblock(
+                        &imb, bpp,
+                    )));
+                }
+                SMotion::Gmc(amv) => {
+                    let residual = decode_inter_mb_partitioned(
+                        br,
+                        coded,
+                        vol.reversible_vlc,
+                        MacroblockTextureContext {
+                            ac_pred_flag: false,
+                            ..ctx
+                        },
+                        &inter_matrix,
+                    )?;
+                    out.push(SGmcMbContent::Gmc {
+                        amv,
+                        not_coded: false,
+                        residual,
+                    });
+                }
+                SMotion::Local(motion) => {
+                    let residual = decode_inter_mb_partitioned(
+                        br,
+                        coded,
+                        vol.reversible_vlc,
+                        MacroblockTextureContext {
+                            ac_pred_flag: false,
+                            ..ctx
+                        },
+                        &inter_matrix,
+                    )?;
+                    out.push(SGmcMbContent::Local { motion, residual });
+                }
+            }
+        }
+        mb_index += parsed.mbs.len();
+    }
+    Ok((out, geometry))
+}
+
 /// §E.1.4.4 error path for one data-partitioned P-VOP video packet: run
 /// [`recover_video_packet_dct`](crate::rvlc_recovery::recover_video_packet_dct)
 /// over the packet's DCT-coefficient region, stitch the keep decision +

@@ -228,12 +228,13 @@ fn registry_gmc_full_toolset_round_trips() {
     let frames = decode_all(&stream);
     assert_eq!(frames.len(), 6);
 
-    // gmc + data-partitioned is rejected.
+    // gmc + data-partitioned is accepted (§6.2.5.3 data_partitioned_p_vop()
+    // carries the S(GMC) mcsel clauses; see tests/encoder_gmc_dp.rs).
     let mut params = oxideav_core::CodecParameters::video(oxideav_core::CodecId::new("mpeg4video"));
     params.width = Some(32);
     params.height = Some(32);
     params.options = oxideav_core::CodecOptions::default()
         .set("gmc", "true")
         .set("data-partitioned", "true");
-    assert!(oxideav_mpeg4video::encoder::Mpeg4VideoEncoder::from_params(&params).is_err());
+    assert!(oxideav_mpeg4video::encoder::Mpeg4VideoEncoder::from_params(&params).is_ok());
 }

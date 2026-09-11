@@ -506,6 +506,21 @@ ffmpeg -idct faani -i enc_ipb_rcbudget_96x64.m4v -f rawvideo -pix_fmt yuv420p en
 ffmpeg -idct faani -i enc_ipb_rc2pass_96x64.m4v -f rawvideo -pix_fmt yuv420p enc_ipb_rc2pass_96x64.yuv
 ```
 
+## S(GMC) + data partitioning (round 458 — black-box observation, no pair)
+
+`tests/encoder_gmc_dp.rs` builds S(GMC)-VOPs on the §6.2.5.3
+`data_partitioned_p_vop()` layout (partition 1: `not_coded`, `mcbpc`,
+`mcsel` on `derived_mb_type < 2`, `motion_coding()` only when
+`mcsel == 0`). The reference decoder does **not** follow those
+clauses: on a data-partitioned S-VOP it desynchronises at the very
+first macroblock (measured per macroblock: every macroblock of the
+first S picture differs, intra ones included, while the leading I-VOP
+is bit-exact and the same encoder's combined-syntax S(GMC) streams —
+`enc_isb_*` — stay bit-exact; packets, RVLC, warping-point count and
+B-VOPs change nothing). No reference decode is therefore committed
+for the combination; the crate keeps the printed syntax on both sides
+and validates it through its own decoder walk.
+
 ## SHA-256
 
 ```

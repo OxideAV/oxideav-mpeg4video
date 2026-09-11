@@ -634,7 +634,11 @@ pub fn encode_s_vop(
             interlaced: cfg.interlaced,
             sprite_trajectory: Some(trajectory),
         },
-        Layout::Combined,
+        if cfg.resilience.data_partitioned {
+            Layout::PartitionedP
+        } else {
+            Layout::Combined
+        },
     );
 
     let mut intra_grid = IntraBlockGrid::new(mb_height, mb_width);
@@ -969,12 +973,21 @@ pub fn reconstruct_own_s_vop_with_anchor_motion(
     )
     .expect("own S-VOP header must parse");
     assert!(matches!(vop.coding_type, VopCodingType::S));
-    let (entries, geometry) = crate::vop_decode::decode_s_gmc_vop_macroblocks(
-        &mut br,
-        vol,
-        &vop,
-        crate::compat::DecodeOptions::spec(),
-    )
+    let (entries, geometry) = if vol.data_partitioned {
+        crate::vop_decode::decode_s_gmc_vop_macroblocks_dp(
+            &mut br,
+            vol,
+            &vop,
+            crate::compat::DecodeOptions::spec(),
+        )
+    } else {
+        crate::vop_decode::decode_s_gmc_vop_macroblocks(
+            &mut br,
+            vol,
+            &vop,
+            crate::compat::DecodeOptions::spec(),
+        )
+    }
     .expect("own S-VOP payload must decode");
     let motion = entries
         .iter()

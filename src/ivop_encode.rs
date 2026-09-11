@@ -116,7 +116,8 @@ pub struct EncoderConfig {
     /// `sprite_enable == "GMC"` with one warping point at half-pel
     /// accuracy (`crate::svop_encode`): anchors after the first I-VOP
     /// are S(GMC)-VOPs. Requires (and selects) the verid-2 VOL and
-    /// the ASP profile; incompatible with `data_partitioned`.
+    /// the ASP profile; combines with `data_partitioned` (the §6.2.5.3
+    /// `data_partitioned_p_vop()` S(GMC) clauses).
     pub gmc: bool,
     /// `no_of_sprite_warping_points` (1..=3) of a GMC VOL: one point
     /// codes a pure translation, two a §7.8.5 similarity (rotation +
@@ -404,10 +405,6 @@ pub fn write_configuration_headers(cfg: &EncoderConfig) -> Vec<u8> {
         // sprite_enable (verid 2 → 2 bits): 10 = GMC, 00 = not used.
         bw.write_bits(if cfg.gmc { 0b10 } else { 0b00 }, 2);
         if cfg.gmc {
-            assert!(
-                !cfg.resilience.data_partitioned,
-                "GMC S-VOPs use the combined syntax only"
-            );
             assert!(
                 (1..=3).contains(&cfg.gmc_points),
                 "GMC needs 1..=3 warping points"

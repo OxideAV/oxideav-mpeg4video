@@ -103,7 +103,7 @@ pub struct Mpeg4EncoderOptions {
     /// `gmc` — global motion compensation: non-keyframe anchors become
     /// S(GMC)-VOPs (one §7.8.4 warping point, half-pel accuracy; per-MB
     /// `mcsel` GMC-vs-local decision). Selects the ASP profile;
-    /// incompatible with `data-partitioned`.
+    /// combines with `data-partitioned` (§6.2.5.3 S(GMC) clauses).
     pub gmc: bool,
     /// `gmc-points` — `no_of_sprite_warping_points` (1..=3): the
     /// global-motion model the S(GMC)-VOP trajectory carries (1 =
@@ -310,8 +310,8 @@ impl oxideav_core::CodecOptionsStruct for Mpeg4EncoderOptions {
             kind: oxideav_core::OptionKind::Bool,
             default: oxideav_core::OptionValue::Bool(false),
             help: "global motion compensation: S(GMC)-VOP anchors with one \
-                   warping point (ISO/IEC 14496-2 §7.8; ASP profile); \
-                   incompatible with data-partitioned",
+                   warping point (ISO/IEC 14496-2 §7.8; ASP profile); combines \
+                   with data-partitioned",
         },
         oxideav_core::OptionField {
             name: "gmc-points",
@@ -603,11 +603,6 @@ impl Mpeg4VideoEncoder {
         };
         if options.rvlc && !options.data_partitioned {
             return Err(Error::invalid("rvlc requires data-partitioned"));
-        }
-        if options.gmc && options.data_partitioned {
-            return Err(Error::invalid(
-                "gmc S-VOPs use the combined syntax (no data-partitioned)",
-            ));
         }
         if options.interlaced && options.data_partitioned {
             // ISO/IEC 14496-2 Annex G Table G.2 note e): "Interlace does

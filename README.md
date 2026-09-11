@@ -516,6 +516,14 @@ both modes' envelopes are pinned).
 
 ## Not yet supported
 
+- S(GMC)-VOPs on the data-partitioned layout are coded and decoded
+  per the printed §6.2.5.3 `data_partitioned_p_vop()` (`mcsel` after
+  `mcbpc`, no `motion_coding()` on GMC macroblocks); the deployed
+  reference decoder does not read those clauses (it desynchronises at
+  the first macroblock of a data-partitioned S-VOP — see
+  `tests/fixtures/NOTES.md`), so the combination is oracle-verified
+  only, and the §E.1.4.4 RVLC two-way recovery is not applied on
+  S(GMC) packets (a texture error surfaces as an error).
 - Interlaced data partitioning / RVLC — **not codable by the
   standard**, not a gap: ISO/IEC 14496-2 Annex G Table G.2 note e)
   ("Interlace does not support Data Partitioning nor RVLC") and the

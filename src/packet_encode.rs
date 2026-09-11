@@ -17,9 +17,10 @@
 //!   partition 2 = per MB `ac_pred_flag` + `cbpy`, partition 3 = the AC
 //!   texture;
 //! * **`data_partitioned_p_vop()`** — partition 1 = per MB `not_coded`
-//!   [+ `mcbpc` + `motion_vector()`s], `motion_marker`, partition 2 =
-//!   per coded MB [`ac_pred_flag`] + `cbpy` [+ `dquant`] [+ intra DC],
-//!   partition 3 = the AC texture.
+//!   [+ `mcbpc` [+ `mcsel` on an S(GMC)-VOP `derived_mb_type < 2`
+//!   macroblock] + `motion_vector()`s (none when `mcsel == 1`)],
+//!   `motion_marker`, partition 2 = per coded MB [`ac_pred_flag`] +
+//!   `cbpy` [+ `dquant`] [+ intra DC], partition 3 = the AC texture.
 //!
 //! A packet is cut at the first macroblock boundary after the packet
 //! has accumulated `packet_bits` bits (encoder freedom — §6.3.3 only
@@ -300,6 +301,12 @@ impl MbFields {
                     return;
                 }
                 self.write_mcbpc(&mut p[0], false);
+                if let Some(mcsel) = self.mcsel {
+                    // §6.2.5.3: mcsel follows mcbpc in partition 1 of
+                    // an S(GMC)-VOP (derived_mb_type < 2 only).
+                    assert!(self.mb_type < 2, "mcsel rides inter / inter+q only");
+                    p[0].write_bit(mcsel);
+                }
                 self.write_mvs(&mut p[0]);
                 if self.is_intra() {
                     p[1].write_bit(self.ac_pred_flag);
