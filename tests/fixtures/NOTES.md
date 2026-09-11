@@ -501,9 +501,16 @@ directions inside every VOP.
   statistics fed back through `with_first_pass_stats`): 299 875 b/s
   (×1.000), luma PSNR 33.62 dB. **Bit-exact** reference decode.
 
+* `enc_ilaced_rcbudget_compat_96x64` — the same budget mode on an
+  interlaced VOL (`interlaced`, `ecosystem-compat`, `qpel`): budget-
+  driven `dquant` on field-DCT / field-predicted anchors, `dbquant` on
+  interlaced B macroblocks; 303 492 b/s (×1.012), luma PSNR 33.17 dB.
+  **Bit-exact** reference decode.
+
 ```
 ffmpeg -idct faani -i enc_ipb_rcbudget_96x64.m4v -f rawvideo -pix_fmt yuv420p enc_ipb_rcbudget_96x64.yuv
 ffmpeg -idct faani -i enc_ipb_rc2pass_96x64.m4v -f rawvideo -pix_fmt yuv420p enc_ipb_rc2pass_96x64.yuv
+ffmpeg -idct faani -i enc_ilaced_rcbudget_compat_96x64.m4v -f rawvideo -pix_fmt yuv420p enc_ilaced_rcbudget_compat_96x64.yuv
 ```
 
 ## S(GMC) + data partitioning (round 458 — black-box observation, no pair)
@@ -645,6 +652,8 @@ f958498a6b00db8595f0be1c28f77e042f8e7c4ef8fc863bb0b05537d76c30a0  enc_ip_dp_aq_9
 466c091493690e78ea864774f940cc4425c7a0c0fc1be06fafd364dcf0080f6b  enc_ipb_rcbudget_96x64.yuv
 22b82d3e4bd90eaf6a22b52cdcca8f1da04f49edabb638af5b3cae680bd3f1ec  enc_ipb_rc2pass_96x64.m4v
 ff158355952caa09f49da26d6cd2921047cc978e6d8f15bbd4f1fccc413bcd7c  enc_ipb_rc2pass_96x64.yuv
+c407e135be4af439fe00668e2f834d25926206712160905ef2d761e1218e3c33  enc_ilaced_rcbudget_compat_96x64.m4v
+12820f2bd515910304cf3aea92d2dfbff60d8aebb48b47133261657b8293a740  enc_ilaced_rcbudget_compat_96x64.yuv
 ```
 
 (Note: `aic_ipb_64x64.yuv` and `altscan_ipb_64x64.yuv` are

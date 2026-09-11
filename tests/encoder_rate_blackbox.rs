@@ -221,3 +221,19 @@ fn blackbox_budget_two_pass_ipb_is_bit_exact() {
     let (stream, _) = run(second);
     check("enc_ipb_rc2pass_96x64", &stream);
 }
+
+/// Budget mode on an interlaced VOL (ecosystem-compat B syntax so the
+/// reference reads the stream as we do): budget-driven `dquant` on
+/// field-DCT / field-predicted I/P macroblocks and `dbquant` on
+/// interlaced B macroblocks; the reference decode is bit-exact.
+#[test]
+fn blackbox_budget_interlaced_compat_ipb_is_bit_exact() {
+    let enc = oxideav_mpeg4video::encoder::Mpeg4VideoEncoder::from_params(&params(&[
+        ("interlaced", "true"),
+        ("ecosystem-compat", "true"),
+        ("qpel", "true"),
+    ]))
+    .unwrap();
+    let (stream, _) = run(enc);
+    check("enc_ilaced_rcbudget_compat_96x64", &stream);
+}

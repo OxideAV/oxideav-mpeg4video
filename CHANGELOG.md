@@ -31,8 +31,9 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   (`IVopEncodeStats`, the P/S/B stats) now carry the coded
   macroblocks' quantiser sum. Two new black-box pairs
   (`enc_ipb_rcbudget_96x64` one-pass ×1.006 of the target at 33.49 dB,
-  `enc_ipb_rc2pass_96x64` two-pass ×1.000 at 33.62 dB), both
-  bit-exact in the reference decoder.
+  `enc_ipb_rc2pass_96x64` two-pass ×1.000 at 33.62 dB,
+  `enc_ilaced_rcbudget_compat_96x64` interlaced + qpel ×1.012 at
+  33.17 dB), all bit-exact in the reference decoder.
 - Manifest: `tests/` and `fuzz/` are excluded from the published
   package.
 - S(GMC)-VOPs on the §6.2.5.3 data-partitioned layout, both ways:
