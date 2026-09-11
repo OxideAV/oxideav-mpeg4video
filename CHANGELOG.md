@@ -42,7 +42,9 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   wired into the stream decoder, the encoder's S-VOPs take the
   `PartitionedP` layout (`mcsel` after `mcbpc` in partition 1) —
   `gmc` + `data-partitioned` (+ `rvlc`, `packet-bits`) is accepted;
-  sample-exact through the crate's own walk. Black-box: the reference
+  sample-exact through the crate's own walk; the §E.1.4.4 RVLC
+  two-way recovery runs on S(GMC) packets (a discarded macroblock
+  keeps its trusted GMC / local prediction). Black-box: the reference
   decoder does not read the S(GMC) clauses of the partitioned syntax
   (desync at the first macroblock), so no reference pair is pinned.
 - Encoder `auto-dc-vlc`: the `intra_dc_vlc_thr` election now covers

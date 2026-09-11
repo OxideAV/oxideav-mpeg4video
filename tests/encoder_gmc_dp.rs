@@ -257,3 +257,99 @@ fn registry_gmc_dp_rvlc_stream_decodes() {
         .count();
     assert!(s_vops >= 2, "expected S-VOPs in the stream");
 }
+
+/// §E.1.4.4 on an S(GMC) packet: a data-partitioned RVLC S-VOP whose
+/// texture partition is truncated still decodes through the DP S
+/// walk — the trusted partition 1 keeps every GMC / local prediction
+/// (the macroblock kinds match the clean decode exactly), only the
+/// residuals degrade.
+#[test]
+fn truncated_rvlc_texture_on_a_gmc_packet_recovers() {
+    use oxideav_mpeg4video::bitreader::BitReader;
+    use oxideav_mpeg4video::compat::DecodeOptions;
+    use oxideav_mpeg4video::frame_decode::SGmcMbContent;
+    use oxideav_mpeg4video::vop::{parse_vop_header_body, VopContext};
+    use oxideav_mpeg4video::vop_decode::decode_s_gmc_vop_macroblocks_dp;
+
+    let cfg = EncoderConfig {
+        width: 96,
+        height: 64,
+        gmc: true,
+        fcode: 2,
+        resilience: ResilienceConfig {
+            packet_bits: 0,
+            data_partitioned: true,
+            reversible_vlc: true,
+        },
+        ..EncoderConfig::default()
+    };
+    let (_, vol) = vol_of(&cfg);
+    let mut store = FrameStore::new();
+    let (y, cb, cr) = picture(96, 64, 0, (2, 1));
+    let view = FrameView {
+        y: &y,
+        cb: &cb,
+        cr: &cr,
+        width: 96,
+        height: 64,
+    };
+    let (_, recon) = encode_i_vop(&vol, &cfg, &view, 0, 0, 9);
+    store.push_anchor(recon);
+    let (y, cb, cr) = picture(96, 64, 1, (2, 1));
+    let view = FrameView {
+        y: &y,
+        cb: &cb,
+        cr: &cr,
+        width: 96,
+        height: 64,
+    };
+    let reference = store.backward().unwrap().clone();
+    let (unit, stats) = encode_s_vop(&vol, &cfg, &view, &reference, 0, 1, 9);
+    assert!(
+        stats.gmc + stats.gmc_skipped > 0 && stats.local + stats.intra > 0,
+        "{stats:?}"
+    );
+
+    let kinds = |unit: &[u8]| -> Vec<char> {
+        let mut br = BitReader::new(unit);
+        br.read_bits(32).unwrap();
+        let vop = parse_vop_header_body(
+            &mut br,
+            vol.time_increment_resolution,
+            VopContext::from_vol(&vol),
+        )
+        .unwrap();
+        let (entries, _) =
+            decode_s_gmc_vop_macroblocks_dp(&mut br, &vol, &vop, DecodeOptions::spec())
+                .expect("DP S walk (recovery on the truncated variant)");
+        entries
+            .iter()
+            .map(|e| match e {
+                SGmcMbContent::Gmc {
+                    not_coded: true, ..
+                } => 'g',
+                SGmcMbContent::Gmc { .. } => 'G',
+                SGmcMbContent::Local { .. } | SGmcMbContent::FieldLocal { .. } => 'L',
+                SGmcMbContent::Intra(_) => 'I',
+            })
+            .collect()
+    };
+    let clean = kinds(&unit);
+    assert_eq!(clean.len(), 24);
+    // Truncate the tail of the single packet's texture partition (keep
+    // the header + partitions 1/2 intact) and terminate the unit with
+    // fresh stuffing.
+    let cut = unit.len() * 3 / 4;
+    let mut truncated = unit[..cut].to_vec();
+    truncated.push(0x7F);
+    let recovered = kinds(&truncated);
+    // The trusted partitions keep every prediction kind; a concealed
+    // intra macroblock surfaces as a local zero-MV copy.
+    assert_eq!(recovered.len(), clean.len());
+    for (a, b) in clean.iter().zip(recovered.iter()) {
+        assert!(
+            a == b || (*a == 'I' && *b == 'L'),
+            "{clean:?} vs {recovered:?}"
+        );
+    }
+}

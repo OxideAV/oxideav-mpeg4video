@@ -838,9 +838,12 @@ pub fn decode_p_vop_macroblocks_dp(
 /// [`MvDriver`] exactly as the combined S walk does (a not-coded or
 /// `mcsel == 1` macroblock records its §7.8.7.3 averaged MV), then
 /// partition 2 and the texture partition follow the P-VOP layout
-/// (RVLC forward decode when `reversible_vlc == 1`; the §E.1.4.4
-/// two-way recovery is not applied on S(GMC) packets — a texture error
-/// surfaces as an error).
+/// (RVLC forward decode when `reversible_vlc == 1`, with the §E.1.4.4
+/// two-way recovery as the error path: a kept GMC / local macroblock
+/// reconstructs from its recovered EVENT runs, a discarded one keeps
+/// its trusted partition-1 prediction — the GMC warp or the local
+/// vector — with a zero residual, a concealed intra macroblock becomes
+/// a zero-MV copy).
 #[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub fn decode_s_gmc_vop_macroblocks_dp(
     br: &mut BitReader<'_>,
@@ -966,78 +969,136 @@ pub fn decode_s_gmc_vop_macroblocks_dp(
         )
         .map_err(|e| amv_error.take().unwrap_or(VopDecodeError::DataPartition(e)))?;
 
-        for (k, (mb, tex)) in parsed.mbs.iter().zip(parsed.tex_headers.iter()).enumerate() {
-            let idx = base + k;
-            let (mb_row, mb_col) = (idx / mb_width, idx % mb_width);
-            if mb.not_coded {
-                let SMotion::Gmc(amv) = motions[k] else {
-                    unreachable!("not-coded S macroblocks record their AMV")
-                };
-                out.push(SGmcMbContent::Gmc {
-                    amv,
-                    not_coded: true,
-                    residual: crate::block::InterMacroblock::zero(),
-                });
-                continue;
-            }
-            running_qp = apply_dquant(running_qp, tex.dquant_delta, max_qp);
-            let coded = pattern_code(tex.cbpy, mb.cbpc);
-            let ctx = MacroblockTextureContext {
-                quantiser_scale: running_qp,
-                bits_per_pixel: bpp,
-                quant_type: vol.quant_type,
-                ac_pred_flag: tex.ac_pred_flag,
-                alternate_vertical_scan: vop.alternate_vertical_scan,
-                intra_mismatch_exempt: opts.ecosystem_compat,
-            };
-            match motions[k] {
-                SMotion::Intra => {
-                    let imb = decode_intra_mb_partitioned(
-                        br,
-                        &mut grid,
-                        mb_row,
-                        mb_col,
-                        coded,
-                        tex.intra_dc,
-                        vol.reversible_vlc,
-                        ctx,
-                        &intra_matrix,
-                    )?;
-                    out.push(SGmcMbContent::Intra(reconstruct_intra_macroblock(
-                        &imb, bpp,
-                    )));
-                }
-                SMotion::Gmc(amv) => {
-                    let residual = decode_inter_mb_partitioned(
-                        br,
-                        coded,
-                        vol.reversible_vlc,
-                        MacroblockTextureContext {
-                            ac_pred_flag: false,
-                            ..ctx
-                        },
-                        &inter_matrix,
-                    )?;
-                    out.push(SGmcMbContent::Gmc {
+        let qp_at_texture_start = running_qp;
+        let texture_result: Result<Vec<SGmcMbContent>, VopDecodeError> = (|| {
+            let mut packet_out = Vec::with_capacity(parsed.mbs.len());
+            for (k, (mb, tex)) in parsed.mbs.iter().zip(parsed.tex_headers.iter()).enumerate() {
+                let idx = base + k;
+                let (mb_row, mb_col) = (idx / mb_width, idx % mb_width);
+                if mb.not_coded {
+                    let SMotion::Gmc(amv) = motions[k] else {
+                        unreachable!("not-coded S macroblocks record their AMV")
+                    };
+                    packet_out.push(SGmcMbContent::Gmc {
                         amv,
-                        not_coded: false,
-                        residual,
+                        not_coded: true,
+                        residual: crate::block::InterMacroblock::zero(),
+                    });
+                    continue;
+                }
+                running_qp = apply_dquant(running_qp, tex.dquant_delta, max_qp);
+                let coded = pattern_code(tex.cbpy, mb.cbpc);
+                let ctx = MacroblockTextureContext {
+                    quantiser_scale: running_qp,
+                    bits_per_pixel: bpp,
+                    quant_type: vol.quant_type,
+                    ac_pred_flag: tex.ac_pred_flag,
+                    alternate_vertical_scan: vop.alternate_vertical_scan,
+                    intra_mismatch_exempt: opts.ecosystem_compat,
+                };
+                match motions[k] {
+                    SMotion::Intra => {
+                        let imb = decode_intra_mb_partitioned(
+                            br,
+                            &mut grid,
+                            mb_row,
+                            mb_col,
+                            coded,
+                            tex.intra_dc,
+                            vol.reversible_vlc,
+                            ctx,
+                            &intra_matrix,
+                        )?;
+                        packet_out.push(SGmcMbContent::Intra(reconstruct_intra_macroblock(
+                            &imb, bpp,
+                        )));
+                    }
+                    SMotion::Gmc(amv) => {
+                        let residual = decode_inter_mb_partitioned(
+                            br,
+                            coded,
+                            vol.reversible_vlc,
+                            MacroblockTextureContext {
+                                ac_pred_flag: false,
+                                ..ctx
+                            },
+                            &inter_matrix,
+                        )?;
+                        packet_out.push(SGmcMbContent::Gmc {
+                            amv,
+                            not_coded: false,
+                            residual,
+                        });
+                    }
+                    SMotion::Local(motion) => {
+                        let residual = decode_inter_mb_partitioned(
+                            br,
+                            coded,
+                            vol.reversible_vlc,
+                            MacroblockTextureContext {
+                                ac_pred_flag: false,
+                                ..ctx
+                            },
+                            &inter_matrix,
+                        )?;
+                        packet_out.push(SGmcMbContent::Local { motion, residual });
+                    }
+                }
+            }
+            Ok(packet_out)
+        })();
+
+        match texture_result {
+            Ok(packet_out) => out.extend(packet_out),
+            Err(_) if vol.reversible_vlc => {
+                // §E.1.4.4 on an S(GMC) packet: the P-VOP recovery
+                // runs over the same partition layout (partition 1 is
+                // trusted); the placeholder vectors it is handed are
+                // mapped back onto the S macroblock kinds afterwards.
+                let placeholders: Vec<PvopMbMotion> = motions
+                    .iter()
+                    .map(|m| match m {
+                        SMotion::Gmc(amv) => PvopMbMotion::OneMv(*amv),
+                        SMotion::Local(motion) => *motion,
+                        SMotion::Intra => PvopMbMotion::Intra,
+                    })
+                    .collect();
+                let recovered = recover_dp_p_packet_texture(
+                    br,
+                    &parsed,
+                    &placeholders,
+                    vol,
+                    vop,
+                    opts,
+                    qp_at_texture_start,
+                    max_qp,
+                    &inter_matrix,
+                    &vp_ctx,
+                )?;
+                for (k, content) in recovered.into_iter().enumerate() {
+                    let residual = match content {
+                        PVopMbContent::Inter { residual, .. }
+                        | PVopMbContent::FieldInter { residual, .. } => residual,
+                        PVopMbContent::Intra(_) => crate::block::InterMacroblock::zero(),
+                    };
+                    out.push(match motions[k] {
+                        SMotion::Gmc(amv) => SGmcMbContent::Gmc {
+                            amv,
+                            not_coded: parsed.mbs[k].not_coded,
+                            residual,
+                        },
+                        SMotion::Local(motion) => SGmcMbContent::Local { motion, residual },
+                        // §E.1.4.4.2.2 INTRA concealment: a zero-MV
+                        // copy of the co-located reference macroblock.
+                        SMotion::Intra => SGmcMbContent::Local {
+                            motion: PvopMbMotion::Skipped,
+                            residual: crate::block::InterMacroblock::zero(),
+                        },
                     });
                 }
-                SMotion::Local(motion) => {
-                    let residual = decode_inter_mb_partitioned(
-                        br,
-                        coded,
-                        vol.reversible_vlc,
-                        MacroblockTextureContext {
-                            ac_pred_flag: false,
-                            ..ctx
-                        },
-                        &inter_matrix,
-                    )?;
-                    out.push(SGmcMbContent::Local { motion, residual });
-                }
+                running_qp = qp_at_texture_start;
             }
+            Err(e) => return Err(e),
         }
         mb_index += parsed.mbs.len();
     }
