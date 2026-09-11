@@ -9,6 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+oxideav-core = "0.1"
 
 [dependencies.oxideav-mpeg4video]
 path = ".."
@@ -23,6 +24,20 @@ bench = false
 [[bin]]
 name = "stream_decode"
 path = "fuzz_targets/stream_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "first_pass_stats"
+path = "fuzz_targets/first_pass_stats.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "encode_roundtrip"
+path = "fuzz_targets/encode_roundtrip.rs"
 test = false
 doc = false
 bench = false

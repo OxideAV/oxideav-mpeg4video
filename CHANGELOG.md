@@ -111,6 +111,11 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   motion. New black-box pair `enc_isb_ilaced_gmc_compat_96x64`,
   bit-exact.
 
+- Fuzz targets `first_pass_stats` (the `stats-file` parser + planner)
+  and `encode_roundtrip` (fuzzer-chosen tool sets through the registry
+  encoder, decoded back by the crate's own decoder): 240 s / 480 s
+  bounded runs clean locally.
+
 ### Changed
 
 - Interlaced + data-partitioned is documented as not codable by the

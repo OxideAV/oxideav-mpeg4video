@@ -596,8 +596,17 @@ the §6.2.5.2 picture parser, the GOB / macroblock walk and the stream
 decoder's VOL-less auto-detection on arbitrary bytes; `stream_decode`
 feeds whole elementary streams to `Mpeg4VideoDecoder`, raw and behind
 a fixed VOS/VOL prefix so the VOP headers, video-packet HEC bodies,
-data partitioning and every macroblock walk get exercised. The `Fuzz`
-workflow runs both daily through the org-level reusable job.
+data partitioning and every macroblock walk get exercised;
+`first_pass_stats` drives the `rate_control::FirstPassStats` text
+parser (the `stats-file` a `pass=2` encoder reads) and plans a
+sequence from whatever parses; `encode_roundtrip` lets the bytes pick
+the picture size, the tool set (budget / reactive rate control,
+`mb-aq`, video packets, data partitioning incl. S(GMC), RVLC, GMC
+points, B-VOPs, qpel, 4MV, fcode, interlaced tools, method-1
+quantisation, `intra_dc_vlc_thr`, short header) and the content of
+two to four tiny frames, encodes through the registry encoder and
+requires the crate's own decoder to read every frame back. The `Fuzz`
+workflow runs all four daily through the org-level reusable job.
 
 ## Provenance
 
