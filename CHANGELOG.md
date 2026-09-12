@@ -6,6 +6,27 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.8](https://github.com/OxideAV/oxideav-mpeg4video/compare/v0.1.7...v0.1.8) - 2026-09-11
+
+### Other
+
+- §E.1.4.4 backward RVLC pass treats a non-LAST opening EVENT as a detected backward error (truncated / corrupted region tail) instead of a debug assertion — fixes the debug-build CI failure of the S(GMC) truncated-texture test
+- interlaced budget-mode black-box pair — budget-driven dquant/dbquant on an interlaced + qpel (ecosystem-compat) IPB stream, ×1.012 of target at 33.17 dB, bit-exact in the reference decoder
+- §E.1.4.4 RVLC two-way recovery on data-partitioned S(GMC) packets — the P-layout recovery runs over the trusted partition 1, recovered residuals map back onto the GMC / local / concealed-intra macroblock kinds; truncated-texture test keeps every prediction kind
+- mpeg4video fuzz: first_pass_stats (stats-file parser + BudgetPlanner) and encode_roundtrip (fuzzer-chosen tool sets through the registry encoder, read back by the own decoder) targets — 240 s / 480 s bounded runs clean
+- S(GMC)-VOPs on the §6.2.5.3 data-partitioned layout both ways — decoder DP S walk (mcsel / GMC clauses in partition 1 driving the §7.6.5 driver + §7.8.7.3 averaged MVs, P-layout partitions 2/3, RVLC forward decode) wired into the stream decoder, encoder S-VOPs on the PartitionedP layout; gmc + data-partitioned (+ rvlc, packets) accepted, sample-exact through the own walk; black-box observation: the reference decoder desyncs at the first macroblock of a partitioned S-VOP, no pair pinned
+- interlaced + data partitioning ruled not codable by ISO/IEC 14496-2 (Annex G Table G.2 note e; §6.2.5.3 carries no interlaced_information()) — typed rejection cites the note, README moves it from the gaps to the spec rulings
+- mpeg4video encoder: intra_dc_vlc_thr elected over the whole Table 6-25 — one probe encode costs every macroblock under both DC-differential VLCs (DcVlcProbe), the eight thresholds are scored against the per-macroblock running quantisers (elect_intra_dc_vlc_thr), exact under constant / activity-classed quantisers; mid-table winners appear under budget regulation
+- budget-driven rate control black-box pairs — one-pass (×1.006, 33.49 dB) and two-pass (×1.000, 33.62 dB) IPB streams with budget-driven dquant/dbquant bit-exact in the reference decoder; tests/ + fuzz/ excluded from the package
+- mpeg4video encoder: budget-driven rate control — GOP bit budgets split by a per-class bits×qp complexity model (BudgetPlanner: trailing B-VOPs charged to their GOP, one-second carry, first-VOP calibration, VBV clamp), per-macroblock dquant/dbquant regulation against an activity-weighted expected-spend curve (MbRegulator, rc-band), two-pass via FirstPassStats (pass/stats-file + direct API); rc-mode=vop keeps the reactive controller; rate accuracy matrix across GOP shapes
+- fix two intra-doc links in bvop_interlaced_encode
+- interlaced S(GMC)-VOPs both ways — decoder S walk on interlaced VOLs (field-predicted local MBs, field DCT on GMC residuals, §6.2.6.3 dct_type read on coded mcsel==1 MBs), encoder interlaced+gmc with field-local candidates over the AMV predictors; black-box bit-exact pair
+- cargo-fuzz harness — short_header (§6.2.5.2 parser + walk + VOL-less auto-detect) and stream_decode (raw + VOS/VOL-prefixed elementary streams) targets, 240 s each clean locally; Fuzz workflow shim over the org reusable job
+- Table 6-25 intra_dc_vlc_thr on the encoder (explicit + measured election, combined and data-partitioned layouts) + S(GMC)-VOP packet HEC bodies restating sprite_trajectory() both ways; data-partitioned parsers decide use_intra_dc_vlc per macroblock after dquant; black-box bit-exact pair
+- mpeg4video encoder: GMC with two / three warping points — §7.8.5 similarity / affine trajectory fitting (mode-seeded robust least squares + coordinate-descent refinement on the decoder's warp), gmc-points option, quantiser-scaled GMC preference; three-point stream black-box bit-exact, two-point exact up to one intra near-tie
+- §6.2.5.2 short header (H.263-compatible) both ways — VOL-less stream auto-detect + I/P picture decode (GOB headers, 8-bit intra DC, Table B.17 + Type-4 escapes, §7.6.5 GOB predictor rule), short-header / gob-headers encoder options; black-box bit-exact in both directions
+- mpeg4video encoder: interlaced tools — field DCT, §7.7.2.1 field-predicted P macroblocks, §7.7.2.2 field / interlaced-direct B modes, interlaced_information() emission; black-box bit-exact I+P and compat I/P/B pairs; decoder §7.6.3 field-vector wrap + §7.6.4 frame-grid qpel field clamp
+
 ### Added
 
 - Encoder: budget-driven rate control (`rc-mode=budget`, the new
