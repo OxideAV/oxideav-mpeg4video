@@ -6,7 +6,7 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-## [0.2.0](https://github.com/OxideAV/oxideav-mpeg4video/compare/v0.1.7...v0.2.0) - 2026-09-11
+## [0.1.8](https://github.com/OxideAV/oxideav-mpeg4video/compare/v0.1.7...v0.1.8) - 2026-09-11
 
 ### Other
 
