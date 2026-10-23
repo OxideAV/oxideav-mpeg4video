@@ -15,7 +15,7 @@ use oxideav_mpeg4video::compat::DecodeOptions;
 use oxideav_mpeg4video::decoder::Mpeg4VideoDecoder;
 use oxideav_mpeg4video::framestore::DecodedFrame;
 use oxideav_mpeg4video::ivop_encode::{
-    encode_i_vop, write_configuration_headers, EncoderConfig, FrameView,
+    EncoderConfig, FrameView, encode_i_vop, write_configuration_headers,
 };
 use oxideav_mpeg4video::svop_encode::write_s_vop_header;
 use oxideav_mpeg4video::vlc_encode::{put_cbpy, put_mcbpc_p, put_motion_vector};

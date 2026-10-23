@@ -68,7 +68,7 @@
 
 use crate::bitreader::{BitReader, BitReaderError};
 use crate::interlaced_information::{
-    parse_interlaced_information, InterlacedInfoContext, InterlacedInformation, McSel,
+    InterlacedInfoContext, InterlacedInformation, McSel, parse_interlaced_information,
 };
 use crate::vol::{SpriteEnable, VolHeader};
 use crate::vop::VopCodingType;
@@ -782,7 +782,7 @@ mod tests {
         fn write_bits(&mut self, value: u32, n: usize) {
             for i in (0..n).rev() {
                 let bit = ((value >> i) & 1) as u8;
-                if self.bit_pos % 8 == 0 {
+                if self.bit_pos.is_multiple_of(8) {
                     self.buf.push(0);
                 }
                 let byte = self.buf.last_mut().unwrap();
@@ -791,7 +791,7 @@ mod tests {
             }
         }
         fn align(&mut self) {
-            while self.bit_pos % 8 != 0 {
+            while !self.bit_pos.is_multiple_of(8) {
                 self.write_bits(0, 1);
             }
         }
@@ -1478,8 +1478,8 @@ mod tests {
         w.write_bits(0, 1); // not_coded
         w.write_bits(0b010, 3); // mcbpc → mb_type 2 (inter4v), cbpc 00
         w.write_bits(0b11, 2); // cbpy_inter=0000 → cbp == 0
-                               // No interlaced bits follow (both gates unfired).
-                               // Append a sentinel so the reader doesn't run dry mid-test.
+        // No interlaced bits follow (both gates unfired).
+        // Append a sentinel so the reader doesn't run dry mid-test.
         w.write_bits(0b1, 1);
         w.align();
         let data = w.buf;
@@ -1556,8 +1556,8 @@ mod tests {
         w.write_bits(0b0011, 4); // cbpy_inter=1111 → cbp != 0
         w.write_bits(0, 1); // dct_type
         w.write_bits(1, 1); // field_prediction = 1 → forward pair must follow
-                            // 1 + 1 + 4 + 1 + 1 = 8 bits = exactly one byte. The forward
-                            // reference pair (2 bits) overruns the slice.
+        // 1 + 1 + 4 + 1 + 1 = 8 bits = exactly one byte. The forward
+        // reference pair (2 bits) overruns the slice.
         let data = w.buf;
         assert_eq!(data.len(), 1);
         let mut br = BitReader::new(&data);

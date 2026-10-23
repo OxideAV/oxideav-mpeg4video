@@ -166,11 +166,7 @@ pub fn inverse_quant_method2_coef(qf: i32, quantiser_scale: u32) -> i32 {
     } else {
         (2 * abs_qf + 1) * qs - 1
     };
-    if qf < 0 {
-        -magnitude
-    } else {
-        magnitude
-    }
+    if qf < 0 { -magnitude } else { magnitude }
 }
 
 /// Apply §7.4.4.2 (method 2) end-to-end to one 8×8 block.

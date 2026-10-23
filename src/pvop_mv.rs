@@ -83,10 +83,10 @@
 use crate::bitreader::BitReader;
 use crate::macroblock::DerivedMbType;
 use crate::motion::{
-    decode_motion_vector_delta, predict_motion_vector, reconstruct_motion_vector, MotionParseError,
-    MotionVector, MvMode,
+    MotionParseError, MotionVector, MvMode, decode_motion_vector_delta, predict_motion_vector,
+    reconstruct_motion_vector,
 };
-use crate::mv_predictor_grid::{MbMv, MbMvRecord, MvGrid, MvGridError, LUMA_BLOCKS_PER_MB};
+use crate::mv_predictor_grid::{LUMA_BLOCKS_PER_MB, MbMv, MbMvRecord, MvGrid, MvGridError};
 
 /// One decoded P-VOP macroblock's motion-vector outcome, as recorded
 /// into the [`MvGrid`].
@@ -1239,17 +1239,19 @@ mod tests {
         let luma_ref = ReferenceVop::new(&luma, 16, 16).unwrap();
         let cb_ref = ReferenceVop::new(&chroma, 8, 8).unwrap();
         let cr_ref = ReferenceVop::new(&chroma, 8, 8).unwrap();
-        assert!(predict_inter_macroblock(
-            PvopMbMotion::Intra,
-            &luma_ref,
-            &cb_ref,
-            &cr_ref,
-            0,
-            0,
-            0,
-            HP
-        )
-        .is_none());
+        assert!(
+            predict_inter_macroblock(
+                PvopMbMotion::Intra,
+                &luma_ref,
+                &cb_ref,
+                &cr_ref,
+                0,
+                0,
+                0,
+                HP
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -1299,7 +1301,7 @@ mod tests {
         // co-located reference, and a constant residual offsets it.
         use crate::block::InterMacroblock;
         use crate::reconstruct::{
-            reconstruct_inter_macroblock, MACROBLOCK_CHROMA_SIDE, MACROBLOCK_LUMA_SIDE,
+            MACROBLOCK_CHROMA_SIDE, MACROBLOCK_LUMA_SIDE, reconstruct_inter_macroblock,
         };
 
         let lw = 32;
@@ -1367,19 +1369,21 @@ mod tests {
             cb: [[0i32; MACROBLOCK_CHROMA_SIDE]; MACROBLOCK_CHROMA_SIDE],
             cr: [[0i32; MACROBLOCK_CHROMA_SIDE]; MACROBLOCK_CHROMA_SIDE],
         };
-        assert!(reconstruct_pvop_macroblock(
-            PvopMbMotion::Intra,
-            &luma_ref,
-            &cb_ref,
-            &cr_ref,
-            &residual,
-            0,
-            0,
-            0,
-            HP,
-            8,
-        )
-        .is_none());
+        assert!(
+            reconstruct_pvop_macroblock(
+                PvopMbMotion::Intra,
+                &luma_ref,
+                &cb_ref,
+                &cr_ref,
+                &residual,
+                0,
+                0,
+                0,
+                HP,
+                8,
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -1562,8 +1566,8 @@ mod tests {
         // confirm the frame value is the bilinear of the four reference
         // neighbours (rc = 0) for one interior sample.
         let p00 = frame_y[8 * 32 + 8]; // MB(0,0), sample (8,8)
-                                       // sample(8,8) origin in ref: base (8,8), half (1,1) → bilinear of
-                                       // (16),(17),(17),(18) … using (x+y) gradient: base_x=8,base_y=8.
+        // sample(8,8) origin in ref: base (8,8), half (1,1) → bilinear of
+        // (16),(17),(17),(18) … using (x+y) gradient: base_x=8,base_y=8.
         let a = (8 + 8) & 0xff;
         let b = (8 + 1 + 8) & 0xff;
         let c = (8 + 8 + 1) & 0xff;

@@ -130,11 +130,7 @@ pub fn decode_warping_mv_code(br: &mut BitReader<'_>) -> Result<i32, SpriteTraje
                     return Err(SpriteTrajectoryError::LengthOverflow);
                 }
             }
-            if extra == 0 {
-                5
-            } else {
-                5 + extra
-            }
+            if extra == 0 { 5 } else { 5 + extra }
         }
     };
 

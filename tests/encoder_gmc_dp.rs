@@ -11,7 +11,7 @@
 use oxideav_mpeg4video::decoder::Mpeg4VideoDecoder;
 use oxideav_mpeg4video::framestore::{DecodedFrame, FrameStore};
 use oxideav_mpeg4video::ivop_encode::{
-    encode_i_vop, write_configuration_headers, EncoderConfig, FrameView,
+    EncoderConfig, FrameView, encode_i_vop, write_configuration_headers,
 };
 use oxideav_mpeg4video::packet_encode::ResilienceConfig;
 use oxideav_mpeg4video::svop_encode::{encode_s_vop, reconstruct_own_s_vop_with_motion};
@@ -268,7 +268,7 @@ fn truncated_rvlc_texture_on_a_gmc_packet_recovers() {
     use oxideav_mpeg4video::bitreader::BitReader;
     use oxideav_mpeg4video::compat::DecodeOptions;
     use oxideav_mpeg4video::frame_decode::SGmcMbContent;
-    use oxideav_mpeg4video::vop::{parse_vop_header_body, VopContext};
+    use oxideav_mpeg4video::vop::{VopContext, parse_vop_header_body};
     use oxideav_mpeg4video::vop_decode::decode_s_gmc_vop_macroblocks_dp;
 
     let cfg = EncoderConfig {

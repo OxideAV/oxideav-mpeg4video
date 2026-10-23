@@ -77,7 +77,7 @@
 
 #![allow(clippy::needless_range_loop)]
 
-use crate::sample_padding::{SamplePresence, ShapeRowState, CHROMA_SIDE, LUMA_SIDE};
+use crate::sample_padding::{CHROMA_SIDE, LUMA_SIDE, SamplePresence, ShapeRowState};
 
 /// Per-column §7.6.1.2 outcome, returned alongside the padded column.
 ///

@@ -383,7 +383,7 @@ mod tests {
         assert_eq!(dc_scaler(DcComponent::Chrominance, 7), 10); // (7+13)/2 = 10
         assert_eq!(dc_scaler(DcComponent::Chrominance, 8), 10); // (8+13)/2 = 10
         assert_eq!(dc_scaler(DcComponent::Chrominance, 24), 18); // (24+13)/2 = 18
-                                                                 // Quantiser >=25 -> qs - 6.
+        // Quantiser >=25 -> qs - 6.
         assert_eq!(dc_scaler(DcComponent::Chrominance, 25), 19);
         assert_eq!(dc_scaler(DcComponent::Chrominance, 31), 25);
     }

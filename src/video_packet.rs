@@ -712,11 +712,7 @@ mod tests {
             return 0;
         }
         let ones = remaining - 1;
-        if ones == 0 {
-            0
-        } else {
-            (1u8 << ones) - 1
-        }
+        if ones == 0 { 0 } else { (1u8 << ones) - 1 }
     }
 
     #[test]
@@ -823,7 +819,7 @@ mod tests {
         }
         fn finish(mut self) -> Vec<u8> {
             // Pad to byte alignment with 0s.
-            while self.bits.len() % 8 != 0 {
+            while !self.bits.len().is_multiple_of(8) {
                 self.bits.push(false);
             }
             let mut out = vec![0u8; self.bits.len() / 8];
@@ -863,7 +859,7 @@ mod tests {
         for _ in 0..7 {
             w.write_bool(true);
         } // pad to byte boundary
-          // resync_marker for I-VOP: 17 bits = 16 zeros + 1.
+        // resync_marker for I-VOP: 17 bits = 16 zeros + 1.
         w.write_bits(1, 17);
         // macroblock_number: QCIF total=99 → 7 bits. Pick 42.
         w.write_bits(42, 7);
@@ -938,12 +934,12 @@ mod tests {
         w.write_bits(5, 7); // macroblock_number
         w.write_bits(7, 5); // quant_scale
         w.write_bool(true); // header_extension_code
-                            // modulo_time_base = 0
+        // modulo_time_base = 0
         w.write_bool(false);
         w.write_bool(true); // marker
         w.write_bits(0, 5); // vop_time_increment
         w.write_bool(true); // marker
-                            // vop_coding_type = P = 01
+        // vop_coding_type = P = 01
         w.write_bits(0b01, 2);
         w.write_bits(0, 3); // intra_dc_vlc_thr
         w.write_bits(1, 3); // vop_fcode_forward
@@ -1126,9 +1122,9 @@ mod tests {
         w.write_bool(true); // marker
         w.write_bits(0b11, 2); // S
         w.write_bits(0, 3); // intra_dc_vlc_thr
-                            // §6.2.5 sprite_trajectory(), one point: du = 3 (Table B.34
-                            // dmv_length "011" = 2 bits, dmv_code "11", marker), dv = 0
-                            // (dmv_length "00", marker).
+        // §6.2.5 sprite_trajectory(), one point: du = 3 (Table B.34
+        // dmv_length "011" = 2 bits, dmv_code "11", marker), dv = 0
+        // (dmv_length "00", marker).
         w.write_bits(0b011, 3);
         w.write_bits(0b11, 2);
         w.write_bool(true);

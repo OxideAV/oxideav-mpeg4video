@@ -28,9 +28,9 @@ use crate::block::InterMacroblock;
 use crate::bvop_mv::{BVopAnchorPlanes, BVopMbTexturedDecode};
 use crate::bvop_prediction::BVopSampleMode;
 use crate::framestore::{DecodedFrame, FrameStore, FrameStoreError};
-use crate::pvop_mv::{predict_inter_macroblock, reconstruct_pvop_macroblock, PvopMbMotion};
-use crate::reconstruct::{reconstruct_inter_macroblock, ReconstructedMacroblock};
-use crate::s_gmc_recon::{gmc_prediction_macroblock, GmcReferencePlanes};
+use crate::pvop_mv::{PvopMbMotion, predict_inter_macroblock, reconstruct_pvop_macroblock};
+use crate::reconstruct::{ReconstructedMacroblock, reconstruct_inter_macroblock};
+use crate::s_gmc_recon::{GmcReferencePlanes, gmc_prediction_macroblock};
 use crate::vop::VopCodingType;
 use crate::warp::WarpGeometry;
 
@@ -317,7 +317,7 @@ pub fn assemble_p_vop_frame_obmc(
     bits_per_pixel: u32,
 ) -> Result<DecodedFrame, FrameDecodeError> {
     use crate::half_sample::{fetch_clamped_sample, split_half_pel};
-    use crate::obmc::{obmc_predict_block, ObmcConfig, ObmcMv, ObmcNeighbourhood};
+    use crate::obmc::{ObmcConfig, ObmcMv, ObmcNeighbourhood, obmc_predict_block};
     use crate::reconstruct::InterPredictionMacroblock;
 
     let expected = mb_width * mb_height;

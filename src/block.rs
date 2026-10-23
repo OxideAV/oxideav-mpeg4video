@@ -141,7 +141,7 @@
 
 use crate::bitreader::BitReader;
 use crate::idct::idct_8x8;
-use crate::inverse_quant::{inverse_quant_method1, inverse_quant_method2, InverseQuantContext};
+use crate::inverse_quant::{InverseQuantContext, inverse_quant_method1, inverse_quant_method2};
 use crate::macroblock::{DerivedMbType, MacroblockHeader};
 use crate::predictor::{
     dc_scaler, default_neighbour_dc, predict_intra_ac_column, predict_intra_ac_row,
@@ -149,7 +149,7 @@ use crate::predictor::{
 };
 use crate::scan::{events_to_qfs, inverse_scan, select_scan_type};
 use crate::texture::{
-    decode_ac_events, decode_intra_dc, DcComponent, TcoefTable, TextureParseError,
+    DcComponent, TcoefTable, TextureParseError, decode_ac_events, decode_intra_dc,
 };
 use crate::vol::VolHeader;
 
@@ -1254,10 +1254,10 @@ mod tests {
         // QF[0][0] = PQFX[0][0] + chosen/dc_scaler = 0 + 1024 / dc_scaler.
         let scaler = dc_scaler(DcComponent::Luminance, 8) as i32; // qs=8 → 16
         let qf00 = 1024 / scaler; // = 64
-                                  // method-2 intra DC: F''[0][0] = dc_scaler * QF[0][0].
+        // method-2 intra DC: F''[0][0] = dc_scaler * QF[0][0].
         let f00 = scaler * qf00; // = 16 * 64 = 1024
-                                 // Flat block: every spatial sample = F''[0][0] / 8 (the DC term
-                                 // of the orthonormal IDCT). 1024 / 8 = 128.
+        // Flat block: every spatial sample = F''[0][0] / 8 (the DC term
+        // of the orthonormal IDCT). 1024 / 8 = 128.
         let expected = (f00 / 8).clamp(0, 255);
         for row in block.iter() {
             for &px in row.iter() {
@@ -1299,7 +1299,7 @@ mod tests {
         .unwrap();
 
         let scaler = dc_scaler(DcComponent::Luminance, 8) as i32; // 16
-                                                                  // QF[0][0] = +1 (differential) + 1024/16 = 1 + 64 = 65.
+        // QF[0][0] = +1 (differential) + 1024/16 = 1 + 64 = 65.
         let qf00 = 1 + 1024 / scaler;
         let f00 = scaler * qf00; // 16 * 65 = 1040
         let expected = (f00 / 8).clamp(0, 255); // 130
@@ -1488,8 +1488,8 @@ mod tests {
         let cscaler = dc_scaler(DcComponent::Chrominance, 8) as i32; // 10
         let cqf = 1024 / cscaler; // 102
         let cf = cscaler * cqf; // 1020
-                                // Flat IDCT sample = round(F''[0][0] / 8); 1020 / 8 = 127.5 →
-                                // 128 under the §4.1 round-to-nearest (away from zero) of §7.4.5.
+        // Flat IDCT sample = round(F''[0][0] / 8); 1020 / 8 = 127.5 →
+        // 128 under the §4.1 round-to-nearest (away from zero) of §7.4.5.
         let cexp = (((cf as f64) / 8.0).round() as i32).clamp(0, 255); // 128
         for row in mb.cb.iter() {
             for &px in row.iter() {

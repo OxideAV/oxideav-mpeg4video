@@ -7,10 +7,10 @@
 use oxideav_mpeg4video::decoder::Mpeg4VideoDecoder;
 use oxideav_mpeg4video::framestore::{DecodedFrame, FrameStore};
 use oxideav_mpeg4video::ivop_encode::{
-    encode_i_vop, write_configuration_headers, EncoderConfig, FrameView,
+    EncoderConfig, FrameView, encode_i_vop, write_configuration_headers,
 };
 use oxideav_mpeg4video::pvop_encode::{
-    encode_p_vop, reconstruct_own_p_vop_with_motion, PVopEncodeStats,
+    PVopEncodeStats, encode_p_vop, reconstruct_own_p_vop_with_motion,
 };
 use oxideav_mpeg4video::pvop_mv::PvopMbMotion;
 use oxideav_mpeg4video::vol::parse_video_object_layer;
@@ -120,7 +120,7 @@ fn max_component(motion: &[PvopMbMotion]) -> i32 {
 
 /// The P-VOP header's `vop_fcode_forward` of every P unit in `stream`.
 fn header_fcodes(stream: &[u8], vol_fcode_expected: u8) -> usize {
-    use oxideav_mpeg4video::vop::{parse_vop_header_body, VopCodingType, VopContext};
+    use oxideav_mpeg4video::vop::{VopCodingType, VopContext, parse_vop_header_body};
     let pos = stream
         .windows(4)
         .position(|win| win == [0, 0, 1, 0x20])

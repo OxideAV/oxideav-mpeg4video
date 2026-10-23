@@ -38,20 +38,20 @@ use crate::bvop_prediction::BVopSampleMode;
 use crate::fdct::forward_dct_8x8;
 use crate::framestore::{DecodedFrame, FrameStore};
 use crate::half_sample::ReferenceVop;
-use crate::ivop_encode::{forward_scan, qfs_to_events, EncoderConfig, FrameView};
-use crate::motion::{predict_motion_vector, MotionVector};
+use crate::ivop_encode::{EncoderConfig, FrameView, forward_scan, qfs_to_events};
+use crate::motion::{MotionVector, predict_motion_vector};
 use crate::mv_predictor_grid::MvGrid;
 use crate::pvop_encode::{
-    inter_cbp, intra_activity, macroblock_residual, quantise_inter_block, source_luma_mb,
-    PVopEncodeStats,
+    PVopEncodeStats, inter_cbp, intra_activity, macroblock_residual, quantise_inter_block,
+    source_luma_mb,
 };
-use crate::pvop_mv::{predict_inter_macroblock, PvopMbMotion};
+use crate::pvop_mv::{PvopMbMotion, predict_inter_macroblock};
 use crate::quantise::quantise_method2_intra;
 use crate::scan::ScanType;
 use crate::short_header::{
-    decode_short_header_macroblocks, intra_dc_code, parse_short_header_picture, SourceFormat,
     GOB_MARKER_BITS, GOB_RESYNC_MARKER, SHORT_MARKER_BITS, SHORT_VIDEO_END_MARKER,
-    SHORT_VIDEO_START_MARKER,
+    SHORT_VIDEO_START_MARKER, SourceFormat, decode_short_header_macroblocks, intra_dc_code,
+    parse_short_header_picture,
 };
 use crate::texture::AcEvent;
 use crate::vlc_encode::{

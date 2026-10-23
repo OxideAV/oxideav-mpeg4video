@@ -26,13 +26,13 @@ use oxideav_core::{
 use crate::bvop_encode::encode_b_vop;
 use crate::framestore::FrameStore;
 use crate::ivop_encode::{
-    encode_i_vop_elect_thr_full, encode_i_vop_full, write_configuration_headers, EncoderConfig,
-    FrameView,
+    EncoderConfig, FrameView, encode_i_vop_elect_thr_full, encode_i_vop_full,
+    write_configuration_headers,
 };
 use crate::mb_quant::MbBudget;
 use crate::pvop_encode::{encode_p_vop, reconstruct_own_p_vop_with_anchor_motion};
 use crate::rate_control::{BudgetPlanner, FirstPassStats, FrameStat, RateController, VopClass};
-use crate::vol::{parse_video_object_layer, VolHeader};
+use crate::vol::{VolHeader, parse_video_object_layer};
 
 /// The quantiser-adaptation mode of the rate control (`rc-mode`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -650,12 +650,12 @@ impl Mpeg4VideoEncoder {
                 ));
             }
         }
-        if let Some(pf) = params.pixel_format {
-            if pf != PixelFormat::Yuv420P {
-                return Err(Error::unsupported(
-                    "mpeg4video encoder accepts Yuv420P input only",
-                ));
-            }
+        if let Some(pf) = params.pixel_format
+            && pf != PixelFormat::Yuv420P
+        {
+            return Err(Error::unsupported(
+                "mpeg4video encoder accepts Yuv420P input only",
+            ));
         }
         let frame_rate = params.frame_rate.unwrap_or(Rational::new(25, 1));
         if frame_rate.num <= 0 || frame_rate.den <= 0 || frame_rate.num > 65_535 {
@@ -863,7 +863,7 @@ impl oxideav_core::Encoder for Mpeg4VideoEncoder {
 
         // Anchor selection: the first frame, the keyframe cadence, and
         // every (bf + 1)-th frame terminate a B run.
-        let keyframe_due = display_index % u64::from(self.options.gop_size) == 0;
+        let keyframe_due = display_index.is_multiple_of(u64::from(self.options.gop_size));
         let no_anchor = self.store.backward().is_none();
         let is_anchor =
             no_anchor || keyframe_due || self.pending_bs.len() as u32 >= self.options.bf;
@@ -894,7 +894,7 @@ impl oxideav_core::Encoder for Mpeg4VideoEncoder {
         if let Some(last) = self.pending_bs.pop() {
             let keyframe_due = self.store.backward().is_none() || {
                 // The anchor's display index is frames_seen - 1.
-                (self.frames_seen - 1) % u64::from(self.options.gop_size) == 0
+                (self.frames_seen - 1).is_multiple_of(u64::from(self.options.gop_size))
             };
             self.encode_anchor(&last, keyframe_due);
             self.drain_pending_bs();

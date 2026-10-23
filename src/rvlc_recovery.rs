@@ -38,7 +38,7 @@
 use crate::bitreader::{BackwardBitReader, BitReader};
 use crate::rvlc_arbitration::{RvlcArbitration, RvlcArbitrationInput};
 use crate::texture::{
-    decode_ac_event_rvlc, decode_ac_event_rvlc_reverse, AcEvent, TcoefTable, TextureParseError,
+    AcEvent, TcoefTable, TextureParseError, decode_ac_event_rvlc, decode_ac_event_rvlc_reverse,
 };
 
 /// The coded-block layout of one macroblock's texture: the Tcoef table
@@ -383,7 +383,7 @@ pub fn recovered_inter_macroblock(
     ctx: crate::block::MacroblockTextureContext,
     quant_matrix: &[[u8; 8]; 8],
 ) -> Option<crate::block::InterMacroblock> {
-    use crate::block::{block_component, inter_block_from_events, InterMacroblock};
+    use crate::block::{InterMacroblock, block_component, inter_block_from_events};
 
     if rec.blocks.len() != coded.iter().filter(|&&c| c).count() {
         return None;

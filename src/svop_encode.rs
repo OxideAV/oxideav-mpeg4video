@@ -41,21 +41,21 @@ use crate::block::nonintra_quant_matrix;
 use crate::data_partition::use_intra_dc_vlc;
 use crate::framestore::{DecodedFrame, FrameStore};
 use crate::ivop_encode::{EncoderConfig, FrameView};
-use crate::motion::{predict_motion_vector, MotionVector};
+use crate::motion::{MotionVector, predict_motion_vector};
 use crate::mv_predictor_grid::MvGrid;
 use crate::neighbour::IntraBlockGrid;
 use crate::packet_encode::{Layout, MbFields, PacketVopInfo, PacketWriter};
 use crate::pvop_encode::{
-    estimate_motion, intra_activity, intra_mb_in_p_fields, sample_mode_of, source_luma_mb,
-    PVopEncodeStats,
+    PVopEncodeStats, estimate_motion, intra_activity, intra_mb_in_p_fields, sample_mode_of,
+    source_luma_mb,
 };
 use crate::pvop_mv::PvopMbMotion;
-use crate::s_gmc_recon::{gmc_prediction_macroblock, GmcReferencePlanes};
+use crate::s_gmc_recon::{GmcReferencePlanes, gmc_prediction_macroblock};
 use crate::sprite::SpriteTrajectory;
 use crate::texture::AcEvent;
 use crate::vol::SpriteWarpingAccuracy;
-use crate::vop::{parse_vop_header_body, vop_time_increment_bits, VopCodingType, VopContext};
-use crate::vop_decode::{gmc_averaged_mv, AnchorMbMotion};
+use crate::vop::{VopCodingType, VopContext, parse_vop_header_body, vop_time_increment_bits};
+use crate::vop_decode::{AnchorMbMotion, gmc_averaged_mv};
 use crate::warp::WarpGeometry;
 
 const VOP_START_CODE: u32 = 0x0000_01B6;
@@ -380,22 +380,22 @@ fn fit_trajectory(
         .collect();
     let min_samples = usize::from(points) + 1;
     let mut model = translation;
-    if band.len() >= min_samples {
-        if let Some(first) = fit_global_motion(&band, points) {
-            model = first;
-            let inliers: Vec<_> = samples
-                .iter()
-                .copied()
-                .filter(|&(x, y, dx, dy)| {
-                    let (px, py) = first.displacement(x, y);
-                    (px - dx).abs() <= 1.0 && (py - dy).abs() <= 1.0
-                })
-                .collect();
-            if inliers.len() >= min_samples {
-                if let Some(second) = fit_global_motion(&inliers, points) {
-                    model = second;
-                }
-            }
+    if band.len() >= min_samples
+        && let Some(first) = fit_global_motion(&band, points)
+    {
+        model = first;
+        let inliers: Vec<_> = samples
+            .iter()
+            .copied()
+            .filter(|&(x, y, dx, dy)| {
+                let (px, py) = first.displacement(x, y);
+                (px - dx).abs() <= 1.0 && (py - dy).abs() <= 1.0
+            })
+            .collect();
+        if inliers.len() >= min_samples
+            && let Some(second) = fit_global_motion(&inliers, points)
+        {
+            model = second;
         }
     }
     let half = |v: f64| -> i32 { (2.0 * v).round().clamp(-16000.0, 16000.0) as i32 };

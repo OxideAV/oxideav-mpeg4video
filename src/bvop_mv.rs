@@ -64,25 +64,25 @@
 //! No external MPEG-4 implementation consulted.
 
 use crate::bitreader::BitReader;
-use crate::block::{decode_b_vop_inter_macroblock, InterMacroblock, MacroblockTextureContext};
+use crate::block::{InterMacroblock, MacroblockTextureContext, decode_b_vop_inter_macroblock};
 use crate::bvop::{
-    decode_b_vop_mb_motion_vectors, parse_b_vop_mb_header, BMbTypeTable, BVopMbHeader,
-    BVopMbParseError, BVopMbType, BVopMotionVectors, BVopMvBody,
+    BMbTypeTable, BVopMbHeader, BVopMbParseError, BVopMbType, BVopMotionVectors, BVopMvBody,
+    decode_b_vop_mb_motion_vectors, parse_b_vop_mb_header,
 };
 use crate::bvop_field_direct::{
-    interlaced_direct_mvs, interlaced_direct_prediction, ColocatedFutureField, InterlacedDirectMvs,
+    ColocatedFutureField, InterlacedDirectMvs, interlaced_direct_mvs, interlaced_direct_prediction,
 };
 use crate::bvop_field_motion::{
-    field_backward_prediction, field_bidirectional_prediction, field_forward_prediction,
     BVopFieldReferences, FieldMvDeltas, FieldReferenceFlags, FieldSampleMode,
+    field_backward_prediction, field_bidirectional_prediction, field_forward_prediction,
 };
 use crate::bvop_field_predictor::FieldPmvBank;
 use crate::bvop_prediction::{BVopMvPair, BVopPredictionMode, MB_SUB_BLOCKS};
-use crate::chroma_mv::{chroma_mv_from_luma_blocks, ChromaMvError};
+use crate::chroma_mv::{ChromaMvError, chroma_mv_from_luma_blocks};
 use crate::interlaced_information::FieldReference;
 use crate::motion::{
-    direct_mode_motion_vector, reconstruct_motion_vector, DirectCoLocatedMv, DirectModeMv,
-    DirectMvError, DirectMvUnits, MotionVector, MotionVectorDelta,
+    DirectCoLocatedMv, DirectModeMv, DirectMvError, DirectMvUnits, MotionVector, MotionVectorDelta,
+    direct_mode_motion_vector, reconstruct_motion_vector,
 };
 use crate::vol::VolHeader;
 use crate::vop::VopCodingType;
@@ -1259,12 +1259,12 @@ impl BVopMvDriver {
             .as_ref()
             .and_then(|info| info.field_prediction)
             .filter(|fp| fp.forward.is_some() || fp.backward.is_some());
-        if let Some(field) = field {
-            if header.mb_type != BVopMbType::Direct {
-                return self
-                    .field_from_header(br, &header, &field)
-                    .map(|d| (BVopInterlacedMb::Field(d), field_dct));
-            }
+        if let Some(field) = field
+            && header.mb_type != BVopMbType::Direct
+        {
+            return self
+                .field_from_header(br, &header, &field)
+                .map(|d| (BVopInterlacedMb::Field(d), field_dct));
         }
 
         // Direct macroblock: interlaced direct when the future MB was
@@ -1970,7 +1970,7 @@ mod tests {
         fn write_bits(&mut self, value: u32, n: usize) {
             for i in (0..n).rev() {
                 let bit = ((value >> i) & 1) as u8;
-                if self.bit_pos % 8 == 0 {
+                if self.bit_pos.is_multiple_of(8) {
                     self.buf.push(0);
                 }
                 let byte = self.buf.last_mut().unwrap();
@@ -1992,7 +1992,7 @@ mod tests {
             self.write_zero_mv_data();
         }
         fn align(&mut self) {
-            while self.bit_pos % 8 != 0 {
+            while !self.bit_pos.is_multiple_of(8) {
                 self.write_bits(0, 1);
             }
         }
@@ -2456,12 +2456,12 @@ mod tests {
         w.write_bits(0b00, 2); // modb "00" — mb_type + cbpb present
         w.write_bits(0b0001, 4); // mb_type forward
         w.write_bits(0b10_0000, 6); // cbpb — only block 0 coded
-                                    // mb_type carries dbquant only when non-direct; forward does, but
-                                    // dbquant is gated on cbpb != 0, so it IS present here. Write the
-                                    // Table 6-33 "no change" code (`0`).
+        // mb_type carries dbquant only when non-direct; forward does, but
+        // dbquant is gated on cbpb != 0, so it IS present here. Write the
+        // Table 6-33 "no change" code (`0`).
         w.write_bits(0b0, 1); // dbquant code 0 → delta 0
         w.write_zero_mv_data_pair(); // mvdf == (0, 0)
-                                     // Texture: block 0 one positive inter EVENT (LAST=1,RUN=0,LVL=1).
+        // Texture: block 0 one positive inter EVENT (LAST=1,RUN=0,LVL=1).
         w.write_bits(0b0111, 4);
         w.write_bits(0b0, 1); // sign +
         w.align();
@@ -2477,7 +2477,7 @@ mod tests {
         let mb = &mbs[0];
         assert_eq!(mb.motion.mb_type, BVopMbType::Forward);
         assert_eq!(mb.quantiser_scale, 8); // base + delta 0
-                                           // Block 0 carries the residual near 2; everything else is zero.
+        // Block 0 carries the residual near 2; everything else is zero.
         for y in 0..8 {
             for x in 0..8 {
                 assert!(
@@ -2556,11 +2556,13 @@ mod tests {
             })
             .unwrap();
         assert_eq!(mbs[0].motion.cbpb, None);
-        assert!(mbs[0]
-            .residual
-            .luma
-            .iter()
-            .all(|r| r.iter().all(|&p| p == 0)));
+        assert!(
+            mbs[0]
+                .residual
+                .luma
+                .iter()
+                .all(|r| r.iter().all(|&p| p == 0))
+        );
     }
 
     /// End-to-end frame decode: `decode_vop` decodes a single forward
@@ -2874,7 +2876,7 @@ mod tests {
         let mut w = BitWriter::new();
         w.write_bits(0b01, 2); // modb "01"
         w.write_bits(0b1, 1); // mb_type "1" → direct
-                              // MVD[0] = (1, 0): mv_data 1 then mv_data 0.
+        // MVD[0] = (1, 0): mv_data 1 then mv_data 0.
         w.write_bits(0b010, 3); // mv_data == 1
         w.write_zero_mv_data(); // mv_data == 0
         w.align();
@@ -3336,13 +3338,13 @@ mod tests {
         w.write_bits(0b0, 1); // forward_bottom → Top
         w.write_zero_mv_data_pair(); // MVD[0]
         w.write_zero_mv_data_pair(); // MVD[1]
-                                     // MB1 — progressive forward, cbpb block 0 coded + residual.
+        // MB1 — progressive forward, cbpb block 0 coded + residual.
         w.write_bits(0b00, 2); // modb "00" — mb_type + cbpb
         w.write_bits(0b0001, 4); // forward
         w.write_bits(0b10_0000, 6); // cbpb — block 0 coded
         w.write_bits(0b0, 1); // dbquant code 0 → delta 0
-                              // §6.2.6.3 interlaced_information: cbp != 0 → dct_type bit, then
-                              // field_prediction bit (both inside the body, after dbquant).
+        // §6.2.6.3 interlaced_information: cbp != 0 → dct_type bit, then
+        // field_prediction bit (both inside the body, after dbquant).
         w.write_bits(0b0, 1); // dct_type = 0 (frame DCT)
         w.write_bits(0b0, 1); // field_prediction = 0 → frame
         w.write_zero_mv_data_pair(); // frame mvdf (0, 0)
@@ -3360,11 +3362,13 @@ mod tests {
         assert_eq!(mbs.len(), 2);
         // MB0 routed to the field path, zero residual.
         assert!(matches!(mbs[0].motion, BVopInterlacedMb::Field(_)));
-        assert!(mbs[0]
-            .residual
-            .luma
-            .iter()
-            .all(|r| r.iter().all(|&p| p == 0)));
+        assert!(
+            mbs[0]
+                .residual
+                .luma
+                .iter()
+                .all(|r| r.iter().all(|&p| p == 0))
+        );
         // MB1 routed to the progressive path, residual ~2 in block 0.
         assert!(matches!(mbs[1].motion, BVopInterlacedMb::Progressive(_)));
         for y in 0..8 {

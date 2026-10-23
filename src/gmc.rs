@@ -37,11 +37,7 @@ fn div_floor(n: i64, d: i64) -> i64 {
     debug_assert!(d > 0);
     let q = n / d;
     let r = n % d;
-    if r != 0 && (r < 0) {
-        q - 1
-    } else {
-        q
-    }
+    if r != 0 && (r < 0) { q - 1 } else { q }
 }
 
 /// Reconstruct one §7.8.6 GMC sample at warp coordinate `(cap_f, cap_g)`

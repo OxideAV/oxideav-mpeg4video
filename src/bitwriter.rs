@@ -39,7 +39,7 @@ impl BitWriter {
 
     /// Whether the current position lies on a byte boundary.
     pub fn is_byte_aligned(&self) -> bool {
-        self.bit_len % 8 == 0
+        self.bit_len.is_multiple_of(8)
     }
 
     /// Append the low `n` bits of `value` (1..=32), most significant
@@ -60,7 +60,7 @@ impl BitWriter {
         }
         for i in (0..n).rev() {
             let bit = ((value >> i) & 1) as u8;
-            if self.bit_len % 8 == 0 {
+            if self.bit_len.is_multiple_of(8) {
                 self.bytes.push(0);
             }
             let last = self.bytes.last_mut().expect("push above guarantees a byte");

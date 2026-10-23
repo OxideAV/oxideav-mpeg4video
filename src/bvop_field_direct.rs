@@ -275,8 +275,8 @@ pub fn interlaced_direct_prediction(
 ) -> crate::reconstruct::InterPredictionMacroblock {
     use crate::bvop_field_motion::FieldSampleMode;
     use crate::field_motion::{
-        field_motion_compensate_one_reference, field_motion_compensate_one_reference_qpel,
-        FieldMotionVectors,
+        FieldMotionVectors, field_motion_compensate_one_reference,
+        field_motion_compensate_one_reference_qpel,
     };
     use crate::reconstruct::{MACROBLOCK_CHROMA_SIDE, MACROBLOCK_LUMA_SIDE};
 

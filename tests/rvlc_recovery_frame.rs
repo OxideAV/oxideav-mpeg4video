@@ -21,7 +21,7 @@ use oxideav_mpeg4video::compat::DecodeOptions;
 use oxideav_mpeg4video::frame_decode::PVopMbContent;
 use oxideav_mpeg4video::video_packet::macroblock_number_bit_width;
 use oxideav_mpeg4video::vol::parse_video_object_layer;
-use oxideav_mpeg4video::vop::{parse_vop_header_body, VopContext};
+use oxideav_mpeg4video::vop::{VopContext, parse_vop_header_body};
 use oxideav_mpeg4video::vop_decode::decode_p_vop_macroblocks_dp;
 
 #[derive(Default)]

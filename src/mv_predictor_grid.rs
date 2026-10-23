@@ -1056,7 +1056,7 @@ mod tests {
     // ---------------------------------------------------------------------
 
     use crate::motion::{
-        predict_field_motion_vector, FieldMvPair, FieldPredCandidate, MotionVectorDelta,
+        FieldMvPair, FieldPredCandidate, MotionVectorDelta, predict_field_motion_vector,
     };
 
     #[test]
@@ -1182,7 +1182,7 @@ mod tests {
 
     #[test]
     fn field_candidates_end_to_end_case3_reconstruction() {
-        use crate::field_motion::{reconstruct_field_motion_vectors, FieldMotionVectors};
+        use crate::field_motion::{FieldMotionVectors, reconstruct_field_motion_vectors};
 
         // CASE 3: current MB field-predicted, above neighbour also field-
         // predicted. left frame (10, 2), above field top=(6,2)

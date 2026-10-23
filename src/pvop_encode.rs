@@ -38,23 +38,23 @@ use crate::block::nonintra_quant_matrix;
 use crate::bvop_prediction::BVopSampleMode;
 use crate::data_partition::use_intra_dc_vlc;
 use crate::fdct::forward_dct_8x8;
-use crate::field_encode::{estimate_field_motion, field_mv_differential, FieldEstimate};
+use crate::field_encode::{FieldEstimate, estimate_field_motion, field_mv_differential};
 use crate::framestore::{DecodedFrame, FrameStore};
 use crate::ivop_encode::{
-    elect_field_dct, field_dct_luma, forward_scan, intra_mb_fields, plan_block, qfs_to_events,
-    quantise_intra_block, BlockPlan, EncoderConfig, FrameView, PreparedBlock, VopInterlaceFlags,
+    BlockPlan, EncoderConfig, FrameView, PreparedBlock, VopInterlaceFlags, elect_field_dct,
+    field_dct_luma, forward_scan, intra_mb_fields, plan_block, qfs_to_events, quantise_intra_block,
 };
-use crate::motion::{predict_motion_vector, MotionVector};
+use crate::motion::{MotionVector, predict_motion_vector};
 use crate::mv_predictor_grid::MvGrid;
 use crate::neighbour::{BlockNeighbour, IntraBlockGrid};
 use crate::packet_encode::{InterlacedMbInfo, Layout, MbFields, PacketVopInfo, PacketWriter};
 use crate::predictor::select_dc_direction;
-use crate::pvop_mv::{predict_inter_macroblock, PvopMbMotion};
+use crate::pvop_mv::{PvopMbMotion, predict_inter_macroblock};
 use crate::quantise::{quantise_method1_inter, quantise_method2_inter};
 use crate::scan::ScanType;
 use crate::texture::{AcEvent, DcComponent};
-use crate::vop::{parse_vop_header_body, vop_time_increment_bits, VopCodingType, VopContext};
-use crate::vop_decode::{decode_p_vop_macroblocks, AnchorMbMotion};
+use crate::vop::{VopCodingType, VopContext, parse_vop_header_body, vop_time_increment_bits};
+use crate::vop_decode::{AnchorMbMotion, decode_p_vop_macroblocks};
 
 /// Dense full-pel motion search radius in pels (each direction) —
 /// the `fcode == 1` window, whose refined half-pel vector stays inside

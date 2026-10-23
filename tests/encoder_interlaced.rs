@@ -8,18 +8,18 @@
 //! (`tests/fixtures/NOTES.md`).
 
 use oxideav_mpeg4video::bvop_interlaced_encode::{
-    encode_b_vop_interlaced, BVopInterlacedEncodeStats,
+    BVopInterlacedEncodeStats, encode_b_vop_interlaced,
 };
 use oxideav_mpeg4video::decoder::Mpeg4VideoDecoder;
 use oxideav_mpeg4video::framestore::{DecodedFrame, FrameStore};
 use oxideav_mpeg4video::ivop_encode::{
-    encode_i_vop, write_configuration_headers, EncoderConfig, FrameView,
+    EncoderConfig, FrameView, encode_i_vop, write_configuration_headers,
 };
 use oxideav_mpeg4video::pvop_encode::{
-    encode_p_vop, reconstruct_own_p_vop_with_anchor_motion, PVopEncodeStats,
+    PVopEncodeStats, encode_p_vop, reconstruct_own_p_vop_with_anchor_motion,
 };
 use oxideav_mpeg4video::svop_encode::{
-    encode_s_vop, reconstruct_own_s_vop_with_anchor_motion, SVopEncodeStats,
+    SVopEncodeStats, encode_s_vop, reconstruct_own_s_vop_with_anchor_motion,
 };
 use oxideav_mpeg4video::vol::parse_video_object_layer;
 use oxideav_mpeg4video::vop_decode::AnchorMbMotion;

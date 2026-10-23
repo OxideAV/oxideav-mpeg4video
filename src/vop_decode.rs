@@ -42,9 +42,9 @@
 
 use crate::bitreader::BitReader;
 use crate::block::{
-    decode_b_vop_inter_macroblock, decode_inter_macroblock, decode_intra_block_full,
-    intra_quant_matrix, nonintra_quant_matrix, pattern_code, BlockAssemblyError, IntraMacroblock,
-    MacroblockTextureContext,
+    BlockAssemblyError, IntraMacroblock, MacroblockTextureContext, decode_b_vop_inter_macroblock,
+    decode_inter_macroblock, decode_intra_block_full, intra_quant_matrix, nonintra_quant_matrix,
+    pattern_code,
 };
 use crate::bvop_mv::{
     BVopMbTexturedDecode, BVopMvDriver, BVopMvDriverError, BVopTextureParams, CoLocatedAnchor,
@@ -52,15 +52,15 @@ use crate::bvop_mv::{
 use crate::compat::DecodeOptions;
 use crate::data_partition::use_intra_dc_vlc;
 use crate::frame_decode::{PVopMbContent, SGmcMbContent};
-use crate::macroblock::{parse_macroblock_header, MacroblockParseError};
-use crate::motion::{averaged_motion_vector, DirectCoLocatedMv, MotionVector, AMV_PIXEL_COUNT};
+use crate::macroblock::{MacroblockParseError, parse_macroblock_header};
+use crate::motion::{AMV_PIXEL_COUNT, DirectCoLocatedMv, MotionVector, averaged_motion_vector};
 use crate::neighbour::{BlockNeighbour, IntraBlockGrid};
 use crate::pvop_mv::{MvDriver, PvopMbMotion, PvopMvError};
-use crate::reconstruct::{reconstruct_intra_macroblock, ReconstructedMacroblock};
+use crate::reconstruct::{ReconstructedMacroblock, reconstruct_intra_macroblock};
 use crate::sprite::SpriteTrajectory;
 use crate::video_packet::{
-    consume_next_resync_marker, parse_video_packet_header, probe_resync_marker, VideoPacketContext,
-    VideoPacketHeader, VideoPacketParseError,
+    VideoPacketContext, VideoPacketHeader, VideoPacketParseError, consume_next_resync_marker,
+    parse_video_packet_header, probe_resync_marker,
 };
 use crate::vol::{SpriteEnable, SpriteWarpingAccuracy, VolHeader};
 use crate::vop::{VopCodingType, VopHeader};
@@ -723,7 +723,7 @@ pub fn decode_p_vop_macroblocks_dp(
                     // GMC needs the S(GMC) walk; `is_s_gmc == false`
                     // keeps this arm unreachable on conforming input.
                     DpMbEvent::Gmc => {
-                        return Err(crate::data_partition::DataPartitionError::Truncated)
+                        return Err(crate::data_partition::DataPartitionError::Truncated);
                     }
                 }
                 .map_err(|_| crate::data_partition::DataPartitionError::Truncated)?;
@@ -2230,10 +2230,10 @@ mod tests {
         let vop = test_i_vop(&vol, 8);
         let mut w = BitWriter::default();
         write_intra_mb_first_block_dc_plus1(&mut w); // 22 bits
-                                                     // §5.2.5 stuffing to the byte boundary: '0' + '1's.
+        // §5.2.5 stuffing to the byte boundary: '0' + '1's.
         w.write_bits(0, 1);
         w.write_bits(1, 1); // now at bit 24
-                            // resync_marker: 16 zeros + 1 (I-VOP → 17 bits).
+        // resync_marker: 16 zeros + 1 (I-VOP → 17 bits).
         w.write_bits(1, 17);
         // macroblock_number: 2 MBs total → 1 bit (Table 6-27).
         w.write_bits(1, 1);
@@ -2299,7 +2299,7 @@ mod tests {
         w.write_bits(0b11, 2); // cbpy inter 0
         w.write_bits(1, 1); // MVDx 0
         w.write_bits(1, 1); // MVDy 0
-                            // Stuffing from bit 6: '0' + '1' → bit 8 (byte aligned).
+        // Stuffing from bit 6: '0' + '1' → bit 8 (byte aligned).
         w.write_bits(0, 1);
         w.write_bits(1, 1);
         // P-VOP resync marker: 15 + fcode(1) zeros + 1 → 17 bits.
@@ -2307,7 +2307,7 @@ mod tests {
         w.write_bits(1, 1); // macroblock_number = 1
         w.write_bits(8, 5); // quant_scale
         w.write_bits(0, 1); // header_extension_code
-                            // MB1: same coded inter MB.
+        // MB1: same coded inter MB.
         w.write_bits(0, 1);
         w.write_bits(0b1, 1);
         w.write_bits(0b11, 2);
@@ -2724,7 +2724,7 @@ mod tests {
     /// backward P (flat 80, intra content).
     fn two_flat_anchor_store() -> FrameStore {
         use crate::reconstruct::{
-            ReconstructedMacroblock, MACROBLOCK_CHROMA_SIDE, MACROBLOCK_LUMA_SIDE,
+            MACROBLOCK_CHROMA_SIDE, MACROBLOCK_LUMA_SIDE, ReconstructedMacroblock,
         };
         let flat = |v: i32| ReconstructedMacroblock {
             luma: [[v; MACROBLOCK_LUMA_SIDE]; MACROBLOCK_LUMA_SIDE],

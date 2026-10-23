@@ -48,9 +48,9 @@ use crate::neighbour::{BlockNeighbour, IntraBlockGrid};
 use crate::packet_encode::{InterlacedMbInfo, Layout, MbFields, PacketVopInfo, PacketWriter};
 use crate::predictor::{dc_scaler, predict_intra_dc, select_dc_direction};
 use crate::quantise::{quantise_intra_dc, quantise_method1_intra, quantise_method2_intra};
-use crate::scan::{inverse_scan, select_scan_type, DcPredictionDirection, ScanType};
+use crate::scan::{DcPredictionDirection, ScanType, inverse_scan, select_scan_type};
 use crate::texture::{AcEvent, DcComponent};
-use crate::vop::{vop_time_increment_bits, VopCodingType};
+use crate::vop::{VopCodingType, vop_time_increment_bits};
 use crate::vop_decode::decode_i_vop_macroblocks;
 
 /// Start codes the emitters write (§6.2.1 Table 6-3).
@@ -286,22 +286,14 @@ impl EncoderConfig {
     /// once an ASP tool (method-1 quantisation, quarter-sample) is
     /// selected.
     pub fn profile_and_level(&self) -> u8 {
-        if self.uses_asp_tools() {
-            0xF3
-        } else {
-            0x03
-        }
+        if self.uses_asp_tools() { 0xF3 } else { 0x03 }
     }
 
     /// Table 6-11 `video_object_type_indication`: Simple (`1`) or
     /// Advanced Simple (`0x11`), matching
     /// [`Self::profile_and_level`].
     pub fn video_object_type(&self) -> u8 {
-        if self.uses_asp_tools() {
-            0x11
-        } else {
-            0x01
-        }
+        if self.uses_asp_tools() { 0x11 } else { 0x01 }
     }
 
     /// Macroblock grid dimensions (`§6.3.3`: a partial edge macroblock
@@ -1268,7 +1260,7 @@ fn decode_own_i_vop(
     mb_height: usize,
 ) -> DecodedFrame {
     use crate::compat::DecodeOptions;
-    use crate::vop::{parse_vop_header_body, VopContext};
+    use crate::vop::{VopContext, parse_vop_header_body};
     let mut br = BitReader::new(unit);
     let sc = br
         .read_bits(32)

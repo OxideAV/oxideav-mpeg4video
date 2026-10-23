@@ -70,7 +70,7 @@
 //! * **Interlaced field-prediction extension** (§7.6.9 last paragraph,
 //!   alongside MVF / MVB doubling) — out of scope this round.
 
-use crate::half_sample::{interpolate_block_into, ReferenceVop};
+use crate::half_sample::{ReferenceVop, interpolate_block_into};
 use crate::motion::MotionVector;
 use crate::quarter_sample::interpolate_block_qpel_into;
 

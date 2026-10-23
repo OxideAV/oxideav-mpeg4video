@@ -86,7 +86,7 @@
 
 #![allow(clippy::needless_range_loop)]
 
-use crate::sample_padding::{SamplePresence, CHROMA_SIDE, LUMA_SIDE};
+use crate::sample_padding::{CHROMA_SIDE, LUMA_SIDE, SamplePresence};
 
 /// §6.1.3.7.1 decimation of a single 2 × 2 luminance shape block to one
 /// chroma shape sample.

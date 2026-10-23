@@ -9,7 +9,7 @@ use libfuzzer_sys::fuzz_target;
 use oxideav_mpeg4video::bitreader::BitReader;
 use oxideav_mpeg4video::decoder::Mpeg4VideoDecoder;
 use oxideav_mpeg4video::short_header::{
-    decode_short_header_macroblocks, parse_short_header_picture, SHORT_VIDEO_START_MARKER,
+    SHORT_VIDEO_START_MARKER, decode_short_header_macroblocks, parse_short_header_picture,
 };
 
 fuzz_target!(|data: &[u8]| {

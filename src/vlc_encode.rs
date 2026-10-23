@@ -33,7 +33,7 @@ use crate::bitwriter::BitWriter;
 use crate::macroblock::{CBPY_4, MCBPC_I, MCBPC_P};
 use crate::motion::mvd_table;
 use crate::texture::{
-    dc_size_table, lmax, rmax, tcoef_table, AcEvent, DcComponent, TcoefTable, ESCAPE,
+    AcEvent, DcComponent, ESCAPE, TcoefTable, dc_size_table, lmax, rmax, tcoef_table,
 };
 
 /// Emit a §7.4.1.1 differential intra DC: `dct_dc_size` VLC (Table
@@ -169,17 +169,17 @@ pub fn put_ac_event(bw: &mut BitWriter, kind: TcoefTable, event: AcEvent) {
 
     // Type 2: RUN reduced by RMAX(last, |level|) + 1 must be a
     // tabulated EVENT for the same (last, level).
-    if let Some(rm) = rmax(kind, last, level.abs()) {
-        if let Some(reduced) = run.checked_sub(rm + 1) {
-            let mut probe = BitWriter::new();
-            if try_put_tcoef_vlc(&mut probe, kind, last, reduced, level) {
-                bw.write_bits(esc_code, usize::from(esc_len));
-                bw.write_bit(true); // "1"
-                bw.write_bit(false); // "0" — Type 2
-                let ok = try_put_tcoef_vlc(bw, kind, last, reduced, level);
-                debug_assert!(ok);
-                return;
-            }
+    if let Some(rm) = rmax(kind, last, level.abs())
+        && let Some(reduced) = run.checked_sub(rm + 1)
+    {
+        let mut probe = BitWriter::new();
+        if try_put_tcoef_vlc(&mut probe, kind, last, reduced, level) {
+            bw.write_bits(esc_code, usize::from(esc_len));
+            bw.write_bit(true); // "1"
+            bw.write_bit(false); // "0" — Type 2
+            let ok = try_put_tcoef_vlc(bw, kind, last, reduced, level);
+            debug_assert!(ok);
+            return;
         }
     }
 
@@ -441,7 +441,7 @@ mod tests {
     use super::*;
     use crate::bitreader::BitReader;
     use crate::macroblock::{decode_cbpy4, decode_mcbpc};
-    use crate::motion::{decode_motion_vector_delta, MvMode};
+    use crate::motion::{MvMode, decode_motion_vector_delta};
     use crate::texture::{decode_ac_event, decode_intra_dc};
 
     #[test]

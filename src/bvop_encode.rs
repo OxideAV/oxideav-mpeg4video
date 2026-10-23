@@ -51,20 +51,20 @@
 
 use crate::bitreader::BitReader;
 use crate::bitwriter::BitWriter;
-use crate::block::{nonintra_quant_matrix, InterMacroblock};
+use crate::block::{InterMacroblock, nonintra_quant_matrix};
 use crate::bvop::BVopMbType;
 use crate::bvop_mv::{BVopAnchorPlanes, BVopMbDecode};
 use crate::bvop_prediction::{BVopMvPair, BVopPredictionMode, BVopSampleMode, MB_SUB_BLOCKS};
 use crate::framestore::{DecodedFrame, FrameStore};
 use crate::ivop_encode::{EncoderConfig, FrameView};
 use crate::motion::{
-    direct_mode_motion_vector, DirectCoLocatedMv, DirectMvUnits, MotionVector, MotionVectorDelta,
+    DirectCoLocatedMv, DirectMvUnits, MotionVector, MotionVectorDelta, direct_mode_motion_vector,
 };
 use crate::pvop_encode::{estimate_motion, quantise_inter_block, sample_mode_of, source_luma_mb};
 use crate::pvop_mv::PvopMbMotion;
 use crate::texture::{AcEvent, TcoefTable};
 use crate::vlc_encode::{put_ac_events, put_motion_vector};
-use crate::vop::{parse_vop_header_body, vop_time_increment_bits, VopCodingType, VopContext};
+use crate::vop::{VopCodingType, VopContext, parse_vop_header_body, vop_time_increment_bits};
 use crate::vop_decode::decode_b_vop_macroblocks;
 
 const VOP_START_CODE: u32 = 0x0000_01B6;
@@ -677,7 +677,7 @@ mod tests {
     fn mb_type_codes_match_table_b4() {
         // Emit each type and decode through the crate's own Table B.4
         // parser path (modb "01" + mb_type).
-        use crate::bvop::{parse_b_vop_mb_header, BMbTypeTable};
+        use crate::bvop::{BMbTypeTable, parse_b_vop_mb_header};
         use crate::vol::parse_video_object_layer;
         let cfg = EncoderConfig {
             width: 16,

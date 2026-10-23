@@ -47,19 +47,19 @@ use crate::framestore::DecodedFrame;
 use crate::pvop_mv::PvopMbMotion;
 use crate::sequence::SequenceDecoder;
 use crate::vol::{
-    parse_video_object_layer, parse_visual_object_header, parse_visual_object_sequence_header,
-    VolHeader, VolParseError, VIDEO_OBJECT_LAYER_START_CODE_MAX, VIDEO_OBJECT_LAYER_START_CODE_MIN,
+    VIDEO_OBJECT_LAYER_START_CODE_MAX, VIDEO_OBJECT_LAYER_START_CODE_MIN,
     VIDEO_OBJECT_START_CODE_MAX, VIDEO_OBJECT_START_CODE_MIN, VISUAL_OBJECT_SEQUENCE_END_CODE,
-    VISUAL_OBJECT_SEQUENCE_START_CODE, VISUAL_OBJECT_START_CODE,
+    VISUAL_OBJECT_SEQUENCE_START_CODE, VISUAL_OBJECT_START_CODE, VolHeader, VolParseError,
+    parse_video_object_layer, parse_visual_object_header, parse_visual_object_sequence_header,
 };
 use crate::vop::{
-    parse_group_of_vop_header, parse_vop_header_body, VopCodingType, VopContext, VopHeader,
-    VopParseError, GROUP_OF_VOP_START_CODE, VOP_START_CODE,
+    GROUP_OF_VOP_START_CODE, VOP_START_CODE, VopCodingType, VopContext, VopHeader, VopParseError,
+    parse_group_of_vop_header, parse_vop_header_body,
 };
 use crate::vop_decode::{
-    decode_b_vop_interlaced_macroblocks, decode_b_vop_macroblocks, decode_i_vop_macroblocks,
-    decode_p_vop_macroblocks, decode_s_gmc_vop_macroblocks, vop_mb_dimensions, AnchorMbMotion,
-    VopDecodeError,
+    AnchorMbMotion, VopDecodeError, decode_b_vop_interlaced_macroblocks, decode_b_vop_macroblocks,
+    decode_i_vop_macroblocks, decode_p_vop_macroblocks, decode_s_gmc_vop_macroblocks,
+    vop_mb_dimensions,
 };
 
 /// §6.2.1 `user_data_start_code`.
@@ -273,10 +273,10 @@ impl Mpeg4VideoDecoder {
             let first_sh = crate::short_header::scan_short_header_pictures(data)
                 .first()
                 .copied();
-            if let Some(sh) = first_sh {
-                if first_sc.map_or(true, |sc| sh < sc) {
-                    self.short_header = Some(ShortHeaderClock::default());
-                }
+            if let Some(sh) = first_sh
+                && first_sc.is_none_or(|sc| sh < sc)
+            {
+                self.short_header = Some(ShortHeaderClock::default());
             }
         }
         if self.short_header.is_some() {
@@ -1478,7 +1478,7 @@ mod tests {
 
 #[cfg(test)]
 mod registry_tests {
-    use super::tests::{write_i_vop, write_skipped_p_vop, write_vol, write_vos, BitWriter};
+    use super::tests::{BitWriter, write_i_vop, write_skipped_p_vop, write_vol, write_vos};
     use super::*;
     use oxideav_core::{CodecId, CodecParameters, Packet, TimeBase};
 

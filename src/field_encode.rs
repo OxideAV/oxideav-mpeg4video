@@ -36,7 +36,7 @@ use crate::bvop_prediction::BVopSampleMode;
 use crate::field_motion::mc;
 use crate::half_sample::ReferenceVop;
 use crate::motion::MotionVector;
-use crate::pvop_encode::{mv_range, SEARCH_RANGE};
+use crate::pvop_encode::{SEARCH_RANGE, mv_range};
 use crate::quarter_sample::interpolate_block_qpel_field_into;
 
 /// The estimate for one output field.
@@ -277,7 +277,7 @@ pub(crate) fn estimate_field_motion(
             sad: best_sad,
         };
         // Ties keep the top reference field (the all-zero default).
-        if best.map_or(true, |b| est.sad < b.sad) {
+        if best.is_none_or(|b| est.sad < b.sad) {
             best = Some(est);
         }
     }
@@ -295,7 +295,7 @@ pub(crate) fn field_mv_differential(mv: MotionVector, predictor: MotionVector) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::field_motion::{reconstruct_field_motion_vectors, FieldMotionVectors};
+    use crate::field_motion::{FieldMotionVectors, reconstruct_field_motion_vectors};
     use crate::motion::{FieldMvPair, MotionVectorDelta};
 
     /// A textured 32×32 plane whose two fields carry unrelated

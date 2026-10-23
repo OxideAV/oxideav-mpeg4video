@@ -35,8 +35,8 @@
 //! S(GMC)-VOPs are reordered exactly as P-VOPs (§6.1.3.8 final sentence).
 
 use crate::frame_decode::{
-    assemble_b_vop_frame, assemble_p_vop_frame, assemble_s_gmc_vop_frame, FrameDecodeError,
-    PVopMbContent, SGmcMbContent,
+    FrameDecodeError, PVopMbContent, SGmcMbContent, assemble_b_vop_frame, assemble_p_vop_frame,
+    assemble_s_gmc_vop_frame,
 };
 use crate::framestore::{DecodedFrame, FrameStore};
 use crate::reconstruct::ReconstructedMacroblock;

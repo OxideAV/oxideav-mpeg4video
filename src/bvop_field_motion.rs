@@ -64,8 +64,8 @@
 
 use crate::bvop_field_predictor::{FieldMvDirection, FieldPmvBank};
 use crate::field_motion::{
-    field_motion_compensate_one_reference, field_motion_compensate_one_reference_qpel,
-    FieldMotionVectors,
+    FieldMotionVectors, field_motion_compensate_one_reference,
+    field_motion_compensate_one_reference_qpel,
 };
 use crate::half_sample::ReferenceVop;
 use crate::interlaced_information::FieldReference;

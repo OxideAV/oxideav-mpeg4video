@@ -139,11 +139,7 @@ pub enum DctType {
 impl DctType {
     /// Decode a single `dct_type` bit per §6.2.6.3.
     pub fn from_bit(bit: bool) -> Self {
-        if bit {
-            DctType::Field
-        } else {
-            DctType::Frame
-        }
+        if bit { DctType::Field } else { DctType::Frame }
     }
 
     /// Re-encode this flag back to its 1-bit form.

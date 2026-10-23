@@ -9,7 +9,7 @@ use oxideav_mpeg4video::bvop_encode::encode_b_vop;
 use oxideav_mpeg4video::decoder::Mpeg4VideoDecoder;
 use oxideav_mpeg4video::framestore::{DecodedFrame, FrameStore};
 use oxideav_mpeg4video::ivop_encode::{
-    encode_i_vop, write_configuration_headers, EncoderConfig, FrameView,
+    EncoderConfig, FrameView, encode_i_vop, write_configuration_headers,
 };
 use oxideav_mpeg4video::packet_encode::ResilienceConfig;
 use oxideav_mpeg4video::pvop_encode::{encode_p_vop, reconstruct_own_p_vop_with_motion};

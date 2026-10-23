@@ -50,26 +50,26 @@
 
 use crate::bitreader::BitReader;
 use crate::bitwriter::BitWriter;
-use crate::block::{nonintra_quant_matrix, InterMacroblock};
+use crate::block::{InterMacroblock, nonintra_quant_matrix};
 use crate::bvop::BVopMbType;
 use crate::bvop_encode::{
-    candidate_sad, direct_candidate, one_mv_candidate, put_b_mb_type, write_b_vop_header,
-    ModeCandidate, DIRECT_SEARCH, INTERP_MODE_BIAS, ONE_MV_MODE_BIAS,
+    DIRECT_SEARCH, INTERP_MODE_BIAS, ModeCandidate, ONE_MV_MODE_BIAS, candidate_sad,
+    direct_candidate, one_mv_candidate, put_b_mb_type, write_b_vop_header,
 };
 use crate::bvop_field_direct::{interlaced_direct_mvs, interlaced_direct_prediction};
 use crate::bvop_field_motion::{
-    field_backward_prediction, field_bidirectional_prediction, field_forward_prediction,
     BVopFieldReferences, FieldMvDeltas, FieldReferenceFlags, FieldSampleMode,
+    field_backward_prediction, field_bidirectional_prediction, field_forward_prediction,
 };
 use crate::bvop_field_predictor::{
     FieldPmvBank, PMV_BOT_BWD, PMV_BOT_FWD, PMV_TOP_BWD, PMV_TOP_FWD,
 };
 use crate::bvop_mv::{BVopAnchorPlanes, ColocatedFutureFieldMvs};
 use crate::bvop_prediction::BVopSampleMode;
-use crate::field_encode::{estimate_field_motion, field_mv_differential, FieldEstimate};
+use crate::field_encode::{FieldEstimate, estimate_field_motion, field_mv_differential};
 use crate::framestore::{DecodedFrame, FrameStore};
 use crate::interlaced_information::FieldReference;
-use crate::ivop_encode::{elect_field_dct, field_dct_luma, EncoderConfig, FrameView};
+use crate::ivop_encode::{EncoderConfig, FrameView, elect_field_dct, field_dct_luma};
 use crate::motion::{DirectCoLocatedMv, MotionVector, MotionVectorDelta};
 use crate::pvop_encode::{
     estimate_motion, inter_scan, macroblock_residual, quantise_inter_residual, sample_mode_of,
@@ -79,8 +79,8 @@ use crate::pvop_mv::PvopMbMotion;
 use crate::reconstruct::InterPredictionMacroblock;
 use crate::texture::TcoefTable;
 use crate::vlc_encode::{put_ac_events, put_motion_vector};
-use crate::vop::{parse_vop_header_body, vop_time_increment_bits, VopCodingType, VopContext};
-use crate::vop_decode::{decode_b_vop_interlaced_macroblocks, AnchorMbMotion};
+use crate::vop::{VopCodingType, VopContext, parse_vop_header_body, vop_time_increment_bits};
+use crate::vop_decode::{AnchorMbMotion, decode_b_vop_interlaced_macroblocks};
 
 const VOP_START_CODE: u32 = 0x0000_01B6;
 
@@ -365,7 +365,7 @@ pub fn encode_b_vop_interlaced(
             // ---- Candidate modes -------------------------------------
             let mut best: Option<(Chosen, u32)> = None;
             let mut consider = |chosen: Chosen, cost: u32| {
-                if best.as_ref().map_or(true, |(_, c)| cost < *c) {
+                if best.as_ref().is_none_or(|(_, c)| cost < *c) {
                     best = Some((chosen, cost));
                 }
             };

@@ -1436,8 +1436,10 @@ mod tests {
         assert!(
             format!("{}", TextureParseError::InvalidTcoef { window: 0 }).contains("invalid Tcoef")
         );
-        assert!(format!("{}", TextureParseError::EscapeMarkerBitMissing)
-            .contains("Type-3 escape marker_bit"));
+        assert!(
+            format!("{}", TextureParseError::EscapeMarkerBitMissing)
+                .contains("Type-3 escape marker_bit")
+        );
         assert!(format!("{}", TextureParseError::ReservedEscapeLevel).contains("reserved value"));
     }
 

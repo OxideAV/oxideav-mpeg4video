@@ -73,9 +73,9 @@
 #![allow(clippy::needless_range_loop)]
 
 use crate::sample_padding::{
-    horizontal_repetitive_padding_luma, SamplePresence, ShapeRowState, LUMA_SIDE,
+    LUMA_SIDE, SamplePresence, ShapeRowState, horizontal_repetitive_padding_luma,
 };
-use crate::vertical_padding::{vertical_repetitive_padding_column, ColumnState};
+use crate::vertical_padding::{ColumnState, vertical_repetitive_padding_column};
 
 /// Number of luma rows per field in a 4:2:0 interlaced macroblock.
 ///
@@ -353,7 +353,7 @@ pub fn interlaced_boundary_padding_luma(
 mod tests {
     use super::*;
     use crate::sample_padding::{
-        horizontal_repetitive_padding_luma, SamplePresence, CHROMA_SIDE, LUMA_SIDE,
+        CHROMA_SIDE, LUMA_SIDE, SamplePresence, horizontal_repetitive_padding_luma,
     };
     use crate::vertical_padding::vertical_repetitive_padding_luma;
 

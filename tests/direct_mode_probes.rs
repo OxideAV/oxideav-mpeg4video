@@ -48,7 +48,7 @@
 use oxideav_mpeg4video::compat::DecodeOptions;
 use oxideav_mpeg4video::decoder::Mpeg4VideoDecoder;
 use oxideav_mpeg4video::vol::parse_video_object_layer;
-use oxideav_mpeg4video::vop::{parse_video_object_plane_header, VopContext};
+use oxideav_mpeg4video::vop::{VopContext, parse_video_object_plane_header};
 
 const MB_COLS: usize = 4;
 const MB_ROWS: usize = 4;

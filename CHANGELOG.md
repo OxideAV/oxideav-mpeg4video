@@ -6,6 +6,10 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- edition 2024, MSRV 1.95
+
 ## [0.1.8](https://github.com/OxideAV/oxideav-mpeg4video/compare/v0.1.7...v0.1.8) - 2026-09-11
 
 ### Other
@@ -494,7 +498,6 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   edges) across qp {1, 13, 31}, both quantisation methods, partial-
   edge and single-macroblock grids, in I/P/I/P GOPs — every stream
   self-decodes sample-exact against the closed-loop reconstructions.
-
 
 - **P-VOP encoder end-to-end (round 438, stage 6)** — `pvop_encode`:
   §7.6 motion estimation (±8-pel full-search SAD with §7.6.4

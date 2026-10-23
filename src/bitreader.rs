@@ -72,7 +72,7 @@ impl<'a> BitReader<'a> {
 
     /// Whether `bit_pos` currently lies on a byte boundary.
     pub fn is_byte_aligned(&self) -> bool {
-        self.bit_pos % 8 == 0
+        self.bit_pos.is_multiple_of(8)
     }
 
     /// Skip `n` bits without returning their value.

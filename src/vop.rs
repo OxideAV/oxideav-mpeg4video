@@ -55,7 +55,7 @@
 //! `scalability=false`.
 
 use crate::bitreader::{BitReader, BitReaderError};
-use crate::sprite::{decode_sprite_trajectory, SpriteTrajectory, SpriteTrajectoryError};
+use crate::sprite::{SpriteTrajectory, SpriteTrajectoryError, decode_sprite_trajectory};
 use crate::vol::{SpriteEnable, VolHeader, VolParseError};
 
 /// Start code for a `Group_of_VideoObjectPlane()` (§6.2.4 / §6.3.4 —
@@ -681,7 +681,7 @@ mod tests {
             assert!(n <= 32);
             for i in (0..n).rev() {
                 let bit = ((value >> i) & 1) as u8;
-                if self.bit_pos % 8 == 0 {
+                if self.bit_pos.is_multiple_of(8) {
                     self.buf.push(0);
                 }
                 let byte = self.buf.last_mut().unwrap();
@@ -693,7 +693,7 @@ mod tests {
             self.write_bits(1, 1);
         }
         fn align(&mut self) {
-            while self.bit_pos % 8 != 0 {
+            while !self.bit_pos.is_multiple_of(8) {
                 self.write_bits(0, 1);
             }
         }
@@ -711,7 +711,7 @@ mod tests {
         let mut w = BitWriter::new();
         w.write_bits(VOP_START_CODE, 32);
         w.write_bits(0b00, 2); // vop_coding_type = I
-                               // modulo_time_base: `modulo` 1-bits, then a 0.
+        // modulo_time_base: `modulo` 1-bits, then a 0.
         for _ in 0..modulo {
             w.write_bits(1, 1);
         }
@@ -721,8 +721,8 @@ mod tests {
         w.write_bits(time_increment, bits);
         w.write_marker();
         w.write_bits(1, 1); // vop_coded = 1
-                            // I-VOP: no vop_rounding_type.
-                            // intra_dc_vlc_thr.
+        // I-VOP: no vop_rounding_type.
+        // intra_dc_vlc_thr.
         w.write_bits(intra_dc, 3);
         // (interlaced = false → no top_field_first / alt_vert_scan)
         w.write_bits(quant, 5);
@@ -759,7 +759,7 @@ mod tests {
         w.write_bits(0, bits);
         w.write_marker();
         w.write_bits(1, 1); // vop_coded
-                            // B-VOP is not P / not S(GMC) → no vop_rounding_type.
+        // B-VOP is not P / not S(GMC) → no vop_rounding_type.
         w.write_bits(0, 3); // intra_dc_vlc_thr
         w.write_bits(quant, 5);
         w.write_bits(fcode_fwd, 3);
@@ -800,12 +800,12 @@ mod tests {
         w.write_bits(1, 1); // vop_coded
         w.write_bits(0, 1); // vop_rounding_type (present: S && GMC)
         w.write_bits(0, 3); // intra_dc_vlc_thr
-                            // sprite_trajectory(): 2 points.
+        // sprite_trajectory(): 2 points.
         write_warping(&mut w, 1, 1); // du0 = +1
         write_warping(&mut w, 1, 0); // dv0 = -1
         write_warping(&mut w, 2, 0b11); // du1 = +3
         write_warping(&mut w, 2, 0b01); // dv1 = -2
-                                        // No brightness_change (GMC). Continue as a P-VOP.
+        // No brightness_change (GMC). Continue as a P-VOP.
         w.write_bits(quant, 5); // vop_quant
         w.write_bits(fcode_fwd, 3); // vop_fcode_forward (S != I)
         w.align();

@@ -545,7 +545,7 @@ impl PacketWriter {
 mod tests {
     use super::*;
     use crate::bitreader::BitReader;
-    use crate::video_packet::{parse_video_packet_header, VideoPacketContext};
+    use crate::video_packet::{VideoPacketContext, parse_video_packet_header};
 
     fn info(coding_type: VopCodingType) -> PacketVopInfo {
         PacketVopInfo {

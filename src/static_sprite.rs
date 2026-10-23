@@ -51,11 +51,7 @@ fn div_floor(n: i64, d: i64) -> i64 {
     debug_assert!(d > 0);
     let q = n / d;
     let r = n % d;
-    if r < 0 {
-        q - 1
-    } else {
-        q
-    }
+    if r < 0 { q - 1 } else { q }
 }
 
 /// `// ` operator (§3.4): integer division with rounding to nearest,

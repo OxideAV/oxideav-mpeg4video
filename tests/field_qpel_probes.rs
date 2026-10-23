@@ -202,8 +202,8 @@ fn build_probe(cfg: &ProbeCfg) -> Vec<u8> {
             w.write_bits(0, 1); // not_coded = 0
             w.write_bits(0b1, 1); // mcbpc: inter, cbpc 00 (Table B.7)
             w.write_bits(0b11, 2); // cbpy: inter pattern 0 (Table B.8)
-                                   // interlaced_information(): cbp == 0 and derived_mb_type 0
-                                   // → no dct_type bit (§6.2.6.3 first gate).
+            // interlaced_information(): cbp == 0 and derived_mb_type 0
+            // → no dct_type bit (§6.2.6.3 first gate).
             w.write_bits(1, 1); // field_prediction = 1
             w.write_bits(u32::from(cfg.refs.0), 1); // forward_top_field_reference
             w.write_bits(u32::from(cfg.refs.1), 1); // forward_bottom_field_reference

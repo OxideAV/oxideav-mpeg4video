@@ -293,11 +293,7 @@ fn reconstruct_component(mv_data: i32, residual: i32, f: i32) -> i32 {
         mv_data
     } else {
         let magnitude = (mv_data.abs() - 1) * f + residual + 1;
-        if mv_data < 0 {
-            -magnitude
-        } else {
-            magnitude
-        }
+        if mv_data < 0 { -magnitude } else { magnitude }
     }
 }
 
@@ -1490,7 +1486,7 @@ mod tests {
         fn write_bits(&mut self, value: u32, n: usize) {
             for i in (0..n).rev() {
                 let bit = ((value >> i) & 1) as u8;
-                if self.bit_pos % 8 == 0 {
+                if self.bit_pos.is_multiple_of(8) {
                     self.buf.push(0);
                 }
                 let byte = self.buf.last_mut().unwrap();
@@ -1499,7 +1495,7 @@ mod tests {
             }
         }
         fn align(&mut self) {
-            while self.bit_pos % 8 != 0 {
+            while !self.bit_pos.is_multiple_of(8) {
                 self.write_bits(0, 1);
             }
         }
@@ -2001,7 +1997,7 @@ mod tests {
 
     #[test]
     fn case3_field_current_mixed_neighbours_feed_field_reconstruct() {
-        use crate::field_motion::{reconstruct_field_motion_vectors, FieldMotionVectors};
+        use crate::field_motion::{FieldMotionVectors, reconstruct_field_motion_vectors};
         // CASE 3: current field-predicted, at least one neighbour field
         // predicted. MV1 frame (2,4); MV2 field MVf1=(8,8),MVf2=(4,4) →
         // (Div2Round(12),Div2Round(12))=(6,6); MV3 frame (10,2).

@@ -57,11 +57,11 @@
 
 use crate::bitreader::{BitReader, BitReaderError};
 use crate::interlaced_information::{
-    parse_interlaced_information, InterlacedInfoContext, InterlacedInformation,
+    InterlacedInfoContext, InterlacedInformation, parse_interlaced_information,
 };
 use crate::motion::{
-    decode_field_motion_vector_pair, decode_motion_vector_delta, FieldMvPair, MotionParseError,
-    MotionVectorDelta, MvMode,
+    FieldMvPair, MotionParseError, MotionVectorDelta, MvMode, decode_field_motion_vector_pair,
+    decode_motion_vector_delta,
 };
 use crate::vol::VolHeader;
 use crate::vop::VopCodingType;
@@ -430,12 +430,12 @@ pub fn parse_b_vop_mb_header(
     // the block the format defaults to 4:2:0 (the only non-reserved
     // value per §6.2.3). The round-94 cbpb decode is pinned to
     // block_count == 6 (4:2:0 rectangular).
-    if let Some(ctrl) = vol.vol_control {
-        if ctrl.chroma_format != 0b01 {
-            return Err(BVopMbParseError::UnsupportedChromaFormat(
-                ctrl.chroma_format,
-            ));
-        }
+    if let Some(ctrl) = vol.vol_control
+        && ctrl.chroma_format != 0b01
+    {
+        return Err(BVopMbParseError::UnsupportedChromaFormat(
+            ctrl.chroma_format,
+        ));
     }
 
     let (_modb_bits, modb, mb_type_present, cbpb_present) = decode_modb(br)?;
@@ -712,7 +712,7 @@ mod tests {
         fn write_bits(&mut self, value: u32, n: usize) {
             for i in (0..n).rev() {
                 let bit = ((value >> i) & 1) as u8;
-                if self.bit_pos % 8 == 0 {
+                if self.bit_pos.is_multiple_of(8) {
                     self.buf.push(0);
                 }
                 let byte = self.buf.last_mut().unwrap();
@@ -721,7 +721,7 @@ mod tests {
             }
         }
         fn align(&mut self) {
-            while self.bit_pos % 8 != 0 {
+            while !self.bit_pos.is_multiple_of(8) {
                 self.write_bits(0, 1);
             }
         }
@@ -1086,8 +1086,8 @@ mod tests {
         let mut w = BitWriter::new();
         w.write_bits(0b01, 2); // modb
         w.align(); // pads to one byte; mb_type window is empty
-                   // But the byte is now 0b0100_0000 — when we read modb=01, the
-                   // next 6 bits are zeros (no valid mb_type in Table B.4).
+        // But the byte is now 0b0100_0000 — when we read modb=01, the
+        // next 6 bits are zeros (no valid mb_type in Table B.4).
         let data = w.buf;
         let mut br = BitReader::new(&data);
         let err = parse_b_vop_mb_header(&mut br, &make_vol(), VopCodingType::B, BMbTypeTable::B4)
@@ -1103,10 +1103,10 @@ mod tests {
         w.write_bits(0b00, 2);
         w.write_bits(0b0001, 4); // mb_type = Forward
         w.write_bits(0b100000, 6); // cbpb non-zero
-                                   // Total bits so far: 12 → 1.5 bytes; ends at bit 12, byte
-                                   // boundary at 16. We deliberately allocate only those 12
-                                   // bits (truncated by clamping the buffer to the bit count
-                                   // already consumed).
+        // Total bits so far: 12 → 1.5 bytes; ends at bit 12, byte
+        // boundary at 16. We deliberately allocate only those 12
+        // bits (truncated by clamping the buffer to the bit count
+        // already consumed).
         let bits_consumed: usize = 12;
         let bytes_needed = bits_consumed.div_ceil(8);
         let mut data = w.buf;

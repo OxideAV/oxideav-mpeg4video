@@ -38,9 +38,9 @@
 
 use crate::bitreader::BitReader;
 use crate::macroblock::{
-    decode_cbpy4, decode_mcbpc, DerivedMbType, MacroblockParseError, MCBPC_I, MCBPC_P,
+    DerivedMbType, MCBPC_I, MCBPC_P, MacroblockParseError, decode_cbpy4, decode_mcbpc,
 };
-use crate::texture::{decode_intra_dc, DcComponent, TextureParseError};
+use crate::texture::{DcComponent, TextureParseError, decode_intra_dc};
 
 /// §6.3.5 `dc_marker` — `110 1011 0000 0000 0001`, 19 bits. Inserted
 /// after the §6.2.5.3 first partition of a data-partitioned I-VOP.
@@ -308,7 +308,7 @@ pub fn decode_motion_coding(
     mb_type: DerivedMbType,
     vop_fcode_forward: u8,
 ) -> Result<Vec<crate::motion::MotionVectorDelta>, crate::motion::MotionParseError> {
-    use crate::motion::{decode_motion_vector_delta, MvMode};
+    use crate::motion::{MvMode, decode_motion_vector_delta};
     let count = if matches!(mb_type, DerivedMbType::Inter4V) {
         4
     } else {
@@ -802,7 +802,7 @@ mod tests {
 
     #[test]
     fn i_vop_data_partitioned_to_rvlc_recovery_end_to_end() {
-        use crate::rvlc_recovery::{recover_video_packet_dct, RvlcRecovery};
+        use crate::rvlc_recovery::{RvlcRecovery, recover_video_packet_dct};
         // Build a data-partitioned, reversible-VLC I-VOP packet with two
         // intra MBs, each with exactly one coded luma block (block 0):
         //   cbpy intra 1000 → block 0 coded only → Table B.8 code "0001 0"

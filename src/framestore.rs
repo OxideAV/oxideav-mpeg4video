@@ -34,7 +34,7 @@
 //! separate follow-up, tracked in the crate README).
 
 use crate::half_sample::ReferenceVop;
-use crate::reconstruct::{ReconstructedMacroblock, MACROBLOCK_CHROMA_SIDE, MACROBLOCK_LUMA_SIDE};
+use crate::reconstruct::{MACROBLOCK_CHROMA_SIDE, MACROBLOCK_LUMA_SIDE, ReconstructedMacroblock};
 use crate::vop::VopCodingType;
 
 /// Errors from frame-store construction and macroblock blitting.
@@ -104,8 +104,8 @@ impl DecodedFrame {
     ) -> Result<Self, FrameStoreError> {
         if width == 0
             || height == 0
-            || width % MACROBLOCK_LUMA_SIDE != 0
-            || height % MACROBLOCK_LUMA_SIDE != 0
+            || !width.is_multiple_of(MACROBLOCK_LUMA_SIDE)
+            || !height.is_multiple_of(MACROBLOCK_LUMA_SIDE)
         {
             return Err(FrameStoreError::InvalidDimensions { width, height });
         }

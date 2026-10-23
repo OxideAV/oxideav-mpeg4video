@@ -7,7 +7,7 @@
 use oxideav_mpeg4video::decoder::Mpeg4VideoDecoder;
 use oxideav_mpeg4video::framestore::{DecodedFrame, FrameStore};
 use oxideav_mpeg4video::ivop_encode::{
-    encode_i_vop, write_configuration_headers, EncoderConfig, FrameView,
+    EncoderConfig, FrameView, encode_i_vop, write_configuration_headers,
 };
 use oxideav_mpeg4video::svop_encode::{encode_s_vop, reconstruct_own_s_vop_with_motion};
 use oxideav_mpeg4video::vol::parse_video_object_layer;

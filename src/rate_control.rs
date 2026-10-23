@@ -486,34 +486,33 @@ impl BudgetPlanner {
             self.left = self.gop_counts();
         }
         let idx = class.index();
-        if class == VopClass::B {
-            if let Some((remaining, pending)) = self.prev_gop {
-                if pending > 0 {
-                    // A B-VOP owed by the previous GOP: an equal split
-                    // of what that GOP has left.
-                    self.current_prev = true;
-                    let target = (remaining / f64::from(pending))
-                        .min(occupancy * 0.9)
-                        .min(buffer_bits * 0.9)
-                        .max(self.bits_per_frame * 0.05)
-                        .max(64.0);
-                    let qp = match self.two_pass_qp(class, target) {
-                        Some(q) => q,
-                        None => match self.complexity[idx] {
-                            Some(x) => (x / target).round(),
-                            None => f64::from(self.seed_qp(class)),
-                        },
-                    };
-                    let last = f64::from(self.last_qp[idx]);
-                    let qp = qp.clamp(last - 4.0, last + 4.0).clamp(1.0, 31.0) as u32;
-                    let plan = VopPlan {
-                        qp,
-                        target_bits: target.round() as u32,
-                    };
-                    self.current = Some((class, plan));
-                    return plan;
-                }
-            }
+        if class == VopClass::B
+            && let Some((remaining, pending)) = self.prev_gop
+            && pending > 0
+        {
+            // A B-VOP owed by the previous GOP: an equal split
+            // of what that GOP has left.
+            self.current_prev = true;
+            let target = (remaining / f64::from(pending))
+                .min(occupancy * 0.9)
+                .min(buffer_bits * 0.9)
+                .max(self.bits_per_frame * 0.05)
+                .max(64.0);
+            let qp = match self.two_pass_qp(class, target) {
+                Some(q) => q,
+                None => match self.complexity[idx] {
+                    Some(x) => (x / target).round(),
+                    None => f64::from(self.seed_qp(class)),
+                },
+            };
+            let last = f64::from(self.last_qp[idx]);
+            let qp = qp.clamp(last - 4.0, last + 4.0).clamp(1.0, 31.0) as u32;
+            let plan = VopPlan {
+                qp,
+                target_bits: target.round() as u32,
+            };
+            self.current = Some((class, plan));
+            return plan;
         }
         if self.left[idx] == 0 {
             // A truncated GOP at flush: extend the budget by one frame.
@@ -707,15 +706,15 @@ impl BudgetPlanner {
             self.left[idx] = self.left[idx].saturating_sub(1);
         }
         self.spent += bits as f64;
-        if let Some((stats, next, planned_ahead)) = self.plan.as_mut() {
-            if let Some(rec) = stats.frames.get(*next) {
-                if rec.class == class {
-                    *planned_ahead -= rec.complexity() / Self::class_ratio(class);
-                    *next += 1;
-                } else {
-                    // Structure mismatch: abandon the plan.
-                    *next = stats.frames.len();
-                }
+        if let Some((stats, next, planned_ahead)) = self.plan.as_mut()
+            && let Some(rec) = stats.frames.get(*next)
+        {
+            if rec.class == class {
+                *planned_ahead -= rec.complexity() / Self::class_ratio(class);
+                *next += 1;
+            } else {
+                // Structure mismatch: abandon the plan.
+                *next = stats.frames.len();
             }
         }
     }
