@@ -1794,12 +1794,15 @@ pub(crate) fn gmc_averaged_mv(
     let mut amv =
         averaged_motion_vector(&mvs_x, &mvs_y, geometry.s as u32, quarter_sample, vop_fcode)
             .map_err(|e| VopDecodeError::Motion(PvopMvError::Motion(e)))?;
-    if ecosystem_compat {
-        // Compat divergence 3 (`crate::compat`): the deployed ecosystem
+    if ecosystem_compat && geometry.s == 2 && geometry.is_translation() {
+        // Compat divergence 3 (`crate::compat`): for a translational
+        // warp at half-sample sprite accuracy the deployed ecosystem
         // derives each non-positive AMV component one MV-grid unit
         // lower than the §7.8.7.3 quantisation (strictly positive
         // components exact; measured on crafted GMC-neighbour probes at
-        // both half- and quarter-sample, zero included: 0 → −1).
+        // both half- and quarter-sample, zero included: 0 → −1). Finer
+        // accuracies and non-translational warps follow §7.8.7.3
+        // (measured against XviD GMC streams at 1/16 sample).
         // Re-clip to the Table 7-9 range afterwards.
         let f = 1i32 << (vop_fcode - 1);
         let (low, high) = (-32 * f, 32 * f - 1);
@@ -2903,5 +2906,34 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    fn geometry(
+        points: [[i32; 2]; 3],
+        accuracy: crate::vol::SpriteWarpingAccuracy,
+    ) -> WarpGeometry {
+        let trajectory = crate::sprite::SpriteTrajectory { count: 3, points };
+        WarpGeometry::decode(&trajectory, 176, 144, accuracy)
+    }
+
+    /// Compat divergence 3 is the deployed decoders' translation-only, half-sample-accuracy path:
+    /// warps they evaluate pel by pel (zoom) and translations at finer accuracies average exactly
+    /// as §7.8.7.3 says, non-positive components included.
+    #[test]
+    fn compat_amv_matches_the_spec_for_finer_accuracy_warps() {
+        use crate::vol::SpriteWarpingAccuracy::SixteenthPel;
+        let zoom = geometry([[-9, -7], [18, 0], [0, 15]], SixteenthPel);
+        let pan = geometry([[-20, -10], [0, 0], [0, 0]], SixteenthPel);
+        for (name, geo) in [("zoom", zoom), ("pan", pan)] {
+            for (mb_x, mb_y) in [(0, 0), (16, 0), (0, 16), (32, 32)] {
+                let spec = gmc_averaged_mv(&geo, mb_x, mb_y, false, 1, false).unwrap();
+                let compat = gmc_averaged_mv(&geo, mb_x, mb_y, false, 1, true).unwrap();
+                assert!(
+                    spec.x <= 0 && spec.y <= 0,
+                    "{name} ({mb_x}, {mb_y}): probe is non-positive"
+                );
+                assert_eq!(compat, spec, "{name} ({mb_x}, {mb_y})");
+            }
+        }
     }
 }

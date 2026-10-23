@@ -210,6 +210,18 @@ impl WarpGeometry {
         }
     }
 
+    /// Whether the warp moves every pel by the same vector (point 0's), so `F − s·i` and `G − s·j`
+    /// are constant: one point, or two/three points whose virtual points sit exactly where a pure
+    /// translation of the VOP corners puts them (all higher-order coefficients zero).
+    pub fn is_translation(&self) -> bool {
+        let [x, y] = [self.r * self.p0[0], self.r * self.p0[1]];
+        match self.points {
+            0 | 1 => true,
+            2 => self.v1 == [x + 16 * self.w_prime, y],
+            _ => self.v1 == [x + 16 * self.w_prime, y] && self.v2 == [x, y + 16 * self.h_prime],
+        }
+    }
+
     /// §7.8.5 luminance warp: map VOP pixel `(i, j)` to the sub-pel
     /// reference coordinate `(F, G)` in `1/s`-pel units. `i0 = j0 = 0`
     /// for the rectangular shape, so `I = i`, `J = j`.

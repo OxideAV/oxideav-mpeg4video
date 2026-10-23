@@ -54,7 +54,14 @@
 //!    on crafted GMC-neighbour + zero-MVD-local probes at half-sample
 //!    (du −2→−3, −3→−4, −4→−5, −10→−11, 0→−1) and quarter-sample
 //!    (−6→−7, −8→−9, −18→−19, −20→−21); pinned bit-exact by the
-//!    `dec_sgmc_*` fixture pairs (`tests/compat_gmc_amv.rs`).
+//!    `dec_sgmc_*` fixture pairs (`tests/compat_gmc_amv.rs`). Those
+//!    probes are one-point (translational) warps at half-sample sprite
+//!    accuracy, and the adjustment applies only there: XviD GMC streams
+//!    (three warping points at 1/16-sample accuracy, both zooms and
+//!    pure pans) decode like the reference with the §7.8.7.3 value,
+//!    non-positive components included. This matches a rounding right
+//!    shift by the sprite accuracy that biases non-positive values by
+//!    one only when the shift is zero.
 //!
 //! Everything else decodes identically in both modes. The switch is
 //! wired through every public decode surface: the
@@ -81,9 +88,10 @@ pub struct DecodeOptions {
     ///   reference fields keep the co-located selections);
     /// * the §7.4.4.5 method-1 mismatch toggle is skipped on intra
     ///   blocks (non-intra blocks keep it);
-    /// * each non-positive §7.8.7.3 GMC averaged-MV component is
-    ///   derived one MV-grid unit lower than the spec quantisation
-    ///   (zero included: 0 → −1).
+    /// * for a translational warp at half-sample sprite accuracy, each
+    ///   non-positive §7.8.7.3 GMC averaged-MV component is derived one
+    ///   MV-grid unit lower than the spec quantisation (zero included:
+    ///   0 → −1).
     ///
     /// When `false` (the default) all three clauses follow the printed
     /// specification text.
