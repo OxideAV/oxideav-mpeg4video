@@ -2,14 +2,14 @@
 //! deployed decoder ecosystem disagree.
 //!
 //! This crate's default behaviour is always the **literal
-//! specification text**. For three clauses, black-box comparison
+//! specification text**. For four clauses, black-box comparison
 //! against reference decodes of conformant streams (pixel-level output
 //! comparison only — no implementation source was consulted) shows the
 //! deployed ecosystem behaves differently, so real-world streams
 //! produced/consumed by that ecosystem reconstruct slightly
 //! differently from the printed clauses. [`DecodeOptions`] carries the
 //! opt-in **ecosystem-compat** switch that reproduces the observed
-//! behaviour bit-for-bit; it covers exactly these three divergences:
+//! behaviour bit-for-bit; it covers exactly these four divergences:
 //!
 //! 1. **§7.7.2.2 interlaced direct mode.** The spec derives the four
 //!    field motion vectors "from the forward field motion vectors of
@@ -63,6 +63,17 @@
 //!    shift by the sprite accuracy that biases non-positive values by
 //!    one only when the shift is zero.
 //!
+//! 4. **§7.6.9.5.1 direct mode over a coded GMC macroblock.** This
+//!    crate reads the spec as giving a co-located S(GMC) macroblock
+//!    coded with `mcsel == 1` no local vector, so a direct-mode B
+//!    macroblock falls back to the zero vector (only a skipped GMC
+//!    macroblock gets the §7.6.9.6 averaged-MV substitution). Reference
+//!    decodes of libxvid GMC streams with B-VOPs (`-gmc 1 -bf 1` and
+//!    `-bf 2`) use the coded macroblock's §7.8.7.3 averaged motion
+//!    vector too: with the zero vector, isolated B-VOP macroblocks
+//!    differed by up to 66 per sample; with the averaged vector the
+//!    streams match within IDCT drift.
+//!
 //! Everything else decodes identically in both modes. The switch is
 //! wired through every public decode surface: the
 //! [`crate::vop_decode`] macroblock walks take a [`DecodeOptions`]
@@ -80,7 +91,7 @@
 pub struct DecodeOptions {
     /// Opt-in ecosystem-compat mode. When `true` the decoder
     /// reproduces the black-box-observed ecosystem behaviour on
-    /// exactly three clauses:
+    /// exactly four clauses:
     ///
     /// * §7.7.2.2 interlaced-direct derivation runs with the
     ///   co-located field motion vectors read as zero
@@ -91,9 +102,12 @@ pub struct DecodeOptions {
     /// * for a translational warp at half-sample sprite accuracy, each
     ///   non-positive §7.8.7.3 GMC averaged-MV component is derived one
     ///   MV-grid unit lower than the spec quantisation (zero included:
-    ///   0 → −1).
+    ///   0 → −1);
+    /// * a co-located S(GMC) macroblock coded with `mcsel == 1` supplies
+    ///   its §7.8.7.3 averaged motion vector to direct mode, as a skipped
+    ///   one does.
     ///
-    /// When `false` (the default) all three clauses follow the printed
+    /// When `false` (the default) all four clauses follow the printed
     /// specification text.
     pub ecosystem_compat: bool,
 }

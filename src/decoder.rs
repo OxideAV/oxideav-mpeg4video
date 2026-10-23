@@ -518,7 +518,8 @@ impl Mpeg4VideoDecoder {
                 } else {
                     decode_s_gmc_vop_macroblocks(&mut br, &vol, &vop, self.options)?
                 };
-                self.anchor_motion = Some(motion_of_s_entries(&entries));
+                self.anchor_motion =
+                    Some(motion_of_s_entries(&entries, self.options.ecosystem_compat));
                 out.extend(self.sequence.push_s_gmc_vop(
                     mb_width,
                     mb_height,
@@ -754,8 +755,10 @@ fn motion_of_p_entries(entries: &[PVopMbContent]) -> Vec<AnchorMbMotion> {
 ///   zero-MV path.
 /// * A **coded** GMC macroblock and an intra macroblock carry no local
 ///   vector — they resolve to the §7.6.9.5.1 zero-vector fallback
-///   (represented as `Intra` for the co-located adapter).
-fn motion_of_s_entries(entries: &[SGmcMbContent]) -> Vec<AnchorMbMotion> {
+///   (represented as `Intra` for the co-located adapter). Under
+///   `ecosystem_compat` (compat divergence 4, `crate::compat`) a coded
+///   GMC macroblock carries its averaged motion vector as well.
+fn motion_of_s_entries(entries: &[SGmcMbContent], ecosystem_compat: bool) -> Vec<AnchorMbMotion> {
     entries
         .iter()
         .map(|e| match e {
@@ -770,15 +773,12 @@ fn motion_of_s_entries(entries: &[SGmcMbContent]) -> Vec<AnchorMbMotion> {
                 top_ref: *top_field_ref,
                 bottom_ref: *bottom_field_ref,
             },
-            SGmcMbContent::Gmc {
-                amv,
-                not_coded: true,
-                ..
-            } => AnchorMbMotion::Frame(PvopMbMotion::OneMv(*amv)),
-            SGmcMbContent::Gmc {
-                not_coded: false, ..
+            SGmcMbContent::Gmc { amv, not_coded, .. } if *not_coded || ecosystem_compat => {
+                AnchorMbMotion::Frame(PvopMbMotion::OneMv(*amv))
             }
-            | SGmcMbContent::Intra(_) => AnchorMbMotion::Frame(PvopMbMotion::Intra),
+            SGmcMbContent::Gmc { .. } | SGmcMbContent::Intra(_) => {
+                AnchorMbMotion::Frame(PvopMbMotion::Intra)
+            }
         })
         .collect()
 }
@@ -1729,7 +1729,7 @@ mod registry_tests {
                 cr: [[0; 8]; 8],
             }),
         ];
-        let motion = motion_of_s_entries(&entries);
+        let motion = motion_of_s_entries(&entries, false);
         assert_eq!(motion[0], AnchorMbMotion::Frame(PvopMbMotion::OneMv(amv)));
         assert_eq!(motion[1], AnchorMbMotion::Frame(PvopMbMotion::Intra));
         assert_eq!(
@@ -1737,5 +1737,13 @@ mod registry_tests {
             AnchorMbMotion::Frame(PvopMbMotion::OneMv(MotionVector { x: 1, y: 2 }))
         );
         assert_eq!(motion[3], AnchorMbMotion::Frame(PvopMbMotion::Intra));
+
+        // Compat divergence 4: a coded GMC macroblock also carries its
+        // averaged motion vector as the co-located vector.
+        let compat = motion_of_s_entries(&entries, true);
+        assert_eq!(compat[0], motion[0]);
+        assert_eq!(compat[1], AnchorMbMotion::Frame(PvopMbMotion::OneMv(amv)));
+        assert_eq!(compat[2], motion[2]);
+        assert_eq!(compat[3], motion[3]);
     }
 }
