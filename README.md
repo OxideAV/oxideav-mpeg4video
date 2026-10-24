@@ -298,6 +298,27 @@ module docs carry the full write-up):
    follow §7.8.7.3 in both modes and decode bit-exact against the
    reference that way.
 
+Within tolerance, also switched by the compat mode: **IDCT exact
+half-integers.** Annex A bounds the IDCT by accuracy only (peak error
+≤ 1 against the mathematical transform), so an exact half-integer may
+round either way. The default rounds it away from zero (§4's
+half-integer convention); ecosystem-compat rounds it to the **even**
+neighbour, as the reference decodes do (202.5 → 202, 203.5 → 204).
+These halves are common, not corner cases: a DC-only block is
+`F[0][0] / 8`, a half-integer whenever `dc_scaler · QF[0][0] ≡ 4
+(mod 8)` — most quantisers above 4. On a plain 300-frame
+reference-encoder AVI (qscale 2–31 under rate control) this alone took
+the default decode to 5/300 frames identical with the floating-point
+reference decode (mean error 0.09, from tie drift through P chains);
+the compat decode matches 270/300 frames exactly (peak 1, mean
+< 0.0001). Pinned by `ties_q6_96x64` (`compat_idct_rounds_exact_halves_to_even`).
+The remaining distance to a *default* reference decode is that
+decoder's own integer IDCT, which differs from its floating-point one
+by the same amount (peak 1 per intra pass, 0.25–0.6 % of samples,
+drifting to peak 3 inside a 12-frame GOP) — inside the Annex A bound.
+Both modes keep the mathematical Annex A.1 transform; no integer IDCT
+is offered.
+
 Not a divergence: §7.6.9.5.1 makes a co-located S(GMC) macroblock with
 `mcsel == 1` — coded or skipped — supply its §7.8.7.3 averaged motion
 vector to B-VOP direct mode, and both modes follow it (black-box GMC
@@ -317,7 +338,7 @@ Measured effect (`tests/conformance.rs` `compat_*` pins): the
 `mpeg_quant` I/P/B stream collapses from a 3062-sample envelope to 4
 near-tie samples, the interlaced I/P/B stream from 650 samples to 7
 near-ties, and the 176×144 interlaced-direct stream from 6202 samples
-(max 114) to 2777 (0.29 %, max 64) with 29/30 interlaced-direct
+(max 114) to 380 (0.04 %, max 64, 22/25 frames exact) with 29/30 interlaced-direct
 macroblocks bit-exact, and the interlaced qpel-IPB stream (whose
 direct macroblocks compensate through the §7.6.2.2 field cascade)
 from 582 samples to **fully bit-exact** — the single 176×144 residual

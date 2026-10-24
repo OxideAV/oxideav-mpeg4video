@@ -63,6 +63,17 @@
 //!    shift by the sprite accuracy that biases non-positive values by
 //!    one only when the shift is zero.
 //!
+//! Within tolerance, not a divergence: Annex A bounds the IDCT by
+//! accuracy only, so an exact half-integer result may round to either
+//! neighbour. The default rounds it away from zero (§4's convention for
+//! half-integers); ecosystem-compat rounds it to the even neighbour, as
+//! black-box reference decodes do on every DC-only block whose
+//! `F[0][0] / 8` is a half-integer (202.5 → 202, 203.5 → 204). These
+//! halves arise at most quantisers above 4 (`dc_scaler` not 8 or 16),
+//! so on plain ecosystem-encoded streams this choice alone separates
+//! 4–25 % of an I-VOP's samples by one and then drifts through the
+//! prediction chain.
+//!
 //! Not a divergence: §7.6.9.5.1 gives a co-located S(GMC) macroblock
 //! with `mcsel == 1` (coded or skipped) its §7.8.7.3 averaged motion
 //! vector as the direct-mode MV, and both modes do exactly that; the
@@ -98,6 +109,11 @@ pub struct DecodeOptions {
     ///   MV-grid unit lower than the spec quantisation (zero included:
     ///   0 → −1).
     ///
+    /// It also resolves exact half-integer IDCT results to the even
+    /// neighbour ([`crate::idct::HalfIntegerRounding::ToEven`]), a
+    /// choice inside the Annex A accuracy tolerance rather than a
+    /// divergence from the text.
+    ///
     /// When `false` (the default) all three clauses follow the printed
     /// specification text.
     pub ecosystem_compat: bool,
@@ -115,6 +131,15 @@ impl DecodeOptions {
     pub const fn ecosystem() -> Self {
         Self {
             ecosystem_compat: true,
+        }
+    }
+
+    /// How the IDCT resolves exact half-integers under these options.
+    pub const fn idct_rounding(self) -> crate::idct::HalfIntegerRounding {
+        if self.ecosystem_compat {
+            crate::idct::HalfIntegerRounding::ToEven
+        } else {
+            crate::idct::HalfIntegerRounding::AwayFromZero
         }
     }
 }

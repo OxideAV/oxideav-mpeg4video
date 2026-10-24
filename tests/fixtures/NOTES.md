@@ -534,6 +534,23 @@ B-VOPs change nothing). No reference decode is therefore committed
 for the combination; the crate keeps the printed syntax on both sides
 and validates it through its own decoder walk.
 
+## IDCT half-integer rounding (round 480)
+
+* `ties_q6_96x64` — plain reference-encoder stream at `-qscale:v 6`
+  (I P P P P I P P P P). At this quantiser the luminance `dc_scaler`
+  is 12 (Table 7-1), so every DC-only block with an odd `QF[0][0]`
+  reconstructs `F[0][0] / 8` to an exact half-integer. The reference
+  decode resolves those halves to the even neighbour, the default
+  decode away from zero (both inside the Annex A tolerance): the
+  ecosystem-compat decode is **bit-exact**, the default one differs on
+  8262 samples, every one by exactly 1 (`tests/conformance.rs`
+  `compat_idct_rounds_exact_halves_to_even`).
+
+```
+ffmpeg -f lavfi -i testsrc2=s=96x64:r=25 -frames:v 10 -c:v mpeg4 -g 5 -bf 0 -qscale:v 6 -f m4v ties_q6_96x64.m4v
+ffmpeg -idct faani -i ties_q6_96x64.m4v -f rawvideo -pix_fmt yuv420p ties_q6_96x64.yuv
+```
+
 ## SHA-256
 
 ```
@@ -660,6 +677,8 @@ f958498a6b00db8595f0be1c28f77e042f8e7c4ef8fc863bb0b05537d76c30a0  enc_ip_dp_aq_9
 ff158355952caa09f49da26d6cd2921047cc978e6d8f15bbd4f1fccc413bcd7c  enc_ipb_rc2pass_96x64.yuv
 c407e135be4af439fe00668e2f834d25926206712160905ef2d761e1218e3c33  enc_ilaced_rcbudget_compat_96x64.m4v
 12820f2bd515910304cf3aea92d2dfbff60d8aebb48b47133261657b8293a740  enc_ilaced_rcbudget_compat_96x64.yuv
+b7ea047a2b675e23c06baf2dfc6f00cc60fa105f37b89bd609c5578e3888c854  ties_q6_96x64.m4v
+aadaa7fd85f1455ad6a5a75a416c41b1906db567393439151a55803d9c699154  ties_q6_96x64.yuv
 ```
 
 (Note: `aic_ipb_64x64.yuv` and `altscan_ipb_64x64.yuv` are

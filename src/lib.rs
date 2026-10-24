@@ -517,7 +517,9 @@ pub use half_sample::{
     ReferenceVop, fetch_clamped_sample, interpolate_block, interpolate_block_into,
     interpolate_pixel, split_half_pel,
 };
-pub use idct::{idct_8x8, idct_saturation_bounds, saturate_idct_sample};
+pub use idct::{
+    HalfIntegerRounding, idct_8x8, idct_8x8_rounded, idct_saturation_bounds, saturate_idct_sample,
+};
 #[doc(hidden)]
 pub use interlaced_information::{
     DctType, FieldPrediction, FieldReference, InterlacedInfoContext, InterlacedInfoContextError,

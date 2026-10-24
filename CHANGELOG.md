@@ -13,6 +13,8 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- ecosystem-compat IDCT rounding: exact half-integer IDCT results round to the even neighbour (`idct_8x8_rounded` + `HalfIntegerRounding::ToEven`), matching black-box reference decodes on DC-only blocks whose `dc_scaler · QF[0][0] ≡ 4 (mod 8)` (most quantisers above 4); the default keeps §4's away-from-zero rule, now applied to exact halves deterministically (within `1e-8`) rather than by the `f64` evaluation error. Plain reference-encoder AVI: compat decode 270/300 frames identical to the floating-point reference decode (was 5/300); `ties_q6_96x64` pair bit-exact under compat; the interlaced-direct compat envelope drops from 2777 to 380 samples
+
 - `Decoder::output_pixel_format` answers `Yuv420P` before the first packet (Table 6-15's only `chroma_format` and the short-header syntax are 4:2:0; frames are always 8-bit planar), so pipelines need no pre-roll to label the decoder's frames
 
 - coded-order output: `Mpeg4VideoDecoder::set_coded_order_output` / `SequenceDecoder::set_coded_order` return each VOP's frame from the decode call that decodes it (coding order, that call's container pts, §6.3.5 ticks, empty flush) for containers whose presentation times order the frames; the default stays §6.1.3.8 display order

@@ -463,9 +463,11 @@ fn compat_interlaced_ipb_stream_collapses_to_near_ties() {
 fn compat_interlaced_direct_bframes_stream_tightens_to_one_macroblock() {
     // Spec mode carries a 6202-sample max-114 envelope across the 30
     // interlaced-direct macroblocks. With the compat derivation 29 of
-    // the 30 go bit-exact; measured 2777/950400 ≈ 0.29 % (max 64),
-    // of which everything except ONE macroblock is ±1 near-tie
-    // propagation through the last GOP's anchor chain.
+    // the 30 go bit-exact; measured 380/950400 ≈ 0.04 % (max 64,
+    // 22/25 frames bit-exact — 2777 before the compat IDCT resolved
+    // exact half-integers to the even neighbour), of which everything
+    // except ONE macroblock is ±1 propagation through the last GOP's
+    // anchor chain.
     //
     // The residual macroblock (display frame 19, mb (6,8)) is
     // root-caused as far as black-box pixels allow: an exhaustive
@@ -488,9 +490,40 @@ fn compat_interlaced_direct_bframes_stream_tightens_to_one_macroblock() {
         176,
         144,
         64,
-        0.005,
+        0.0005,
         DecodeOptions::ecosystem(),
     );
+}
+
+#[test]
+fn compat_idct_rounds_exact_halves_to_even() {
+    // A plain reference-encoder stream at qscale 6: luminance
+    // dc_scaler 12 puts every odd-QF DC-only block's F[0][0] / 8 on an
+    // exact half-integer. The reference decode takes the even
+    // neighbour, which the compat IDCT reproduces bit-exactly; the
+    // default decode rounds those halves away from zero, so it
+    // differs on exactly the tie samples, each by one, in every frame.
+    let (max, differing, _) = stream_diff_with(
+        "ties_q6_96x64.m4v",
+        "ties_q6_96x64.yuv",
+        96,
+        64,
+        DecodeOptions::ecosystem(),
+    );
+    assert_eq!((max, differing), (0, 0), "compat decode must be bit-exact");
+
+    let spec = decode_stream("ties_q6_96x64.m4v", DecodeOptions::spec());
+    let reference = fixture("ties_q6_96x64.yuv");
+    let reference = yuv_frames(&reference, 96, 64);
+    assert_eq!(spec.len(), 10);
+    let mut total = 0usize;
+    for (k, (frame, &(y, u, v))) in spec.iter().zip(reference.iter()).enumerate() {
+        let (max, differing, _) = diff_stats(frame, y, u, v);
+        assert_eq!(max, 1, "frame {k}: tie rounding moves samples by one");
+        assert!(differing > 0, "frame {k}: every frame carries ties");
+        total += differing;
+    }
+    assert_eq!(total, 8262, "default-mode tie samples");
 }
 
 #[test]

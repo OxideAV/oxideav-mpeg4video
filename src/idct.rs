@@ -175,12 +175,82 @@ fn idct_1d(input: &[f64; N]) -> [f64; N] {
 /// closing sentence.
 ///
 /// The computation is a straightforward two-pass separable IDCT (row
-/// pass over `u`, column pass over `v`) in `f64`. The §4.1 rounding
-/// note ("round to nearest") is followed verbatim — half-up rounding
-/// via `(value + 0.5).floor()` on the non-negative branch and
-/// `(value - 0.5).ceil()` on the negative branch (Rust's `f64::round`
-/// rounds half-away-from-zero, which matches §4.1).
+/// pass over `u`, column pass over `v`) in `f64`, then rounded to the
+/// nearest integer. A mathematically exact half-integer (detected
+/// within [`HALF_INTEGER_TOLERANCE`], so the `f64` evaluation error
+/// cannot tip it either way) rounds away from zero, the §4 convention
+/// for half-integers; [`idct_8x8_rounded`] selects the alternative.
 pub fn idct_8x8(coefficients: &[[i32; 8]; 8], bits_per_pixel: u32) -> [[i32; 8]; 8] {
+    idct_8x8_rounded(
+        coefficients,
+        bits_per_pixel,
+        HalfIntegerRounding::AwayFromZero,
+    )
+}
+
+/// How [`idct_8x8_rounded`] resolves a transformed value that lies
+/// exactly half-way between two integers.
+///
+/// Annex A.1 bounds the IDCT only by accuracy (a peak error of 1
+/// against the mathematical IDCT on the item-3 set, 2 on the IEEE
+/// 1180 random sets), so either neighbour of an exact half-integer is
+/// conformant. Exact halves are common, not a corner case: a DC-only
+/// block evaluates to `F[0][0] / 8`, a half-integer whenever
+/// `F[0][0] = dc_scaler · QF[0][0]` is congruent to 4 modulo 8 (Table
+/// 7-1 `dc_scaler` values other than 8 and 16, i.e. most quantisers
+/// above 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum HalfIntegerRounding {
+    /// Away from zero — the convention ISO/IEC 14496-2 §4 states for
+    /// its `//` operator ("Half-integer values are rounded away from
+    /// zero unless otherwise specified"). The default, spec-literal
+    /// decode.
+    #[default]
+    AwayFromZero,
+    /// To the even neighbour — the ecosystem-compat choice
+    /// ([`crate::compat`]): black-box reference decodes resolve every
+    /// exact half-integer of a DC-only block to the even neighbour
+    /// (202.5 → 202, 166.5 → 166, 203.5 → 204).
+    ToEven,
+}
+
+/// Distance from one half below which a transformed `f64` value is
+/// treated as an exact half-integer. A true half-integer comes out of
+/// the two `f64` passes within a few hundred ulps of the value
+/// (magnitudes stay below `2^12`, so under `1e-10`); a value that is
+/// not a half-integer but lies within `1e-8` of one is far rarer than
+/// one sample per million and is equally conformant either way.
+const HALF_INTEGER_TOLERANCE: f64 = 1e-8;
+
+/// Round `value` to the nearest integer, resolving exact
+/// half-integers (within [`HALF_INTEGER_TOLERANCE`]) per `rounding`.
+#[inline]
+fn round_to_integer(value: f64, rounding: HalfIntegerRounding) -> i32 {
+    let below = value.floor();
+    if (value - below - 0.5).abs() < HALF_INTEGER_TOLERANCE {
+        let below = below as i32;
+        return match rounding {
+            HalfIntegerRounding::AwayFromZero => {
+                if below >= 0 {
+                    below + 1
+                } else {
+                    below
+                }
+            }
+            HalfIntegerRounding::ToEven => below + (below & 1),
+        };
+    }
+    value.round() as i32
+}
+
+/// [`idct_8x8`] with an explicit [`HalfIntegerRounding`] for the
+/// final round-to-integer step (the transform itself is identical).
+pub fn idct_8x8_rounded(
+    coefficients: &[[i32; 8]; 8],
+    bits_per_pixel: u32,
+    rounding: HalfIntegerRounding,
+) -> [[i32; 8]; 8] {
     // Row pass: 1-D IDCT on each row of F (varying u for each fixed v).
     let mut row_out = [[0.0f64; N]; N];
     for v in 0..N {
@@ -210,8 +280,7 @@ pub fn idct_8x8(coefficients: &[[i32; 8]; 8], bits_per_pixel: u32) -> [[i32; 8];
     let mut out = [[0i32; 8]; 8];
     for y in 0..N {
         for x in 0..N {
-            let rounded = full[y][x].round() as i32;
-            out[y][x] = rounded.clamp(lo, hi);
+            out[y][x] = round_to_integer(full[y][x], rounding).clamp(lo, hi);
         }
     }
     out
@@ -253,6 +322,60 @@ mod tests {
             }
         }
         out
+    }
+
+    fn dc_only(dc: i32) -> [[i32; 8]; 8] {
+        let mut f = [[0i32; 8]; 8];
+        f[0][0] = dc;
+        f
+    }
+
+    #[test]
+    fn exact_halves_round_per_the_selected_rule() {
+        // A DC-only block evaluates to F[0][0] / 8 on every sample.
+        // (F[0][0], away-from-zero, to-even)
+        for (dc, away, even) in [
+            (1620, 203, 202), // 202.5
+            (1628, 204, 204), // 203.5
+            (1332, 167, 166), // 166.5
+            (4, 1, 0),        // 0.5
+            (12, 2, 2),       // 1.5
+            (-4, -1, 0),      // -0.5
+            (-12, -2, -2),    // -1.5
+            (-1620, -203, -202),
+        ] {
+            let f = dc_only(dc);
+            let a = idct_8x8_rounded(&f, 8, HalfIntegerRounding::AwayFromZero);
+            let e = idct_8x8_rounded(&f, 8, HalfIntegerRounding::ToEven);
+            assert!(a.iter().flatten().all(|&v| v == away), "{dc}: away {a:?}");
+            assert!(e.iter().flatten().all(|&v| v == even), "{dc}: even {e:?}");
+            assert_eq!(idct_8x8(&f, 8), a, "{dc}: idct_8x8 is the away rule");
+        }
+    }
+
+    #[test]
+    fn non_half_values_round_identically_under_both_rules() {
+        // Away from the halves the two rules agree: a spread of DC
+        // levels plus a textured block.
+        for dc in [-2047, -1001, -9, -3, 3, 9, 1001, 2047] {
+            let f = dc_only(dc);
+            assert_eq!(
+                idct_8x8_rounded(&f, 8, HalfIntegerRounding::AwayFromZero),
+                idct_8x8_rounded(&f, 8, HalfIntegerRounding::ToEven),
+                "{dc}"
+            );
+        }
+        let mut f = [[0i32; 8]; 8];
+        for (v, row) in f.iter_mut().enumerate() {
+            for (u, c) in row.iter_mut().enumerate() {
+                *c = ((u * 37 + v * 11) % 41) as i32 - 20;
+            }
+        }
+        f[0][0] = 803;
+        assert_eq!(
+            idct_8x8_rounded(&f, 8, HalfIntegerRounding::AwayFromZero),
+            idct_8x8_rounded(&f, 8, HalfIntegerRounding::ToEven)
+        );
     }
 
     #[test]
