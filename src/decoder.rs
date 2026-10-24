@@ -226,6 +226,13 @@ impl Mpeg4VideoDecoder {
         self.options
     }
 
+    /// Return each VOP's frame from the call that decodes it, in coding
+    /// order, rather than in §6.1.3.8 display order (for a container
+    /// whose presentation times order the frames).
+    pub fn set_coded_order_output(&mut self, coded_order: bool) {
+        self.sequence.set_coded_order(coded_order);
+    }
+
     /// The active VOL header, once one has been decoded.
     pub fn vol(&self) -> Option<&VolHeader> {
         self.vol.as_ref()
@@ -349,7 +356,11 @@ impl Mpeg4VideoDecoder {
         };
         clock.ticks = ticks;
         clock.last_tr = Some(pic.temporal_reference);
-        if let Some(pending) = self.sequence.pending_anchor_mut() {
+        if let Some(pending) = if self.sequence.coded_order() {
+            out.last_mut()
+        } else {
+            self.sequence.pending_anchor_mut()
+        } {
             pending.set_pts(container_pts);
             pending.set_pts_ticks(Some(ticks));
         }
@@ -588,7 +599,11 @@ impl Mpeg4VideoDecoder {
         // `out` (displayed immediately); an anchor is the held
         // §6.1.3.8 pending frame.
         if is_anchor {
-            if let Some(pending) = self.sequence.pending_anchor_mut() {
+            if let Some(pending) = if self.sequence.coded_order() {
+                out.last_mut()
+            } else {
+                self.sequence.pending_anchor_mut()
+            } {
                 pending.set_pts(container_pts);
                 pending.set_pts_ticks(Some(vop_ticks));
             }
@@ -660,7 +675,11 @@ impl Mpeg4VideoDecoder {
                     sample_mode,
                     bpp,
                 )?);
-                if let Some(pending) = self.sequence.pending_anchor_mut() {
+                if let Some(pending) = if self.sequence.coded_order() {
+                    out.last_mut()
+                } else {
+                    self.sequence.pending_anchor_mut()
+                } {
                     pending.set_pts(container_pts);
                     pending.set_pts_ticks(Some(vop_ticks));
                 }
@@ -1245,6 +1264,39 @@ mod tests {
             vec![VopCodingType::I, VopCodingType::B, VopCodingType::P]
         );
         assert_eq!(frames[1].luma_at(0, 0), Some(128));
+    }
+
+    #[test]
+    fn coded_order_output_returns_each_vop_from_its_own_call() {
+        // Coding order I(t=0) P(t=2) B(t=1), fed one VOP per call with
+        // coded-order output: each call returns its own VOP's frame
+        // (I, P, B), stamped with that call's container pts, and the
+        // flush returns nothing more.
+        let mut header = BitWriter::default();
+        write_vos(&mut header);
+        write_vol(&mut header, 16, 16);
+        let mut i = BitWriter::default();
+        write_i_vop(&mut i, 1, 0);
+        let mut p = BitWriter::default();
+        write_skipped_p_vop(&mut p, 1, 2);
+        let mut b = BitWriter::default();
+        write_direct_b_vop(&mut b, 1, 1);
+
+        let mut dec = Mpeg4VideoDecoder::new();
+        dec.set_coded_order_output(true);
+        assert!(dec.decode(&header.finish()).unwrap().is_empty());
+        let mut types = Vec::new();
+        for (pts, unit) in [(0, i), (2, p), (1, b)] {
+            let frames = dec.decode_with_pts(&unit.finish(), Some(pts)).unwrap();
+            assert_eq!(frames.len(), 1);
+            assert_eq!(frames[0].pts(), Some(pts));
+            types.push(frames[0].coding_type());
+        }
+        assert_eq!(
+            types,
+            vec![VopCodingType::I, VopCodingType::P, VopCodingType::B]
+        );
+        assert!(dec.flush().is_empty());
     }
 
     #[test]

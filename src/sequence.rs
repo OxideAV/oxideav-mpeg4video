@@ -55,12 +55,31 @@ pub struct SequenceDecoder {
     /// for display (held back by the §6.1.3.8 one-slot delay). `None`
     /// before the first anchor and immediately after a flush.
     pending_anchor: Option<DecodedFrame>,
+    /// Output every VOP as it is decoded (coding order), leaving the
+    /// §6.1.3.8 reorder to the caller (a container's presentation
+    /// times).
+    coded_order: bool,
 }
 
 impl SequenceDecoder {
     /// A fresh decoder with an empty chain and no pending anchor.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Output each VOP's frame as soon as it is decoded, in coding
+    /// order, instead of holding anchors back for the §6.1.3.8 display
+    /// reorder. A held anchor is released by the next call to
+    /// [`SequenceDecoder::flush`].
+    pub fn set_coded_order(&mut self, coded_order: bool) {
+        self.coded_order = coded_order;
+    }
+
+    /// Whether frames are output in coding order
+    /// ([`SequenceDecoder::set_coded_order`]).
+    #[inline]
+    pub fn coded_order(&self) -> bool {
+        self.coded_order
     }
 
     /// Borrow the underlying reference-frame chain (e.g. to inspect the
@@ -247,6 +266,9 @@ impl SequenceDecoder {
         // Push into the reference chain so subsequent VOPs can reference
         // it (this is decode-order state, independent of display delay).
         self.store.push_anchor(frame.clone());
+        if self.coded_order {
+            return vec![frame];
+        }
         // The previously-held anchor is now displayable.
         let mut out = Vec::new();
         if let Some(prev) = self.pending_anchor.take() {
