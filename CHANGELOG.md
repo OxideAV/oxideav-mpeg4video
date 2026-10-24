@@ -6,6 +6,25 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.9](https://github.com/OxideAV/oxideav-mpeg4video/compare/v0.1.8...v0.1.9) - 2026-10-24
+
+### Added
+
+- coded-order output — each VOP's frame from the call that decodes it
+
+### Fixed
+
+- fixup for #16: one anchor-stamp helper, setter docs, reorder-equivalence test, CHANGELOG + README
+- fixup for #15: §7.6.9.5.1 coded-GMC co-located averaged MV is the spec rule, not a compat divergence
+
+### Other
+
+- ecosystem-compat IDCT resolves exact half-integers to the even neighbour
+- Decoder::output_pixel_format states Yuv420P before the first packet
+- Give direct mode the averaged vector of a coded GMC macroblock in compat mode
+- Limit the GMC averaged-MV compat adjustment to half-sample translations
+- edition 2024, MSRV 1.95
+
 ### Changed
 
 - edition 2024, MSRV 1.95
