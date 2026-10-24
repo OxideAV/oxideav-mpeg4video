@@ -408,7 +408,11 @@ on these pairs, conformance corpus unchanged):
   the S anchors' field motion (compat emission — no interlaced direct).
   The reference decode is **bit-exact**, log clean — the reference
   decoder also reads `dct_type` on a coded `mcsel == 1` macroblock, the
-  §6.3.6.3 reading this crate's parser now follows.
+  §6.3.6.3 reading this crate's parser now follows. Regenerated in
+  round 480 once the encoder's reconstruction gave coded `mcsel == 1`
+  co-located macroblocks their §7.6.9.5.1 averaged MV: the pair now
+  pins that rule (the zero-vector reading misses B-VOP samples by up
+  to 146).
 
 ```
 ffmpeg -idct faani -i enc_isb_ilaced_gmc_compat_96x64.m4v -f rawvideo -pix_fmt yuv420p enc_isb_ilaced_gmc_compat_96x64.yuv
@@ -449,7 +453,9 @@ reference decodes as above (`ffmpeg -idct faani -i <name>.m4v …`):
   reference decoder logs an `untested` notice while consuming the
   S-VOP packet HEC bodies (its own path-coverage remark — the pair
   without S-VOP HEC bodies decodes silently), yet reconstructs every
-  sample identically.
+  sample identically. Regenerated in round 480 for the §7.6.9.5.1
+  coded-GMC co-located averaged MV (the zero-vector reading misses
+  the B-VOPs by up to 184 per sample).
 
 ```
 ffmpeg -idct faani -i enc_isb_dcvlc7_hec_96x64.m4v -f rawvideo -pix_fmt yuv420p enc_isb_dcvlc7_hec_96x64.yuv
@@ -531,10 +537,10 @@ and validates it through its own decoder walk.
 ## SHA-256
 
 ```
-3a5d76db248dd883f83483583021b81b232a874cefd7291f193cf5960bf76eb2  enc_isb_ilaced_gmc_compat_96x64.m4v
-d53ad223d6821207ddfb50d4dcce23153f93b4c640158cf1a74e2f1f28fa1674  enc_isb_ilaced_gmc_compat_96x64.yuv
-c0b9105c0f423dc536f4808600836c4aad64bbcafcf65691da41b826ead2eee1  enc_isb_dcvlc7_hec_96x64.m4v
-e5174ea5ec489b9dae7fd9043294bf06585dbd0763b6bc9d0cdc1d9c2f3aa10b  enc_isb_dcvlc7_hec_96x64.yuv
+f16ace5a3d95f23a3cf4c18ae694f66e3a0d5d9a3c99f4c71ab100e274ec2f8d  enc_isb_ilaced_gmc_compat_96x64.m4v
+fc089074a81a6c865ef81ecc486d6adce4708bb843fafbd1e21efc256f809e39  enc_isb_ilaced_gmc_compat_96x64.yuv
+ee762e0dbd81519e2783e7029daf9a5902c7b704b6e80e883496d3a1309c24cc  enc_isb_dcvlc7_hec_96x64.m4v
+4076b7c838d00201759ea518e300f44ffd04fa214e71622d1f106e590fd8b04a  enc_isb_dcvlc7_hec_96x64.yuv
 1b3f275670116b291b656d64a6649ebd7bff87a9bb169ac5ea045ce9c5ed1777  enc_is_gmc3_zoom_96x64.m4v
 2f0677e7da0fd2a0b743dc098e6931ebb53dc93c1e49e7e7688adbcd89ab3e1b  enc_is_gmc3_zoom_96x64.yuv
 ef61f2af0ce809fab9332d8fba8419d7751c0ba99f84b7b6bbdc47b28eac6483  enc_is_gmc2_rot_96x64.m4v

@@ -669,11 +669,9 @@ pub enum SGmcMbContent {
     /// `mcsel == 1`: global-motion-compensated. The §7.8 warp is applied
     /// to the forward reference plane; the §7.4 residual is carried
     /// together with the macroblock's §7.8.7.3 **averaged motion
-    /// vector** and its skip status, which the §7.6.9.6 co-located
-    /// substitution for a following B-VOP consumes (a *skipped*
-    /// co-located S(GMC) macroblock is treated as non-skipped with the
-    /// AMV; a coded GMC macroblock keeps the §7.6.9.5.1 zero-vector
-    /// fallback).
+    /// vector** and its skip status; the AMV is the co-located vector a
+    /// following B-VOP's direct mode consumes (§7.6.9.5.1 for a coded
+    /// GMC macroblock, §7.6.9.6 for a skipped one).
     Gmc {
         /// The §7.8.7.3 averaged pel-wise warping vector for this
         /// macroblock (VOL-grid units: half-pel, or quarter-pel when

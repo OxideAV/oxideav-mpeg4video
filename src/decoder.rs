@@ -518,8 +518,7 @@ impl Mpeg4VideoDecoder {
                 } else {
                     decode_s_gmc_vop_macroblocks(&mut br, &vol, &vop, self.options)?
                 };
-                self.anchor_motion =
-                    Some(motion_of_s_entries(&entries, self.options.ecosystem_compat));
+                self.anchor_motion = Some(motion_of_s_entries(&entries));
                 out.extend(self.sequence.push_s_gmc_vop(
                     mb_width,
                     mb_height,
@@ -753,12 +752,14 @@ fn motion_of_p_entries(entries: &[PVopMbContent]) -> Vec<AnchorMbMotion> {
 ///   1-MV macroblock carrying the AMV, so a direct-mode B macroblock
 ///   scales the AMV instead of taking the skipped-co-located forward
 ///   zero-MV path.
-/// * A **coded** GMC macroblock and an intra macroblock carry no local
-///   vector — they resolve to the §7.6.9.5.1 zero-vector fallback
-///   (represented as `Intra` for the co-located adapter). Under
-///   `ecosystem_compat` (compat divergence 4, `crate::compat`) a coded
-///   GMC macroblock carries its averaged motion vector as well.
-fn motion_of_s_entries(entries: &[SGmcMbContent], ecosystem_compat: bool) -> Vec<AnchorMbMotion> {
+/// * A **coded** GMC macroblock (`mcsel == 1`) carries the same AMV:
+///   §7.6.9.5.1 "The averaged motion vector defined in subclause 7.8.7.3
+///   is used as the MV of the co-located macroblock when this
+///   co-located macroblock is included in an S(GMC)-VOP and mcsel ==
+///   '1'", restated by §7.8.7.3 for the frame-based direct mode.
+/// * An intra macroblock carries no vector — the §7.6.9.5.1 zero-vector
+///   fallback (represented as `Intra` for the co-located adapter).
+fn motion_of_s_entries(entries: &[SGmcMbContent]) -> Vec<AnchorMbMotion> {
     entries
         .iter()
         .map(|e| match e {
@@ -773,12 +774,8 @@ fn motion_of_s_entries(entries: &[SGmcMbContent], ecosystem_compat: bool) -> Vec
                 top_ref: *top_field_ref,
                 bottom_ref: *bottom_field_ref,
             },
-            SGmcMbContent::Gmc { amv, not_coded, .. } if *not_coded || ecosystem_compat => {
-                AnchorMbMotion::Frame(PvopMbMotion::OneMv(*amv))
-            }
-            SGmcMbContent::Gmc { .. } | SGmcMbContent::Intra(_) => {
-                AnchorMbMotion::Frame(PvopMbMotion::Intra)
-            }
+            SGmcMbContent::Gmc { amv, .. } => AnchorMbMotion::Frame(PvopMbMotion::OneMv(*amv)),
+            SGmcMbContent::Intra(_) => AnchorMbMotion::Frame(PvopMbMotion::Intra),
         })
         .collect()
 }
@@ -946,11 +943,13 @@ impl oxideav_core::Decoder for Mpeg4PacketDecoder {
 /// One key is recognised:
 ///
 /// * `ecosystem-compat` (bool, default `false`) — decode with the
-///   ecosystem-compat behaviour on the two documented spec
+///   ecosystem-compat behaviour on the three documented spec
 ///   divergences (see [`crate::compat`]): the §7.7.2.2
 ///   interlaced-direct derivation reads the co-located field MVs as
-///   zero, and the §7.4.4.5 method-1 mismatch toggle is skipped on
-///   intra blocks. The default is the literal spec text.
+///   zero, the §7.4.4.5 method-1 mismatch toggle is skipped on intra
+///   blocks, and non-positive §7.8.7.3 GMC averaged-MV components of a
+///   half-sample translational warp derive one MV-grid unit lower.
+///   The default is the literal spec text.
 ///
 /// Typed consumers can skip the bag and pass
 /// [`DecodeOptions`](crate::compat::DecodeOptions) to
@@ -974,9 +973,10 @@ impl oxideav_core::CodecOptionsStruct for Mpeg4DecoderOptions {
         name: "ecosystem-compat",
         kind: oxideav_core::OptionKind::Bool,
         default: oxideav_core::OptionValue::Bool(false),
-        help: "match the black-box-observed ecosystem behaviour on the two documented \
+        help: "match the black-box-observed ecosystem behaviour on the three documented \
                ISO/IEC 14496-2 divergences (interlaced-direct co-located MVs read as zero; \
-               §7.4.4.5 mismatch control skipped on intra blocks) instead of the literal \
+               §7.4.4.5 mismatch control skipped on intra blocks; half-sample translational \
+               GMC averaged MVs lowered on non-positive components) instead of the literal \
                spec text",
     }];
 
@@ -1698,11 +1698,12 @@ mod registry_tests {
         assert!(max <= 2, "toggle ripple must stay small, got max {max}");
     }
     #[test]
-    fn skipped_s_gmc_colocated_maps_to_the_averaged_motion_vector() {
+    fn s_gmc_colocated_maps_to_the_averaged_motion_vector() {
         // §7.6.9.6: a skipped co-located S(GMC) macroblock is treated as
         // a NON-skipped macroblock carrying the §7.8.7.3 averaged motion
-        // vector; a coded GMC macroblock (and an intra one) keeps the
-        // §7.6.9.5.1 zero-vector fallback.
+        // vector; §7.6.9.5.1: a coded GMC (mcsel == 1) macroblock
+        // supplies the same averaged motion vector; an intra one keeps
+        // the zero-vector fallback.
         use crate::block::InterMacroblock;
         use crate::motion::MotionVector;
         use crate::reconstruct::ReconstructedMacroblock;
@@ -1729,21 +1730,13 @@ mod registry_tests {
                 cr: [[0; 8]; 8],
             }),
         ];
-        let motion = motion_of_s_entries(&entries, false);
+        let motion = motion_of_s_entries(&entries);
         assert_eq!(motion[0], AnchorMbMotion::Frame(PvopMbMotion::OneMv(amv)));
-        assert_eq!(motion[1], AnchorMbMotion::Frame(PvopMbMotion::Intra));
+        assert_eq!(motion[1], AnchorMbMotion::Frame(PvopMbMotion::OneMv(amv)));
         assert_eq!(
             motion[2],
             AnchorMbMotion::Frame(PvopMbMotion::OneMv(MotionVector { x: 1, y: 2 }))
         );
         assert_eq!(motion[3], AnchorMbMotion::Frame(PvopMbMotion::Intra));
-
-        // Compat divergence 4: a coded GMC macroblock also carries its
-        // averaged motion vector as the co-located vector.
-        let compat = motion_of_s_entries(&entries, true);
-        assert_eq!(compat[0], motion[0]);
-        assert_eq!(compat[1], AnchorMbMotion::Frame(PvopMbMotion::OneMv(amv)));
-        assert_eq!(compat[2], motion[2]);
-        assert_eq!(compat[3], motion[3]);
     }
 }

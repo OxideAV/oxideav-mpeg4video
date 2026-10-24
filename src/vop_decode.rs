@@ -1381,8 +1381,9 @@ pub fn decode_p_vop_macroblocks(
 /// * a 4-MV inter MB → its four sub-block vectors `{MV[i]}` in
 ///   Figure 6-8 order (§7.6.9.5.2 gives each 8×8 block its own
 ///   scaled `(MVF[i], MVB[i])` pair),
-/// * an intra MB (or a GMC MB, which carries no local vector) → the
-///   §7.6.9.5.1 final-sentence zero-vector fallback.
+/// * an intra MB → the §7.6.9.5.1 final-sentence zero-vector fallback
+///   (a GMC MB reaches this adapter as a 1-MV MB carrying its
+///   §7.8.7.3 averaged motion vector).
 fn co_located_from_motion(motion: PvopMbMotion) -> CoLocatedAnchor {
     match motion {
         PvopMbMotion::Skipped => {
@@ -2916,9 +2917,9 @@ mod tests {
         WarpGeometry::decode(&trajectory, 176, 144, accuracy)
     }
 
-    /// Compat divergence 3 is the deployed decoders' translation-only, half-sample-accuracy path:
-    /// warps they evaluate pel by pel (zoom) and translations at finer accuracies average exactly
-    /// as §7.8.7.3 says, non-positive components included.
+    /// Compat divergence 3 is scoped to translational warps at half-sample sprite accuracy:
+    /// black-box reference decodes of zooms and of translations at finer accuracies average
+    /// exactly as §7.8.7.3 says, non-positive components included.
     #[test]
     fn compat_amv_matches_the_spec_for_finer_accuracy_warps() {
         use crate::vol::SpriteWarpingAccuracy::SixteenthPel;

@@ -9,6 +9,11 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 ### Changed
 
 - edition 2024, MSRV 1.95
+- ecosystem-compat divergence 3 (§7.8.7.3 GMC averaged MV lowered on non-positive components) is scoped to translational warps at half-sample sprite accuracy; zooms, multi-point warps and 1/4–1/16 accuracies follow §7.8.7.3 in both modes (`WarpGeometry::is_translation`)
+
+### Fixed
+
+- §7.6.9.5.1 direct mode: a co-located S(GMC) macroblock coded with `mcsel == 1` now supplies its §7.8.7.3 averaged motion vector (it fell back to the zero vector; only skipped GMC macroblocks used the AMV) — default spec mode, ecosystem-compat and the encoder's own reconstruction alike
 
 ## [0.1.8](https://github.com/OxideAV/oxideav-mpeg4video/compare/v0.1.7...v0.1.8) - 2026-09-11
 

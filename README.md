@@ -291,7 +291,17 @@ module docs carry the full write-up):
    and pinned by the `dec_sgmc_*` fixture pairs
    (`tests/compat_gmc_amv.rs`): a full encoder-produced
    negative-trajectory S(GMC) stream decodes **bit-exact** against
-   the reference decoder under ecosystem-compat.
+   the reference decoder under ecosystem-compat. The adjustment is
+   scoped to **translational warps at half-sample sprite accuracy**
+   (`s == 2`, the case those probes exercise); zooms, multi-point
+   warps and finer accuracies (1/4, 1/8, 1/16 — the XviD layout)
+   follow §7.8.7.3 in both modes and decode bit-exact against the
+   reference that way.
+
+Not a divergence: §7.6.9.5.1 makes a co-located S(GMC) macroblock with
+`mcsel == 1` — coded or skipped — supply its §7.8.7.3 averaged motion
+vector to B-VOP direct mode, and both modes follow it (black-box GMC
+streams with B-VOPs decode bit-exact against the reference that way).
 
 Selection is wired through every decode surface:
 

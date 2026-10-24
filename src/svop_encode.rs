@@ -938,8 +938,8 @@ pub fn encode_s_vop(
 /// advance `store`'s anchor chain, and return the reconstruction plus
 /// the per-macroblock motion the following B-VOPs' §7.6.9.5.1 /
 /// §7.6.9.6 co-located substitution consumes (the same mapping the
-/// stream decoder applies: a skipped GMC macroblock contributes its
-/// averaged MV; a coded GMC or intra macroblock the zero-vector
+/// stream decoder applies: a GMC macroblock, skipped or coded,
+/// contributes its averaged MV; an intra macroblock the zero-vector
 /// fallback).
 pub fn reconstruct_own_s_vop_with_motion(
     vol: &crate::vol::VolHeader,
@@ -1005,15 +1005,10 @@ pub fn reconstruct_own_s_vop_with_anchor_motion(
                 top_ref: *top_field_ref,
                 bottom_ref: *bottom_field_ref,
             },
-            crate::frame_decode::SGmcMbContent::Gmc {
-                amv,
-                not_coded: true,
-                ..
-            } => AnchorMbMotion::Frame(PvopMbMotion::OneMv(*amv)),
-            crate::frame_decode::SGmcMbContent::Gmc {
-                not_coded: false, ..
+            crate::frame_decode::SGmcMbContent::Gmc { amv, .. } => {
+                AnchorMbMotion::Frame(PvopMbMotion::OneMv(*amv))
             }
-            | crate::frame_decode::SGmcMbContent::Intra(_) => {
+            crate::frame_decode::SGmcMbContent::Intra(_) => {
                 AnchorMbMotion::Frame(PvopMbMotion::Intra)
             }
         })
