@@ -947,6 +947,21 @@ impl oxideav_core::Decoder for Mpeg4PacketDecoder {
         Ok(())
     }
 
+    /// Planar 4:2:0 at 8 bits per sample, known before the first
+    /// packet so a pipeline needs no pre-roll to label the frames.
+    ///
+    /// Every layout this decoder emits is fixed by the syntax rather
+    /// than by a per-picture choice: the VOL's `chroma_format` has a
+    /// single defined value, 4:2:0 (§6.3.3 Table 6-15 — the others are
+    /// reserved), and §6.2.5.2 short-header pictures are 4:2:0 as well;
+    /// the frame conversion always builds the Y, Cb,
+    /// Cr planes at full / half / half resolution with one byte per
+    /// sample. A VOL that arrives later (in-band, after a seek, or a
+    /// new one mid-stream) cannot change the answer.
+    fn output_pixel_format(&self) -> Option<oxideav_core::PixelFormat> {
+        Some(oxideav_core::PixelFormat::Yuv420P)
+    }
+
     fn reset(&mut self) -> oxideav_core::Result<()> {
         // Preserve the compat behaviour selection across seeks.
         self.inner = Mpeg4VideoDecoder::with_options(self.inner.options());
@@ -1646,6 +1661,47 @@ mod registry_tests {
         assert_eq!(v.pts, Some(1)); // P-VOP tick time (tinc = 1)
         assert_eq!(v.planes[0].data[0], 128);
         assert!(matches!(dec.receive_frame(), Err(oxideav_core::Error::Eof)));
+    }
+
+    #[test]
+    fn output_pixel_format_is_stated_before_the_first_frame() {
+        // Without extradata (configuration in-band, as in AVI) and with
+        // it (MP4 decoder-specific info), the layout is answered before
+        // any packet, and the frames that follow have that shape.
+        let mut w = BitWriter::default();
+        write_vos(&mut w);
+        write_vol(&mut w, 48, 32);
+        let config = w.finish();
+        for extradata in [Vec::new(), config.clone()] {
+            let mut params = CodecParameters::video(CodecId::new("mpeg4video"));
+            params.extradata = extradata.clone();
+            let mut dec = make_decoder(&params).unwrap();
+            assert_eq!(
+                dec.output_pixel_format(),
+                Some(oxideav_core::PixelFormat::Yuv420P)
+            );
+            if extradata.is_empty() {
+                dec.send_packet(&packet(config.clone())).unwrap();
+            }
+            let mut w = BitWriter::default();
+            write_i_vop(&mut w, 6, 0); // 3×2 macroblocks
+            dec.send_packet(&packet(w.finish())).unwrap();
+            dec.flush().unwrap();
+            let oxideav_core::Frame::Video(v) = dec.receive_frame().unwrap() else {
+                panic!("expected a video frame");
+            };
+            let layout: Vec<_> = v.planes.iter().map(|p| (p.stride, p.data.len())).collect();
+            assert_eq!(layout, vec![(48, 48 * 32), (24, 24 * 16), (24, 24 * 16)]);
+            assert_eq!(
+                dec.output_pixel_format(),
+                Some(oxideav_core::PixelFormat::Yuv420P)
+            );
+            dec.reset().unwrap();
+            assert_eq!(
+                dec.output_pixel_format(),
+                Some(oxideav_core::PixelFormat::Yuv420P)
+            );
+        }
     }
 
     #[test]

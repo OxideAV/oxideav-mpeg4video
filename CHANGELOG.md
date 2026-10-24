@@ -13,6 +13,8 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `Decoder::output_pixel_format` answers `Yuv420P` before the first packet (Table 6-15's only `chroma_format` and the short-header syntax are 4:2:0; frames are always 8-bit planar), so pipelines need no pre-roll to label the decoder's frames
+
 - coded-order output: `Mpeg4VideoDecoder::set_coded_order_output` / `SequenceDecoder::set_coded_order` return each VOP's frame from the decode call that decodes it (coding order, that call's container pts, §6.3.5 ticks, empty flush) for containers whose presentation times order the frames; the default stays §6.1.3.8 display order
 
 ### Fixed
