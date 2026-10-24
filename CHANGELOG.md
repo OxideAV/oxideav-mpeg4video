@@ -11,6 +11,10 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 - edition 2024, MSRV 1.95
 - ecosystem-compat divergence 3 (§7.8.7.3 GMC averaged MV lowered on non-positive components) is scoped to translational warps at half-sample sprite accuracy; zooms, multi-point warps and 1/4–1/16 accuracies follow §7.8.7.3 in both modes (`WarpGeometry::is_translation`)
 
+### Added
+
+- coded-order output: `Mpeg4VideoDecoder::set_coded_order_output` / `SequenceDecoder::set_coded_order` return each VOP's frame from the decode call that decodes it (coding order, that call's container pts, §6.3.5 ticks, empty flush) for containers whose presentation times order the frames; the default stays §6.1.3.8 display order
+
 ### Fixed
 
 - §7.6.9.5.1 direct mode: a co-located S(GMC) macroblock coded with `mcsel == 1` now supplies its §7.8.7.3 averaged motion vector (it fell back to the zero vector; only skipped GMC macroblocks used the AMV) — default spec mode, ecosystem-compat and the encoder's own reconstruction alike

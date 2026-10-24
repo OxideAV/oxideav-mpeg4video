@@ -228,7 +228,12 @@ impl Mpeg4VideoDecoder {
 
     /// Return each VOP's frame from the call that decodes it, in coding
     /// order, rather than in §6.1.3.8 display order (for a container
-    /// whose presentation times order the frames).
+    /// whose presentation times order the frames). Each frame carries
+    /// the container pts of the call that decoded it and its §6.3.5
+    /// tick time; [`Mpeg4VideoDecoder::flush`] then returns nothing.
+    /// Default `false` (display order). Select it before the first
+    /// VOP: an anchor already held for display when it is switched on
+    /// is released only by the next flush.
     pub fn set_coded_order_output(&mut self, coded_order: bool) {
         self.sequence.set_coded_order(coded_order);
     }
@@ -356,11 +361,7 @@ impl Mpeg4VideoDecoder {
         };
         clock.ticks = ticks;
         clock.last_tr = Some(pic.temporal_reference);
-        if let Some(pending) = if self.sequence.coded_order() {
-            out.last_mut()
-        } else {
-            self.sequence.pending_anchor_mut()
-        } {
+        if let Some(pending) = produced_anchor(&mut self.sequence, out) {
             pending.set_pts(container_pts);
             pending.set_pts_ticks(Some(ticks));
         }
@@ -599,11 +600,7 @@ impl Mpeg4VideoDecoder {
         // `out` (displayed immediately); an anchor is the held
         // §6.1.3.8 pending frame.
         if is_anchor {
-            if let Some(pending) = if self.sequence.coded_order() {
-                out.last_mut()
-            } else {
-                self.sequence.pending_anchor_mut()
-            } {
+            if let Some(pending) = produced_anchor(&mut self.sequence, out) {
                 pending.set_pts(container_pts);
                 pending.set_pts_ticks(Some(vop_ticks));
             }
@@ -675,11 +672,7 @@ impl Mpeg4VideoDecoder {
                     sample_mode,
                     bpp,
                 )?);
-                if let Some(pending) = if self.sequence.coded_order() {
-                    out.last_mut()
-                } else {
-                    self.sequence.pending_anchor_mut()
-                } {
+                if let Some(pending) = produced_anchor(&mut self.sequence, out) {
                     pending.set_pts(container_pts);
                     pending.set_pts_ticks(Some(vop_ticks));
                 }
@@ -797,6 +790,20 @@ fn motion_of_s_entries(entries: &[SGmcMbContent]) -> Vec<AnchorMbMotion> {
             SGmcMbContent::Intra(_) => AnchorMbMotion::Frame(PvopMbMotion::Intra),
         })
         .collect()
+}
+
+/// The frame the anchor VOP just pushed produced: the §6.1.3.8 held
+/// anchor in display order, or the frame appended to `out` in coded
+/// order ([`Mpeg4VideoDecoder::set_coded_order_output`]).
+fn produced_anchor<'a>(
+    sequence: &'a mut SequenceDecoder,
+    out: &'a mut [DecodedFrame],
+) -> Option<&'a mut DecodedFrame> {
+    if sequence.coded_order() {
+        out.last_mut()
+    } else {
+        sequence.pending_anchor_mut()
+    }
 }
 
 /// A forward-only zero-MV zero-residual B-VOP macroblock — the §6.3.5
@@ -1297,6 +1304,52 @@ mod tests {
             vec![VopCodingType::I, VopCodingType::P, VopCodingType::B]
         );
         assert!(dec.flush().is_empty());
+    }
+
+    #[test]
+    fn coded_order_frames_reorder_to_the_display_order_output() {
+        // The same I P B units decoded both ways: sorting the
+        // coded-order frames by their tick time reproduces the
+        // display-order output frame for frame (samples, pts, ticks).
+        let units = || {
+            let mut header = BitWriter::default();
+            write_vos(&mut header);
+            write_vol(&mut header, 16, 16);
+            let mut i = BitWriter::default();
+            write_i_vop(&mut i, 1, 0);
+            let mut p = BitWriter::default();
+            write_skipped_p_vop(&mut p, 1, 2);
+            let mut b = BitWriter::default();
+            write_direct_b_vop(&mut b, 1, 1);
+            (
+                header.finish(),
+                [(0, i.finish()), (2, p.finish()), (1, b.finish())],
+            )
+        };
+        let run = |coded: bool| {
+            let (header, vops) = units();
+            let mut dec = Mpeg4VideoDecoder::new();
+            dec.set_coded_order_output(coded);
+            let mut frames = dec.decode(&header).unwrap();
+            for (pts, unit) in &vops {
+                frames.extend(dec.decode_with_pts(unit, Some(*pts)).unwrap());
+            }
+            frames.extend(dec.flush());
+            frames
+        };
+        let display = run(false);
+        let mut coded = run(true);
+        coded.sort_by_key(|f| f.pts_ticks());
+        assert_eq!(display.len(), 3);
+        assert_eq!(coded.len(), display.len());
+        for (c, d) in coded.iter().zip(&display) {
+            assert_eq!(c.pts(), d.pts());
+            assert_eq!(c.pts_ticks(), d.pts_ticks());
+            assert_eq!(c.coding_type(), d.coding_type());
+            assert_eq!(c.luma_samples(), d.luma_samples());
+            assert_eq!(c.cb_samples(), d.cb_samples());
+            assert_eq!(c.cr_samples(), d.cr_samples());
+        }
     }
 
     #[test]

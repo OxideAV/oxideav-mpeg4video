@@ -480,7 +480,10 @@ both modes' envelopes are pinned).
   anchors), `assemble_s_gmc_vop_frame` (§7.8.7.1 per-MB warped/local
   `mcsel` selection). The [`sequence::SequenceDecoder`] applies §6.1.3.8
   VOP reordering — a one-slot anchor delay that turns a coding-order VOP
-  stream into display order (`1I 4P 2B 3B` → `1I 2B 3B 4P`).
+  stream into display order (`1I 4P 2B 3B` → `1I 2B 3B 4P`); opt-in
+  coded-order output (`Mpeg4VideoDecoder::set_coded_order_output`)
+  instead returns every VOP from the call that decodes it, leaving the
+  reorder to the container's presentation times.
 - **Half-sample / quarter-sample** motion compensation, OBMC, and the
   padding stages (sample / vertical / extended / interlaced).
 - **RVLC error recovery — now driven end-to-end**: the §E.1.4.4.2.1
