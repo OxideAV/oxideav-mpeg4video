@@ -416,6 +416,7 @@ pub mod vop; // mixed: `VopCodingType` / `VopParseError` stay visible
 pub mod vop_decode; // mixed: `VopDecodeError` stays visible
 #[doc(hidden)]
 pub mod warp;
+pub mod xvid_idct;
 
 // Crate-root re-exports of internal plumbing are hidden alongside their
 // modules; the visible re-exports below them are the stable surface.

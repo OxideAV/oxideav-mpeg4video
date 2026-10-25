@@ -353,6 +353,8 @@ impl Default for CoLocatedAnchor {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[doc(hidden)] // internal decode plumbing, not the crate's stable public API
 pub struct BVopTextureParams {
+    /// Which inverse DCT reconstructs the residual blocks (see [`crate::compat::IdctKind`]).
+    pub idct: crate::compat::IdctKind,
     /// §6.3.5 `vop_quant` — the B-VOP base quantiser scale.
     pub base_quantiser_scale: u32,
     /// §6.3.5 `alternate_vertical_scan_flag` from the interlaced VOP
@@ -1362,6 +1364,7 @@ impl BVopMvDriver {
                     // mismatch exemption is never consulted here.
                     intra_mismatch_exempt: false,
                     idct_rounding: texture.idct_rounding,
+                    idct: texture.idct,
                 };
                 let mut residual =
                     decode_b_vop_inter_macroblock(br, motion.cbpb(), ctx, &quant_matrix)?;
@@ -1511,6 +1514,7 @@ impl BVopMvDriver {
                     // mismatch exemption is never consulted here.
                     intra_mismatch_exempt: false,
                     idct_rounding: texture.idct_rounding,
+                    idct: texture.idct,
                 };
                 let residual = decode_b_vop_inter_macroblock(br, motion.cbpb, ctx, &quant_matrix)?;
 
@@ -2441,6 +2445,7 @@ mod tests {
 
     fn texture_params() -> BVopTextureParams {
         BVopTextureParams {
+            idct: crate::compat::IdctKind::Exact,
             alternate_vertical_scan: false,
             base_quantiser_scale: 8,
             max_quantiser_scale: 31,
