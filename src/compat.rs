@@ -91,9 +91,26 @@
 /// Options selecting the decoder's behaviour on the spec-vs-ecosystem
 /// divergences documented at [`crate::compat`] (module docs).
 ///
+/// Which 8×8 inverse DCT reconstructs texture blocks. Both are conformant (Annex A gives a
+/// tolerance, not a bit-exact transform); they differ by a level or two per block, which a long
+/// GOP compounds, so matching the encoder's transform is what keeps a decode bit-exact with it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum IdctKind {
+    /// The exact transform in `f64` ([`crate::idct::idct_8x8`]).
+    #[default]
+    Exact,
+    /// XviD's integer transform ([`crate::xvid_idct::xvid_idct_8x8`]), which the ecosystem's
+    /// reference decoder switches to for streams whose user data names XviD; the decoder makes
+    /// the same switch when it sees that user data.
+    Xvid,
+}
+
 /// `Default` is the literal-spec behaviour on every axis.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DecodeOptions {
+    /// The inverse DCT for texture blocks; `Exact` unless set, or until the stream's user data
+    /// names XviD (see [`IdctKind`]).
+    pub idct: IdctKind,
     /// Opt-in ecosystem-compat mode. When `true` the decoder
     /// reproduces the black-box-observed ecosystem behaviour on
     /// exactly three clauses:
@@ -124,6 +141,7 @@ impl DecodeOptions {
     pub const fn spec() -> Self {
         Self {
             ecosystem_compat: false,
+            idct: IdctKind::Exact,
         }
     }
 
@@ -131,6 +149,7 @@ impl DecodeOptions {
     pub const fn ecosystem() -> Self {
         Self {
             ecosystem_compat: true,
+            idct: IdctKind::Exact,
         }
     }
 

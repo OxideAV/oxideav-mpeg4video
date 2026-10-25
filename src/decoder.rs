@@ -381,7 +381,13 @@ impl Mpeg4VideoDecoder {
                 self.profile_level = parse_visual_object_sequence_header(unit)?;
             }
             VISUAL_OBJECT_SEQUENCE_END_CODE => {}
-            USER_DATA_START_CODE => {}
+            USER_DATA_START_CODE => {
+                // The ecosystem's reference decoder reconstructs XviD streams with XviD's own
+                // integer IDCT; the same switch keeps such streams bit-exact with it.
+                if xvid_build(&unit[4..]).is_some() {
+                    self.options.idct = crate::compat::IdctKind::Xvid;
+                }
+            }
             VISUAL_OBJECT_START_CODE => {
                 let _ = parse_visual_object_header(unit)?;
             }
@@ -1005,6 +1011,7 @@ impl From<Mpeg4DecoderOptions> for DecodeOptions {
     fn from(o: Mpeg4DecoderOptions) -> Self {
         DecodeOptions {
             ecosystem_compat: o.ecosystem_compat,
+            idct: crate::compat::IdctKind::Exact,
         }
     }
 }
@@ -1899,5 +1906,51 @@ mod registry_tests {
             AnchorMbMotion::Frame(PvopMbMotion::OneMv(MotionVector { x: 1, y: 2 }))
         );
         assert_eq!(motion[3], AnchorMbMotion::Frame(PvopMbMotion::Intra));
+    }
+}
+
+/// The build number XviD writes into user data (`XviD0064`, say; the reference decoder's
+/// `xvid_build`), or `None` for user data from anyone else. The build number must follow, as
+/// the reference requires; `XviD` alone is not a signature.
+pub fn xvid_build(user_data: &[u8]) -> Option<u32> {
+    let rest = user_data.strip_prefix(b"XviD")?;
+    let digits: Vec<u8> = rest
+        .iter()
+        .copied()
+        .take_while(u8::is_ascii_digit)
+        .collect();
+    if digits.is_empty() {
+        return None;
+    }
+    std::str::from_utf8(&digits).ok()?.parse().ok()
+}
+
+#[cfg(test)]
+mod xvid_user_data_tests {
+    use super::*;
+    use crate::compat::IdctKind;
+
+    #[test]
+    fn xvid_user_data_is_recognised_by_name_and_build() {
+        assert_eq!(xvid_build(b"XviD0064"), Some(64));
+        assert_eq!(xvid_build(b"XviD0039 trailing"), Some(39));
+        assert_eq!(xvid_build(b"XviD"), None);
+        assert_eq!(xvid_build(b"DivX503b1393"), None);
+        assert_eq!(xvid_build(b"Lavc61.19.100"), None);
+        assert_eq!(xvid_build(b""), None);
+    }
+
+    /// A user data unit naming XviD switches the decoder to XviD's IDCT for the rest of the
+    /// stream; other user data leaves the exact transform in place.
+    #[test]
+    fn xvid_user_data_switches_the_inverse_dct() {
+        let mut decoder = Mpeg4VideoDecoder::new();
+        assert_eq!(decoder.options().idct, IdctKind::Exact);
+        let lavc = [&[0, 0, 1, 0xB2][..], b"Lavc61.19.100"].concat();
+        decoder.decode(&lavc).unwrap();
+        assert_eq!(decoder.options().idct, IdctKind::Exact);
+        let xvid = [&[0, 0, 1, 0xB2][..], b"XviD0064"].concat();
+        decoder.decode(&xvid).unwrap();
+        assert_eq!(decoder.options().idct, IdctKind::Xvid);
     }
 }
