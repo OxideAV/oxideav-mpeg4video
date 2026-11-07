@@ -39,6 +39,7 @@ use crate::vop::VopCodingType;
 
 /// Errors from frame-store construction and macroblock blitting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FrameStoreError {
     /// A zero width or height was requested, or a dimension was not a
     /// whole number of macroblocks. MPEG-4 Part 2 luma planes are an

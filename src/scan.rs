@@ -412,6 +412,7 @@ pub fn events_to_pqf(
 
 /// Errors produced when expanding EVENTs into `QFS[]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum InverseScanError {
     /// The cumulative `RUN + 1` exceeded the 64-coefficient block size.
     /// The first out-of-range write position is reported for

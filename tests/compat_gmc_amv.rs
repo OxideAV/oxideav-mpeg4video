@@ -43,14 +43,12 @@ fn maybe_write_fixture(name: &str, bytes: &[u8]) -> bool {
 /// rest are `not_coded` GMC copies.
 fn craft_probe_stream(quarter_sample: bool, du: i32, dv: i32) -> Vec<u8> {
     let (w, h) = (64usize, 64usize);
-    let cfg = EncoderConfig {
-        width: w as u16,
-        height: h as u16,
-        gmc: true,
-        quarter_sample,
-        fcode: 2,
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default()
+        .with_width(w as u16)
+        .with_height(h as u16)
+        .with_gmc(true)
+        .with_quarter_sample(quarter_sample)
+        .with_fcode(2);
     let headers = write_configuration_headers(&cfg);
     let pos = headers
         .windows(4)

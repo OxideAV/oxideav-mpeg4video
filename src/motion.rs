@@ -84,6 +84,7 @@ pub enum MvMode {
 
 /// Errors produced by the motion-vector decoder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MotionParseError {
     /// The supplied bit reader ran out mid-field.
     Truncated,
@@ -808,6 +809,7 @@ pub enum DirectCoLocatedMv {
 /// `DirectMvError` extends the surface with the temporal-reference
 /// preconditions §7.6.7 imposes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DirectMvError {
     /// `trd` was zero (or non-positive). §7.6.7 places the next
     /// anchor strictly after the previous anchor whenever direct mode

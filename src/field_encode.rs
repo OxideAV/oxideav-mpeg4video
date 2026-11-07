@@ -41,6 +41,7 @@ use crate::quarter_sample::interpolate_block_qpel_field_into;
 
 /// The estimate for one output field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct FieldEstimate {
     /// The field motion vector in frame coordinates (VOL units,
     /// vertical component even).

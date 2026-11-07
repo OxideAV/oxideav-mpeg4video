@@ -120,6 +120,7 @@ pub fn write_b_vop_header(
 
 /// Per-VOP B encode statistics (mode-decision observability).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct BVopEncodeStats {
     /// §6.2.6 zero-bit macroblocks (co-located future-P MB skipped).
     pub zero_bit: usize,

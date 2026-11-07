@@ -264,6 +264,7 @@ pub fn pad_macroblock_vectors(
 
 /// Errors returned by [`pad_macroblock_vectors`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum VectorPaddingError {
     /// All four blocks are transparent under
     /// [`MacroblockPaddingMode::PerBlock`]. §7.6.1.6 explicitly scopes

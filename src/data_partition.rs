@@ -60,6 +60,7 @@ pub const MOTION_MARKER_BITS: usize = 17;
 
 /// Errors emitted while parsing a data-partitioned macroblock layer.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DataPartitionError {
     /// The bit reader ran out mid-partition.
     Truncated,

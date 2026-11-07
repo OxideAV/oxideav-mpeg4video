@@ -105,12 +105,10 @@ fn build_ibp(cfg: &EncoderConfig, qp: u32) -> (Vec<u8>, Vec<DecodedFrame>, BVopE
 
 #[test]
 fn ibp_stream_self_decodes_sample_exact() {
-    let cfg = EncoderConfig {
-        width: 64,
-        height: 64,
-        b_vops: true,
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default()
+        .with_width(64)
+        .with_height(64)
+        .with_b_vops(true);
     assert_eq!(cfg.profile_and_level(), 0xF3, "B-VOPs select ASP");
     let (stream, recons, stats) = build_ibp(&cfg, 4);
     let decoded = decode_full(&stream);
@@ -125,14 +123,12 @@ fn ibp_stream_self_decodes_sample_exact() {
 #[test]
 fn ibp_stream_qpel_and_method1_self_decode() {
     for (quant_type, quarter_sample) in [(true, false), (false, true), (true, true)] {
-        let cfg = EncoderConfig {
-            width: 64,
-            height: 48,
-            quant_type,
-            quarter_sample,
-            b_vops: true,
-            ..EncoderConfig::default()
-        };
+        let cfg = EncoderConfig::default()
+            .with_width(64)
+            .with_height(48)
+            .with_quant_type(quant_type)
+            .with_quarter_sample(quarter_sample)
+            .with_b_vops(true);
         let (stream, recons, _stats) = build_ibp(&cfg, 5);
         let decoded = decode_full(&stream);
         assert_frames_match(&decoded, &recons);
@@ -141,12 +137,10 @@ fn ibp_stream_qpel_and_method1_self_decode() {
 
 #[test]
 fn ibp_byte_deterministic() {
-    let cfg = EncoderConfig {
-        width: 64,
-        height: 64,
-        b_vops: true,
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default()
+        .with_width(64)
+        .with_height(64)
+        .with_b_vops(true);
     let (a, _, _) = build_ibp(&cfg, 4);
     let (b, _, _) = build_ibp(&cfg, 4);
     assert_eq!(a, b);
@@ -157,12 +151,10 @@ fn ibp_byte_deterministic() {
 /// co_located_not_coded) — the smallest legal B-VOP.
 #[test]
 fn static_scene_b_vop_is_all_zero_bit() {
-    let cfg = EncoderConfig {
-        width: 48,
-        height: 48,
-        b_vops: true,
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default()
+        .with_width(48)
+        .with_height(48)
+        .with_b_vops(true);
     let (w, h) = (48usize, 48usize);
     let headers = write_configuration_headers(&cfg);
     let pos = headers

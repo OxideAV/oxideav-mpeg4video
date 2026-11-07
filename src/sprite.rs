@@ -49,6 +49,7 @@ pub const MAX_STATIC_WARPING_POINTS: usize = 4;
 
 /// Errors raised while decoding a `sprite_trajectory()`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SpriteTrajectoryError {
     /// The bitstream ran out mid-codeword.
     Truncated,

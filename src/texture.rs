@@ -144,6 +144,7 @@ pub struct IntraDcDifferential {
 
 /// Errors produced by the intra-DC decoder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TextureParseError {
     /// The supplied bit reader ran out mid-field.
     Truncated,

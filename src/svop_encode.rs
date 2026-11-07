@@ -149,6 +149,7 @@ pub fn write_s_vop_header(
 
 /// Per-VOP S(GMC) encode statistics.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SVopEncodeStats {
     /// `not_coded` GMC copies (implied `mcsel == 1`, zero residual).
     pub gmc_skipped: usize,

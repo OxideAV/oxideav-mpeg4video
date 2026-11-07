@@ -53,6 +53,7 @@
 
 /// Static parameters of the Annex D simulation.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub struct RateControlConfig {
     /// Peak channel rate `Rvol` in bits per second (item 3; the VOL
     /// signals `ceil(bit_rate / 400)` in 400-bit units).
@@ -69,8 +70,28 @@ pub struct RateControlConfig {
     pub initial_qp: u32,
 }
 
+impl RateControlConfig {
+    /// Build a [`RateControlConfig`] from its fields.
+    pub fn new(
+        bit_rate: u64,
+        vbv_buffer_units: u32,
+        occupancy_64: u32,
+        seconds_per_vop: f64,
+        initial_qp: u32,
+    ) -> Self {
+        Self {
+            bit_rate,
+            vbv_buffer_units,
+            occupancy_64,
+            seconds_per_vop,
+            initial_qp,
+        }
+    }
+}
+
 /// The Annex D VBV simulation + reactive quantiser controller.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct RateController {
     cfg: RateControlConfig,
     /// Buffer occupancy in bits immediately **before** the next VOP's
@@ -236,6 +257,7 @@ const B_QP_RATIO: f64 = 1.4;
 /// Per-frame record of a first (analysis) pass: the numbers the
 /// two-pass planner needs to allot the sequence budget exactly.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub struct FrameStat {
     /// Coding class in bitstream order.
     pub class: VopClass,
@@ -256,6 +278,7 @@ impl FrameStat {
 /// coded VOP in bitstream order — with a line-oriented text form for
 /// the registry `stats-file` round trip.
 #[derive(Debug, Clone, Default, PartialEq)]
+#[non_exhaustive]
 pub struct FirstPassStats {
     /// One record per coded VOP, bitstream order.
     pub frames: Vec<FrameStat>,
@@ -325,6 +348,7 @@ impl FirstPassStats {
 /// The plan of one VOP: the quantiser to seed it with and the bit
 /// budget its macroblock layer must land on.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub struct VopPlan {
     /// `vop_quant` (1..=31).
     pub qp: u32,

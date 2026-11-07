@@ -683,6 +683,7 @@ pub use warp::{WarpGeometry, div_sdr};
 /// parse errors into this enum so callers don't need to depend on the
 /// private modules' error types.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Error {
     /// Returned by code paths that haven't been wired up yet (VOP
     /// decode, encoder, etc.). The round-1 scope intentionally stops

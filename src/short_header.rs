@@ -198,6 +198,7 @@ impl SourceFormat {
 /// The decoded `video_plane_with_short_header()` picture header
 /// (through the `pei` loop).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ShortHeaderPicture {
     /// 8-bit `temporal_reference` (30000/1001 Hz ticks, modulo 256).
     pub temporal_reference: u8,
@@ -217,6 +218,7 @@ pub struct ShortHeaderPicture {
 
 /// Short-header parse / decode errors.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ShortHeaderError {
     /// The unit does not start with `short_video_start_marker`.
     MissingStartMarker,

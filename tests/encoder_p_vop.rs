@@ -145,11 +145,7 @@ fn ip_stream_self_decodes_sample_exact_with_motion() {
         width: 64,
         height: 64,
     };
-    let cfg = EncoderConfig {
-        width: 64,
-        height: 64,
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default().with_width(64).with_height(64);
     let enc = encode_ip_stream(&cfg, 4, 6, &scene);
     let decoded = decode_full(&enc.stream);
     assert_frames_match(&decoded, &enc.recons);
@@ -186,11 +182,7 @@ fn static_scene_collapses_to_skips() {
         width: 48,
         height: 48,
     };
-    let cfg = EncoderConfig {
-        width: 48,
-        height: 48,
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default().with_width(48).with_height(48);
     // Static: same picture every frame (frame_index fixed at 0).
     let headers = write_configuration_headers(&cfg);
     let pos = headers
@@ -214,13 +206,11 @@ fn static_scene_collapses_to_skips() {
     let reference = store.backward().unwrap().clone();
     let (p_unit, stats) = encode_p_vop(&vol, &cfg, &view, &reference, 0, 1, 4);
     // Every macroblock of an unchanged frame must be skipped: 3×3 MBs.
-    assert_eq!(
-        stats,
-        PVopEncodeStats {
-            skipped: 9,
-            ..Default::default()
-        }
-    );
+    assert_eq!(stats, {
+        let mut want = PVopEncodeStats::default();
+        want.skipped = 9;
+        want
+    });
     // A fully-skipped P-VOP is tiny (header + 9 bits + stuffing).
     assert!(
         p_unit.len() < 16,
@@ -264,12 +254,10 @@ fn divergent_picture(w: usize, h: usize, k: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>
 #[test]
 fn divergent_block_motion_selects_inter4v_and_self_decodes() {
     let (w, h) = (64usize, 64usize);
-    let cfg = EncoderConfig {
-        width: 64,
-        height: 64,
-        four_mv: true,
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default()
+        .with_width(64)
+        .with_height(64)
+        .with_four_mv(true);
     let headers = write_configuration_headers(&cfg);
     let pos = headers
         .windows(4)
@@ -313,10 +301,7 @@ fn divergent_block_motion_selects_inter4v_and_self_decodes() {
 
     // With four-mv disabled the same content still self-decodes (and
     // emits no inter4v macroblocks).
-    let cfg_off = EncoderConfig {
-        four_mv: false,
-        ..cfg
-    };
+    let cfg_off = cfg.with_four_mv(false);
     let mut store = FrameStore::new();
     let mut stream = write_configuration_headers(&cfg_off);
     let mut recons = Vec::new();
@@ -353,12 +338,10 @@ fn four_mv_stream_is_byte_deterministic() {
         width: 64,
         height: 48,
     };
-    let cfg = EncoderConfig {
-        width: 64,
-        height: 48,
-        four_mv: true,
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default()
+        .with_width(64)
+        .with_height(48)
+        .with_four_mv(true);
     let a = encode_ip_stream(&cfg, 4, 4, &scene);
     let b = encode_ip_stream(&cfg, 4, 4, &scene);
     assert_eq!(a.stream, b.stream);
@@ -372,12 +355,10 @@ fn qpel_ip_stream_self_decodes_sample_exact() {
         width: 64,
         height: 64,
     };
-    let cfg = EncoderConfig {
-        width: 64,
-        height: 64,
-        quarter_sample: true,
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default()
+        .with_width(64)
+        .with_height(64)
+        .with_quarter_sample(true);
     assert_eq!(cfg.profile_and_level(), 0xF3, "qpel selects ASP");
     let enc = encode_ip_stream(&cfg, 4, 5, &scene);
     let decoded = decode_full(&enc.stream);
@@ -397,13 +378,11 @@ fn qpel_ip_stream_self_decodes_sample_exact() {
 #[test]
 fn qpel_four_mv_divergent_motion_self_decodes() {
     let (w, h) = (64usize, 64usize);
-    let cfg = EncoderConfig {
-        width: 64,
-        height: 64,
-        four_mv: true,
-        quarter_sample: true,
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default()
+        .with_width(64)
+        .with_height(64)
+        .with_four_mv(true)
+        .with_quarter_sample(true);
     let headers = write_configuration_headers(&cfg);
     let pos = headers
         .windows(4)
@@ -451,12 +430,10 @@ fn ip_determinism_and_method1() {
         width: 64,
         height: 48,
     };
-    let cfg = EncoderConfig {
-        width: 64,
-        height: 48,
-        quant_type: true,
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default()
+        .with_width(64)
+        .with_height(48)
+        .with_quant_type(true);
     let a = encode_ip_stream(&cfg, 5, 4, &scene);
     let b = encode_ip_stream(&cfg, 5, 4, &scene);
     assert_eq!(

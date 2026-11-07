@@ -90,6 +90,7 @@ use crate::vop::VopCodingType;
 /// Errors surfaced while driving one B-VOP macroblock through the
 /// §7.6.8 decode pipeline.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum BVopMvDriverError {
     /// A §6.2.6 header / motion-vector body failed to decode.
     Parse(BVopMbParseError),

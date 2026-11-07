@@ -62,6 +62,7 @@ const VOP_START_CODE: u32 = 0x0000_01B6;
 
 /// Static encoder configuration — the fields that shape the VOL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct EncoderConfig {
     /// Visible luma width in samples (13-bit field, 1..=8191).
     pub width: u16,
@@ -158,14 +159,157 @@ pub struct EncoderConfig {
     pub intra_dc_vlc_thr: u8,
 }
 
+impl EncoderConfig {
+    /// Set `width`.
+    pub fn with_width(mut self, v: u16) -> Self {
+        self.width = v;
+        self
+    }
+
+    /// Set `height`.
+    pub fn with_height(mut self, v: u16) -> Self {
+        self.height = v;
+        self
+    }
+
+    /// Set `time_increment_resolution`.
+    pub fn with_time_increment_resolution(mut self, v: u16) -> Self {
+        self.time_increment_resolution = v;
+        self
+    }
+
+    /// Set `quant_type`.
+    pub fn with_quant_type(mut self, v: bool) -> Self {
+        self.quant_type = v;
+        self
+    }
+
+    /// Set `ac_prediction`.
+    pub fn with_ac_prediction(mut self, v: bool) -> Self {
+        self.ac_prediction = v;
+        self
+    }
+
+    /// Set `four_mv`.
+    pub fn with_four_mv(mut self, v: bool) -> Self {
+        self.four_mv = v;
+        self
+    }
+
+    /// Set `quarter_sample`.
+    pub fn with_quarter_sample(mut self, v: bool) -> Self {
+        self.quarter_sample = v;
+        self
+    }
+
+    /// Set `b_vops`.
+    pub fn with_b_vops(mut self, v: bool) -> Self {
+        self.b_vops = v;
+        self
+    }
+
+    /// Set `vbv`.
+    pub fn with_vbv(mut self, v: Option<VbvSignalling>) -> Self {
+        self.vbv = v;
+        self
+    }
+
+    /// Set `fcode`.
+    pub fn with_fcode(mut self, v: u8) -> Self {
+        self.fcode = v;
+        self
+    }
+
+    /// Set `adaptive_quant`.
+    pub fn with_adaptive_quant(mut self, v: bool) -> Self {
+        self.adaptive_quant = v;
+        self
+    }
+
+    /// Set `mb_budget`.
+    pub fn with_mb_budget(mut self, v: Option<crate::mb_quant::MbBudget>) -> Self {
+        self.mb_budget = v;
+        self
+    }
+
+    /// Set `resilience`.
+    pub fn with_resilience(mut self, v: crate::packet_encode::ResilienceConfig) -> Self {
+        self.resilience = v;
+        self
+    }
+
+    /// Set `gmc`.
+    pub fn with_gmc(mut self, v: bool) -> Self {
+        self.gmc = v;
+        self
+    }
+
+    /// Set `gmc_points`.
+    pub fn with_gmc_points(mut self, v: u8) -> Self {
+        self.gmc_points = v;
+        self
+    }
+
+    /// Set `interlaced`.
+    pub fn with_interlaced(mut self, v: bool) -> Self {
+        self.interlaced = v;
+        self
+    }
+
+    /// Set `top_field_first`.
+    pub fn with_top_field_first(mut self, v: bool) -> Self {
+        self.top_field_first = v;
+        self
+    }
+
+    /// Set `alternate_scan`.
+    pub fn with_alternate_scan(mut self, v: bool) -> Self {
+        self.alternate_scan = v;
+        self
+    }
+
+    /// Set `short_header`.
+    pub fn with_short_header(mut self, v: bool) -> Self {
+        self.short_header = v;
+        self
+    }
+
+    /// Set `gob_headers`.
+    pub fn with_gob_headers(mut self, v: bool) -> Self {
+        self.gob_headers = v;
+        self
+    }
+
+    /// Set `intra_dc_vlc_thr`.
+    pub fn with_intra_dc_vlc_thr(mut self, v: u8) -> Self {
+        self.intra_dc_vlc_thr = v;
+        self
+    }
+}
+
 /// The two §6.3.5 interlaced VOP-header flags, written right after
 /// `intra_dc_vlc_thr` when the VOL codes `interlaced == 1`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct VopInterlaceFlags {
     /// `top_field_first`.
     pub top_field_first: bool,
     /// `alternate_vertical_scan_flag`.
     pub alternate_vertical_scan: bool,
+}
+
+impl VopInterlaceFlags {
+    /// Set `top_field_first`.
+    pub fn with_top_field_first(mut self, v: bool) -> Self {
+        self.top_field_first = v;
+        self
+    }
+
+    /// Set `alternate_vertical_scan`.
+    pub fn with_alternate_vertical_scan(mut self, v: bool) -> Self {
+        self.alternate_vertical_scan = v;
+        self
+    }
 }
 
 impl VopInterlaceFlags {
@@ -865,6 +1009,7 @@ pub fn encode_i_vop_elect_thr_full(
 /// running quantiser and its measured cost under the DC VLC and under
 /// the AC VLC (both with the macroblock's own `ac_pred` decision).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DcVlcProbe {
     /// The quantiser the macroblock was coded with.
     pub qp: u32,
@@ -902,6 +1047,7 @@ pub fn elect_intra_dc_vlc_thr(probe: &[DcVlcProbe]) -> u8 {
 /// Per-VOP I encode statistics (observability for tests and the rate
 /// model).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct IVopEncodeStats {
     /// Macroblocks that carried a `dquant` (`intra+q`).
     pub dquant: usize,

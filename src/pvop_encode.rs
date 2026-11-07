@@ -132,6 +132,7 @@ pub fn write_p_vop_header(
 
 /// Per-VOP encode statistics (mode-decision observability for tests).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PVopEncodeStats {
     /// Macroblocks emitted as `not_coded` skips.
     pub skipped: usize,

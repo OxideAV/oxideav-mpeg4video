@@ -122,6 +122,7 @@ pub const TABLE_7_10: [u8; 16] = [0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2
 
 /// Errors raised by [`chroma_mv_from_luma_blocks`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ChromaMvError {
     /// `K` (the number of contributing luminance sub-blocks) was zero
     /// or greater than 4 — §7.6.5 requires `1 <= K <= 4` because the

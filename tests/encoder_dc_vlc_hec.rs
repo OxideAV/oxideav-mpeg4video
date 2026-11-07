@@ -173,18 +173,17 @@ fn explicit_thresholds_round_trip_in_both_layouts() {
         (7, 9, true),
         (3, 17, true),
     ] {
-        let cfg = EncoderConfig {
-            width: 96,
-            height: 64,
-            adaptive_quant: true,
-            intra_dc_vlc_thr: thr,
-            resilience: ResilienceConfig {
-                packet_bits: if dp { 700 } else { 0 },
-                data_partitioned: dp,
-                reversible_vlc: dp,
-            },
-            ..EncoderConfig::default()
-        };
+        let cfg = EncoderConfig::default()
+            .with_width(96)
+            .with_height(64)
+            .with_adaptive_quant(true)
+            .with_intra_dc_vlc_thr(thr)
+            .with_resilience(
+                ResilienceConfig::default()
+                    .with_packet_bits(if dp { 700 } else { 0 })
+                    .with_data_partitioned(dp)
+                    .with_reversible_vlc(dp),
+            );
         let (headers, vol) = vol_of(&cfg);
         let mut stream = headers;
         let mut recons = Vec::new();
@@ -224,11 +223,7 @@ fn explicit_thresholds_round_trip_in_both_layouts() {
 /// the explicit variants bracket it.
 #[test]
 fn election_keeps_the_cheaper_variant() {
-    let cfg = EncoderConfig {
-        width: 64,
-        height: 48,
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default().with_width(64).with_height(48);
     let (_, vol) = vol_of(&cfg);
     for qp in [2u32, 8, 20, 31] {
         let (y, cb, cr) = picture(64, 48, 0, (0, 0));
@@ -331,12 +326,10 @@ fn registry_dc_vlc_options() {
 /// mid-table winner appears at the straddling quantisers).
 #[test]
 fn election_is_optimal_over_the_whole_table() {
-    let cfg = EncoderConfig {
-        width: 96,
-        height: 64,
-        adaptive_quant: true,
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default()
+        .with_width(96)
+        .with_height(64)
+        .with_adaptive_quant(true);
     let (_, vol) = vol_of(&cfg);
     let (y, cb, cr) = picture(96, 64, 1, (0, 0));
     let view = FrameView {
@@ -390,15 +383,13 @@ fn election_is_optimal_over_the_whole_table() {
     };
     let mut mid = None;
     for target_bits in [3_000u32, 4_000, 5_000, 6_000, 8_000, 10_000] {
-        let cfg = EncoderConfig {
-            width: 96,
-            height: 64,
-            mb_budget: Some(oxideav_mpeg4video::mb_quant::MbBudget {
+        let cfg = EncoderConfig::default()
+            .with_width(96)
+            .with_height(64)
+            .with_mb_budget(Some(oxideav_mpeg4video::mb_quant::MbBudget::new(
                 target_bits,
-                band: 14,
-            }),
-            ..EncoderConfig::default()
-        };
+                14,
+            )));
         let (_, vol) = vol_of(&cfg);
         let (unit, _recon, thr) = encode_i_vop_elect_thr(&vol, &cfg, &view, 0, 0, 8);
         let extremes =
@@ -430,19 +421,17 @@ fn election_is_optimal_over_the_whole_table() {
 #[test]
 fn gmc_packets_carry_the_hec_trajectory() {
     for points in [1u8, 3] {
-        let cfg = EncoderConfig {
-            width: 96,
-            height: 64,
-            gmc: true,
-            gmc_points: points,
-            fcode: 2,
-            intra_dc_vlc_thr: 7,
-            resilience: ResilienceConfig {
-                packet_bits: 500,
-                ..Default::default()
-            },
-            ..EncoderConfig::default()
-        };
+        let cfg = EncoderConfig::default()
+            .with_width(96)
+            .with_height(64)
+            .with_gmc(true)
+            .with_gmc_points(points)
+            .with_fcode(2)
+            .with_intra_dc_vlc_thr(7)
+            .with_resilience(
+                oxideav_mpeg4video::packet_encode::ResilienceConfig::default()
+                    .with_packet_bits(500),
+            );
         let (headers, vol) = vol_of(&cfg);
         let mut stream = headers;
         let mut recons = Vec::new();

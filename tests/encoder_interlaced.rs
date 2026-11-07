@@ -220,12 +220,10 @@ fn encode_ip(
 /// decode is sample-exact.
 #[test]
 fn interlaced_ip_field_tools_fire_and_round_trip() {
-    let cfg = EncoderConfig {
-        width: 64,
-        height: 64,
-        interlaced: true,
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default()
+        .with_width(64)
+        .with_height(64)
+        .with_interlaced(true);
     let (stream, recons, stats) = encode_ip(&cfg, 4, ((2, 0), (0, 0)), 4);
     let field: usize = stats.iter().map(|s| s.field).sum();
     let field_dct: usize = stats.iter().map(|s| s.field_dct).sum();
@@ -240,14 +238,12 @@ fn interlaced_ip_field_tools_fire_and_round_trip() {
 /// §7.6.2.2 per-8×8 field cascade, still sample-exact.
 #[test]
 fn interlaced_qpel_ip_round_trips() {
-    let cfg = EncoderConfig {
-        width: 64,
-        height: 48,
-        interlaced: true,
-        quarter_sample: true,
-        fcode: 2,
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default()
+        .with_width(64)
+        .with_height(48)
+        .with_interlaced(true)
+        .with_quarter_sample(true)
+        .with_fcode(2);
     let (stream, recons, stats) = encode_ip(&cfg, 4, ((1, 0), (2, 2)), 5);
     assert!(
         stats.iter().map(|s| s.field).sum::<usize>() > 0,
@@ -261,16 +257,14 @@ fn interlaced_qpel_ip_round_trips() {
 /// inter paths; the flags survive the VOP-header round trip.
 #[test]
 fn interlaced_alternate_scan_bottom_field_first_round_trips() {
-    let cfg = EncoderConfig {
-        width: 48,
-        height: 48,
-        interlaced: true,
-        alternate_scan: true,
-        top_field_first: false,
-        four_mv: true,
-        adaptive_quant: true,
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default()
+        .with_width(48)
+        .with_height(48)
+        .with_interlaced(true)
+        .with_alternate_scan(true)
+        .with_top_field_first(false)
+        .with_four_mv(true)
+        .with_adaptive_quant(true);
     let (stream, recons, _stats) = encode_ip(&cfg, 3, ((0, 2), (1, 0)), 6);
     let frames = decode_all(&stream);
     assert_exact(&frames, &recons);
@@ -381,13 +375,11 @@ fn encode_ipbb(
 /// sample-exact through the interlaced B walk.
 #[test]
 fn interlaced_ipbb_spec_modes_fire_and_round_trip() {
-    let cfg = EncoderConfig {
-        width: 96,
-        height: 64,
-        interlaced: true,
-        b_vops: true,
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default()
+        .with_width(96)
+        .with_height(64)
+        .with_interlaced(true)
+        .with_b_vops(true);
     let (stream, recons, stats) = encode_ipbb(&cfg, ((2, 0), (0, 0)), 4, false);
     let field: usize = stats
         .iter()
@@ -406,14 +398,12 @@ fn interlaced_ipbb_spec_modes_fire_and_round_trip() {
 /// §7.7.2.2 divergence, identical under the ecosystem-compat decode.
 #[test]
 fn interlaced_ipbb_compat_emission_avoids_interlaced_direct() {
-    let cfg = EncoderConfig {
-        width: 96,
-        height: 64,
-        interlaced: true,
-        b_vops: true,
-        quarter_sample: true,
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default()
+        .with_width(96)
+        .with_height(64)
+        .with_interlaced(true)
+        .with_b_vops(true)
+        .with_quarter_sample(true);
     let (stream, recons, stats) = encode_ipbb(&cfg, ((1, 2), (2, 0)), 5, true);
     assert!(stats.iter().all(|s| s.interlaced_direct == 0), "{stats:?}");
     assert!(
@@ -511,12 +501,10 @@ fn registry_interlaced_options() {
 /// bit-exactly (commands + SHA-256 in `tests/fixtures/NOTES.md`).
 #[test]
 fn blackbox_interlaced_ip_stream_is_bit_exact() {
-    let cfg = EncoderConfig {
-        width: 64,
-        height: 64,
-        interlaced: true,
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default()
+        .with_width(64)
+        .with_height(64)
+        .with_interlaced(true);
     let (stream, recons, _) = encode_ip(&cfg, 4, ((2, 0), (0, 0)), 4);
     pin_fixture("enc_ilaced_ip_64x64.m4v", &stream);
     if std::env::var_os("OXIDEAV_MPEG4VIDEO_WRITE_FIXTURES").is_some() {
@@ -536,13 +524,11 @@ fn blackbox_interlaced_ip_stream_is_bit_exact() {
 /// closed loop bit-exactly.
 #[test]
 fn blackbox_interlaced_ipbb_compat_stream_is_bit_exact() {
-    let cfg = EncoderConfig {
-        width: 96,
-        height: 64,
-        interlaced: true,
-        b_vops: true,
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default()
+        .with_width(96)
+        .with_height(64)
+        .with_interlaced(true)
+        .with_b_vops(true);
     let (stream, recons, _) = encode_ipbb(&cfg, ((2, 0), (0, 0)), 4, true);
     pin_fixture("enc_ilaced_ipbb_compat_96x64.m4v", &stream);
     if std::env::var_os("OXIDEAV_MPEG4VIDEO_WRITE_FIXTURES").is_some() {
@@ -571,14 +557,12 @@ fn blackbox_interlaced_ipbb_compat_stream_is_bit_exact() {
 fn blackbox_interlaced_ipbb_spec_stream_diverges_only_in_interlaced_direct() {
     use oxideav_mpeg4video::compat::DecodeOptions;
     let (w, h) = (96usize, 64usize);
-    let cfg = EncoderConfig {
-        width: w as u16,
-        height: h as u16,
-        interlaced: true,
-        b_vops: true,
-        quarter_sample: true,
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default()
+        .with_width(w as u16)
+        .with_height(h as u16)
+        .with_interlaced(true)
+        .with_b_vops(true)
+        .with_quarter_sample(true);
     let (stream, recons, stats) = encode_ipbb(&cfg, ((1, 2), (2, 0)), 5, false);
     assert!(
         stats.iter().map(|s| s.interlaced_direct).sum::<usize>() > 0,
@@ -753,15 +737,13 @@ fn encode_isbb(
 /// interlaced B-VOPs over the S anchors decode sample-exact.
 #[test]
 fn interlaced_gmc_isbb_round_trips() {
-    let cfg = EncoderConfig {
-        width: 96,
-        height: 64,
-        interlaced: true,
-        gmc: true,
-        b_vops: true,
-        fcode: 2,
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default()
+        .with_width(96)
+        .with_height(64)
+        .with_interlaced(true)
+        .with_gmc(true)
+        .with_b_vops(true)
+        .with_fcode(2);
     let (stream, recons, s_stats, b_stats) = encode_isbb(&cfg, ((2, 0), (2, 2)), 5, false);
     let gmc: usize = s_stats.iter().map(|s| s.gmc + s.gmc_skipped).sum();
     let field: usize = s_stats.iter().map(|s| s.field).sum();

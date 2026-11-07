@@ -67,6 +67,7 @@ pub const VIDEO_OBJECT_START_CODE_MAX: u32 = 0x0000_011F;
 
 /// Errors produced by the structural VOL header parser.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum VolParseError {
     /// The supplied byte slice ran out mid-field.
     Truncated,
@@ -434,6 +435,7 @@ pub struct VbvParameters {
 /// Typed view of the bits that precede VOP data in a Video Object
 /// Layer header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct VolHeader {
     /// The 8-bit `profile_and_level_indication` from the parent
     /// `VisualObjectSequence`.

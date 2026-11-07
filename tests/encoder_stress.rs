@@ -70,12 +70,10 @@ fn synthesise(kind: &Kind, w: usize, h: usize, seed: u32) -> (Vec<u8>, Vec<u8>, 
 
 /// Encode a 4-frame I P I P stream and assert exact self-decode.
 fn roundtrip(kind: Kind, w: u16, h: u16, qp: u32, quant_type: bool) {
-    let cfg = EncoderConfig {
-        width: w,
-        height: h,
-        quant_type,
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default()
+        .with_width(w)
+        .with_height(h)
+        .with_quant_type(quant_type);
     let headers = write_configuration_headers(&cfg);
     let pos = headers
         .windows(4)
@@ -176,15 +174,13 @@ fn minimum_size_single_macroblock() {
 /// quarter-sample + B-VOPs) on adversarial content — every stream
 /// self-decodes sample-exact against the closed-loop reconstructions.
 fn roundtrip_ibp(kind: Kind, w: u16, h: u16, qp: u32, quant_type: bool) {
-    let cfg = EncoderConfig {
-        width: w,
-        height: h,
-        quant_type,
-        four_mv: true,
-        quarter_sample: true,
-        b_vops: true,
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default()
+        .with_width(w)
+        .with_height(h)
+        .with_quant_type(quant_type)
+        .with_four_mv(true)
+        .with_quarter_sample(true)
+        .with_b_vops(true);
     roundtrip_ibp_cfg(kind, &cfg, qp);
 }
 
@@ -192,22 +188,21 @@ fn roundtrip_ibp(kind: Kind, w: u16, h: u16, qp: u32, quant_type: bool) {
 /// per-macroblock `dquant` / `dbquant`, ~200-bit video packets, data
 /// partitioning and reversible VLCs.
 fn roundtrip_ibp_resilient(kind: Kind, w: u16, h: u16, qp: u32, quant_type: bool) {
-    let cfg = EncoderConfig {
-        width: w,
-        height: h,
-        quant_type,
-        four_mv: true,
-        quarter_sample: true,
-        b_vops: true,
-        fcode: 3,
-        adaptive_quant: true,
-        resilience: oxideav_mpeg4video::packet_encode::ResilienceConfig {
-            packet_bits: 200,
-            data_partitioned: true,
-            reversible_vlc: true,
-        },
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default()
+        .with_width(w)
+        .with_height(h)
+        .with_quant_type(quant_type)
+        .with_four_mv(true)
+        .with_quarter_sample(true)
+        .with_b_vops(true)
+        .with_fcode(3)
+        .with_adaptive_quant(true)
+        .with_resilience(
+            oxideav_mpeg4video::packet_encode::ResilienceConfig::default()
+                .with_packet_bits(200)
+                .with_data_partitioned(true)
+                .with_reversible_vlc(true),
+        );
     roundtrip_ibp_cfg(kind, &cfg, qp);
 }
 

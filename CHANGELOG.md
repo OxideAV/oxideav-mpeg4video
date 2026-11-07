@@ -6,6 +6,34 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `with_*` setters for every field of `EncoderConfig`, `ResilienceConfig`,
+  `VopInterlaceFlags`, `DecodeOptions` and `Mpeg4DecoderOptions`, plus
+  `RateControlConfig::new(..)` and `MbBudget::new(target_bits, band)`.
+
+### Changed
+
+- API hygiene: `#[non_exhaustive]` on the crate `Error` and every
+  public parse / decode error enum (`VolParseError`, `VopParseError`,
+  `VopDecodeError`, `StreamDecodeError`, `FrameDecodeError`,
+  `FrameStoreError`, `MacroblockParseError`, `BVopMbParseError`,
+  `BVopMvDriverError`, `MotionParseError`, `DirectMvError`,
+  `TextureParseError`, `InverseScanError`, `BlockAssemblyError`,
+  `VideoPacketParseError`, `DataPartitionError`, `ChromaMvError`,
+  `MvGridError`, `PvopMvError`, `VectorPaddingError`,
+  `SpriteTrajectoryError`, `ShortHeaderError`), and on the records
+  `EncoderConfig`, `ResilienceConfig`, `VopInterlaceFlags`,
+  `RateControlConfig`, `RateController`, `MbBudget`, `DecodeOptions`,
+  `Mpeg4DecoderOptions`, `VolHeader`, `ShortHeaderPicture`,
+  `FieldEstimate`, `DcVlcProbe`, `FrameStat`, `VopPlan`,
+  `FirstPassStats` and the per-VOP encode stats (`IVopEncodeStats`,
+  `PVopEncodeStats`, `BVopEncodeStats`, `BVopInterlacedEncodeStats`,
+  `SVopEncodeStats`). Bitstream-fixed enums (`VopCodingType`,
+  `SourceFormat`, `AspectRatio`, `SpriteEnable`,
+  `SpriteWarpingAccuracy`) and fixed VOL sub-records stay exhaustive.
+  No behaviour change.
+
 ## [0.1.9](https://github.com/OxideAV/oxideav-mpeg4video/compare/v0.1.8...v0.1.9) - 2026-10-24
 
 ### Added

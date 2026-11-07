@@ -127,6 +127,7 @@ impl PvopMbMotion {
 
 /// Errors produced by the P-VOP motion-vector driver.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum PvopMvError {
     /// The motion-vector body failed to decode (Table B.12 VLC miss,
     /// truncation, or an out-of-range `vop_fcode`).

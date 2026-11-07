@@ -56,6 +56,7 @@ use crate::vop::VopCodingType;
 
 /// Errors produced by the `video_packet_header` parsers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum VideoPacketParseError {
     /// The supplied byte slice ran out before the parser finished
     /// reading a field. Includes the §5.2.5 stuffing run, the resync

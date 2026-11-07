@@ -36,6 +36,7 @@ use crate::warp::WarpGeometry;
 
 /// Errors raised while assembling a frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FrameDecodeError {
     /// The reference-frame chain lacked the anchor(s) this VOP type needs
     /// (a P-VOP with no preceding I/P/S-VOP, or a B-VOP missing one of

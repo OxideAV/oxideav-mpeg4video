@@ -94,6 +94,7 @@ pub fn plan_dbquant(running: u32, target: u32) -> (u32, Option<i8>) {
 /// `dquant` / `dbquant` steps then regulate the spend against it
 /// through an [`MbRegulator`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MbBudget {
     /// Target size of the whole VOP unit in bits (VOP header and
     /// packet headers included — the regulator measures the writer's
@@ -103,6 +104,13 @@ pub struct MbBudget {
     /// `vop_quant` (a wide band tracks the budget tightly, a narrow
     /// one keeps the quantiser — and the quality — more uniform).
     pub band: u8,
+}
+
+impl MbBudget {
+    /// Build a [`MbBudget`] from its fields.
+    pub fn new(target_bits: u32, band: u8) -> Self {
+        Self { target_bits, band }
+    }
 }
 
 /// The per-macroblock budget regulator: maps the bits spent before a

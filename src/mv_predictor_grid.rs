@@ -219,6 +219,7 @@ pub const LUMA_BLOCKS_PER_MB: usize = 4;
 
 /// `MvGrid` errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MvGridError {
     /// `mb_row` was `>= mb_rows`.
     RowOutOfBounds {

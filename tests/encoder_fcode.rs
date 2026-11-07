@@ -148,12 +148,10 @@ fn header_fcodes(stream: &[u8], vol_fcode_expected: u8) -> usize {
 
 #[test]
 fn fcode2_half_sample_finds_20_pel_translation() {
-    let cfg = EncoderConfig {
-        width: 96,
-        height: 64,
-        fcode: 2,
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default()
+        .with_width(96)
+        .with_height(64)
+        .with_fcode(2);
     let enc = encode_ip(&cfg, 3, (20, 5), 4);
     assert_self_decodes(&enc);
     assert_eq!(header_fcodes(&enc.stream, 2), 2);
@@ -175,13 +173,11 @@ fn fcode2_half_sample_finds_20_pel_translation() {
 
 #[test]
 fn fcode3_quarter_sample_finds_24_pel_translation() {
-    let cfg = EncoderConfig {
-        width: 96,
-        height: 64,
-        fcode: 3,
-        quarter_sample: true,
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default()
+        .with_width(96)
+        .with_height(64)
+        .with_fcode(3)
+        .with_quarter_sample(true);
     let enc = encode_ip(&cfg, 3, (24, -3), 4);
     assert_self_decodes(&enc);
     for (k, m) in enc.motion.iter().enumerate() {
@@ -197,13 +193,11 @@ fn fcode3_quarter_sample_finds_24_pel_translation() {
 
 #[test]
 fn fcode2_with_inter4v_stays_in_range_and_exact() {
-    let cfg = EncoderConfig {
-        width: 80,
-        height: 48,
-        fcode: 2,
-        four_mv: true,
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default()
+        .with_width(80)
+        .with_height(48)
+        .with_fcode(2)
+        .with_four_mv(true);
     let enc = encode_ip(&cfg, 4, (13, 9), 6);
     assert_self_decodes(&enc);
     for m in &enc.motion {
@@ -216,13 +210,11 @@ fn fcode2_with_inter4v_stays_in_range_and_exact() {
 fn every_fcode_round_trips_a_small_grid() {
     for fcode in 1..=7u8 {
         for quarter_sample in [false, true] {
-            let cfg = EncoderConfig {
-                width: 48,
-                height: 32,
-                fcode,
-                quarter_sample,
-                ..EncoderConfig::default()
-            };
+            let cfg = EncoderConfig::default()
+                .with_width(48)
+                .with_height(32)
+                .with_fcode(fcode)
+                .with_quarter_sample(quarter_sample);
             let enc = encode_ip(&cfg, 3, (5, 2), 8);
             assert_self_decodes(&enc);
             let (low, high) = {

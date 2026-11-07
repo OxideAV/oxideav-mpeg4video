@@ -159,12 +159,10 @@ fn encode_stream(
 
 #[test]
 fn qcif_ip_with_gob_headers_round_trips() {
-    let cfg = EncoderConfig {
-        width: 176,
-        height: 144,
-        short_header: true,
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default()
+        .with_width(176)
+        .with_height(144)
+        .with_short_header(true);
     let (stream, recons) = encode_stream(&cfg, 5, 3, (2, 1), 5);
     // No MPEG-4 start code anywhere; the picture starts are
     // byte-aligned short_video_start_markers.
@@ -183,26 +181,22 @@ fn qcif_ip_with_gob_headers_round_trips() {
 
 #[test]
 fn sub_qcif_without_gob_headers_round_trips_with_adaptive_quant() {
-    let cfg = EncoderConfig {
-        width: 128,
-        height: 96,
-        short_header: true,
-        gob_headers: false,
-        adaptive_quant: true,
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default()
+        .with_width(128)
+        .with_height(96)
+        .with_short_header(true)
+        .with_gob_headers(false)
+        .with_adaptive_quant(true);
     let (stream, recons) = encode_stream(&cfg, 4, 4, (-3, 2), 8);
     assert_exact(&decode_all(&stream), &recons);
 }
 
 #[test]
 fn cif_intra_only_round_trips_at_quantiser_extremes() {
-    let cfg = EncoderConfig {
-        width: 352,
-        height: 288,
-        short_header: true,
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default()
+        .with_width(352)
+        .with_height(288)
+        .with_short_header(true);
     for qp in [1u32, 31] {
         let (stream, recons) = encode_stream(&cfg, 1, 1, (0, 0), qp);
         assert_exact(&decode_all(&stream), &recons);
@@ -314,13 +308,11 @@ fn registry_short_header_option() {
 /// bit-exactly through the reference decoder.
 #[test]
 fn blackbox_our_short_header_stream_is_bit_exact() {
-    let cfg = EncoderConfig {
-        width: 176,
-        height: 144,
-        short_header: true,
-        adaptive_quant: true,
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default()
+        .with_width(176)
+        .with_height(144)
+        .with_short_header(true)
+        .with_adaptive_quant(true);
     let (stream, recons) = encode_stream(&cfg, 5, 3, (2, 1), 5);
     pin_fixture("enc_sh_ippip_176x144.h263", &stream);
     if std::env::var_os("OXIDEAV_MPEG4VIDEO_WRITE_FIXTURES").is_some() {

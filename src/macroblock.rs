@@ -252,6 +252,7 @@ impl MacroblockHeader {
 
 /// Errors emitted by the macroblock-header parser.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MacroblockParseError {
     /// The supplied bit reader ran out mid-field.
     Truncated,

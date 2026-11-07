@@ -67,6 +67,7 @@ const USER_DATA_START_CODE: u32 = 0x0000_01B2;
 
 /// Errors raised by the elementary-stream decoder.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum StreamDecodeError {
     /// A configuration header failed to parse.
     Vol(VolParseError),
@@ -996,9 +997,18 @@ impl oxideav_core::Decoder for Mpeg4PacketDecoder {
 /// [`DecodeOptions`](crate::compat::DecodeOptions) to
 /// [`Mpeg4VideoDecoder::with_options`] directly.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Mpeg4DecoderOptions {
     /// The [`crate::compat`] ecosystem-compat switch.
     pub ecosystem_compat: bool,
+}
+
+impl Mpeg4DecoderOptions {
+    /// Set `ecosystem_compat`.
+    pub fn with_ecosystem_compat(mut self, v: bool) -> Self {
+        self.ecosystem_compat = v;
+        self
+    }
 }
 
 impl From<Mpeg4DecoderOptions> for DecodeOptions {

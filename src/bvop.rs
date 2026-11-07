@@ -221,6 +221,7 @@ pub struct BVopMbHeader {
 
 /// Errors produced by the B-VOP macroblock header parser.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum BVopMbParseError {
     /// The supplied bit reader ran out mid-field.
     Truncated,

@@ -273,6 +273,7 @@ pub struct VopHeader {
 /// marker-bit cases so callers can keep a single error surface, and
 /// add this enum for the new VOP-specific failure modes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum VopParseError {
     /// The supplied byte slice ran out mid-field.
     Truncated,

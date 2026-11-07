@@ -188,6 +188,7 @@ pub const DEFAULT_NONINTRA_QUANT_MATRIX: [[u8; 8]; 8] = [
 
 /// Errors produced while assembling a `block(i)` / macroblock.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum BlockAssemblyError {
     /// The supplied macroblock header is not an intra macroblock; this
     /// driver only handles the intra `block(i)` assembly so far.

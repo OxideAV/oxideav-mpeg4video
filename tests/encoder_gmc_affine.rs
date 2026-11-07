@@ -208,14 +208,12 @@ fn encode_is(
 /// and the decode is sample-exact.
 #[test]
 fn affine_zoom_lands_in_a_three_point_trajectory() {
-    let cfg = EncoderConfig {
-        width: 96,
-        height: 64,
-        gmc: true,
-        gmc_points: 3,
-        fcode: 2,
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default()
+        .with_width(96)
+        .with_height(64)
+        .with_gmc(true)
+        .with_gmc_points(3)
+        .with_fcode(2);
     let (stream, recons, stats) = encode_is(
         &cfg,
         4,
@@ -251,14 +249,12 @@ fn affine_zoom_lands_in_a_three_point_trajectory() {
 /// Rotation + pan through a two-point (similarity) trajectory.
 #[test]
 fn similarity_rotation_lands_in_a_two_point_trajectory() {
-    let cfg = EncoderConfig {
-        width: 96,
-        height: 64,
-        gmc: true,
-        gmc_points: 2,
-        fcode: 2,
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default()
+        .with_width(96)
+        .with_height(64)
+        .with_gmc(true)
+        .with_gmc_points(2)
+        .with_fcode(2);
     let (stream, recons, stats) = encode_is(&cfg, 4, Motion::Rotate { pan: (1, 0) }, 4);
     for (k, st) in stats.iter().enumerate() {
         assert_eq!(st.points.count, 2);
@@ -281,13 +277,11 @@ fn similarity_rotation_lands_in_a_two_point_trajectory() {
 /// A pure pan still fits the multi-point models (zero warp terms).
 #[test]
 fn pure_pan_fits_the_affine_model_as_translation() {
-    let cfg = EncoderConfig {
-        width: 64,
-        height: 48,
-        gmc: true,
-        gmc_points: 3,
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default()
+        .with_width(64)
+        .with_height(48)
+        .with_gmc(true)
+        .with_gmc_points(3);
     let (stream, recons, stats) = encode_is(
         &cfg,
         3,
@@ -335,14 +329,12 @@ fn registry_gmc_points_option() {
 /// against the spec closed loop.
 #[test]
 fn blackbox_three_point_gmc_stream() {
-    let cfg = EncoderConfig {
-        width: 96,
-        height: 64,
-        gmc: true,
-        gmc_points: 3,
-        fcode: 2,
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default()
+        .with_width(96)
+        .with_height(64)
+        .with_gmc(true)
+        .with_gmc_points(3)
+        .with_fcode(2);
     let (stream, recons, _) = encode_is(
         &cfg,
         4,
@@ -369,14 +361,12 @@ fn blackbox_three_point_gmc_stream() {
 /// near-tie sample of the intra picture.
 #[test]
 fn blackbox_two_point_gmc_stream() {
-    let cfg = EncoderConfig {
-        width: 96,
-        height: 64,
-        gmc: true,
-        gmc_points: 2,
-        fcode: 2,
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default()
+        .with_width(96)
+        .with_height(64)
+        .with_gmc(true)
+        .with_gmc_points(2)
+        .with_fcode(2);
     let (stream, recons, _) = encode_is(&cfg, 4, Motion::Rotate { pan: (1, 0) }, 4);
     pin_fixture("enc_is_gmc2_rot_96x64.m4v", &stream);
     if std::env::var_os("OXIDEAV_MPEG4VIDEO_WRITE_FIXTURES").is_some() {

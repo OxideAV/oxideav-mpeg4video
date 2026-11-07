@@ -93,6 +93,7 @@
 ///
 /// `Default` is the literal-spec behaviour on every axis.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DecodeOptions {
     /// Opt-in ecosystem-compat mode. When `true` the decoder
     /// reproduces the black-box-observed ecosystem behaviour on
@@ -117,6 +118,14 @@ pub struct DecodeOptions {
     /// When `false` (the default) all three clauses follow the printed
     /// specification text.
     pub ecosystem_compat: bool,
+}
+
+impl DecodeOptions {
+    /// Set `ecosystem_compat`.
+    pub fn with_ecosystem_compat(mut self, v: bool) -> Self {
+        self.ecosystem_compat = v;
+        self
+    }
 }
 
 impl DecodeOptions {

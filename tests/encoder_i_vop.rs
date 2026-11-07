@@ -165,11 +165,7 @@ fn decode_full(stream: &[u8]) -> Vec<DecodedFrame> {
 
 #[test]
 fn intra_stream_self_decodes_sample_exact_method2() {
-    let cfg = EncoderConfig {
-        width: 64,
-        height: 64,
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default().with_width(64).with_height(64);
     let (stream, recons, pics) = encode_stream(&cfg, 4, 3);
     let decoded = decode_full(&stream);
     assert_frames_match(&decoded, &recons);
@@ -181,12 +177,10 @@ fn intra_stream_self_decodes_sample_exact_method2() {
 
 #[test]
 fn intra_stream_self_decodes_sample_exact_method1() {
-    let cfg = EncoderConfig {
-        width: 64,
-        height: 48,
-        quant_type: true,
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default()
+        .with_width(64)
+        .with_height(48)
+        .with_quant_type(true);
     let (stream, recons, pics) = encode_stream(&cfg, 5, 2);
     let decoded = decode_full(&stream);
     assert_frames_match(&decoded, &recons);
@@ -199,11 +193,7 @@ fn intra_stream_self_decodes_sample_exact_method1() {
 #[test]
 fn partial_edge_macroblocks_encode_and_decode() {
     // 40×24 → a 3×2 macroblock grid with 8-sample partial edges.
-    let cfg = EncoderConfig {
-        width: 40,
-        height: 24,
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default().with_width(40).with_height(24);
     let (stream, recons, pics) = encode_stream(&cfg, 6, 2);
     let decoded = decode_full(&stream);
     assert_eq!(decoded[0].width(), 48, "decoded frame covers the MB grid");
@@ -215,11 +205,7 @@ fn partial_edge_macroblocks_encode_and_decode() {
 
 #[test]
 fn encoding_is_deterministic() {
-    let cfg = EncoderConfig {
-        width: 64,
-        height: 64,
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default().with_width(64).with_height(64);
     let (a, _, _) = encode_stream(&cfg, 4, 2);
     let (b, _, _) = encode_stream(&cfg, 4, 2);
     assert_eq!(a, b, "same input must produce identical bytes");
@@ -227,16 +213,11 @@ fn encoding_is_deterministic() {
 
 #[test]
 fn ac_prediction_never_costs_bits() {
-    let base = EncoderConfig {
-        width: 64,
-        height: 64,
-        ac_prediction: false,
-        ..EncoderConfig::default()
-    };
-    let with_pred = EncoderConfig {
-        ac_prediction: true,
-        ..base
-    };
+    let base = EncoderConfig::default()
+        .with_width(64)
+        .with_height(64)
+        .with_ac_prediction(false);
+    let with_pred = base.with_ac_prediction(true);
     let (off, _, _) = encode_stream(&base, 4, 2);
     let (on, recons, _) = encode_stream(&with_pred, 4, 2);
     assert!(
@@ -252,11 +233,7 @@ fn ac_prediction_never_costs_bits() {
 
 #[test]
 fn quantiser_sweep_rate_and_distortion_are_monotone_ish() {
-    let cfg = EncoderConfig {
-        width: 64,
-        height: 64,
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default().with_width(64).with_height(64);
     let mut sizes = Vec::new();
     let mut psnrs = Vec::new();
     for qp in [2u32, 8, 31] {

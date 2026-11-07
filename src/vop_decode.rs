@@ -68,6 +68,7 @@ use crate::warp::WarpGeometry;
 
 /// Errors raised by the bitstream-driven VOP macroblock walks.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum VopDecodeError {
     /// The VOL / VOP configuration selects a branch this walk does not
     /// decode (data partitioning, interlace, OBMC, quarter-sample, a

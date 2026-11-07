@@ -134,16 +134,14 @@ fn count_vop_start_codes(stream: &[u8]) -> usize {
 #[test]
 fn video_packets_combined_ip_round_trip_every_fcode() {
     for fcode in [1u8, 2, 3] {
-        let cfg = EncoderConfig {
-            width: 96,
-            height: 64,
-            fcode,
-            resilience: ResilienceConfig {
-                packet_bits: 400,
-                ..Default::default()
-            },
-            ..EncoderConfig::default()
-        };
+        let cfg = EncoderConfig::default()
+            .with_width(96)
+            .with_height(64)
+            .with_fcode(fcode)
+            .with_resilience(
+                oxideav_mpeg4video::packet_encode::ResilienceConfig::default()
+                    .with_packet_bits(400),
+            );
         let enc = encode_ip(&cfg, 3, (6, 2), 6);
         assert!(
             enc.packets >= 4,
@@ -157,17 +155,14 @@ fn video_packets_combined_ip_round_trip_every_fcode() {
 
 #[test]
 fn video_packets_with_adaptive_quant_reseed_the_quantiser() {
-    let cfg = EncoderConfig {
-        width: 96,
-        height: 64,
-        adaptive_quant: true,
-        four_mv: true,
-        resilience: ResilienceConfig {
-            packet_bits: 300,
-            ..Default::default()
-        },
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default()
+        .with_width(96)
+        .with_height(64)
+        .with_adaptive_quant(true)
+        .with_four_mv(true)
+        .with_resilience(
+            oxideav_mpeg4video::packet_encode::ResilienceConfig::default().with_packet_bits(300),
+        );
     let enc = encode_ip(&cfg, 4, (3, 1), 9);
     assert!(enc.packets > 0);
     assert_exact(&decode_all(&enc.stream), &enc.recons);
@@ -177,18 +172,17 @@ fn video_packets_with_adaptive_quant_reseed_the_quantiser() {
 fn data_partitioned_ip_round_trips_single_and_multi_packet() {
     for packet_bits in [0u32, 500] {
         for quant_type in [false, true] {
-            let cfg = EncoderConfig {
-                width: 80,
-                height: 48,
-                quant_type,
-                adaptive_quant: true,
-                resilience: ResilienceConfig {
-                    packet_bits,
-                    data_partitioned: true,
-                    reversible_vlc: false,
-                },
-                ..EncoderConfig::default()
-            };
+            let cfg = EncoderConfig::default()
+                .with_width(80)
+                .with_height(48)
+                .with_quant_type(quant_type)
+                .with_adaptive_quant(true)
+                .with_resilience(
+                    ResilienceConfig::default()
+                        .with_packet_bits(packet_bits)
+                        .with_data_partitioned(true)
+                        .with_reversible_vlc(false),
+                );
             let enc = encode_ip(&cfg, 4, (4, 2), 7);
             assert_eq!(enc.packets > 0, packet_bits > 0);
             assert_exact(&decode_all(&enc.stream), &enc.recons);
@@ -198,20 +192,19 @@ fn data_partitioned_ip_round_trips_single_and_multi_packet() {
 
 #[test]
 fn reversible_vlc_texture_round_trips_with_every_tool() {
-    let cfg = EncoderConfig {
-        width: 96,
-        height: 64,
-        fcode: 2,
-        four_mv: true,
-        quarter_sample: true,
-        adaptive_quant: true,
-        resilience: ResilienceConfig {
-            packet_bits: 600,
-            data_partitioned: true,
-            reversible_vlc: true,
-        },
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default()
+        .with_width(96)
+        .with_height(64)
+        .with_fcode(2)
+        .with_four_mv(true)
+        .with_quarter_sample(true)
+        .with_adaptive_quant(true)
+        .with_resilience(
+            ResilienceConfig::default()
+                .with_packet_bits(600)
+                .with_data_partitioned(true)
+                .with_reversible_vlc(true),
+        );
     for qp in [2u32, 12, 31] {
         let enc = encode_ip(&cfg, 4, (9, -3), qp);
         assert_exact(&decode_all(&enc.stream), &enc.recons);
@@ -223,19 +216,18 @@ fn reversible_vlc_texture_round_trips_with_every_tool() {
 #[test]
 fn b_vops_in_a_partitioned_vol_use_combined_packets() {
     let (w, h) = (96usize, 64usize);
-    let cfg = EncoderConfig {
-        width: w as u16,
-        height: h as u16,
-        b_vops: true,
-        fcode: 2,
-        adaptive_quant: true,
-        resilience: ResilienceConfig {
-            packet_bits: 350,
-            data_partitioned: true,
-            reversible_vlc: true,
-        },
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default()
+        .with_width(w as u16)
+        .with_height(h as u16)
+        .with_b_vops(true)
+        .with_fcode(2)
+        .with_adaptive_quant(true)
+        .with_resilience(
+            ResilienceConfig::default()
+                .with_packet_bits(350)
+                .with_data_partitioned(true)
+                .with_reversible_vlc(true),
+        );
     let (headers, vol) = vol_of(&cfg);
     let mut stream = headers;
     let mut store = FrameStore::new();
@@ -325,16 +317,15 @@ fn registry_resilience_options() {
 /// decodable (every frame is produced) and the I-VOP is untouched.
 #[test]
 fn corrupted_rvlc_texture_partition_still_decodes() {
-    let cfg = EncoderConfig {
-        width: 96,
-        height: 64,
-        resilience: ResilienceConfig {
-            packet_bits: 400,
-            data_partitioned: true,
-            reversible_vlc: true,
-        },
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default()
+        .with_width(96)
+        .with_height(64)
+        .with_resilience(
+            ResilienceConfig::default()
+                .with_packet_bits(400)
+                .with_data_partitioned(true)
+                .with_reversible_vlc(true),
+        );
     let enc = encode_ip(&cfg, 2, (4, 2), 5);
     // Locate the P-VOP, then its second resync marker (P marker under
     // fcode 1: 16 zeros + 1, byte-aligned → bytes 00 00 80 after

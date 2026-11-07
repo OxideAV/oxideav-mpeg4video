@@ -92,6 +92,7 @@ const FIELD_BIDIR_BIAS: u32 = 192;
 
 /// Per-VOP interlaced-B encode statistics.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct BVopInterlacedEncodeStats {
     /// §6.2.6 zero-bit macroblocks (co-located future MB skipped).
     pub zero_bit: usize,
