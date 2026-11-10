@@ -248,6 +248,58 @@ pub fn mc(
     // black-box-confirmed on the interlaced conformance corpus.
     let fetch = |xr: i32, yr: i32| -> i32 { i32::from(reference.fetch_clamped(xr, yr)) };
 
+    // Interior block (every sample read lies inside the plane, so the
+    // clamp is the identity): whole-row arithmetic over plane slices,
+    // the same integer expressions as the per-sample walk below.
+    let need_w = width + usize::from(half_x);
+    let (x0, y_first) = (x + dx, y + dy + ref_y0);
+    let rows = height.div_ceil(y_incr_u);
+    let y_last = y_first + (rows as i32 - 1) * y_incr + if half_y { y_incr } else { 0 };
+    if width > 0
+        && rows > 0
+        && reference.row_run(x0, y_first, need_w).is_some()
+        && reference.row_run(x0, y_last, need_w).is_some()
+    {
+        let rc16 = rc as u16;
+        for r in 0..rows {
+            let y_ref = y_first + r as i32 * y_incr;
+            let top = reference
+                .row_run(x0, y_ref, need_w)
+                .expect("row inside the plane");
+            let dst_row = r * y_incr_u + pred_y0;
+            let dst = &mut pred[dst_row * pred_stride..dst_row * pred_stride + width];
+            match (half_y, half_x) {
+                (false, false) => dst.copy_from_slice(&top[..width]),
+                (false, true) => {
+                    for ((d, &a), &b) in dst.iter_mut().zip(top).zip(&top[1..]) {
+                        *d = ((u16::from(a) + u16::from(b) + 1 - rc16) >> 1) as u8;
+                    }
+                }
+                (true, false) => {
+                    let bot = reference
+                        .row_run(x0, y_ref + y_incr, need_w)
+                        .expect("row inside the plane");
+                    for ((d, &a), &c) in dst.iter_mut().zip(top).zip(bot) {
+                        *d = ((u16::from(a) + u16::from(c) + 1 - rc16) >> 1) as u8;
+                    }
+                }
+                (true, true) => {
+                    let bot = reference
+                        .row_run(x0, y_ref + y_incr, need_w)
+                        .expect("row inside the plane");
+                    for (i, d) in dst.iter_mut().enumerate() {
+                        let sum = u16::from(top[i])
+                            + u16::from(top[i + 1])
+                            + u16::from(bot[i])
+                            + u16::from(bot[i + 1]);
+                        *d = ((sum + 2 - rc16) >> 2) as u8;
+                    }
+                }
+            }
+        }
+        return;
+    }
+
     let mut iy: usize = 0;
     while iy < height {
         for ix in 0..width {
@@ -620,6 +672,95 @@ pub fn field_motion_compensate_one_reference_qpel(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The per-sample `mc` walk of the listing, kept as the reference
+    /// for the interior row path.
+    #[allow(clippy::too_many_arguments)]
+    fn mc_per_sample(
+        pred: &mut [u8],
+        pred_stride: usize,
+        reference: &ReferenceVop<'_>,
+        x: i32,
+        y: i32,
+        width: usize,
+        height: usize,
+        dx_halfpel: i32,
+        dy_halfpel: i32,
+        rounding: u8,
+        pred_y0: usize,
+        ref_y0: i32,
+        y_incr: i32,
+    ) {
+        let rc = (rounding & 1) as i32;
+        let dx = dx_halfpel >> 1;
+        let dy = y_incr * (dy_halfpel >> y_incr);
+        let half_x = (dx_halfpel & 1) != 0;
+        let half_y = (dy_halfpel & y_incr) != 0;
+        let fetch = |xr: i32, yr: i32| -> i32 { i32::from(reference.fetch_clamped(xr, yr)) };
+        let mut iy = 0usize;
+        while iy < height {
+            for ix in 0..width {
+                let (xr, yr) = (x + dx + ix as i32, y + dy + iy as i32 + ref_y0);
+                let value = match (half_y, half_x) {
+                    (true, true) => {
+                        (fetch(xr, yr)
+                            + fetch(xr + 1, yr)
+                            + fetch(xr, yr + y_incr)
+                            + fetch(xr + 1, yr + y_incr)
+                            + 2
+                            - rc)
+                            >> 2
+                    }
+                    (true, false) => (fetch(xr, yr) + fetch(xr, yr + y_incr) + 1 - rc) >> 1,
+                    (false, true) => (fetch(xr, yr) + fetch(xr + 1, yr) + 1 - rc) >> 1,
+                    (false, false) => fetch(xr, yr),
+                };
+                pred[(iy + pred_y0) * pred_stride + ix] = value as u8;
+            }
+            iy += y_incr as usize;
+        }
+    }
+
+    #[test]
+    fn mc_row_path_equals_the_per_sample_walk() {
+        let (w, h) = (40usize, 44usize);
+        let mut state = 0x6C07_8965u32;
+        let plane: Vec<u8> = (0..w * h)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                (state >> 24) as u8
+            })
+            .collect();
+        let reference = ReferenceVop::new(&plane, w, h).unwrap();
+        for (bw, bh, y_incr) in [(16usize, 16usize, 2i32), (8, 8, 2), (16, 16, 1), (8, 8, 1)] {
+            for rounding in 0..2u8 {
+                for dy in [-21, -8, -6, -4, -3, -2, -1, 0, 1, 2, 3, 4, 6, 26] {
+                    for dx in [-19, -3, -2, -1, 0, 1, 2, 5, 23] {
+                        for (x, y) in [(0, 0), (8, 8), (16, 12), (24, 28), (32, 36)] {
+                            for (pred_y0, ref_y0) in [(0usize, 0i32), (0, 1), (1, 0), (1, 1)] {
+                                if y_incr == 1 && (pred_y0, ref_y0) != (0, 0) {
+                                    continue;
+                                }
+                                let mut got = vec![0u8; bw * (bh + 1)];
+                                let mut want = got.clone();
+                                mc(
+                                    &mut got, bw, &reference, x, y, bw, bh, dx, dy, rounding,
+                                    pred_y0, ref_y0, y_incr,
+                                );
+                                mc_per_sample(
+                                    &mut want, bw, &reference, x, y, bw, bh, dx, dy, rounding,
+                                    pred_y0, ref_y0, y_incr,
+                                );
+                                assert_eq!(got, want, "{bw}x{bh} incr {y_incr} mv ({dx},{dy})");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     use crate::motion::MotionVectorDelta;
 
     fn pair(top: (i32, i32), bottom: (i32, i32)) -> FieldMvPair {

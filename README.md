@@ -677,6 +677,8 @@ move.
 |---|---:|---:|---:|
 | 720×576, default tools (I/P) | 16.3 fps | 52.5 fps | 3.2 |
 | 720×576, `qpel` + `four-mv` + `bf=2` | 0.76 fps | 17.0 fps | 22 |
+| 720×576, `interlaced` | 6.6 fps | 26.6 fps | 4.0 |
+| 720×576, `interlaced` + `bf=2` | 2.8 fps | 12.7 fps | 4.5 |
 | 1280×720, default tools | 9.3 fps | 31.6 fps | 3.4 |
 | 1920×1080, default tools | 4.6 fps | 15.3 fps | 3.4 |
 
@@ -685,7 +687,8 @@ separably per block (one horizontal pass per reference row, one
 vertical pass per output row, fixed-width row loops) instead of
 re-deriving every tap of every sample; half-sample prediction and the
 encoder's full-pel SADs run on whole plane rows wherever the §7.6.4
-clamp is the identity, the SAD stopping once it can no longer win;
+clamp is the identity (the §7.7.2.1 field `mc` routine included),
+the SADs on a byte kernel and stopping once they can no longer win;
 B-VOP mode candidates are scored on a luminance-only prediction; the
 bit reader extracts fields from a 64-bit window and Tables B.16 /
 B.17 decode through a direct lookup; the Annex A.1 transform keeps

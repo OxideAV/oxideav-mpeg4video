@@ -77,7 +77,9 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   inverse quantiser hoists its quantiser terms and skips zero rows;
   the encoder's full-pel SAD stops once a partial sum can no longer
   win, and B-VOP mode candidates are scored on a luminance-only
-  prediction. Each restructured path is pinned against its defining
+  prediction; the §7.7.2.1 field `mc` routine and the field SADs take
+  the same whole-row paths, with a byte SAD kernel for picture
+  sources. Each restructured path is pinned against its defining
   per-sample form by an exhaustive or randomised unit test.
 - `benches/throughput.rs`: dependency-free decode / encode throughput
   harness over caller-supplied streams (skips when none is given).

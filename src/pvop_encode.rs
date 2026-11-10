@@ -206,6 +206,7 @@ pub(crate) fn source_luma_mb(
 /// reaches `limit` the walk may stop and return that partial sum (a
 /// value `>= limit`), so `result < limit` is always the exact
 /// comparison. Pass `u32::MAX` for the exact SAD.
+#[allow(clippy::too_many_arguments)]
 fn sad_full_pel(
     src: &[[i32; 16]; 16],
     reference: &crate::half_sample::ReferenceVop<'_>,
@@ -214,6 +215,7 @@ fn sad_full_pel(
     dx: i32,
     dy: i32,
     limit: u32,
+    narrow: Option<&[[u8; 16]; 16]>,
 ) -> u32 {
     let mut sad = 0u32;
     // Interior position: whole reference rows, no §7.6.4 clamp.
@@ -223,7 +225,10 @@ fn sad_full_pel(
                 .row_run(mb_x + dx, mb_y + dy + j as i32, 16)
                 .expect("row inside the plane");
             let run: &[u8; 16] = run.try_into().expect("sixteen samples");
-            sad += row_sad(row, run);
+            sad += match narrow {
+                Some(rows) => row_sad_u8(&rows[j], run),
+                None => row_sad(row, run),
+            };
             // A partial sum that already reaches the limit cannot
             // beat it: the caller only asks "is it smaller".
             if sad >= limit {
@@ -237,6 +242,28 @@ fn sad_full_pel(
             let r = reference.fetch_clamped(mb_x + i as i32 + dx, mb_y + j as i32 + dy);
             sad += (s - i32::from(r)).unsigned_abs();
         }
+    }
+    sad
+}
+
+/// The source rows as 8-bit samples, when every sample is one (a
+/// picture source always is): the byte SAD kernel then applies.
+pub(crate) fn narrow_rows<const R: usize>(src: &[[i32; 16]; R]) -> Option<[[u8; 16]; R]> {
+    let mut out = [[0u8; 16]; R];
+    for (dst, row) in out.iter_mut().zip(src.iter()) {
+        for (d, &s) in dst.iter_mut().zip(row.iter()) {
+            *d = u8::try_from(s).ok()?;
+        }
+    }
+    Some(out)
+}
+
+/// [`row_sad`] over 8-bit source samples.
+#[inline]
+pub(crate) fn row_sad_u8(src: &[u8; 16], reference: &[u8; 16]) -> u32 {
+    let mut sad = 0u32;
+    for i in 0..16 {
+        sad += u32::from(src[i].abs_diff(reference[i]));
     }
     sad
 }
@@ -366,12 +393,15 @@ pub(crate) fn estimate_motion(
     fcode: u8,
 ) -> (MotionVector, u32) {
     let mut best = (0i32, 0i32);
-    let mut best_sad = sad_full_pel(src, reference, mb_x, mb_y, 0, 0, u32::MAX).saturating_sub(128);
+    let narrow = narrow_rows(src);
+    let narrow = narrow.as_ref();
+    let mut best_sad =
+        sad_full_pel(src, reference, mb_x, mb_y, 0, 0, u32::MAX, narrow).saturating_sub(128);
     let consider = |dx: i32, dy: i32, best: &mut (i32, i32), best_sad: &mut u32| {
         if (dx, dy) == (0, 0) {
             return;
         }
-        let sad = sad_full_pel(src, reference, mb_x, mb_y, dx, dy, *best_sad);
+        let sad = sad_full_pel(src, reference, mb_x, mb_y, dx, dy, *best_sad, narrow);
         if sad < *best_sad {
             *best_sad = sad;
             *best = (dx, dy);

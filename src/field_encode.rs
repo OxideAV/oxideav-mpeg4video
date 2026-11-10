@@ -146,7 +146,10 @@ fn field_sad(src: &[[i32; 16]; 8], pred: &[[i32; 16]; 8]) -> u32 {
 }
 
 /// Full-pel SAD of a source field against reference field `ref_field`
-/// displaced by `(dx, dy)` **field** pels (§7.6.4 edge clamp).
+/// displaced by `(dx, dy)` **field** pels (§7.6.4 edge clamp). Exact
+/// below `limit`; once a partial sum reaches `limit` the walk may
+/// stop and return it (`u32::MAX` asks for the exact SAD).
+#[allow(clippy::too_many_arguments)]
 fn field_sad_full_pel(
     src: &[[i32; 16]; 8],
     reference: &ReferenceVop<'_>,
@@ -155,6 +158,8 @@ fn field_sad_full_pel(
     mb_y: i32,
     dx: i32,
     dy: i32,
+    limit: u32,
+    narrow: Option<&[[u8; 16]; 8]>,
 ) -> u32 {
     let mut sad = 0u32;
     let y0 = mb_y + i32::from(ref_field);
@@ -166,7 +171,14 @@ fn field_sad_full_pel(
                 .row_run(mb_x + dx, y0 + 2 * (j as i32 + dy), 16)
                 .expect("row inside the plane");
             let run: &[u8; 16] = run.try_into().expect("sixteen samples");
-            sad += crate::pvop_encode::row_sad(row, run);
+            sad += match narrow {
+                Some(rows) => crate::pvop_encode::row_sad_u8(&rows[j], run),
+                None => crate::pvop_encode::row_sad(row, run),
+            };
+            // A partial sum at the limit cannot beat it.
+            if sad >= limit {
+                return sad;
+            }
         }
         return sad;
     }
@@ -210,6 +222,8 @@ pub(crate) fn estimate_field_motion(
     fcode: u8,
 ) -> FieldEstimate {
     let src_field = source_field(src, field);
+    let narrow = crate::pvop_encode::narrow_rows(&src_field);
+    let narrow = narrow.as_ref();
     let unit = units_per_pel(mode);
     let (low, high) = mv_range(fcode);
     // Codable window in field MV units (horizontal in VOL units,
@@ -234,14 +248,25 @@ pub(crate) fn estimate_field_motion(
         // Full-pel search on the field grid; the zero vector keeps the
         // progressive estimator's small favouring bias.
         let mut best_full = (0i32, 0i32);
-        let mut best_full_sad =
-            field_sad_full_pel(&src_field, reference, ref_field, mb_x, mb_y, 0, 0)
-                .saturating_sub(64);
+        let mut best_full_sad = field_sad_full_pel(
+            &src_field,
+            reference,
+            ref_field,
+            mb_x,
+            mb_y,
+            0,
+            0,
+            u32::MAX,
+            narrow,
+        )
+        .saturating_sub(64);
         let consider = |dx: i32, dy: i32, best: &mut (i32, i32), best_sad: &mut u32| {
             if (dx, dy) == (0, 0) || !codable(dx, dy) {
                 return;
             }
-            let sad = field_sad_full_pel(&src_field, reference, ref_field, mb_x, mb_y, dx, dy);
+            let sad = field_sad_full_pel(
+                &src_field, reference, ref_field, mb_x, mb_y, dx, dy, *best_sad, narrow,
+            );
             if sad < *best_sad {
                 *best_sad = sad;
                 *best = (dx, dy);
