@@ -156,6 +156,33 @@ pub fn saturate_idct_sample(value: i32, bits_per_pixel: u32) -> i32 {
 fn idct_1d(input: &[f64; N]) -> [f64; N] {
     let cos = cos_table();
     let scale = (2.0_f64 / N as f64).sqrt();
+    // Each output accumulates its terms in ascending `u`, exactly as
+    // the defining sum reads; the loops are nested `u`-outer so the
+    // eight accumulators advance together, and a zero input (whose
+    // term is an exact zero) is skipped. Neither changes any
+    // accumulated value.
+    let mut output = [0.0f64; N];
+    for u in 0..N {
+        if input[u] == 0.0 {
+            continue;
+        }
+        let term = c(u) * input[u];
+        for x in 0..N {
+            output[x] += term * cos[u][x];
+        }
+    }
+    for value in &mut output {
+        *value *= scale;
+    }
+    output
+}
+
+/// The defining double loop of [`idct_1d`], kept as the bit-identity
+/// reference for the restructured evaluation.
+#[cfg(test)]
+fn idct_1d_reference(input: &[f64; N]) -> [f64; N] {
+    let cos = cos_table();
+    let scale = (2.0_f64 / N as f64).sqrt();
     let mut output = [0.0f64; N];
     for x in 0..N {
         let mut acc = 0.0f64;
@@ -254,6 +281,10 @@ pub fn idct_8x8_rounded(
     // Row pass: 1-D IDCT on each row of F (varying u for each fixed v).
     let mut row_out = [[0.0f64; N]; N];
     for v in 0..N {
+        // An all-zero coefficient row transforms to zeros.
+        if coefficients[v] == [0i32; N] {
+            continue;
+        }
         let mut row_in = [0.0f64; N];
         for u in 0..N {
             row_in[u] = coefficients[v][u] as f64;
@@ -289,6 +320,51 @@ pub fn idct_8x8_rounded(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restructured_1d_pass_is_value_identical_to_the_defining_sum() {
+        // Dense, sparse and single-coefficient inputs: every output of
+        // the restructured pass equals the defining double loop (an
+        // exact zero may differ in sign only).
+        let mut state = 0x1234_5678u32;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        for round in 0..20_000 {
+            let mut input = [0.0f64; N];
+            for v in input.iter_mut() {
+                let r = next();
+                let keep = match round % 4 {
+                    0 => true,
+                    1 => r & 3 == 0,
+                    2 => r & 15 == 0,
+                    _ => r & 1 == 0,
+                };
+                if keep {
+                    // Integer-valued (row pass) and fractional (column
+                    // pass) magnitudes.
+                    let int = f64::from((next() % 4096) as i32 - 2048);
+                    *v = if round % 2 == 0 {
+                        int
+                    } else {
+                        int + f64::from(next() % 1000) / 1024.0 * 0.731
+                    };
+                }
+            }
+            let (got, want) = (idct_1d(&input), idct_1d_reference(&input));
+            for x in 0..N {
+                assert!(
+                    got[x] == want[x],
+                    "round {round} x {x}: {} vs {}",
+                    got[x],
+                    want[x]
+                );
+            }
+        }
+    }
 
     /// Round-trip helper: forward 8×8 orthonormal DCT for tests.
     ///

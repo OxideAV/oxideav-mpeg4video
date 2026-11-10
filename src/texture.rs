@@ -488,7 +488,9 @@ pub(crate) fn rmax(kind: TcoefTable, last: bool, level: i32) -> Option<u32> {
 
 /// Match a prefix-free Tcoef table against the leading bits of `window`.
 /// Returns `(code_len, last, run, level)` on a hit (before the sign bit),
-/// `None` on no match.
+/// `None` on no match. The linear definition [`match_tcoef_lut`] is
+/// checked against.
+#[cfg(test)]
 fn match_tcoef(
     table: &[(u32, u8, u8, u8, u16)],
     window: u32,
@@ -576,6 +578,66 @@ fn rmax_inter(last: bool, level: i32) -> Option<u32> {
     }
 }
 
+/// Index width of the direct Tcoef lookup — the longest Table B.16 /
+/// B.17 code (sign bit excluded).
+const TCOEF_LUT_BITS: u8 = 12;
+
+/// Direct lookup over the next [`TCOEF_LUT_BITS`] bits for one Tcoef
+/// table: each slot holds the unique (prefix-free) code that leads
+/// those bits, packed `len | last << 4 | run << 5 | level << 11`, or
+/// zero when no code does. Built once per table from the same rows
+/// the linear [`match_tcoef`] scans.
+fn tcoef_lut(kind: TcoefTable) -> &'static [u32; 1 << TCOEF_LUT_BITS] {
+    use std::sync::OnceLock;
+    static INTRA: OnceLock<Box<[u32; 1 << TCOEF_LUT_BITS]>> = OnceLock::new();
+    static INTER: OnceLock<Box<[u32; 1 << TCOEF_LUT_BITS]>> = OnceLock::new();
+    let (cell, table) = match kind {
+        TcoefTable::Intra => (&INTRA, TCOEF_INTRA),
+        TcoefTable::Inter => (&INTER, TCOEF_INTER),
+    };
+    cell.get_or_init(|| {
+        let mut lut = Box::new([0u32; 1 << TCOEF_LUT_BITS]);
+        for &(code, len, last, run, level) in table {
+            debug_assert!((1..=TCOEF_LUT_BITS).contains(&len));
+            let free = TCOEF_LUT_BITS - len;
+            let packed = u32::from(len)
+                | u32::from(last) << 4
+                | u32::from(run) << 5
+                | u32::from(level) << 11;
+            let first = (code << free) as usize;
+            for slot in &mut lut[first..first + (1usize << free)] {
+                *slot = packed;
+            }
+        }
+        lut
+    })
+}
+
+/// [`match_tcoef`] through the direct lookup: the code leading the
+/// `window_len` (1..=13) bits of `window`, if one fits inside them.
+#[inline]
+fn match_tcoef_lut(kind: TcoefTable, window: u32, window_len: u8) -> Option<(u8, bool, u32, i32)> {
+    let index = if window_len >= TCOEF_LUT_BITS {
+        window >> (window_len - TCOEF_LUT_BITS)
+    } else {
+        // Short tail: zero-extend. A code found this way is the only
+        // one that can lead the real bits (prefix-free table); it
+        // counts only when it fits inside them.
+        window << (TCOEF_LUT_BITS - window_len)
+    };
+    let packed = tcoef_lut(kind)[index as usize];
+    let len = (packed & 15) as u8;
+    if packed == 0 || len > window_len {
+        return None;
+    }
+    Some((
+        len,
+        (packed >> 4) & 1 != 0,
+        (packed >> 5) & 63,
+        (packed >> 11) as i32,
+    ))
+}
+
 /// Decode the Table B.16 / B.17 VLC plus its trailing sign bit at the
 /// current position, returning `(last, run, signed_level)`. Used for the
 /// non-escape common path and for the Type-1 / Type-2 escape sub-VLC
@@ -583,7 +645,7 @@ fn rmax_inter(last: bool, level: i32) -> Option<u32> {
 /// Tcoef code, not the escape prefix.
 fn decode_tcoef_vlc(
     br: &mut BitReader<'_>,
-    table: &[(u32, u8, u8, u8, u16)],
+    table: TcoefTable,
 ) -> Result<(bool, u32, i32), TextureParseError> {
     let avail = br.remaining_bits().min(13) as u8;
     if avail == 0 {
@@ -591,7 +653,7 @@ fn decode_tcoef_vlc(
     }
     let window = br.next_bits(avail as usize)?;
     let (code_len, last, run, level) =
-        match_tcoef(table, window, avail).ok_or(TextureParseError::InvalidTcoef {
+        match_tcoef_lut(table, window, avail).ok_or(TextureParseError::InvalidTcoef {
             window: window as u16,
         })?;
     br.skip_bits(code_len as usize)?;
@@ -619,11 +681,6 @@ pub fn decode_ac_event(
     br: &mut BitReader<'_>,
     table_kind: TcoefTable,
 ) -> Result<AcEvent, TextureParseError> {
-    let table = match table_kind {
-        TcoefTable::Intra => TCOEF_INTRA,
-        TcoefTable::Inter => TCOEF_INTER,
-    };
-
     // Peek the escape prefix without consuming so a real code that merely
     // *shares no* prefix with ESC falls through to the table decode.
     let avail = br.remaining_bits().min(TCOEF_ESCAPE_LEN as usize) as u8;
@@ -634,7 +691,7 @@ pub fn decode_ac_event(
         avail == TCOEF_ESCAPE_LEN && br.next_bits(TCOEF_ESCAPE_LEN as usize)? == TCOEF_ESCAPE_CODE;
 
     if !is_escape {
-        let (last, run, level) = decode_tcoef_vlc(br, table)?;
+        let (last, run, level) = decode_tcoef_vlc(br, table_kind)?;
         return Ok(AcEvent { last, run, level });
     }
 
@@ -643,7 +700,7 @@ pub fn decode_ac_event(
 
     if !br.read_bool()? {
         // Type 1: "ESC" + "0" + VLC, LEVEL += LMAX.
-        let (last, run, level) = decode_tcoef_vlc(br, table)?;
+        let (last, run, level) = decode_tcoef_vlc(br, table_kind)?;
         let lmax = match table_kind {
             TcoefTable::Intra => lmax_intra(last, run),
             TcoefTable::Inter => lmax_inter(last, run),
@@ -660,7 +717,7 @@ pub fn decode_ac_event(
 
     if !br.read_bool()? {
         // Type 2: "ESC" + "10" + VLC, RUN += RMAX + 1.
-        let (last, run, level) = decode_tcoef_vlc(br, table)?;
+        let (last, run, level) = decode_tcoef_vlc(br, table_kind)?;
         let rmax = match table_kind {
             TcoefTable::Intra => rmax_intra(last, level.abs()),
             TcoefTable::Inter => rmax_inter(last, level.abs()),
@@ -741,11 +798,6 @@ pub fn decode_ac_event_short_video_header(
     br: &mut BitReader<'_>,
     table_kind: TcoefTable,
 ) -> Result<AcEvent, TextureParseError> {
-    let table = match table_kind {
-        TcoefTable::Intra => TCOEF_INTRA,
-        TcoefTable::Inter => TCOEF_INTER,
-    };
-
     // Peek the 7-bit escape prefix without consuming; a real code that
     // shares no prefix with ESC falls through to the table decode.
     let avail = br.remaining_bits().min(TCOEF_ESCAPE_LEN as usize) as u8;
@@ -756,7 +808,7 @@ pub fn decode_ac_event_short_video_header(
         avail == TCOEF_ESCAPE_LEN && br.next_bits(TCOEF_ESCAPE_LEN as usize)? == TCOEF_ESCAPE_CODE;
 
     if !is_escape {
-        let (last, run, level) = decode_tcoef_vlc(br, table)?;
+        let (last, run, level) = decode_tcoef_vlc(br, table_kind)?;
         return Ok(AcEvent { last, run, level });
     }
 
@@ -1137,6 +1189,25 @@ pub fn decode_ac_events_rvlc_reverse(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tcoef_lookup_equals_the_linear_table_scan() {
+        // Every window of every length the decoder can present.
+        for (kind, table) in [
+            (TcoefTable::Intra, TCOEF_INTRA),
+            (TcoefTable::Inter, TCOEF_INTER),
+        ] {
+            for len in 1..=13u8 {
+                for window in 0..(1u32 << len) {
+                    assert_eq!(
+                        match_tcoef_lut(kind, window, len),
+                        match_tcoef(table, window, len),
+                        "{kind:?} window {window:#b} / {len}"
+                    );
+                }
+            }
+        }
+    }
 
     /// Build a `BitReader` over MSB-first bits described by a `&str` of
     /// `'0'`/`'1'` (whitespace ignored), zero-padded up to a byte.

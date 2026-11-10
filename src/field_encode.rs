@@ -158,6 +158,18 @@ fn field_sad_full_pel(
 ) -> u32 {
     let mut sad = 0u32;
     let y0 = mb_y + i32::from(ref_field);
+    // Interior position (the eight same-field lines span 15 frame
+    // lines): whole reference rows, no §7.6.4 clamp.
+    if reference.contains_rect(mb_x + dx, y0 + 2 * dy, 16, 15) {
+        for (j, row) in src.iter().enumerate() {
+            let run = reference
+                .row_run(mb_x + dx, y0 + 2 * (j as i32 + dy), 16)
+                .expect("row inside the plane");
+            let run: &[u8; 16] = run.try_into().expect("sixteen samples");
+            sad += crate::pvop_encode::row_sad(row, run);
+        }
+        return sad;
+    }
     for (j, row) in src.iter().enumerate() {
         let ry = y0 + 2 * (j as i32 + dy);
         for (i, &s) in row.iter().enumerate() {

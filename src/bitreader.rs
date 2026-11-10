@@ -105,28 +105,56 @@ impl<'a> BitReader<'a> {
         if self.remaining_bits() < n {
             return Err(BitReaderError::EndOfStream);
         }
-        let mut value: u32 = 0;
-        for _ in 0..n {
-            let byte = self.data[self.bit_pos / 8];
-            let bit = (byte >> (7 - (self.bit_pos % 8))) & 1;
-            value = (value << 1) | u32::from(bit);
-            self.bit_pos += 1;
-        }
+        let value = self.window(n);
+        self.bit_pos += n;
         Ok(value)
     }
 
+    /// The `n` (1..=32) bits at the current position, MSB first. The
+    /// caller has checked that `n` bits remain.
+    #[inline]
+    fn window(&self, n: usize) -> u32 {
+        let byte = self.bit_pos >> 3;
+        let offset = self.bit_pos & 7;
+        // Eight bytes from the current one, big-endian; a short tail
+        // is zero-extended (those bits lie beyond the `n` requested).
+        let word = match self.data.get(byte..byte + 8) {
+            Some(chunk) => u64::from_be_bytes(chunk.try_into().expect("eight bytes")),
+            None => {
+                let mut buf = [0u8; 8];
+                let tail = &self.data[byte..];
+                buf[..tail.len()].copy_from_slice(tail);
+                u64::from_be_bytes(buf)
+            }
+        };
+        // offset <= 7 and n <= 32, so the field lies inside the word.
+        ((word << offset) >> (64 - n)) as u32
+    }
+
     /// Read a single bit as a `bool`.
+    #[inline]
     pub fn read_bool(&mut self) -> Result<bool, BitReaderError> {
-        Ok(self.read_bits(1)? == 1)
+        let Some(&byte) = self.data.get(self.bit_pos >> 3) else {
+            return Err(BitReaderError::EndOfStream);
+        };
+        let bit = (byte >> (7 - (self.bit_pos & 7))) & 1;
+        self.bit_pos += 1;
+        Ok(bit == 1)
     }
 
     /// Peek `n` bits without advancing the position.
+    #[inline]
     pub fn next_bits(&self, n: usize) -> Result<u32, BitReaderError> {
-        let mut clone = BitReader {
-            data: self.data,
-            bit_pos: self.bit_pos,
-        };
-        clone.read_bits(n)
+        if n == 0 {
+            return Ok(0);
+        }
+        if n > 32 {
+            return Err(BitReaderError::TooManyBits);
+        }
+        if self.remaining_bits() < n {
+            return Err(BitReaderError::EndOfStream);
+        }
+        Ok(self.window(n))
     }
 }
 
@@ -240,6 +268,43 @@ impl<'a> BackwardBitReader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn word_reads_equal_bit_by_bit_reads() {
+        // Every width at every bit offset over a 19-byte buffer (tail
+        // reads included) against a bit-serial reference.
+        let data: Vec<u8> = (0..19u32).map(|i| (i * 151 + 43) as u8).collect();
+        let serial = |pos: usize, n: usize| -> u32 {
+            (0..n).fold(0u32, |v, k| {
+                let p = pos + k;
+                (v << 1) | u32::from((data[p / 8] >> (7 - p % 8)) & 1)
+            })
+        };
+        for pos in 0..data.len() * 8 {
+            for n in 1..=32usize {
+                let mut br = BitReader::new(&data);
+                br.skip_bits(pos).unwrap();
+                if pos + n > data.len() * 8 {
+                    assert!(br.next_bits(n).is_err());
+                    assert!(br.read_bits(n).is_err());
+                    assert_eq!(br.bit_position(), pos);
+                    continue;
+                }
+                assert_eq!(br.next_bits(n).unwrap(), serial(pos, n));
+                assert_eq!(br.bit_position(), pos);
+                assert_eq!(br.read_bits(n).unwrap(), serial(pos, n));
+                assert_eq!(br.bit_position(), pos + n);
+            }
+            let mut br = BitReader::new(&data);
+            br.skip_bits(pos).unwrap();
+            assert_eq!(u32::from(br.read_bool().unwrap()), serial(pos, 1));
+        }
+        let mut br = BitReader::new(&data);
+        br.skip_bits(data.len() * 8).unwrap();
+        assert!(br.read_bool().is_err());
+        assert_eq!(br.read_bits(0).unwrap(), 0);
+        assert_eq!(br.next_bits(0).unwrap(), 0);
+    }
 
     #[test]
     fn reads_msb_first_across_byte_boundary() {

@@ -30,6 +30,21 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Performance (output bit-identical — corpus pins, committed encoder
+  fixtures and the bench hashes unchanged): §7.6.2.2 quarter-sample
+  prediction evaluates the Figure 7-32 cascade separably per block
+  (one horizontal pass per interior row, one vertical pass per output
+  row, fixed-width row loops) instead of re-deriving every tap of every
+  sample; §7.6.2.1 half-sample prediction and the encoder's full-pel
+  SADs run on whole plane rows when the block needs no §7.6.4 clamp;
+  the bit reader extracts fields from a 64-bit window; Tables
+  B.16 / B.17 decode through a 12-bit direct lookup; the Annex A.1
+  transform skips zero inputs and advances its eight accumulators
+  together (same terms, same order); the method-2 inverse quantiser
+  skips zero rows. Each restructured path is pinned against its
+  defining per-sample form by an exhaustive or randomised unit test.
+- `benches/throughput.rs`: dependency-free decode / encode throughput
+  harness over caller-supplied streams (skips when none is given).
 - Encoder: the §7.7.2.1 / §7.7.2.2 field motion estimator searches the
   **whole field-unit Table 7-9 range** whatever the predictor is (the
   differential is coded modulo the range width), and scans the window

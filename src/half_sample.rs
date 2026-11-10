@@ -276,6 +276,28 @@ impl<'a> ReferenceVop<'a> {
         let idx = (cy as usize) * (self.stride as usize) + (cx as usize);
         self.samples[idx]
     }
+
+    /// The `len` samples of row `y` starting at column `x`, when the
+    /// whole run lies inside the plane (no §7.6.4 clamp involved);
+    /// `None` otherwise.
+    #[inline]
+    pub(crate) fn row_run(&self, x: i32, y: i32, len: usize) -> Option<&'a [u8]> {
+        if x < 0 || y < 0 || y >= self.height || (x as usize) + len > self.width as usize {
+            return None;
+        }
+        let start = (y as usize) * (self.stride as usize) + (x as usize);
+        self.samples.get(start..start + len)
+    }
+
+    /// `true` when the `w × h` rectangle at `(x, y)` lies entirely
+    /// inside the plane.
+    #[inline]
+    pub(crate) fn contains_rect(&self, x: i32, y: i32, w: usize, h: usize) -> bool {
+        x >= 0
+            && y >= 0
+            && (x as usize) + w <= self.width as usize
+            && (y as usize) + h <= self.height as usize
+    }
 }
 
 /// Interpolate one sub-pel sample at `(int_x + half_x/2, int_y +
@@ -397,6 +419,48 @@ pub fn interpolate_block_into(
     let (mvx_int, half_x) = split_half_pel(mv_x);
     let (mvy_int, half_y) = split_half_pel(mv_y);
     let rc = vop_rounding_type & 1;
+    // Interior blocks (every sample the §7.6.2.1 equation reads lies
+    // inside the plane, so the §7.6.4 clamp is the identity): whole-row
+    // arithmetic over plane slices. Same integer expressions as
+    // [`interpolate_pixel`].
+    let (x0, y0) = (origin_x + mvx_int, origin_y + mvy_int);
+    let (need_w, need_h) = (block_w + usize::from(half_x), block_h + usize::from(half_y));
+    if block_w > 0 && vop.contains_rect(x0, y0, need_w, need_h) {
+        let rc16 = u16::from(rc);
+        for (j, dst) in out.chunks_exact_mut(block_w).take(block_h).enumerate() {
+            let y = y0 + j as i32;
+            let top = vop.row_run(x0, y, need_w).expect("row inside the plane");
+            match (half_x, half_y) {
+                (false, false) => dst.copy_from_slice(top),
+                (true, false) => {
+                    for ((d, &a), &b) in dst.iter_mut().zip(top).zip(&top[1..]) {
+                        *d = ((u16::from(a) + u16::from(b) + 1 - rc16) >> 1) as u8;
+                    }
+                }
+                (false, true) => {
+                    let bot = vop
+                        .row_run(x0, y + 1, need_w)
+                        .expect("row inside the plane");
+                    for ((d, &a), &c) in dst.iter_mut().zip(top).zip(bot) {
+                        *d = ((u16::from(a) + u16::from(c) + 1 - rc16) >> 1) as u8;
+                    }
+                }
+                (true, true) => {
+                    let bot = vop
+                        .row_run(x0, y + 1, need_w)
+                        .expect("row inside the plane");
+                    for (i, d) in dst.iter_mut().enumerate() {
+                        let sum = u16::from(top[i])
+                            + u16::from(top[i + 1])
+                            + u16::from(bot[i])
+                            + u16::from(bot[i + 1]);
+                        *d = ((sum + 2 - rc16) >> 2) as u8;
+                    }
+                }
+            }
+        }
+        return;
+    }
     for j in 0..block_h {
         for i in 0..block_w {
             let int_x = origin_x + (i as i32) + mvx_int;
@@ -409,6 +473,50 @@ pub fn interpolate_block_into(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interior_fast_path_equals_the_per_sample_equation() {
+        // Every block position (interior and clamped), all four
+        // sub-pel phases, both rounding controls, two block sizes:
+        // the block routine equals the per-sample §7.6.2.1 fetch.
+        let (w, h) = (40usize, 36usize);
+        let mut state = 0x2545_F491u32;
+        let plane: Vec<u8> = (0..w * h)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                (state >> 24) as u8
+            })
+            .collect();
+        let vop = ReferenceVop::new(&plane, w, h).unwrap();
+        for (bw, bh) in [(16usize, 16usize), (8, 8)] {
+            for rc in 0..2u8 {
+                for mv_y in -9..=9 {
+                    for mv_x in -9..=9 {
+                        for (ox, oy) in [(0, 0), (8, 8), (24, 20), (32, 28)] {
+                            let got = interpolate_block(&vop, mv_x, mv_y, ox, oy, bw, bh, rc);
+                            let (xi, hx) = split_half_pel(mv_x);
+                            let (yi, hy) = split_half_pel(mv_y);
+                            for j in 0..bh {
+                                for i in 0..bw {
+                                    let want = fetch_clamped_sample(
+                                        &vop,
+                                        ox + i as i32 + xi,
+                                        oy + j as i32 + yi,
+                                        hx,
+                                        hy,
+                                        rc,
+                                    );
+                                    assert_eq!(got[j * bw + i], want);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn split_half_pel_basic_cases() {

@@ -265,8 +265,9 @@ impl DecodedFrame {
         let luma_y0 = mb_row * MACROBLOCK_LUMA_SIDE;
         for (dy, row) in mb.luma.iter().enumerate() {
             let base = (luma_y0 + dy) * self.width + luma_x0;
-            for (dx, &sample) in row.iter().enumerate() {
-                self.luma[base + dx] = sample.clamp(0, 255) as u8;
+            let dst = &mut self.luma[base..base + MACROBLOCK_LUMA_SIDE];
+            for (d, &sample) in dst.iter_mut().zip(row.iter()) {
+                *d = sample.clamp(0, 255) as u8;
             }
         }
 
@@ -276,9 +277,13 @@ impl DecodedFrame {
         let chroma_y0 = mb_row * MACROBLOCK_CHROMA_SIDE;
         for (dy, (cb_row, cr_row)) in mb.cb.iter().zip(mb.cr.iter()).enumerate() {
             let base = (chroma_y0 + dy) * chroma_w + chroma_x0;
-            for (dx, (&cb_s, &cr_s)) in cb_row.iter().zip(cr_row.iter()).enumerate() {
-                self.cb[base + dx] = cb_s.clamp(0, 255) as u8;
-                self.cr[base + dx] = cr_s.clamp(0, 255) as u8;
+            let cb_dst = &mut self.cb[base..base + MACROBLOCK_CHROMA_SIDE];
+            for (d, &sample) in cb_dst.iter_mut().zip(cb_row.iter()) {
+                *d = sample.clamp(0, 255) as u8;
+            }
+            let cr_dst = &mut self.cr[base..base + MACROBLOCK_CHROMA_SIDE];
+            for (d, &sample) in cr_dst.iter_mut().zip(cr_row.iter()) {
+                *d = sample.clamp(0, 255) as u8;
             }
         }
         Ok(())

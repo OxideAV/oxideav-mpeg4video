@@ -137,12 +137,25 @@ use crate::half_sample::ReferenceVop;
 /// field's line index.
 trait QpelSource {
     fn fetch(&self, x: i32, y: i32) -> u8;
+
+    /// The `len` samples of source row `y` from column `x`, when the
+    /// run needs no §7.6.4 clamp; `None` otherwise (the caller falls
+    /// back to per-sample [`QpelSource::fetch`]).
+    #[inline]
+    fn row_run(&self, _x: i32, _y: i32, _len: usize) -> Option<&[u8]> {
+        None
+    }
 }
 
 impl QpelSource for ReferenceVop<'_> {
     #[inline]
     fn fetch(&self, x: i32, y: i32) -> u8 {
         self.fetch_clamped(x, y)
+    }
+
+    #[inline]
+    fn row_run(&self, x: i32, y: i32, len: usize) -> Option<&[u8]> {
+        ReferenceVop::row_run(self, x, y, len)
     }
 }
 
@@ -186,6 +199,11 @@ impl QpelSource for FieldRefView<'_, '_> {
         // rows of such macroblocks.)
         let frame_y = self.field_y0 + 2 * y_field;
         self.vop.fetch_clamped(x, frame_y)
+    }
+
+    #[inline]
+    fn row_run(&self, x: i32, y_field: i32, len: usize) -> Option<&[u8]> {
+        self.vop.row_run(x, self.field_y0 + 2 * y_field, len)
     }
 }
 
@@ -736,6 +754,117 @@ impl QpelSource for MirroredRefBlock {
     }
 }
 
+/// Largest block side the stack-buffered block cascade
+/// ([`cascade_block`]) handles — the 16×16 / 16×8 / 8×8 luminance
+/// prediction blocks of §7.6.2.2 and §7.7.2.1.
+const CASCADE_MAX_SIDE: usize = 16;
+
+/// The §7.6.2.2 cascade over a whole `w × h` block, evaluated
+/// separably: one horizontal pass per interior row, one vertical pass
+/// per output row. Sample for sample this is
+/// [`interpolate_quarter_pixel_src`] over a [`MirroredRefBlock`] —
+/// every position of Figure 7-32 is a horizontal stage
+/// (`A` / `e` / `b` / `f` for `qfx` 0..=3) followed by a vertical one
+/// (identity, or the 8-tap FIR over the stage-1 column blended as
+/// `g h i j` / `c k d l` / `m n o p`), and the Figure 7-30 mirroring
+/// is separable too, so the stage-1 value of a mirrored row is the
+/// stage-1 value of the row it mirrors.
+///
+/// `src` is the `(w + 1) × (h + 1)` interior block read at
+/// `(x0, y0)` with the §7.6.4 clamp.
+#[allow(clippy::too_many_arguments)]
+fn cascade_block<S: QpelSource>(
+    src: &S,
+    x0: i32,
+    y0: i32,
+    w: usize,
+    h: usize,
+    qfx: u8,
+    qfy: u8,
+    rc: u8,
+    bpp: u32,
+    out: &mut [u8],
+) {
+    debug_assert!((1..=CASCADE_MAX_SIDE).contains(&w) && (1..=CASCADE_MAX_SIDE).contains(&h));
+    let (w1, h1) = (w + 1, h + 1);
+    // Stage 1: the horizontal position of every interior row.
+    let mut stage = [[0u8; CASCADE_MAX_SIDE]; CASCADE_MAX_SIDE + 1];
+    // One interior row extended by the three mirrored samples per side.
+    let mut ext = [0u8; CASCADE_MAX_SIDE + 1 + 6];
+    for (r, stage_row) in stage.iter_mut().enumerate().take(h1) {
+        let y = y0 + r as i32;
+        match src.row_run(x0, y, w1) {
+            Some(run) => ext[3..3 + w1].copy_from_slice(run),
+            None => {
+                for (i, e) in ext[3..3 + w1].iter_mut().enumerate() {
+                    *e = src.fetch(x0 + i as i32, y);
+                }
+            }
+        }
+        // Figure 7-30: E[-k] = R[k-1], E[size-1+k] = R[size-k].
+        for k in 0..3 {
+            ext[2 - k] = ext[3 + k];
+            ext[3 + w1 + k] = ext[3 + w1 - 1 - k];
+        }
+        // The half-sample row `b` over the full stack width (columns
+        // past `w` read zero padding and are never used).
+        let mut half = [0u8; CASCADE_MAX_SIDE];
+        if qfx & 3 != 0 {
+            for (i, hv) in half.iter_mut().enumerate() {
+                let taps: &[u8; 8] = ext[i..i + 8].try_into().expect("eight taps");
+                *hv = fir_8tap_clip(taps, rc, bpp);
+            }
+        }
+        match qfx & 3 {
+            0 => stage_row.copy_from_slice(&ext[3..3 + CASCADE_MAX_SIDE]),
+            1 => {
+                for (i, t) in stage_row.iter_mut().enumerate() {
+                    *t = bilinear(ext[i + 3], half[i], rc, bpp);
+                }
+            }
+            2 => *stage_row = half,
+            _ => {
+                for (i, t) in stage_row.iter_mut().enumerate() {
+                    *t = bilinear(half[i], ext[i + 4], rc, bpp);
+                }
+            }
+        }
+    }
+    // Stage 2: the vertical position.
+    let qfy = qfy & 3;
+    for (j, dst) in out.chunks_exact_mut(w).take(h).enumerate() {
+        if qfy == 0 {
+            dst.copy_from_slice(&stage[j][..w]);
+            continue;
+        }
+        let rows: [&[u8; CASCADE_MAX_SIDE]; 8] = core::array::from_fn(|k| {
+            &stage[mirror_index(j as i32 + k as i32 - 3, h1 as i32) as usize]
+        });
+        let mut line = [0u8; CASCADE_MAX_SIDE];
+        for (i, v) in line.iter_mut().enumerate() {
+            let col = [
+                rows[0][i], rows[1][i], rows[2][i], rows[3][i], rows[4][i], rows[5][i], rows[6][i],
+                rows[7][i],
+            ];
+            *v = fir_8tap_clip(&col, rc, bpp);
+        }
+        match qfy {
+            1 => {
+                for (i, v) in line.iter_mut().enumerate() {
+                    *v = bilinear(stage[j][i], *v, rc, bpp);
+                }
+            }
+            2 => {}
+            _ => {
+                for (i, v) in line.iter_mut().enumerate() {
+                    *v = bilinear(*v, stage[j + 1][i], rc, bpp);
+                }
+            }
+        }
+        dst.copy_from_slice(&line[..w]);
+    }
+}
+
 /// Quarter-sample-interpolate a `block_w × block_h` luminance
 /// prediction block from a reference plane, given an `(mv_x, mv_y)`
 /// motion vector in §7.6.3 quarter-pel units and the block's
@@ -823,6 +952,21 @@ pub fn interpolate_block_qpel_into(
     // the sub-pel direction — the split fraction is non-negative, so
     // the extra column/row sits at the right/bottom) and mirror-extend
     // it; the cascade then runs in block-relative coordinates.
+    if (1..=CASCADE_MAX_SIDE).contains(&block_w) && (1..=CASCADE_MAX_SIDE).contains(&block_h) {
+        cascade_block(
+            vop,
+            origin_x + mvx_int,
+            origin_y + mvy_int,
+            block_w,
+            block_h,
+            qfx,
+            qfy,
+            rc,
+            bits_per_pixel,
+            out,
+        );
+        return;
+    }
     let block = MirroredRefBlock::read(
         vop,
         origin_x + mvx_int,
@@ -911,6 +1055,21 @@ pub fn interpolate_block_qpel_field_into(
     // (M+1)x(N+1) interior block is read from the single-field view
     // (its vertical axis already steps two frame lines per index) and
     // mirror-extended by three samples per Figure 7-30.
+    if (1..=CASCADE_MAX_SIDE).contains(&block_w) && (1..=CASCADE_MAX_SIDE).contains(&block_h) {
+        cascade_block(
+            &field,
+            origin_x + mvx_int,
+            origin_field_line + mvy_int_field,
+            block_w,
+            block_h,
+            qfx,
+            qfy,
+            rc,
+            bits_per_pixel,
+            out,
+        );
+        return;
+    }
     let block = MirroredRefBlock::read(
         &field,
         origin_x + mvx_int,
@@ -969,6 +1128,88 @@ pub fn interpolate_block_qpel_field(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The per-sample Figure 7-32 evaluation over a mirrored block —
+    /// the definition the block cascade must reproduce.
+    #[allow(clippy::too_many_arguments)]
+    fn per_sample_block<S: QpelSource>(
+        src: &S,
+        x0: i32,
+        y0: i32,
+        w: usize,
+        h: usize,
+        qfx: u8,
+        qfy: u8,
+        rc: u8,
+    ) -> Vec<u8> {
+        let block = MirroredRefBlock::read(src, x0, y0, w + 1, h + 1);
+        let mut out = vec![0u8; w * h];
+        for j in 0..h {
+            for i in 0..w {
+                out[j * w + i] =
+                    interpolate_quarter_pixel_src(&block, i as i32, j as i32, qfx, qfy, rc, 8);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn block_cascade_equals_the_per_sample_cascade() {
+        let (w, h) = (44usize, 40usize);
+        let mut state = 0x9E37_79B9u32;
+        let plane: Vec<u8> = (0..w * h)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                // Wide swings so the FIR clip fires on both sides.
+                match state >> 29 {
+                    0 => 0,
+                    1 => 255,
+                    _ => (state >> 16) as u8,
+                }
+            })
+            .collect();
+        let vop = ReferenceVop::new(&plane, w, h).unwrap();
+        for (bw, bh) in [(16usize, 16usize), (8, 8), (16, 8)] {
+            for rc in 0..2u8 {
+                for mv_y in [-37, -4, -3, -2, -1, 0, 1, 2, 3, 5, 41] {
+                    for mv_x in [-41, -3, -2, -1, 0, 1, 2, 3, 6, 39] {
+                        for (ox, oy) in [(0, 0), (16, 16), (28, 24), (8, 32)] {
+                            let (xi, qx) = split_quarter_pel(mv_x);
+                            let (yi, qy) = split_quarter_pel(mv_y);
+                            let got =
+                                interpolate_block_qpel(&vop, mv_x, mv_y, ox, oy, bw, bh, rc, 8);
+                            let want = per_sample_block(&vop, ox + xi, oy + yi, bw, bh, qx, qy, rc);
+                            assert_eq!(
+                                got, want,
+                                "frame {bw}x{bh} mv ({mv_x},{mv_y}) @({ox},{oy})"
+                            );
+                            // Field variant: both reference parities.
+                            for parity in 0..2 {
+                                let mvy_frame = 2 * mv_y;
+                                let got = interpolate_block_qpel_field(
+                                    &vop, mv_x, mvy_frame, ox, oy, bw, bh, parity, rc, 8,
+                                );
+                                let field = FieldRefView::new(&vop, parity);
+                                let want = per_sample_block(
+                                    &field,
+                                    ox + xi,
+                                    (oy >> 1) + yi,
+                                    bw,
+                                    bh,
+                                    qx,
+                                    qy,
+                                    rc,
+                                );
+                                assert_eq!(got, want, "field {bw}x{bh} mv ({mv_x},{mv_y})");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     // ─────────────────────── split_quarter_pel ───────────────────────
 

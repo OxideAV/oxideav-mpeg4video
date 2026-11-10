@@ -211,11 +211,33 @@ fn sad_full_pel(
     dy: i32,
 ) -> u32 {
     let mut sad = 0u32;
+    // Interior position: whole reference rows, no §7.6.4 clamp.
+    if reference.contains_rect(mb_x + dx, mb_y + dy, 16, 16) {
+        for (j, row) in src.iter().enumerate() {
+            let run = reference
+                .row_run(mb_x + dx, mb_y + dy + j as i32, 16)
+                .expect("row inside the plane");
+            let run: &[u8; 16] = run.try_into().expect("sixteen samples");
+            sad += row_sad(row, run);
+        }
+        return sad;
+    }
     for (j, row) in src.iter().enumerate() {
         for (i, &s) in row.iter().enumerate() {
             let r = reference.fetch_clamped(mb_x + i as i32 + dx, mb_y + j as i32 + dy);
             sad += (s - i32::from(r)).unsigned_abs();
         }
+    }
+    sad
+}
+
+/// Sum of absolute differences of one source row against one
+/// reference row.
+#[inline]
+pub(crate) fn row_sad<const N: usize>(src: &[i32; N], reference: &[u8; N]) -> u32 {
+    let mut sad = 0u32;
+    for i in 0..N {
+        sad += (src[i] - i32::from(reference[i])).unsigned_abs();
     }
     sad
 }
@@ -403,6 +425,19 @@ fn sad_full_pel_block8(
     let (row0, col0) = (8 * (block / 2), 8 * (block % 2));
     let (bx, by) = (mb_x + col0 as i32, mb_y + row0 as i32);
     let mut sad = 0u32;
+    if reference.contains_rect(bx + dx, by + dy, 8, 8) {
+        for j in 0..8 {
+            let run = reference
+                .row_run(bx + dx, by + dy + j as i32, 8)
+                .expect("row inside the plane");
+            let run: &[u8; 8] = run.try_into().expect("eight samples");
+            let row: &[i32; 8] = src[row0 + j][col0..col0 + 8]
+                .try_into()
+                .expect("eight samples");
+            sad += row_sad(row, run);
+        }
+        return sad;
+    }
     for j in 0..8 {
         for i in 0..8 {
             let s = src[row0 + j][col0 + i];

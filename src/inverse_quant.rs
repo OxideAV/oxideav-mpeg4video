@@ -184,6 +184,11 @@ pub fn inverse_quant_method2(qf: &[[i32; 8]; 8], ctx: InverseQuantContext) -> [[
     let (lo, hi) = saturation_bounds(ctx.bits_per_pixel);
     let mut out = [[0i32; 8]; 8];
     for v in 0..8 {
+        // A zero QF reconstructs to zero (§7.4.4.2.1); only the intra
+        // DC cell of row 0 has its own formula.
+        if qf[v] == [0i32; 8] && !(v == 0 && ctx.macroblock_intra) {
+            continue;
+        }
         for u in 0..8 {
             let f_pp = if ctx.macroblock_intra && u == 0 && v == 0 {
                 inverse_quant_intra_dc(
