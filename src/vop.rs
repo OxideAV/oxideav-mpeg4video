@@ -150,9 +150,14 @@ pub struct VopContext {
     /// the VOP is S-coded, the parser walks the §6.2.5 `sprite_trajectory()`
     /// branch (the GMC global-motion-compensation path).
     pub sprite_gmc: bool,
-    /// Whether the VOL declared `sprite_enable == "static"`. Round 2
-    /// rejects this branch up front.
+    /// Whether the VOL declared `sprite_enable == "static"`: an S-VOP
+    /// then carries the §6.2.5 static block and no macroblock data.
     pub sprite_static: bool,
+    /// `low_latency_sprite_enable` (§6.3.3) of a static-sprite VOL.
+    /// A basic static sprite (`false`) carries only the trajectory /
+    /// brightness block in its S-VOPs; the low-latency piece loop is
+    /// rejected.
+    pub low_latency_sprite_enable: bool,
     /// `no_of_sprite_warping_points` (Table 6-20) from the VOL header,
     /// `0` when sprite coding is off. Gates the `sprite_trajectory()`
     /// parse — `> 0` triggers it.
@@ -180,6 +185,7 @@ impl Default for VopContext {
             interlaced: false,
             sprite_gmc: false,
             sprite_static: false,
+            low_latency_sprite_enable: false,
             no_of_sprite_warping_points: 0,
             sprite_brightness_change: false,
             scalability: false,
@@ -201,6 +207,7 @@ impl VopContext {
             interlaced: vol.interlaced,
             sprite_gmc: matches!(vol.sprite_enable, SpriteEnable::Gmc),
             sprite_static: matches!(vol.sprite_enable, SpriteEnable::Static),
+            low_latency_sprite_enable: vol.low_latency_sprite_enable.unwrap_or(false),
             no_of_sprite_warping_points: vol.no_of_sprite_warping_points.unwrap_or(0),
             sprite_brightness_change: vol.sprite_brightness_change.unwrap_or(false),
             scalability: vol.scalability,
@@ -209,6 +216,20 @@ impl VopContext {
             complexity_estimation_disable: vol.complexity_estimation_disable,
         }
     }
+}
+
+/// The §6.2.5 static-sprite S-VOP block: `sprite_trajectory()` (up to
+/// four warping points, Table 6-20) and the optional
+/// `brightness_change_factor()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
+pub struct StaticSpriteVop {
+    /// `no_of_sprite_warping_points` (0..=4).
+    pub warping_points: u8,
+    /// `[du[i], dv[i]]` per warping point (unused tail entries zero).
+    pub trajectory: [[i32; 2]; 4],
+    /// `brightness_change_factor` when `sprite_brightness_change == 1`.
+    pub brightness_change: Option<i32>,
 }
 
 /// Decoded §6.2.5 Video Object Plane header.
@@ -256,6 +277,12 @@ pub struct VopHeader {
     /// `no_of_sprite_warping_points > 0`. `None` for every non-GMC VOP
     /// and for the stationary (0-point) GMC case.
     pub sprite_trajectory: Option<SpriteTrajectory>,
+    /// The §6.2.5 static-sprite block of an S-VOP in a
+    /// `sprite_enable == "static"` VOL (`None` otherwise). Such a VOP
+    /// ends after this block: it has no `vop_quant`, no f_code and no
+    /// macroblock data — it is reconstructed by warping the sprite
+    /// memory (§7.8).
+    pub static_sprite: Option<StaticSpriteVop>,
     /// §6.3.5 `top_field_first` — present only when the VOL coded
     /// `interlaced == 1`: the top field (containing the top line) of
     /// the reconstructed VOP displays first. Defaults to `false` for
@@ -535,6 +562,7 @@ fn parse_video_object_plane_body(
             fcode_fwd: 0,
             fcode_bwd: 0,
             sprite_trajectory: None,
+            static_sprite: None,
             top_field_first: false,
             alternate_vertical_scan: false,
         });
@@ -565,15 +593,6 @@ fn parse_video_object_plane_body(
         rounding_type = br.read_bits(1)? as u8;
     }
 
-    // Static sprite S-VOPs need the §7.8.2/§7.8.3 sprite-object buffer
-    // and piece-update machinery (sprite_transmit_mode loop +
-    // decode_sprite_piece()), which is out of scope; reject up front so
-    // the bit position never drifts. GMC S-VOPs fall through to the
-    // §6.2.5 sprite_trajectory() branch below.
-    if matches!(coding_type, VopCodingType::S) && ctx.sprite_static {
-        return Err(VopParseError::UnsupportedBranch("sprite_static_S_VOP"));
-    }
-
     if !ctx.complexity_estimation_disable {
         return Err(VopParseError::UnsupportedBranch(
             "complexity_estimation_header",
@@ -587,6 +606,49 @@ fn parse_video_object_plane_body(
     } else {
         (false, false)
     };
+
+    // §6.2.5 static-sprite S-VOP: sprite_trajectory() (when
+    // no_of_sprite_warping_points > 0), brightness_change_factor()
+    // (when sprite_brightness_change), the low-latency piece loop, then
+    // `next_start_code(); return()` — no vop_quant, no f_code, no
+    // macroblock data.
+    if matches!(coding_type, VopCodingType::S) && ctx.sprite_static {
+        if ctx.low_latency_sprite_enable {
+            // The piece loop carries sprite_shape_texture() macroblock
+            // bodies that update the sprite memory (§7.8.3).
+            return Err(VopParseError::UnsupportedBranch(
+                "low_latency_sprite_enable",
+            ));
+        }
+        let block = crate::sprite_piece::parse_static_sprite_vop_block(
+            br,
+            ctx.no_of_sprite_warping_points,
+            ctx.sprite_brightness_change,
+            false,
+            |_, _| Ok(()),
+        )
+        .map_err(|_| VopParseError::Truncated)?;
+        return Ok(VopHeader {
+            coding_type,
+            modulo_time_base,
+            time_increment,
+            composed_ticks,
+            coded: true,
+            rounding_type: 0,
+            intra_dc_vlc_thr,
+            quant: 0,
+            fcode_fwd: 0,
+            fcode_bwd: 0,
+            sprite_trajectory: None,
+            static_sprite: Some(StaticSpriteVop {
+                warping_points: block.warping_points,
+                trajectory: block.trajectory,
+                brightness_change: block.brightness_change,
+            }),
+            top_field_first,
+            alternate_vertical_scan,
+        });
+    }
 
     // §6.2.5 S(GMC)-VOP sprite branch (spec lines 4328..=4333). For
     // `sprite_enable == "GMC"` the trajectory is followed (when
@@ -655,6 +717,7 @@ fn parse_video_object_plane_body(
         fcode_fwd,
         fcode_bwd,
         sprite_trajectory,
+        static_sprite: None,
         top_field_first,
         alternate_vertical_scan,
     })
@@ -861,25 +924,85 @@ mod tests {
         assert_eq!(header.fcode_fwd, 1);
     }
 
-    #[test]
-    fn static_sprite_s_vop_still_rejected() {
+    /// A static-sprite S-VOP header: no vop_rounding_type, the
+    /// trajectory right after intra_dc_vlc_thr, then the end of the VOP.
+    fn make_static_s_vop() -> Vec<u8> {
         let mut w = BitWriter::new();
         w.write_bits(VOP_START_CODE, 32);
         w.write_bits(0b11, 2); // S
         w.write_bits(0, 1);
         w.write_marker();
         let bits = vop_time_increment_bits(30_000) as usize;
-        w.write_bits(0, bits);
+        w.write_bits(7, bits);
         w.write_marker();
         w.write_bits(1, 1); // vop_coded
+        w.write_bits(5, 3); // intra_dc_vlc_thr
+        write_warping(&mut w, 1, 1); // du0 = +1
+        write_warping(&mut w, 1, 0); // dv0 = -1
+        write_warping(&mut w, 2, 0b11); // du1 = +3
+        write_warping(&mut w, 2, 0b01); // dv1 = -2
+        write_warping(&mut w, 0, 0); // du2 = 0
+        write_warping(&mut w, 1, 1); // dv2 = +1
+        write_warping(&mut w, 2, 0b10); // du3 = +2
+        write_warping(&mut w, 0, 0); // dv3 = 0
         w.align();
+        w.buf
+    }
+
+    #[test]
+    fn basic_static_sprite_s_vop_parses_its_trajectory_block() {
+        let data = make_static_s_vop();
         let ctx = VopContext {
             sprite_static: true,
+            no_of_sprite_warping_points: 4,
             ..VopContext::default()
         };
-        let err = parse_video_object_plane_header(&w.buf, 30_000, ctx).unwrap_err();
-        match err {
-            VopParseError::UnsupportedBranch(name) => assert!(name.contains("static")),
+        let header = parse_video_object_plane_header(&data, 30_000, ctx).unwrap();
+        assert_eq!(header.coding_type, VopCodingType::S);
+        assert_eq!(header.time_increment, 7);
+        assert_eq!(header.intra_dc_vlc_thr, 5);
+        assert_eq!(header.rounding_type, 0);
+        assert!(header.sprite_trajectory.is_none());
+        let block = header.static_sprite.expect("static block present");
+        assert_eq!(block.warping_points, 4);
+        assert_eq!(block.trajectory, [[1, -1], [3, -2], [0, 1], [2, 0]]);
+        assert_eq!(block.brightness_change, None);
+        // Fewer points read fewer codes; zero points read none.
+        for points in 0..4u8 {
+            let ctx = VopContext {
+                no_of_sprite_warping_points: points,
+                ..ctx
+            };
+            let header = parse_video_object_plane_header(&data, 30_000, ctx).unwrap();
+            let block = header.static_sprite.expect("static block present");
+            assert_eq!(block.warping_points, points);
+            let mut expected = [[1, -1], [3, -2], [0, 1], [2, 0]];
+            for p in expected.iter_mut().skip(usize::from(points)) {
+                *p = [0, 0];
+            }
+            assert_eq!(block.trajectory, expected);
+        }
+        // A trajectory cut short is a parse error.
+        let ctx = VopContext {
+            no_of_sprite_warping_points: 4,
+            ..ctx
+        };
+        assert!(parse_video_object_plane_header(&data[..7], 30_000, ctx).is_err());
+    }
+
+    #[test]
+    fn low_latency_static_sprite_s_vop_is_rejected() {
+        // The low-latency piece loop carries sprite_shape_texture()
+        // macroblock bodies (§7.8.3) this decoder does not read.
+        let data = make_static_s_vop();
+        let ctx = VopContext {
+            sprite_static: true,
+            low_latency_sprite_enable: true,
+            no_of_sprite_warping_points: 4,
+            ..VopContext::default()
+        };
+        match parse_video_object_plane_header(&data, 30_000, ctx).unwrap_err() {
+            VopParseError::UnsupportedBranch(name) => assert!(name.contains("low_latency")),
             other => panic!("expected UnsupportedBranch, got {other:?}"),
         }
     }

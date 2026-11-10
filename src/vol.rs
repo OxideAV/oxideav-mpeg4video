@@ -248,6 +248,16 @@ impl SpriteWarpingAccuracy {
         }
     }
 
+    /// The Table 6-21 two-bit code of this accuracy.
+    pub(crate) const fn to_bits(self) -> u32 {
+        match self {
+            SpriteWarpingAccuracy::HalfPel => 0b00,
+            SpriteWarpingAccuracy::QuarterPel => 0b01,
+            SpriteWarpingAccuracy::EighthPel => 0b10,
+            SpriteWarpingAccuracy::SixteenthPel => 0b11,
+        }
+    }
+
     /// The sub-pel denominator `s` for this accuracy: 2, 4, 8, or 16.
     /// This is the `s` used throughout §7.8.4 (reference-point
     /// scaling), §7.8.5 (warping) and §7.8.6 (sample reconstruction).

@@ -124,6 +124,29 @@ impl DecodedFrame {
         })
     }
 
+    /// A frame from three ready 4:2:0 planes (`width × height` luma,
+    /// half-size chroma; both dimensions non-zero multiples of 16).
+    pub(crate) fn from_planes(
+        width: usize,
+        height: usize,
+        coding_type: VopCodingType,
+        luma: Vec<u8>,
+        cb: Vec<u8>,
+        cr: Vec<u8>,
+    ) -> Result<Self, FrameStoreError> {
+        let mut frame = Self::new(width, height, coding_type)?;
+        if luma.len() != frame.luma.len()
+            || cb.len() != frame.cb.len()
+            || cr.len() != frame.cr.len()
+        {
+            return Err(FrameStoreError::InvalidDimensions { width, height });
+        }
+        frame.luma = luma;
+        frame.cb = cb;
+        frame.cr = cr;
+        Ok(frame)
+    }
+
     /// Container-supplied presentation timestamp, in the container's
     /// packet time base (display order — attached by
     /// [`Mpeg4VideoDecoder::decode_with_pts`](crate::decoder::Mpeg4VideoDecoder::decode_with_pts)

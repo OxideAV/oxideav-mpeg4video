@@ -4,7 +4,8 @@
 //! encoder must produce a stream the crate's own decoder reads back
 //! into exactly as many frames (every writer path — budget-driven
 //! dquant / dbquant, video packets, data partitioning incl. S(GMC),
-//! RVLC, interlaced tools, short header — is exercised).
+//! RVLC, interlaced tools, short header, static-sprite VOLs with
+//! fitted trajectories — is exercised).
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
@@ -43,7 +44,19 @@ fuzz_target!(|data: &[u8]| {
     if b[4] & 1 != 0 {
         opts = opts.set("mb-aq", "true");
     }
-    if short_header {
+    // A basic static-sprite VOL (§7.8) takes none of the motion /
+    // rate / resilience tools below.
+    let static_sprite = !short_header && b[0] & 0x40 != 0;
+    if static_sprite {
+        opts = oxideav_core::CodecOptions::default()
+            .set("qp", (1 + u32::from(b[1] & 31)).to_string())
+            .set("static-sprite", "true")
+            .set("sprite-points", (u32::from(b[2]) % 5).to_string());
+        if b[7] & 4 != 0 {
+            opts = opts.set("mpeg-quant", "true");
+        }
+        opts = opts.set("dc-vlc-thr", (u32::from(b[7] >> 4) & 7).to_string());
+    } else if short_header {
         opts = opts.set("short-header", "true");
         if b[4] & 2 != 0 {
             opts = opts.set("gob-headers", "false");

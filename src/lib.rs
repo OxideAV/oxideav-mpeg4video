@@ -398,6 +398,7 @@ pub mod sequence;
 pub mod short_header;
 pub mod short_header_encode;
 pub mod sprite; // mixed: `SpriteTrajectoryError` stays visible
+pub mod sprite_encode;
 #[doc(hidden)]
 pub mod sprite_piece;
 #[doc(hidden)]

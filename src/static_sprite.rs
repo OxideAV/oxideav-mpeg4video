@@ -321,6 +321,201 @@ pub fn static_sprite_luma_macroblock_perspective(
     Ok(out)
 }
 
+/// §7.8.2 sprite memory of a basic static sprite: the three sample
+/// arrays (`width × height` luminance, `(width // 2) × (height // 2)`
+/// chrominance) and the sprite's top-left luminance coordinate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[doc(hidden)] // internal plumbing shared by the decoder and the sprite encoder
+pub struct SpritePlanes {
+    /// Luminance samples, row-major, `width * height`.
+    pub luma: Vec<u8>,
+    /// Cb samples, `width.div_ceil(2) * height.div_ceil(2)`.
+    pub cb: Vec<u8>,
+    /// Cr samples, same layout as `cb`.
+    pub cr: Vec<u8>,
+    /// `sprite_width`.
+    pub width: usize,
+    /// `sprite_height`.
+    pub height: usize,
+    /// `sprite_left_coordinate`.
+    pub left: i64,
+    /// `sprite_top_coordinate`.
+    pub top: i64,
+}
+
+impl SpritePlanes {
+    /// Crop a macroblock-aligned 4:2:0 reconstruction (`stride`-wide
+    /// luminance, `stride / 2`-wide chrominance) to the sprite arrays.
+    /// `None` when a plane is too small for the sprite.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_aligned(
+        luma: &[u8],
+        cb: &[u8],
+        cr: &[u8],
+        stride: usize,
+        width: usize,
+        height: usize,
+        left: i64,
+        top: i64,
+    ) -> Option<Self> {
+        let (cw, ch) = (width.div_ceil(2), height.div_ceil(2));
+        let cstride = stride / 2;
+        if width == 0
+            || height == 0
+            || stride < width
+            || cstride < cw
+            || luma.len() < stride * height
+            || cb.len() < cstride * ch
+            || cr.len() < cstride * ch
+        {
+            return None;
+        }
+        let crop = |plane: &[u8], stride: usize, pw: usize, ph: usize| -> Vec<u8> {
+            let mut tight = Vec::with_capacity(pw * ph);
+            for row in plane.chunks_exact(stride).take(ph) {
+                tight.extend_from_slice(&row[..pw]);
+            }
+            tight
+        };
+        Some(SpritePlanes {
+            luma: crop(luma, stride, width, height),
+            cb: crop(cb, cstride, cw, ch),
+            cr: crop(cr, cstride, cw, ch),
+            width,
+            height,
+            left,
+            top,
+        })
+    }
+
+    /// The luminance array as a [`SpriteMemory`].
+    pub fn luma_memory(&self) -> Option<SpriteMemory<'_>> {
+        SpriteMemory::new(&self.luma, self.width, self.height, self.left, self.top)
+    }
+
+    /// The chrominance arrays as [`SpriteMemory`] views. §7.8.2: their
+    /// top-left sample sits at
+    /// `(sprite_left_coordinate / 2, sprite_top_coordinate / 2)`.
+    pub fn chroma_memories(&self) -> Option<(SpriteMemory<'_>, SpriteMemory<'_>)> {
+        let (cw, ch) = (self.width.div_ceil(2), self.height.div_ceil(2));
+        Some((
+            SpriteMemory::new(&self.cb, cw, ch, self.left / 2, self.top / 2)?,
+            SpriteMemory::new(&self.cr, cw, ch, self.left / 2, self.top / 2)?,
+        ))
+    }
+}
+
+/// The warp one static-sprite S-VOP applies: the §7.8.5 affine family
+/// for up to three warping points, the perspective transform for four.
+#[derive(Debug, Clone, Copy)]
+#[doc(hidden)]
+pub enum StaticWarp {
+    /// 0..=3 warping points.
+    Affine(WarpGeometry),
+    /// Four warping points.
+    Perspective(crate::perspective_warp::PerspectiveWarp),
+}
+
+impl StaticWarp {
+    /// Decode the §7.8.4 reference points of a rectangular `w × h` VOP
+    /// from `points` (0..=4) `[du, dv]` pairs.
+    pub fn decode(
+        points: u8,
+        trajectory: &[[i32; 2]; 4],
+        w: u32,
+        h: u32,
+        accuracy: SpriteWarpingAccuracy,
+    ) -> Self {
+        if points >= 4 {
+            StaticWarp::Perspective(crate::perspective_warp::PerspectiveWarp::decode(
+                trajectory, w, h, accuracy,
+            ))
+        } else {
+            let mut head = [[0i32; 2]; 3];
+            head.copy_from_slice(&trajectory[..3]);
+            let trajectory = crate::sprite::SpriteTrajectory {
+                count: points,
+                points: head,
+            };
+            StaticWarp::Affine(WarpGeometry::decode(&trajectory, w, h, accuracy))
+        }
+    }
+
+    /// `(F, G)` of luminance sample `(i, j)`; `None` where the
+    /// perspective denominator vanishes.
+    #[inline]
+    pub fn luma_fg(&self, i: i64, j: i64) -> Option<[i64; 2]> {
+        match self {
+            StaticWarp::Affine(g) => Some(g.luma_fg(i, j)),
+            StaticWarp::Perspective(p) => p.luma_fg(i, j).ok(),
+        }
+    }
+
+    /// `(Fc, Gc)` of chrominance sample `(ic, jc)`.
+    #[inline]
+    pub fn chroma_fg(&self, ic: i64, jc: i64) -> Option<[i64; 2]> {
+        match self {
+            StaticWarp::Affine(g) => Some(g.chroma_fg(ic, jc)),
+            StaticWarp::Perspective(p) => p.chroma_fg(ic, jc).ok(),
+        }
+    }
+}
+
+/// One §7.8.6 static luminance sample of the warped sprite (the
+/// `brightness_change_factor` of `params` applied).
+#[inline]
+#[doc(hidden)]
+pub fn static_sample(sprite: &SpriteMemory<'_>, fg: [i64; 2], params: &StaticSpriteParams) -> u8 {
+    reconstruct_static_sample(sprite, fg[0], fg[1], params)
+}
+
+/// Reconstruct a whole static-sprite S-VOP (§7.8.4–§7.8.6): the three
+/// planes of a `frame_w × frame_h` picture (macroblock-aligned; the
+/// warp itself is defined on the `vop_w × vop_h` VOP) warped out of
+/// the sprite memory. The brightness change applies to luminance
+/// only (§7.8.6). `None` when the sprite arrays are inconsistent or a
+/// perspective denominator vanishes inside the picture.
+#[allow(clippy::too_many_arguments)]
+#[doc(hidden)]
+pub fn warp_static_sprite_vop(
+    sprite: &SpritePlanes,
+    vop_w: u32,
+    vop_h: u32,
+    frame_w: usize,
+    frame_h: usize,
+    accuracy: SpriteWarpingAccuracy,
+    bits_per_pixel: u32,
+    points: u8,
+    trajectory: &[[i32; 2]; 4],
+    brightness_change: Option<i32>,
+) -> Option<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+    let warp = StaticWarp::decode(points, trajectory, vop_w, vop_h, accuracy);
+    let luma_params = StaticSpriteParams {
+        brightness_change_factor: brightness_change,
+        ..StaticSpriteParams::new(accuracy, bits_per_pixel)
+    };
+    let chroma_params = StaticSpriteParams::new(accuracy, bits_per_pixel);
+    let luma_mem = sprite.luma_memory()?;
+    let (cb_mem, cr_mem) = sprite.chroma_memories()?;
+    let mut luma = vec![0u8; frame_w * frame_h];
+    for (j, row) in luma.chunks_exact_mut(frame_w).enumerate() {
+        for (i, px) in row.iter_mut().enumerate() {
+            *px = static_sample(&luma_mem, warp.luma_fg(i as i64, j as i64)?, &luma_params);
+        }
+    }
+    let (cw, ch) = (frame_w / 2, frame_h / 2);
+    let mut cb = vec![0u8; cw * ch];
+    let mut cr = vec![0u8; cw * ch];
+    for jc in 0..ch {
+        for ic in 0..cw {
+            let fg = warp.chroma_fg(ic as i64, jc as i64)?;
+            cb[jc * cw + ic] = static_sample(&cb_mem, fg, &chroma_params);
+            cr[jc * cw + ic] = static_sample(&cr_mem, fg, &chroma_params);
+        }
+    }
+    Some((luma, cb, cr))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

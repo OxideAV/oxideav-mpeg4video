@@ -113,6 +113,14 @@ impl SequenceDecoder {
         Ok(self.accept_anchor(frame))
     }
 
+    /// Accept an already-reconstructed anchor-class VOP (a §7.8
+    /// static-sprite S-VOP) in coding order: releases the held anchor
+    /// for display and holds this one back.
+    #[doc(hidden)]
+    pub fn push_reconstructed_anchor(&mut self, frame: DecodedFrame) -> Vec<DecodedFrame> {
+        self.accept_anchor(frame)
+    }
+
     /// Decode a P-VOP in coding order against the current forward anchor.
     /// Releases the previously-held anchor for display, then holds this
     /// P-VOP back.

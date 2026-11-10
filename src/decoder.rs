@@ -47,7 +47,7 @@ use crate::framestore::DecodedFrame;
 use crate::pvop_mv::PvopMbMotion;
 use crate::sequence::SequenceDecoder;
 use crate::vol::{
-    VIDEO_OBJECT_LAYER_START_CODE_MAX, VIDEO_OBJECT_LAYER_START_CODE_MIN,
+    SpriteEnable, VIDEO_OBJECT_LAYER_START_CODE_MAX, VIDEO_OBJECT_LAYER_START_CODE_MIN,
     VIDEO_OBJECT_START_CODE_MAX, VIDEO_OBJECT_START_CODE_MIN, VISUAL_OBJECT_SEQUENCE_END_CODE,
     VISUAL_OBJECT_SEQUENCE_START_CODE, VISUAL_OBJECT_START_CODE, VolHeader, VolParseError,
     parse_video_object_layer, parse_visual_object_header, parse_visual_object_sequence_header,
@@ -189,6 +189,9 @@ pub struct Mpeg4VideoDecoder {
     /// running 30000/1001 Hz tick clock and the previous
     /// `temporal_reference` (modulo-256 arithmetic, §6.3.5.2).
     short_header: Option<ShortHeaderClock>,
+    /// §7.8.2 sprite memory of a basic static-sprite VOL: the
+    /// reconstructed initial I-VOP (never displayed).
+    sprite: Option<crate::static_sprite::SpritePlanes>,
 }
 
 /// The short-header picture clock (see
@@ -390,7 +393,13 @@ impl Mpeg4VideoDecoder {
                 // A bare video_object_start_code carries only its id.
             }
             VIDEO_OBJECT_LAYER_START_CODE_MIN..=VIDEO_OBJECT_LAYER_START_CODE_MAX => {
-                self.vol = Some(parse_video_object_layer(unit, self.profile_level)?);
+                let vol = parse_video_object_layer(unit, self.profile_level)?;
+                if self.vol != Some(vol) {
+                    // A different layer configuration: its sprite (if
+                    // any) arrives with its own initial I-VOP.
+                    self.sprite = None;
+                }
+                self.vol = Some(vol);
             }
             GROUP_OF_VOP_START_CODE => {
                 let gov = parse_group_of_vop_header(unit)?;
@@ -421,6 +430,14 @@ impl Mpeg4VideoDecoder {
         out: &mut Vec<DecodedFrame>,
     ) -> Result<(), StreamDecodeError> {
         let vol = self.vol.ok_or(StreamDecodeError::MissingVol)?;
+        if vol.bits_per_pixel != 8 {
+            // §6.3.3 `not_8_bit`: the picture store holds 8-bit
+            // samples; an N-bit VOL would be clipped into it, so it is
+            // declined instead.
+            return Err(StreamDecodeError::Vol(VolParseError::UnsupportedBranch(
+                "not_8_bit with bits_per_pixel != 8",
+            )));
+        }
         let (mb_width, mb_height) = vop_mb_dimensions(&vol);
         let mb_count = mb_width * mb_height;
 
@@ -450,6 +467,17 @@ impl Mpeg4VideoDecoder {
         };
         let vop_ticks = (base_sec + u64::from(vop.modulo_time_base)) as i64 * res
             + i64::from(vop.time_increment);
+
+        if matches!(vol.sprite_enable, SpriteEnable::Static) {
+            return self.decode_static_sprite_vop(
+                &vol,
+                &vop,
+                &mut br,
+                res,
+                (container_pts, vop_ticks),
+                out,
+            );
+        }
 
         if !vop.coded {
             return self.decode_uncoded_vop(
@@ -611,6 +639,134 @@ impl Mpeg4VideoDecoder {
             frame.set_pts_ticks(Some(vop_ticks));
         }
         Ok(())
+    }
+
+    /// One VOP of a basic static-sprite VOL (§7.8, `sprite_enable ==
+    /// "static"`, `low_latency_sprite_enable == 0`).
+    ///
+    /// §7.8.1: the initial I-VOP is the sprite — reconstructed at
+    /// `sprite_width × sprite_height` (§7.8.2 gives the sprite arrays
+    /// those dimensions, and §6.2.5 sends no VOP size for it), stored
+    /// in the sprite memory and not displayed. Every later VOP is an
+    /// S-VOP carrying only `sprite_trajectory()` (+ the brightness
+    /// factor): it is reconstructed by warping the sprite memory
+    /// (§7.8.4 reference points, §7.8.5 warp — affine for up to three
+    /// points, perspective for four — and the §7.8.6 static sample
+    /// reconstruction).
+    fn decode_static_sprite_vop(
+        &mut self,
+        vol: &VolHeader,
+        vop: &VopHeader,
+        br: &mut BitReader<'_>,
+        res: i64,
+        (container_pts, vop_ticks): (Option<i64>, i64),
+        out: &mut Vec<DecodedFrame>,
+    ) -> Result<(), StreamDecodeError> {
+        let unsupported = |what| StreamDecodeError::Vop(VopParseError::UnsupportedBranch(what));
+        if vol.low_latency_sprite_enable.unwrap_or(false) {
+            return Err(unsupported("low_latency_sprite_enable"));
+        }
+        let geometry = vol
+            .sprite_geometry
+            .ok_or_else(|| unsupported("static sprite without geometry"))?;
+        match vop.coding_type {
+            VopCodingType::I => {
+                if !vop.coded {
+                    return Err(unsupported("static sprite I-VOP with vop_coded == 0"));
+                }
+                // The sprite I-VOP is coded on the sprite's own
+                // macroblock grid.
+                let sprite_vol = VolHeader {
+                    width: geometry.width,
+                    height: geometry.height,
+                    ..*vol
+                };
+                let (mb_width, mb_height) = vop_mb_dimensions(&sprite_vol);
+                let mbs = if vol.data_partitioned {
+                    crate::vop_decode::decode_i_vop_macroblocks_dp(
+                        br,
+                        &sprite_vol,
+                        vop,
+                        self.options,
+                    )?
+                } else {
+                    decode_i_vop_macroblocks(br, &sprite_vol, vop, self.options)?
+                };
+                let mut frame = DecodedFrame::new(mb_width * 16, mb_height * 16, VopCodingType::I)
+                    .map_err(FrameDecodeError::from)?;
+                for (idx, mb) in mbs.iter().enumerate() {
+                    frame
+                        .blit_macroblock(idx % mb_width, idx / mb_width, mb)
+                        .map_err(FrameDecodeError::from)?;
+                }
+                // Crop the macroblock-aligned reconstruction to the
+                // sprite arrays (§7.8.2: sprite_width × sprite_height
+                // luminance, `// 2` chrominance).
+                self.sprite = Some(
+                    crate::static_sprite::SpritePlanes::from_aligned(
+                        frame.luma_samples(),
+                        frame.cb_samples(),
+                        frame.cr_samples(),
+                        mb_width * 16,
+                        usize::from(geometry.width),
+                        usize::from(geometry.height),
+                        i64::from(geometry.left),
+                        i64::from(geometry.top),
+                    )
+                    .ok_or_else(|| unsupported("static sprite geometry"))?,
+                );
+                self.anchor_motion = None;
+                self.advance_anchor_time(vop, res);
+                Ok(())
+            }
+            VopCodingType::S => {
+                let sprite = self
+                    .sprite
+                    .as_ref()
+                    .ok_or(StreamDecodeError::MissingAnchor)?;
+                if vol.width == 0 || vol.height == 0 {
+                    return Err(unsupported("static sprite VOP of zero size"));
+                }
+                let (mb_width, mb_height) = vop_mb_dimensions(vol);
+                let (fw, fh) = (mb_width * 16, mb_height * 16);
+                let accuracy = vol
+                    .sprite_warping_accuracy
+                    .ok_or_else(|| unsupported("static sprite without warping accuracy"))?;
+                let bpp = u32::from(vol.bits_per_pixel);
+                // `vop_coded == 0` carries no trajectory: the VOP shows
+                // the sprite through the identity warp.
+                let block = vop.static_sprite.unwrap_or(crate::vop::StaticSpriteVop {
+                    warping_points: 0,
+                    trajectory: [[0; 2]; 4],
+                    brightness_change: None,
+                });
+                let (luma, cb, cr) = crate::static_sprite::warp_static_sprite_vop(
+                    sprite,
+                    u32::from(vol.width),
+                    u32::from(vol.height),
+                    fw,
+                    fh,
+                    accuracy,
+                    bpp,
+                    block.warping_points,
+                    &block.trajectory,
+                    block.brightness_change,
+                )
+                .ok_or_else(|| unsupported("static sprite warp"))?;
+                let frame = DecodedFrame::from_planes(fw, fh, VopCodingType::S, luma, cb, cr)
+                    .map_err(FrameDecodeError::from)?;
+                out.extend(self.sequence.push_reconstructed_anchor(frame));
+                self.anchor_motion = None;
+                if let Some(pending) = produced_anchor(&mut self.sequence, out) {
+                    pending.set_pts(container_pts);
+                    pending.set_pts_ticks(Some(vop_ticks));
+                }
+                self.advance_anchor_time(vop, res);
+                Ok(())
+            }
+            // §7.8.1: a static-sprite VOL holds one I-VOP and S-VOPs.
+            _ => Err(unsupported("P/B-VOP in a static sprite VOL")),
+        }
     }
 
     /// §6.3.5 `vop_coded == 0`: the reconstructed VOP is a copy of the
@@ -884,6 +1040,16 @@ impl Mpeg4PacketDecoder {
                     "mpeg4video: {}x{} exceeds max_pixels_per_frame {}",
                     vol.width, vol.height, self.max_pixels
                 )));
+            }
+            // The §7.8.2 sprite memory is a picture buffer too.
+            if let Some(sprite) = vol.sprite_geometry {
+                let pixels = u64::from(sprite.width) * u64::from(sprite.height);
+                if pixels > self.max_pixels {
+                    return Err(oxideav_core::Error::resource_exhausted(format!(
+                        "mpeg4video: sprite {}x{} exceeds max_pixels_per_frame {}",
+                        sprite.width, sprite.height, self.max_pixels
+                    )));
+                }
             }
         }
         Ok(())

@@ -266,12 +266,37 @@ Two-pass on a 60-frame GOP-12 / bf-2 run at 250 kb/s lands at 1.000
 `encoder::make_encoder` / `Mpeg4VideoEncoder` (options `qp`,
 `mpeg-quant`, `ac-pred`, `four-mv`, `qpel`, `bf`, `bitrate`,
 `vbv-buffer`, `gop-size`, `fcode`, `mb-aq`, `packet-bits`,
-`data-partitioned`, `rvlc`, `gmc`, `gmc-points`, `interlaced`, `top-field-first`,
+`data-partitioned`, `rvlc`, `gmc`, `gmc-points`, `static-sprite`,
+`sprite-points`, `interlaced`, `top-field-first`,
 `alt-scan`, `ecosystem-compat`, `short-header`, `gob-headers`,
 `dc-vlc-thr`, `auto-dc-vlc`, `rc-mode`, `rc-band`, `pass`,
 `stats-file`) is the dual-API sibling of `make_decoder`;
 `Mpeg4VideoEncoder::first_pass_stats` / `with_first_pass_stats` are the
 direct-API two-pass round trip.
+
+**Basic static sprites** (§7.8, `sprite_enable == "static"`,
+`low_latency_sprite_enable == 0`), both directions. The stream decoder
+reconstructs the VOL's initial I-VOP on the sprite's own macroblock
+grid (`sprite_width × sprite_height`, the §7.8.2 sprite arrays) into
+the sprite memory without displaying it, and rebuilds every following
+S-VOP — which carries only `sprite_trajectory()` and the optional
+`brightness_change_factor()` — by the §7.8.4 reference points, the
+§7.8.5 warp (stationary / translation / affine family for 0..=3
+warping points, perspective for 4) and the §7.8.6 static sample
+reconstruction, at any of the four warp accuracies and any sprite
+origin. The encoder's `static-sprite` option (direct API:
+`sprite_encode::StaticSpriteEncoder` over
+`EncoderConfig::with_static_sprite`, Main profile) codes the sprite
+once and then one trajectory-only S-VOP per picture, the trajectory
+fitted on the decoder's own warp of the closed-loop sprite (a coarse
+scan of the picture over the sprite, then a multi-scale descent over
+every transmitted `du[i]` / `dv[i]`) or supplied by the caller. A pan
+over a larger panorama is recovered exactly; a known three-point warp
+is fitted to within the sprite's quantisation error; every warp class
+decodes sample-exact against the encoder's closed loop
+(`tests/static_sprite.rs`). This pair is verified against itself
+only: the black-box decoder used elsewhere reads the VOL as a static
+sprite and then declines it, so no independent decode exists yet.
 
 ## Compatibility modes
 
@@ -599,31 +624,22 @@ both modes' envelopes are pinned).
   transform bodies). What remains is calling it from the residual loop
   with the per-block `opaque_pels` count and `f_shape` derived from the
   decoded binary shape of the current macroblock.
-- The §7.8.3 low-latency static-sprite piece-update machinery. The
-  **basic** static sprite (`low_latency_sprite_enable == 0`) warps the
-  §7.8.2 sprite memory onto the visible VOP via the §7.8.6 static blend
-  (incl. the `brightness_change_factor` post-adjustment). The
-  **low-latency** syntax shell is now parsed too: `sprite_piece` decodes
-  the §6.2.5.4 `decode_sprite_piece()` header (`piece_quant` /
-  `piece_width` / `piece_height` / `piece_xoffset` / `piece_yoffset`),
-  the Table 6-26 `sprite_transmit_mode` (stop / piece / update / pause)
-  with its `do {…} while` piece loop (`drive_sprite_piece_loop`), the
-  Table B.35 `brightness_change_factor()` VLC, and the composed §6.2.5
-  static S-VOP block (`parse_static_sprite_vop_block` — trajectory +
-  brightness + piece loop). The §7.8.5 **four-point perspective** warp
-  (`perspective_warp::PerspectiveWarp`, the
-  `no_of_sprite_warping_points == 4` case) is implemented and wired into
-  static-sprite reconstruction (`static_sprite_luma_perspective`). The
-  §7.8.3.1 / §7.8.3.2 **hole handling** is modelled by
-  `SpriteObjectBuffer`: it tracks the per-macroblock `send_mb()`
-  occupancy of the sprite-object grid (`object_piece_new_macroblocks`
-  returns the new MBs an object-piece carries a body for, skipping holes
-  already sent by an earlier piece) and validates update-pieces
-  (`update_piece_refined_macroblocks` — every refined MB's object MB must
-  already exist, per the §7.8.3.2 ordering rule). What remains end-to-end
-  is decoding each piece's `sprite_shape_texture()` macroblock body into
-  sprite memory (the object-piece I-VOP / update-piece P-VOP macroblock
-  texture subset).
+- The §7.8.3 **low-latency** static-sprite piece updates
+  (`low_latency_sprite_enable == 1`) — rejected with a typed error.
+  Basic static sprites decode and encode end-to-end (see above). The
+  low-latency syntax shell is parsed (`sprite_piece`: the §6.2.5.4
+  `decode_sprite_piece()` header, the Table 6-26
+  `sprite_transmit_mode` loop, the Table B.35
+  `brightness_change_factor()` VLC) and the §7.8.3.1 / §7.8.3.2 hole
+  bookkeeping is modelled (`SpriteObjectBuffer`); what remains is
+  decoding each piece's `sprite_shape_texture()` macroblock body into
+  sprite memory (the object-piece I-VOP / update-piece P-VOP
+  macroblock texture subset).
+- N-bit video (`not_8_bit == 1` with `bits_per_pixel != 8`, §6.3.3):
+  the VOL parses, the stream decoder declines its VOPs with a typed
+  error (the picture store, the motion-compensation paths and the
+  encoder input are 8-bit; a wider VOL would otherwise be clipped
+  silently). Neither direction codes N-bit pictures.
 - Scalability enhancement layers, Studio Profile, and non-rectangular
   shapes (rejected with typed errors). GMC global-motion warping *is*
   supported; the §6.3.6 `mcsel` flag is now routed into the §7.3 recon
@@ -650,7 +666,12 @@ the picture size, the tool set (budget / reactive rate control,
 points, B-VOPs, qpel, 4MV, fcode, interlaced tools, method-1
 quantisation, `intra_dc_vlc_thr`, short header) and the content of
 two to four tiny frames, encodes through the registry encoder and
-requires the crate's own decoder to read every frame back. The `Fuzz`
+requires the crate's own decoder to read every frame back — static-sprite
+VOLs with fitted trajectories included. `stream_decode` additionally
+places its bytes behind complete static-sprite heads (every
+warping-point count, two warp accuracies) so they become
+trajectory-only S-VOPs driving the §7.8 warps with arbitrary reference
+points. The `Fuzz`
 workflow runs all four daily through the org-level reusable job.
 
 ## Provenance

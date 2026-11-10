@@ -8,6 +8,30 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Basic static sprites** (§7.8, `sprite_enable == "static"`,
+  `low_latency_sprite_enable == 0`), decoder and encoder.
+  - Decoder: the initial I-VOP of a static-sprite VOL is
+    reconstructed on the sprite's macroblock grid
+    (`sprite_width × sprite_height`) into the §7.8.2 sprite memory and
+    not displayed; every S-VOP (`sprite_trajectory()` +
+    `brightness_change_factor()`, no macroblock data) is rebuilt by the
+    §7.8.4 / §7.8.5 / §7.8.6 warp — 0..=3 points through the affine
+    family, 4 through the perspective transform, all four warp
+    accuracies, luminance-only brightness change. The packet decoder's
+    `max_pixels_per_frame` cap covers the sprite memory. Low-latency
+    sprites stay a typed rejection.
+  - Encoder: `EncoderConfig::with_static_sprite(StaticSpriteVol)`
+    emits the static VOL (Main profile / Main object type);
+    `sprite_encode::StaticSpriteEncoder` codes the sprite I-VOP and
+    trajectory-only S-VOPs with fitted or caller-supplied
+    trajectories; registry options `static-sprite` and
+    `sprite-points` (first frame = sprite).
+  - `tests/static_sprite.rs`: pan over a panorama recovered exactly,
+    known affine warp fitted, every warp class sample-exact against
+    the closed loop, registry round trip, hostile-stream checks. Fuzz:
+    `stream_decode` drives trajectory-only S-VOPs behind real sprite
+    heads; `encode_roundtrip` picks static-sprite VOLs.
+
 - Erratum E4 (field motion-vector vertical range in **field** units)
   pinned against the staged `interlaced-field-mv-range` fixture set:
   `tests/field_mv_range.rs` decodes both I-P-P streams (`vop_fcode` 1
@@ -27,6 +51,12 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 - `with_*` setters for every field of `EncoderConfig`, `ResilienceConfig`,
   `VopInterlaceFlags`, `DecodeOptions` and `Mpeg4DecoderOptions`, plus
   `RateControlConfig::new(..)` and `MbBudget::new(target_bits, band)`.
+
+### Fixed
+
+- The stream decoder declines the VOPs of an N-bit VOL (`not_8_bit`
+  with `bits_per_pixel != 8`) with a typed error instead of clipping
+  them into its 8-bit picture store.
 
 ### Changed
 

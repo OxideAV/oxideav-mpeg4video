@@ -157,9 +157,76 @@ pub struct EncoderConfig {
     /// macroblock's DC differentials ride the AC (Table B.16) VLC
     /// instead of the DC VLC. Default 0 (DC VLC for the whole VOP).
     pub intra_dc_vlc_thr: u8,
+    /// §6.2.3 `sprite_enable == "static"` (basic static sprite,
+    /// `low_latency_sprite_enable == 0`): the VOL declares the sprite
+    /// geometry and warp model, its initial I-VOP is the sprite and
+    /// every other VOP is an S-VOP that only carries a
+    /// `sprite_trajectory()` (see [`crate::sprite_encode`]). Selects
+    /// the Main profile. `None` (default) = no sprite.
+    pub static_sprite: Option<StaticSpriteVol>,
+}
+
+/// The §6.2.3 static-sprite fields of a VOL (basic sprite).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct StaticSpriteVol {
+    /// `sprite_width` (luminance samples, 1..=8191).
+    pub width: u16,
+    /// `sprite_height`.
+    pub height: u16,
+    /// `sprite_left_coordinate` (13-bit signed; §6.3.3 requires it
+    /// to be divisible by two).
+    pub left: i16,
+    /// `sprite_top_coordinate` (13-bit signed, even).
+    pub top: i16,
+    /// `no_of_sprite_warping_points` (Table 6-20): 0 = stationary,
+    /// 1 = translation, 2 / 3 = affine family, 4 = perspective.
+    pub warping_points: u8,
+    /// `sprite_warping_accuracy` (Table 6-21).
+    pub accuracy: crate::vol::SpriteWarpingAccuracy,
+}
+
+impl StaticSpriteVol {
+    /// A sprite of `width × height` at the origin, one warping point,
+    /// half-sample warping accuracy.
+    pub fn new(width: u16, height: u16) -> Self {
+        Self {
+            width,
+            height,
+            left: 0,
+            top: 0,
+            warping_points: 1,
+            accuracy: crate::vol::SpriteWarpingAccuracy::HalfPel,
+        }
+    }
+
+    /// Set the sprite's top-left coordinate.
+    pub fn with_origin(mut self, left: i16, top: i16) -> Self {
+        self.left = left;
+        self.top = top;
+        self
+    }
+
+    /// Set `no_of_sprite_warping_points`.
+    pub fn with_warping_points(mut self, points: u8) -> Self {
+        self.warping_points = points;
+        self
+    }
+
+    /// Set `sprite_warping_accuracy`.
+    pub fn with_accuracy(mut self, accuracy: crate::vol::SpriteWarpingAccuracy) -> Self {
+        self.accuracy = accuracy;
+        self
+    }
 }
 
 impl EncoderConfig {
+    /// Set `static_sprite`.
+    pub fn with_static_sprite(mut self, v: Option<StaticSpriteVol>) -> Self {
+        self.static_sprite = v;
+        self
+    }
+
     /// Set `width`.
     pub fn with_width(mut self, v: u16) -> Self {
         self.width = v;
@@ -390,6 +457,7 @@ impl Default for EncoderConfig {
             short_header: false,
             gob_headers: true,
             intra_dc_vlc_thr: 0,
+            static_sprite: None,
         }
     }
 }
@@ -430,14 +498,28 @@ impl EncoderConfig {
     /// once an ASP tool (method-1 quantisation, quarter-sample) is
     /// selected.
     pub fn profile_and_level(&self) -> u8 {
-        if self.uses_asp_tools() { 0xF3 } else { 0x03 }
+        if self.static_sprite.is_some() {
+            // Table G.1: Main Profile / Level 2 (the sprite tool).
+            0x32
+        } else if self.uses_asp_tools() {
+            0xF3
+        } else {
+            0x03
+        }
     }
 
     /// Table 6-11 `video_object_type_indication`: Simple (`1`) or
     /// Advanced Simple (`0x11`), matching
     /// [`Self::profile_and_level`].
     pub fn video_object_type(&self) -> u8 {
-        if self.uses_asp_tools() { 0x11 } else { 0x01 }
+        if self.static_sprite.is_some() {
+            // Table 6-11: Main Object Type.
+            0x04
+        } else if self.uses_asp_tools() {
+            0x11
+        } else {
+            0x01
+        }
     }
 
     /// Macroblock grid dimensions (`§6.3.3`: a partial edge macroblock
@@ -537,7 +619,47 @@ pub fn write_configuration_headers(cfg: &EncoderConfig) -> Vec<u8> {
     }
     bw.write_bit(cfg.interlaced); // interlaced
     bw.write_bit(true); // obmc_disable = 1
-    if cfg.verid2() {
+    if let Some(sprite) = cfg.static_sprite {
+        assert!(
+            !cfg.gmc && !cfg.b_vops && !cfg.interlaced && !cfg.resilience.data_partitioned,
+            "a static-sprite VOL holds one I-VOP and trajectory-only S-VOPs"
+        );
+        assert!(
+            sprite.width > 0
+                && sprite.width < (1 << 13)
+                && sprite.height > 0
+                && sprite.height < (1 << 13),
+            "sprite dimensions are 13-bit fields"
+        );
+        assert!(
+            (-4096..=4095).contains(&sprite.left) && (-4096..=4095).contains(&sprite.top),
+            "sprite coordinates are 13-bit signed fields"
+        );
+        assert!(
+            sprite.left % 2 == 0 && sprite.top % 2 == 0,
+            "sprite coordinates shall be even (§6.3.3)"
+        );
+        assert!(sprite.warping_points <= 4, "Table 6-20: 0..=4 points");
+        // sprite_enable = "static": `1` in the verid-1 one-bit field,
+        // `01` in the two-bit field.
+        if cfg.verid2() {
+            bw.write_bits(0b01, 2);
+        } else {
+            bw.write_bit(true);
+        }
+        bw.write_bits(u32::from(sprite.width), 13);
+        bw.write_marker();
+        bw.write_bits(u32::from(sprite.height), 13);
+        bw.write_marker();
+        bw.write_bits((sprite.left as u32) & 0x1FFF, 13); // simsbf
+        bw.write_marker();
+        bw.write_bits((sprite.top as u32) & 0x1FFF, 13); // simsbf
+        bw.write_marker();
+        bw.write_bits(u32::from(sprite.warping_points), 6);
+        bw.write_bits(sprite.accuracy.to_bits(), 2);
+        bw.write_bit(false); // sprite_brightness_change = 0
+        bw.write_bit(false); // low_latency_sprite_enable = 0 (basic sprite)
+    } else if cfg.verid2() {
         // sprite_enable (verid 2 → 2 bits): 10 = GMC, 00 = not used.
         bw.write_bits(if cfg.gmc { 0b10 } else { 0b00 }, 2);
         if cfg.gmc {

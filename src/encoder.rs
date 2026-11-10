@@ -109,6 +109,17 @@ pub struct Mpeg4EncoderOptions {
     /// global-motion model the S(GMC)-VOP trajectory carries (1 =
     /// translation, 2 = similarity, 3 = affine). Default 1.
     pub gmc_points: u32,
+    /// `static-sprite` — code a §7.8 basic static-sprite VOL (Main
+    /// profile): the first submitted frame is the sprite (coded once
+    /// as the initial I-VOP, `sprite_width × sprite_height` = the
+    /// picture size) and every frame — the first included — is an
+    /// S-VOP carrying only a fitted `sprite_trajectory()`. Takes no
+    /// motion / B-VOP / rate-control / interlace / partitioning tool.
+    pub static_sprite: bool,
+    /// `sprite-points` — `no_of_sprite_warping_points` of a
+    /// `static-sprite` stream (0..=4: stationary, translation, the
+    /// affine family, perspective). Default 1.
+    pub sprite_points: u32,
     /// `interlaced` — code an interlaced VOL (§6.3.3): per-macroblock
     /// field DCT (`dct_type`), §7.7.2.1 field-predicted P macroblocks
     /// and §7.7.2.2 field / interlaced-direct B macroblocks, all
@@ -190,6 +201,8 @@ impl Default for Mpeg4EncoderOptions {
             rvlc: false,
             gmc: false,
             gmc_points: 1,
+            static_sprite: false,
+            sprite_points: 1,
             interlaced: false,
             top_field_first: true,
             alt_scan: false,
@@ -319,6 +332,18 @@ impl oxideav_core::CodecOptionsStruct for Mpeg4EncoderOptions {
             default: oxideav_core::OptionValue::U32(1),
             help: "no_of_sprite_warping_points of a gmc stream (1..=3): translation, \
                    similarity or affine global motion (ISO/IEC 14496-2 §7.8.4)",
+        },
+        oxideav_core::OptionField {
+            name: "static-sprite",
+            kind: oxideav_core::OptionKind::Bool,
+            default: oxideav_core::OptionValue::Bool(false),
+            help: "basic static sprite (ISO/IEC 14496-2 §7.8; Main profile): the first                    frame is the sprite, every frame is an S-VOP carrying only a fitted                    sprite_trajectory()",
+        },
+        oxideav_core::OptionField {
+            name: "sprite-points",
+            kind: oxideav_core::OptionKind::U32,
+            default: oxideav_core::OptionValue::U32(1),
+            help: "no_of_sprite_warping_points of a static-sprite stream (0..=4):                    stationary, translation, affine family or perspective (§7.8.5)",
         },
         oxideav_core::OptionField {
             name: "interlaced",
@@ -463,6 +488,14 @@ impl oxideav_core::CodecOptionsStruct for Mpeg4EncoderOptions {
                 }
                 self.gmc_points = n;
             }
+            "static-sprite" => self.static_sprite = value.as_bool()?,
+            "sprite-points" => {
+                let n = value.as_u32()?;
+                if n > 4 {
+                    return Err(Error::invalid("sprite-points must be in 0..=4"));
+                }
+                self.sprite_points = n;
+            }
             "interlaced" => self.interlaced = value.as_bool()?,
             "top-field-first" => self.top_field_first = value.as_bool()?,
             "alt-scan" => self.alt_scan = value.as_bool()?,
@@ -574,6 +607,9 @@ pub struct Mpeg4VideoEncoder {
     /// §7.6.1 anchor chain — the closed-loop references produced by
     /// decoding our own emitted units.
     store: FrameStore,
+    /// The §7.8 static-sprite stream state (`static-sprite` mode, once
+    /// the first frame — the sprite — has been coded).
+    sprite_encoder: Option<crate::sprite_encode::StaticSpriteEncoder>,
     ready: VecDeque<Packet>,
     flushed: bool,
 }
@@ -650,6 +686,21 @@ impl Mpeg4VideoEncoder {
                 ));
             }
         }
+        if options.static_sprite {
+            let trajectory_only = options.bf == 0
+                && options.bitrate == 0
+                && !options.gmc
+                && !options.interlaced
+                && !options.data_partitioned
+                && !options.short_header
+                && !options.qpel
+                && !options.four_mv;
+            if !trajectory_only {
+                return Err(Error::invalid(
+                    "static-sprite codes one I-VOP and trajectory-only S-VOPs (ISO/IEC                      14496-2 §7.8.1): no bf, bitrate, gmc, interlaced, data-partitioned,                      short-header, qpel or four-mv",
+                ));
+            }
+        }
         if let Some(pf) = params.pixel_format
             && pf != PixelFormat::Yuv420P
         {
@@ -710,6 +761,10 @@ impl Mpeg4VideoEncoder {
             short_header: options.short_header,
             gob_headers: options.gob_headers,
             intra_dc_vlc_thr: options.dc_vlc_thr as u8,
+            static_sprite: options.static_sprite.then(|| {
+                crate::ivop_encode::StaticSpriteVol::new(width as u16, height as u16)
+                    .with_warping_points(options.sprite_points as u8)
+            }),
         };
         let (config_headers, vol) = if cfg.short_header {
             // §6.2.5.2: no configuration headers at all.
@@ -797,6 +852,7 @@ impl Mpeg4VideoEncoder {
             stats_log: FirstPassStats::default(),
             config_bits,
             store: FrameStore::new(),
+            sprite_encoder: None,
             ready: VecDeque::new(),
             flushed: false,
         })
@@ -860,6 +916,10 @@ impl oxideav_core::Encoder for Mpeg4VideoEncoder {
         self.next_ticks += self.ticks_per_frame;
         let display_index = self.frames_seen;
         self.frames_seen += 1;
+        if self.options.static_sprite {
+            self.encode_static_sprite_vop(&pending);
+            return Ok(());
+        }
 
         // Anchor selection: the first frame, the keyframe cadence, and
         // every (bf + 1)-th frame terminate a B run.
@@ -1046,6 +1106,47 @@ impl Mpeg4VideoEncoder {
                 "first-pass statistics need bitrate + rc-mode=budget",
             )),
         }
+    }
+
+    /// `static-sprite` mode: the first frame is coded as the sprite
+    /// I-VOP (it rides in the first packet, behind the configuration
+    /// run); every frame — the first included — becomes an S-VOP with
+    /// a fitted trajectory.
+    fn encode_static_sprite_vop(&mut self, frame: &PendingFrame) {
+        let (w, h) = (usize::from(self.cfg.width), usize::from(self.cfg.height));
+        let view = FrameView {
+            y: &frame.y,
+            cb: &frame.cb,
+            cr: &frame.cr,
+            width: w,
+            height: h,
+        };
+        let res = u64::from(self.cfg.time_increment_resolution);
+        let seconds = frame.ticks / res;
+        let modulo = (seconds - self.sync_sec) as u32;
+        let increment = (frame.ticks % res) as u16;
+        let mut unit = Vec::new();
+        let first = self.sprite_encoder.is_none();
+        if first {
+            let (encoder, head) =
+                crate::sprite_encode::StaticSpriteEncoder::new(&self.cfg, &view, self.options.qp);
+            // `head` = configuration run + sprite I-VOP; the packet
+            // emission prepends the configuration run itself.
+            unit.extend_from_slice(&head[self.config_headers.len()..]);
+            self.sprite_encoder = Some(encoder);
+        }
+        let encoder = self
+            .sprite_encoder
+            .as_mut()
+            .expect("sprite coded with the first frame");
+        let (s_vop, _recon, _trajectory) = encoder.encode_vop(&view, modulo, increment);
+        unit.extend_from_slice(&s_vop);
+        self.b_base_sec = self.sync_sec;
+        self.sync_sec = seconds;
+        self.prev_anchor_ticks = self.last_anchor_ticks;
+        self.last_anchor_ticks = Some(frame.ticks);
+        let dts = frame.pts.unwrap_or(frame.ticks as i64);
+        self.push_packet(unit, frame.ticks, frame.pts, first, dts);
     }
 
     /// Encode one anchor VOP (I when `force_i`, else P), advance the
