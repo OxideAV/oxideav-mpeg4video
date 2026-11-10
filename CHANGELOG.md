@@ -6,6 +6,17 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.10](https://github.com/OxideAV/oxideav-mpeg4video/compare/v0.1.9...v0.1.10) - 2026-11-10
+
+### Other
+
+- interlaced hot paths — row-wise field mc, bounded field SAD, byte SAD kernel
+- second hot-path pass — vector FIR rows, column-parallel IDCT, bounded SAD, luma-only B candidate scoring; README performance table
+- basic static sprites end-to-end — decoder sprite memory + trajectory-only S-VOP warps, encoder static-sprite VOL with fitted trajectories
+- decode / encode hot paths — separable qpel cascade, row-wise half-sample MC and SAD, word bit reader, Tcoef lookup
+- erratum E4 — field motion-vector vertical range in field units, decoder + encoder
+- API hygiene: #[non_exhaustive] on error enums and config / stats records
+
 ### Added
 
 - **Basic static sprites** (§7.8, `sprite_enable == "static"`,
