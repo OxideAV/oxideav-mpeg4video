@@ -396,6 +396,40 @@ on these pairs, conformance corpus unchanged):
   `mc` routine already did; the quarter-sample field view previously
   clamped within the field.
 
+## Field-vector range set (erratum E4)
+
+`field_mv_range_fcode{1,2}.m4v` / `.yuv` and `field_mv_range_trace.csv`
+are byte copies of the staged
+`docs/video/mpeg4-visual/fixtures/interlaced-field-mv-range/` set
+(`fcode{1,2}.m4v`, `fcode{1,2}.expected.yuv`, `field-mv-trace.csv`;
+generation and oracle described in that directory's `notes.md`): two
+352×288 interlaced I-P-P streams (`vop_fcode_forward` 1 and 2) whose
+forced field vectors sit on, at and beyond the frame-unit Table 7-9
+boundary, the decode obtained when the §7.6.3 reduction is applied to
+`Py / 2 + MVDy` in **field** units before the §7.7.2.1 doubling
+(equal to the producing encoder's own reconstruction), and the
+per-field-vector trace of predictor, differential and the vector each
+candidate reading yields. `tests/field_mv_range.rs` decodes both
+streams bit-exact (both decode modes) and replays all 134 trace rows
+through the field reconstruction. A black-box decode of the two
+streams (`ffmpeg -idct faani …`) is byte-identical to the staged
+expected output.
+
+* `enc_ilaced_fieldrange_ipbb_64x160` — encoder-side pin of the same
+  rule (deterministic from `tests/encoder_interlaced.rs`; `interlaced`,
+  `bf 2`, `fcode 2`, qp 4, ecosystem-compat emission): fields moving 9
+  field lines per frame in opposite directions, the right half
+  mirrored. P field vectors reach 27 field lines (108 frame
+  half-samples; the frame-unit bound is 63), B field vectors pass
+  through the four-PMV bank with 26 reconstructions whose field-unit
+  sum leaves `[low:high]` and is reduced. The reference decode is
+  **bit-exact**, log clean — the §7.6.3 reduction of a B-VOP field
+  vector is a field-unit reduction as well.
+
+```
+ffmpeg -idct faani -i enc_ilaced_fieldrange_ipbb_64x160.m4v -f rawvideo -pix_fmt yuv420p enc_ilaced_fieldrange_ipbb_64x160.yuv
+```
+
 ## Interlaced S(GMC) stream (round 455)
 
 * `enc_isb_ilaced_gmc_compat_96x64` — registry build (`interlaced`,
@@ -412,7 +446,9 @@ on these pairs, conformance corpus unchanged):
   round 480 once the encoder's reconstruction gave coded `mcsel == 1`
   co-located macroblocks their §7.6.9.5.1 averaged MV: the pair now
   pins that rule (the zero-vector reading misses B-VOP samples by up
-  to 146).
+  to 146). Regenerated again once the field estimator searched the
+  full field-unit Table 7-9 range (erratum E4): 4611 bytes (was 4690),
+  reference decode still bit-exact.
 
 ```
 ffmpeg -idct faani -i enc_isb_ilaced_gmc_compat_96x64.m4v -f rawvideo -pix_fmt yuv420p enc_isb_ilaced_gmc_compat_96x64.yuv
@@ -554,8 +590,15 @@ ffmpeg -idct faani -i ties_q6_96x64.m4v -f rawvideo -pix_fmt yuv420p ties_q6_96x
 ## SHA-256
 
 ```
-f16ace5a3d95f23a3cf4c18ae694f66e3a0d5d9a3c99f4c71ab100e274ec2f8d  enc_isb_ilaced_gmc_compat_96x64.m4v
-fc089074a81a6c865ef81ecc486d6adce4708bb843fafbd1e21efc256f809e39  enc_isb_ilaced_gmc_compat_96x64.yuv
+c8d2561dd20ab60d241e7318549eb9e3d10a2f367e34aa4494e0b3aeff552885  enc_isb_ilaced_gmc_compat_96x64.m4v
+c03ee82f9b34ed6f88e94f95a22f0bfe47d065d21bed685ff22ecc4df7c9fc0f  enc_isb_ilaced_gmc_compat_96x64.yuv
+40c860b1c1fbf46c258c3287ae9f5c8c84061f3350e4e2020cbb128e1315466f  enc_ilaced_fieldrange_ipbb_64x160.m4v
+512d6b0d64d318bfb163748f96397a96473a1976c5257a605fcfae6e69e61839  enc_ilaced_fieldrange_ipbb_64x160.yuv
+41adcc96bbe4a15a873d65f7fb59a8d6cccb6285db7998744a5c29d1b3f3a5f9  field_mv_range_fcode1.m4v
+e069aca5cee1846ef2f50b7d4e121f11bc3dd97eec4a2968dcac531dc2daf412  field_mv_range_fcode1.yuv
+50a58e7c05fc7fe780038943dbab8fd2dff762ffdbe87e72b76926d56834a0e9  field_mv_range_fcode2.m4v
+f8d051fbf7abd41e1d16e76ee900f9b15cc5c290b610a700b830026b7eac9283  field_mv_range_fcode2.yuv
+f0fd66621b8553d5bf78a9d8e307b5508e722f81689179916def8ad7a815b821  field_mv_range_trace.csv
 ee762e0dbd81519e2783e7029daf9a5902c7b704b6e80e883496d3a1309c24cc  enc_isb_dcvlc7_hec_96x64.m4v
 4076b7c838d00201759ea518e300f44ffd04fa214e71622d1f106e590fd8b04a  enc_isb_dcvlc7_hec_96x64.yuv
 1b3f275670116b291b656d64a6649ebd7bff87a9bb169ac5ea045ce9c5ed1777  enc_is_gmc3_zoom_96x64.m4v
@@ -675,8 +718,8 @@ f958498a6b00db8595f0be1c28f77e042f8e7c4ef8fc863bb0b05537d76c30a0  enc_ip_dp_aq_9
 466c091493690e78ea864774f940cc4425c7a0c0fc1be06fafd364dcf0080f6b  enc_ipb_rcbudget_96x64.yuv
 22b82d3e4bd90eaf6a22b52cdcca8f1da04f49edabb638af5b3cae680bd3f1ec  enc_ipb_rc2pass_96x64.m4v
 ff158355952caa09f49da26d6cd2921047cc978e6d8f15bbd4f1fccc413bcd7c  enc_ipb_rc2pass_96x64.yuv
-c407e135be4af439fe00668e2f834d25926206712160905ef2d761e1218e3c33  enc_ilaced_rcbudget_compat_96x64.m4v
-12820f2bd515910304cf3aea92d2dfbff60d8aebb48b47133261657b8293a740  enc_ilaced_rcbudget_compat_96x64.yuv
+20823013a5593d5ad00a6653a123e9e8b80d367c85b78704cbfb18c13f818f80  enc_ilaced_rcbudget_compat_96x64.m4v
+7fded83cabf3afdb410667f53b299550e2cffe31bebbc17698c5752e9525cf1f  enc_ilaced_rcbudget_compat_96x64.yuv
 b7ea047a2b675e23c06baf2dfc6f00cc60fa105f37b89bd609c5578e3888c854  ties_q6_96x64.m4v
 aadaa7fd85f1455ad6a5a75a416c41b1906db567393439151a55803d9c699154  ties_q6_96x64.yuv
 ```

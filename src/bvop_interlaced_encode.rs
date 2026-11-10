@@ -327,7 +327,7 @@ pub fn encode_b_vop_interlaced(
     for mb_row in 0..mb_height {
         // §7.6.8 / Table 7-14: the four-PMV bank resets at each row
         // start (mirrors BVopMvDriver::start_row).
-        let mut bank = FieldPmvBank::new();
+        let mut bank = FieldPmvBank::with_fcodes(fcode, fcode);
         for mb_col in 0..mb_width {
             let idx = mb_row * mb_width + mb_col;
             if pw.maybe_cut(idx, running_qp) {
@@ -443,46 +443,10 @@ pub fn encode_b_vop_interlaced(
             // anchor, codable against the bank slot of that field and
             // direction, scored through the decoder's field predictors
             // over a copy of the bank.
-            let f_top = estimate_field_motion(
-                &src,
-                &fwd_luma,
-                mb_x,
-                mb_y,
-                false,
-                bank.get(PMV_TOP_FWD),
-                mode,
-                fcode,
-            );
-            let f_bot = estimate_field_motion(
-                &src,
-                &fwd_luma,
-                mb_x,
-                mb_y,
-                true,
-                bank.get(PMV_BOT_FWD),
-                mode,
-                fcode,
-            );
-            let b_top = estimate_field_motion(
-                &src,
-                &bwd_luma,
-                mb_x,
-                mb_y,
-                false,
-                bank.get(PMV_TOP_BWD),
-                mode,
-                fcode,
-            );
-            let b_bot = estimate_field_motion(
-                &src,
-                &bwd_luma,
-                mb_x,
-                mb_y,
-                true,
-                bank.get(PMV_BOT_BWD),
-                mode,
-                fcode,
-            );
+            let f_top = estimate_field_motion(&src, &fwd_luma, mb_x, mb_y, false, mode, fcode);
+            let f_bot = estimate_field_motion(&src, &fwd_luma, mb_x, mb_y, true, mode, fcode);
+            let b_top = estimate_field_motion(&src, &bwd_luma, mb_x, mb_y, false, mode, fcode);
+            let b_bot = estimate_field_motion(&src, &bwd_luma, mb_x, mb_y, true, mode, fcode);
             let flags = FieldReferenceFlags {
                 forward_top: FieldReference::from_bit(f_top.ref_field),
                 forward_bottom: FieldReference::from_bit(f_bot.ref_field),

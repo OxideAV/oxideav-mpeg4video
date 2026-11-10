@@ -435,6 +435,42 @@ mod tests {
     }
 
     #[test]
+    fn single_delta_gates_both_field_iterations() {
+        // Erratum E2: the backward branch tests the one transmitted
+        // delta, MVD[0], on the bottom-field pass too (there is no
+        // MVD[1]). δ = (0,0), TRB = 2, TRD = 4; the two fields carry
+        // different co-located vectors so each pass is observable.
+        // MVD = (0, 3): x takes the scaled form, y takes mvf - MV —
+        // for BOTH fields.
+        let out = interlaced_direct_mvs(
+            field(8, 4, FieldReference::Top),
+            field(-12, 8, FieldReference::Bottom),
+            mv(0, 3),
+            1,
+            2,
+            false,
+        );
+        // Bottom field: mvf.x = 2*-12/4 = -6; mvb.x = (2-4)*-12/4 = 6.
+        assert_eq!(out.forward_bottom.x, -6);
+        assert_eq!(out.backward_bottom.x, 6);
+        // y gate is non-zero on both passes: mvb.y = mvf.y - MV.y.
+        assert_eq!(out.backward_top.y, out.forward_top.y - 4);
+        assert_eq!(out.backward_bottom.y, out.forward_bottom.y - 8);
+        // And with MVD = (3, 0) the roles swap on both passes.
+        let out = interlaced_direct_mvs(
+            field(8, 4, FieldReference::Top),
+            field(-12, 8, FieldReference::Bottom),
+            mv(3, 0),
+            1,
+            2,
+            false,
+        );
+        assert_eq!(out.backward_top.x, out.forward_top.x - 8);
+        assert_eq!(out.backward_bottom.x, out.forward_bottom.x + 12);
+        assert_eq!(out.backward_bottom.y, -4); // (2-4)*8/4
+    }
+
+    #[test]
     fn delta_shifts_field_temporal_per_field() {
         // Top ref Bottom, bottom ref Top, tff=0 → δ = (1, -1). So the
         // top field gets TRB=2*trb+1 / TRD=2*trd+1, the bottom field

@@ -748,12 +748,8 @@ pub fn encode_p_vop(
                     .field_predictor_candidates(mb_row, mb_col)
                     .expect("grid coordinates in range");
                 let predictor = crate::motion::predict_field_motion_vector(candidates);
-                let top = estimate_field_motion(
-                    &src, &luma_ref, mb_x, mb_y, false, predictor, mode, fcode,
-                );
-                let bottom = estimate_field_motion(
-                    &src, &luma_ref, mb_x, mb_y, true, predictor, mode, fcode,
-                );
+                let top = estimate_field_motion(&src, &luma_ref, mb_x, mb_y, false, mode, fcode);
+                let bottom = estimate_field_motion(&src, &luma_ref, mb_x, mb_y, true, mode, fcode);
                 (top.sad + bottom.sad + FIELD_MODE_BIAS < frame_sad)
                     .then_some((predictor, top, bottom))
             } else {

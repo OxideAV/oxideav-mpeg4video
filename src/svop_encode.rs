@@ -699,10 +699,10 @@ pub fn encode_s_vop(
                     .expect("grid coordinates in range");
                 let predictor = crate::motion::predict_field_motion_vector(candidates);
                 let top = crate::field_encode::estimate_field_motion(
-                    &src, &luma_ref, mb_x, mb_y, false, predictor, mode, fcode,
+                    &src, &luma_ref, mb_x, mb_y, false, mode, fcode,
                 );
                 let bottom = crate::field_encode::estimate_field_motion(
-                    &src, &luma_ref, mb_x, mb_y, true, predictor, mode, fcode,
+                    &src, &luma_ref, mb_x, mb_y, true, mode, fcode,
                 );
                 (top.sad + bottom.sad + crate::pvop_encode::FIELD_MODE_BIAS < frame_local_sad)
                     .then_some((predictor, top, bottom))

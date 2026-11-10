@@ -8,11 +8,36 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Erratum E4 (field motion-vector vertical range in **field** units)
+  pinned against the staged `interlaced-field-mv-range` fixture set:
+  `tests/field_mv_range.rs` decodes both I-P-P streams (`vop_fcode` 1
+  and 2) bit-exact in both decode modes and replays the 134-row
+  per-vector trace through `reconstruct_field_motion_vectors_wrapped`
+  (24 rows where a frame-unit reduction would differ, 4 where an
+  unreduced sum would).
+- `FieldPmvBank::with_fcodes`: the interlaced B-VOP four-PMV bank
+  reduces every reconstructed **field** vector into the Table 7-9
+  range of its direction's `vop_fcode` — horizontal in frame units,
+  vertical in field units before the doubling (§7.6.3 general process;
+  erratum E4 units). The B-VOP decode driver and the interlaced B
+  encoder use it; `FieldPmvBank::new` keeps the plain §7.6.8 add.
+  Black-box-confirmed on an encoder-produced stream with 26 reduced
+  B field sums (`enc_ilaced_fieldrange_ipbb_64x160`, bit-exact).
+
 - `with_*` setters for every field of `EncoderConfig`, `ResilienceConfig`,
   `VopInterlaceFlags`, `DecodeOptions` and `Mpeg4DecoderOptions`, plus
   `RateControlConfig::new(..)` and `MbBudget::new(target_bits, band)`.
 
 ### Changed
+
+- Encoder: the §7.7.2.1 / §7.7.2.2 field motion estimator searches the
+  **whole field-unit Table 7-9 range** whatever the predictor is (the
+  differential is coded modulo the range width), and scans the window
+  beyond the dense ±8 with a coarse lattice + dense refinement — a
+  field vector now reaches twice the frame-line distance of a frame
+  vector (15 field lines under `fcode == 1`). Streams with fast
+  vertical field motion shrink (`enc_isb_ilaced_gmc_compat_96x64`:
+  4690 → 4611 bytes, regenerated, reference decode still bit-exact).
 
 - API hygiene: `#[non_exhaustive]` on the crate `Error` and every
   public parse / decode error enum (`VolParseError`, `VopParseError`,

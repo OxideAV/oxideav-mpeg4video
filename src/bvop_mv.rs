@@ -830,7 +830,7 @@ impl BVopMvDriver {
             trd,
             quarter_sample: false,
             zero_colocated_direct: false,
-            field_predictor: FieldPmvBank::new(),
+            field_predictor: FieldPmvBank::with_fcodes(vop_fcode_forward, vop_fcode_backward),
         }
     }
 

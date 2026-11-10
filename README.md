@@ -60,7 +60,17 @@ several defects; this decoder implements the corrected readings
 valid zero MV candidates, and the f_code==1 direct-delta rule), each
 **black-box-arbitrated** against a conformant interlaced direct-mode
 B-frame stream (docs fixture, refs #176), plus the field-grid
-vertical arithmetic the §7.7.2 evenness invariant requires. The
+vertical arithmetic the §7.7.2 evenness invariant requires. **Erratum
+E4** — the Table 7-9 range bounds a field vector's vertical component
+in *field* units (`Py / 2 + MVDy` reduced into `[low:high]`, then
+doubled) — holds for P-VOP field vectors and for the interlaced B-VOP
+four-PMV bank: the two staged `interlaced-field-mv-range` streams
+decode **bit-exact** with all 134 traced field vectors reproduced
+(`tests/field_mv_range.rs`), and the encoder's field estimator
+searches that whole field-unit range (a field vector reaches twice
+the frame-line distance of a frame vector; differentials coded modulo
+the range width — black-box bit-exact on an encoder-produced I/P/B
+stream with reduced B field sums). The
 long-standing interlaced-direct deviation is now **root-caused**: an
 exhaustive per-macroblock-field pixel search (12 uniquely-determined
 macroblock-fields, all consistent) proves the reference decoder
@@ -188,8 +198,8 @@ or residual, with the luminance permuted per Figure 6-12 before the
 transform; §7.7.2.1 **field-predicted P macroblocks** — one vector per
 output field against the better reference-field parity, estimated
 through the decoder's own field `mc` / §7.6.2.2 field cascade, coded
-against the shared CASE 1/2/3 predictor on the field grid and confined
-to the Table 7-9 range; §7.7.2.2 **interlaced B modes** — field
+against the shared CASE 1/2/3 predictor on the field grid over the
+whole field-unit Table 7-9 range; §7.7.2.2 **interlaced B modes** — field
 forward / backward / bidirectional through the Table 7-14 four-PMV
 bank shared with the frame modes, and **interlaced direct** over a
 field-predicted co-located anchor with its Table 7-16 δ-corrected

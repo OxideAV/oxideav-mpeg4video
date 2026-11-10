@@ -48,12 +48,17 @@ use crate::motion::MotionVector;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FieldPmvBank {
     pmv: [MotionVector; 4],
+    /// `vop_fcode_forward` / `vop_fcode_backward` when the bank applies
+    /// the §7.6.3 `[low:high]` reduction to the field vectors it
+    /// reconstructs (`0` = no reduction, the plain §7.6.8 add).
+    fcodes: [u8; 2],
 }
 
 impl Default for FieldPmvBank {
     fn default() -> Self {
         FieldPmvBank {
             pmv: [MotionVector { x: 0, y: 0 }; 4],
+            fcodes: [0; 2],
         }
     }
 }
@@ -81,11 +86,37 @@ pub struct FieldMvDirection {
 /// differential per the §7.6.8 pseudo-code:
 /// `x = PMVx + MVDx`, `y = 2 * (PMVy / 2 + MVDy)`. `/` truncates toward
 /// zero (Rust `/` matches the spec).
+///
+/// With a non-zero `fcode` each component is reduced into the Table
+/// 7-9 `[low:high]` range on its own grid — the horizontal in frame
+/// units, the vertical in **field** units before the doubling
+/// (§7.6.3: the general decoding process, range reduction included,
+/// is "valid for the motion vector decoding in interlaced/progressive
+/// P-, S(GMC)- and B-VOPs except that the generation of the predictor
+/// (Px, Py) may be different"; the units of the vertical reduction
+/// are those of erratum E4 in `mpeg4-visual-errata.md`). For a stream
+/// whose field vectors already lie inside the range the reduction is
+/// the identity.
 #[inline]
-fn reconstruct_field_component(pmv: MotionVector, mvd: MotionVector) -> MotionVector {
+fn reconstruct_field_component(pmv: MotionVector, mvd: MotionVector, fcode: u8) -> MotionVector {
+    let (x, y_field) = (pmv.x + mvd.x, pmv.y / 2 + mvd.y);
+    if fcode == 0 {
+        return MotionVector { x, y: 2 * y_field };
+    }
+    let f = 1i32 << (fcode.clamp(1, 7) - 1);
+    let (low, high, range) = (-32 * f, 32 * f - 1, 64 * f);
+    let reduce = |mut v: i32| {
+        if v < low {
+            v += range;
+        }
+        if v > high {
+            v -= range;
+        }
+        v
+    };
     MotionVector {
-        x: pmv.x + mvd.x,
-        y: 2 * (pmv.y / 2 + mvd.y),
+        x: reduce(x),
+        y: 2 * reduce(y_field),
     }
 }
 
@@ -93,6 +124,19 @@ impl FieldPmvBank {
     /// A zeroed bank — the row-start state (§7.6.8).
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A zeroed bank whose **field** reconstructions apply the §7.6.3
+    /// `[low:high]` reduction of `vop_fcode_forward` (slots 0, 1) and
+    /// `vop_fcode_backward` (slots 2, 3): horizontal components in
+    /// frame units, vertical components in field units before the
+    /// doubling (erratum E4). This is the bank a B-VOP decode uses;
+    /// [`FieldPmvBank::new`] keeps the plain §7.6.8 add.
+    pub fn with_fcodes(vop_fcode_forward: u8, vop_fcode_backward: u8) -> Self {
+        FieldPmvBank {
+            pmv: [MotionVector { x: 0, y: 0 }; 4],
+            fcodes: [vop_fcode_forward, vop_fcode_backward],
+        }
     }
 
     /// Reset the bank to zero at the start of a macroblock row (§7.6.8).
@@ -180,8 +224,8 @@ impl FieldPmvBank {
         mvd_top: MotionVector,
         mvd_bot: MotionVector,
     ) -> FieldMvDirection {
-        let top = reconstruct_field_component(self.pmv[PMV_TOP_FWD], mvd_top);
-        let bottom = reconstruct_field_component(self.pmv[PMV_BOT_FWD], mvd_bot);
+        let top = reconstruct_field_component(self.pmv[PMV_TOP_FWD], mvd_top, self.fcodes[0]);
+        let bottom = reconstruct_field_component(self.pmv[PMV_BOT_FWD], mvd_bot, self.fcodes[0]);
         self.pmv[PMV_TOP_FWD] = top;
         self.pmv[PMV_BOT_FWD] = bottom;
         FieldMvDirection { top, bottom }
@@ -208,8 +252,8 @@ impl FieldPmvBank {
         mvd_top: MotionVector,
         mvd_bot: MotionVector,
     ) -> FieldMvDirection {
-        let top = reconstruct_field_component(self.pmv[PMV_TOP_BWD], mvd_top);
-        let bottom = reconstruct_field_component(self.pmv[PMV_BOT_BWD], mvd_bot);
+        let top = reconstruct_field_component(self.pmv[PMV_TOP_BWD], mvd_top, self.fcodes[1]);
+        let bottom = reconstruct_field_component(self.pmv[PMV_BOT_BWD], mvd_bot, self.fcodes[1]);
         self.pmv[PMV_TOP_BWD] = top;
         self.pmv[PMV_BOT_BWD] = bottom;
         FieldMvDirection { top, bottom }
@@ -226,8 +270,8 @@ impl FieldPmvBank {
         &mut self,
         mvd: [MotionVector; 4],
     ) -> (FieldMvDirection, FieldMvDirection) {
-        for (slot, mvd_k) in self.pmv.iter_mut().zip(mvd.iter()) {
-            *slot = reconstruct_field_component(*slot, *mvd_k);
+        for (k, (slot, mvd_k)) in self.pmv.iter_mut().zip(mvd.iter()).enumerate() {
+            *slot = reconstruct_field_component(*slot, *mvd_k, self.fcodes[k / 2]);
         }
         (
             FieldMvDirection {
@@ -248,6 +292,33 @@ mod tests {
 
     fn mv(x: i32, y: i32) -> MotionVector {
         MotionVector { x, y }
+    }
+
+    #[test]
+    fn field_reconstruction_reduces_in_field_units_under_fcodes() {
+        // fcode 1: [low:high] = [-32:31]. Forward top PMV (0, 30):
+        // Py/2 = 15; MVDy = 17 gives 32 -> reduced to -32 field units,
+        // doubled to -64 frame units; MVDy = 16 gives 31 -> 62.
+        let mut bank = FieldPmvBank::with_fcodes(1, 2);
+        bank.frame_forward(mv(30, 30));
+        let d = bank.field_forward(mv(5, 16), mv(-70 + 64, 17));
+        assert_eq!(d.top, mv(-29, 62));
+        assert_eq!(d.bottom, mv(24, -64));
+        // The backward pair reduces under vop_fcode_backward = 2:
+        // [-64:63]; 0 + 63 stays, 0 - 64 stays, both doubled.
+        let d = bank.field_backward(mv(0, 63), mv(0, -64));
+        assert_eq!(d.top, mv(0, 126));
+        assert_eq!(d.bottom, mv(0, -128));
+        // 126 / 2 + 1 = 64 > 63 -> -64 -> -128.
+        let d = bank.field_backward(mv(0, 1), mv(0, 0));
+        assert_eq!(d.top, mv(0, -128));
+        // The plain bank keeps the unreduced §7.6.8 add.
+        let mut plain = FieldPmvBank::new();
+        plain.frame_forward(mv(30, 30));
+        assert_eq!(plain.field_forward(mv(5, 16), mv(0, 17)).bottom, mv(30, 64));
+        // The row reset keeps the range configuration.
+        bank.reset_row();
+        assert_eq!(bank.field_forward(mv(0, 32 - 64), mv(0, 0)).top, mv(0, -64));
     }
 
     #[test]
