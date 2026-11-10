@@ -650,6 +650,54 @@ both modes' envelopes are pinned).
   / `sprite_brightness_change == 1`) — typed-rejected, since the spec
   mandates `sprite_brightness_change == 0` under GMC.
 
+## Performance
+
+Single-threaded throughput on one Apple-silicon laptop core, release
+build, measured with `benches/throughput.rs` (best of 5 decode / 2
+encode passes; the "before" column is the tree before the round's
+hot-path work, same harness, runs interleaved). The streams are
+60-frame I/P/B sequences produced by a black-box encoder from
+synthetic sources (`ipb`: a test pattern, half-sample; `qpel`: a
+fractal zoom with quarter-sample + 4MV + B-VOPs); the encodes read a
+raw fractal-zoom source. Output is **bit-identical** before and after
+— the harness prints an FNV-1a hash of every decoded sample / emitted
+byte, and the conformance pins and committed encoder fixtures did not
+move.
+
+| Decode | before | after | × |
+|---|---:|---:|---:|
+| 720×576 `ipb` | 402 fps | 793 fps | 2.0 |
+| 720×576 `qpel` | 67 fps | 450 fps | 6.7 |
+| 1280×720 `ipb` | 192 fps | 402 fps | 2.1 |
+| 1280×720 `qpel` | 33 fps | 213 fps | 6.5 |
+| 1920×1080 `ipb` | 64 fps | 129 fps | 2.0 |
+| 1920×1080 `qpel` | 14.7 fps | 97.7 fps | 6.6 |
+
+| Encode (`qp=5`) | before | after | × |
+|---|---:|---:|---:|
+| 720×576, default tools (I/P) | 16.3 fps | 52.5 fps | 3.2 |
+| 720×576, `qpel` + `four-mv` + `bf=2` | 0.76 fps | 17.0 fps | 22 |
+| 1280×720, default tools | 9.3 fps | 31.6 fps | 3.4 |
+| 1920×1080, default tools | 4.6 fps | 15.3 fps | 3.4 |
+
+What changed: the §7.6.2.2 quarter-sample cascade is evaluated
+separably per block (one horizontal pass per reference row, one
+vertical pass per output row, fixed-width row loops) instead of
+re-deriving every tap of every sample; half-sample prediction and the
+encoder's full-pel SADs run on whole plane rows wherever the §7.6.4
+clamp is the identity, the SAD stopping once it can no longer win;
+B-VOP mode candidates are scored on a luminance-only prediction; the
+bit reader extracts fields from a 64-bit window and Tables B.16 /
+B.17 decode through a direct lookup; the Annex A.1 transform keeps
+its exact term order but skips zero inputs and advances eight
+accumulators together. Each restructured path is pinned against its
+defining per-sample form by an exhaustive or randomised unit test.
+
+```text
+MPEG4VIDEO_BENCH_DECODE=a.m4v:b.m4v cargo bench --bench throughput
+MPEG4VIDEO_BENCH_ENCODE='1280x720:src.yuv:qp=5,bf=2' cargo bench --bench throughput
+```
+
 ## Fuzzing
 
 `fuzz/` is a `cargo-fuzz` sub-crate (nightly): `short_header` drives

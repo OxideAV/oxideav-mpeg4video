@@ -60,6 +60,9 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- `Mpeg4EncoderOptions` is `#[non_exhaustive]` (it grows with every
+  encoder tool — `static_sprite` / `sprite_points` this time); build
+  it with `Default` or through the options bag.
 - Performance (output bit-identical — corpus pins, committed encoder
   fixtures and the bench hashes unchanged): §7.6.2.2 quarter-sample
   prediction evaluates the Figure 7-32 cascade separably per block
@@ -70,9 +73,12 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   the bit reader extracts fields from a 64-bit window; Tables
   B.16 / B.17 decode through a 12-bit direct lookup; the Annex A.1
   transform skips zero inputs and advances its eight accumulators
-  together (same terms, same order); the method-2 inverse quantiser
-  skips zero rows. Each restructured path is pinned against its
-  defining per-sample form by an exhaustive or randomised unit test.
+  together in both passes (same terms, same order); the method-2
+  inverse quantiser hoists its quantiser terms and skips zero rows;
+  the encoder's full-pel SAD stops once a partial sum can no longer
+  win, and B-VOP mode candidates are scored on a luminance-only
+  prediction. Each restructured path is pinned against its defining
+  per-sample form by an exhaustive or randomised unit test.
 - `benches/throughput.rs`: dependency-free decode / encode throughput
   harness over caller-supplied streams (skips when none is given).
 - Encoder: the §7.7.2.1 / §7.7.2.2 field motion estimator searches the

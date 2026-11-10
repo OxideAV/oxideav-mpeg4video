@@ -754,6 +754,28 @@ impl QpelSource for MirroredRefBlock {
     }
 }
 
+/// [`fir_8tap_clip`] over sixteen positions at once: `out[i]` is the
+/// FIR of `taps[0][i] ..= taps[7][i]` (the eight tap rows), rounded
+/// and clipped exactly as the scalar form.
+#[inline]
+fn fir_rows(
+    taps: &[&[u8; CASCADE_MAX_SIDE]; 8],
+    rounding_control: u8,
+    bits_per_pixel: u32,
+    out: &mut [u8; CASCADE_MAX_SIDE],
+) {
+    let rc = i32::from(rounding_control & 1);
+    let c = QPEL_FIR_C;
+    let max = (1i32 << bits_per_pixel) - 1;
+    for i in 0..CASCADE_MAX_SIDE {
+        let acc = c[0] * (i32::from(taps[3][i]) + i32::from(taps[4][i]))
+            + c[1] * (i32::from(taps[2][i]) + i32::from(taps[5][i]))
+            + c[2] * (i32::from(taps[1][i]) + i32::from(taps[6][i]))
+            + c[3] * (i32::from(taps[0][i]) + i32::from(taps[7][i]));
+        out[i] = ((acc + 128 - rc) / 256).clamp(0, max) as u8;
+    }
+}
+
 /// Largest block side the stack-buffered block cascade
 /// ([`cascade_block`]) handles — the 16×16 / 16×8 / 8×8 luminance
 /// prediction blocks of §7.6.2.2 and §7.7.2.1.
@@ -786,6 +808,21 @@ fn cascade_block<S: QpelSource>(
     out: &mut [u8],
 ) {
     debug_assert!((1..=CASCADE_MAX_SIDE).contains(&w) && (1..=CASCADE_MAX_SIDE).contains(&h));
+    if qfx & 3 == 0 && qfy & 3 == 0 {
+        // Integer position: the samples themselves.
+        for (j, dst) in out.chunks_exact_mut(w).take(h).enumerate() {
+            let y = y0 + j as i32;
+            match src.row_run(x0, y, w) {
+                Some(run) => dst.copy_from_slice(run),
+                None => {
+                    for (i, d) in dst.iter_mut().enumerate() {
+                        *d = src.fetch(x0 + i as i32, y);
+                    }
+                }
+            }
+        }
+        return;
+    }
     let (w1, h1) = (w + 1, h + 1);
     // Stage 1: the horizontal position of every interior row.
     let mut stage = [[0u8; CASCADE_MAX_SIDE]; CASCADE_MAX_SIDE + 1];
@@ -810,10 +847,12 @@ fn cascade_block<S: QpelSource>(
         // past `w` read zero padding and are never used).
         let mut half = [0u8; CASCADE_MAX_SIDE];
         if qfx & 3 != 0 {
-            for (i, hv) in half.iter_mut().enumerate() {
-                let taps: &[u8; 8] = ext[i..i + 8].try_into().expect("eight taps");
-                *hv = fir_8tap_clip(taps, rc, bpp);
-            }
+            let taps: [&[u8; CASCADE_MAX_SIDE]; 8] = core::array::from_fn(|k| {
+                ext[k..k + CASCADE_MAX_SIDE]
+                    .try_into()
+                    .expect("sixteen samples")
+            });
+            fir_rows(&taps, rc, bpp, &mut half);
         }
         match qfx & 3 {
             0 => stage_row.copy_from_slice(&ext[3..3 + CASCADE_MAX_SIDE]),
@@ -841,13 +880,7 @@ fn cascade_block<S: QpelSource>(
             &stage[mirror_index(j as i32 + k as i32 - 3, h1 as i32) as usize]
         });
         let mut line = [0u8; CASCADE_MAX_SIDE];
-        for (i, v) in line.iter_mut().enumerate() {
-            let col = [
-                rows[0][i], rows[1][i], rows[2][i], rows[3][i], rows[4][i], rows[5][i], rows[6][i],
-                rows[7][i],
-            ];
-            *v = fir_8tap_clip(&col, rc, bpp);
-        }
+        fir_rows(&rows, rc, bpp, &mut line);
         match qfy {
             1 => {
                 for (i, v) in line.iter_mut().enumerate() {

@@ -202,6 +202,10 @@ pub(crate) fn source_luma_mb(
 }
 
 /// SAD of the source macroblock against a full-pel reference position.
+/// The sum is exact when it is below `limit`; once a partial sum
+/// reaches `limit` the walk may stop and return that partial sum (a
+/// value `>= limit`), so `result < limit` is always the exact
+/// comparison. Pass `u32::MAX` for the exact SAD.
 fn sad_full_pel(
     src: &[[i32; 16]; 16],
     reference: &crate::half_sample::ReferenceVop<'_>,
@@ -209,6 +213,7 @@ fn sad_full_pel(
     mb_y: i32,
     dx: i32,
     dy: i32,
+    limit: u32,
 ) -> u32 {
     let mut sad = 0u32;
     // Interior position: whole reference rows, no §7.6.4 clamp.
@@ -219,6 +224,11 @@ fn sad_full_pel(
                 .expect("row inside the plane");
             let run: &[u8; 16] = run.try_into().expect("sixteen samples");
             sad += row_sad(row, run);
+            // A partial sum that already reaches the limit cannot
+            // beat it: the caller only asks "is it smaller".
+            if sad >= limit {
+                return sad;
+            }
         }
         return sad;
     }
@@ -356,12 +366,12 @@ pub(crate) fn estimate_motion(
     fcode: u8,
 ) -> (MotionVector, u32) {
     let mut best = (0i32, 0i32);
-    let mut best_sad = sad_full_pel(src, reference, mb_x, mb_y, 0, 0).saturating_sub(128);
+    let mut best_sad = sad_full_pel(src, reference, mb_x, mb_y, 0, 0, u32::MAX).saturating_sub(128);
     let consider = |dx: i32, dy: i32, best: &mut (i32, i32), best_sad: &mut u32| {
         if (dx, dy) == (0, 0) {
             return;
         }
-        let sad = sad_full_pel(src, reference, mb_x, mb_y, dx, dy);
+        let sad = sad_full_pel(src, reference, mb_x, mb_y, dx, dy, *best_sad);
         if sad < *best_sad {
             *best_sad = sad;
             *best = (dx, dy);

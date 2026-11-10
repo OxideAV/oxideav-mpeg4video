@@ -51,6 +51,7 @@ pub enum RcMode {
 /// Typed options struct for the registry / options-bag construction
 /// path ([`oxideav_core::CodecParameters::options`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Mpeg4EncoderOptions {
     /// `qp` — the VOP quantiser scale (1..=31). Default 4.
     pub qp: u32,

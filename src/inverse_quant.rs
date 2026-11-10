@@ -183,25 +183,32 @@ pub fn inverse_quant_method2(qf: &[[i32; 8]; 8], ctx: InverseQuantContext) -> [[
     assert!(ctx.quantiser_scale > 0, "quantiser_scale must be > 0");
     let (lo, hi) = saturation_bounds(ctx.bits_per_pixel);
     let mut out = [[0i32; 8]; 8];
+    // §7.4.4.2.1 with the quantiser terms hoisted: |F''| =
+    // (2·|QF| + 1) · quantiser_scale, minus one for an even scale;
+    // zero stays zero.
+    let qs = ctx.quantiser_scale as i32;
+    let even = i32::from(qs % 2 == 0);
     for v in 0..8 {
-        // A zero QF reconstructs to zero (§7.4.4.2.1); only the intra
-        // DC cell of row 0 has its own formula.
-        if qf[v] == [0i32; 8] && !(v == 0 && ctx.macroblock_intra) {
+        if qf[v] == [0i32; 8] {
             continue;
         }
         for u in 0..8 {
-            let f_pp = if ctx.macroblock_intra && u == 0 && v == 0 {
-                inverse_quant_intra_dc(
-                    qf[0][0],
-                    ctx.component,
-                    ctx.quantiser_scale,
-                    ctx.short_video_header,
-                )
-            } else {
-                inverse_quant_method2_coef(qf[v][u], ctx.quantiser_scale)
-            };
-            out[v][u] = f_pp.clamp(lo, hi);
+            let q = qf[v][u];
+            if q != 0 {
+                let magnitude = (2 * q.abs() + 1) * qs - even;
+                out[v][u] = (if q < 0 { -magnitude } else { magnitude }).clamp(lo, hi);
+            }
         }
+    }
+    if ctx.macroblock_intra {
+        // The intra DC cell follows §7.4.4.1.1.
+        out[0][0] = inverse_quant_intra_dc(
+            qf[0][0],
+            ctx.component,
+            ctx.quantiser_scale,
+            ctx.short_video_header,
+        )
+        .clamp(lo, hi);
     }
     out
 }
@@ -344,6 +351,55 @@ fn inverse_quant_method1_impl(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn method2_block_equals_the_per_coefficient_formula() {
+        let mut state = 0x7F4A_7C15u32;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        for round in 0..4000u32 {
+            let mut qf = [[0i32; 8]; 8];
+            for cell in qf.iter_mut().flatten() {
+                if round % 3 == 0 || next() % 5 == 0 {
+                    *cell = (next() % 4096) as i32 - 2048;
+                }
+            }
+            for quantiser_scale in [1u32, 2, 7, 8, 30, 31] {
+                for macroblock_intra in [false, true] {
+                    for component in [DcComponent::Luminance, DcComponent::Chrominance] {
+                        let ctx = InverseQuantContext {
+                            macroblock_intra,
+                            component,
+                            quantiser_scale,
+                            bits_per_pixel: 8,
+                            short_video_header: false,
+                        };
+                        let (lo, hi) = saturation_bounds(8);
+                        let got = inverse_quant_method2(&qf, ctx);
+                        for v in 0..8 {
+                            for u in 0..8 {
+                                let want = if macroblock_intra && (v, u) == (0, 0) {
+                                    inverse_quant_intra_dc(
+                                        qf[0][0],
+                                        component,
+                                        quantiser_scale,
+                                        false,
+                                    )
+                                } else {
+                                    inverse_quant_method2_coef(qf[v][u], quantiser_scale)
+                                };
+                                assert_eq!(got[v][u], want.clamp(lo, hi));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     fn ctx(intra: bool, qs: u32, bpp: u32) -> InverseQuantContext {
         InverseQuantContext {

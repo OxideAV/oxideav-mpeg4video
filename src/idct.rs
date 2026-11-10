@@ -280,11 +280,13 @@ pub fn idct_8x8_rounded(
 ) -> [[i32; 8]; 8] {
     // Row pass: 1-D IDCT on each row of F (varying u for each fixed v).
     let mut row_out = [[0.0f64; N]; N];
+    let mut row_coded = [false; N];
     for v in 0..N {
         // An all-zero coefficient row transforms to zeros.
         if coefficients[v] == [0i32; N] {
             continue;
         }
+        row_coded[v] = true;
         let mut row_in = [0.0f64; N];
         for u in 0..N {
             row_in[u] = coefficients[v][u] as f64;
@@ -293,16 +295,33 @@ pub fn idct_8x8_rounded(
     }
 
     // Column pass: 1-D IDCT on each column of the row-pass output
-    // (varying v for each fixed x).
+    // (varying v for each fixed x). The eight columns advance
+    // together: every `full[y][x]` accumulates its terms
+    // `c(v) · row_out[v][x] · cos[v][y]` in ascending `v`, exactly the
+    // per-column sum, and a row of the row pass that is entirely zero
+    // (its terms are exact zeros) is skipped.
+    let cos = cos_table();
+    let scale = (2.0_f64 / N as f64).sqrt();
     let mut full = [[0.0f64; N]; N];
-    for x in 0..N {
-        let mut col_in = [0.0f64; N];
-        for v in 0..N {
-            col_in[v] = row_out[v][x];
+    for v in 0..N {
+        if !row_coded[v] {
+            continue;
         }
-        let col_out = idct_1d(&col_in);
+        let cv = c(v);
+        let mut term = [0.0f64; N];
+        for x in 0..N {
+            term[x] = cv * row_out[v][x];
+        }
         for y in 0..N {
-            full[y][x] = col_out[y];
+            let k = cos[v][y];
+            for x in 0..N {
+                full[y][x] += term[x] * k;
+            }
+        }
+    }
+    for row in &mut full {
+        for value in row {
+            *value *= scale;
         }
     }
 
@@ -320,6 +339,97 @@ pub fn idct_8x8_rounded(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The separable transform written directly from the defining
+    /// 1-D sum (row pass, then one column at a time), with the same
+    /// final rounding.
+    fn idct_8x8_reference(
+        coefficients: &[[i32; 8]; 8],
+        bits_per_pixel: u32,
+        rounding: HalfIntegerRounding,
+    ) -> [[i32; 8]; 8] {
+        let mut row_out = [[0.0f64; N]; N];
+        for v in 0..N {
+            let mut row_in = [0.0f64; N];
+            for u in 0..N {
+                row_in[u] = coefficients[v][u] as f64;
+            }
+            row_out[v] = idct_1d_reference(&row_in);
+        }
+        let (lo, hi) = idct_saturation_bounds(bits_per_pixel);
+        let mut out = [[0i32; 8]; 8];
+        for x in 0..N {
+            let mut col_in = [0.0f64; N];
+            for v in 0..N {
+                col_in[v] = row_out[v][x];
+            }
+            let col_out = idct_1d_reference(&col_in);
+            for y in 0..N {
+                out[y][x] = round_to_integer(col_out[y], rounding).clamp(lo, hi);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn restructured_8x8_transform_equals_the_defining_evaluation() {
+        // Dense, sparse, DC-only and single-row / single-column
+        // blocks (half-integer ties included), both tie rules.
+        let mut state = 0x0BAD_5EEDu32;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        for round in 0..30_000u32 {
+            let mut block = [[0i32; 8]; 8];
+            match round % 6 {
+                0 => {
+                    for cell in block.iter_mut().flatten() {
+                        *cell = (next() % 4096) as i32 - 2048;
+                    }
+                }
+                1 => {
+                    for cell in block.iter_mut().flatten() {
+                        if next() % 8 == 0 {
+                            *cell = (next() % 1024) as i32 - 512;
+                        }
+                    }
+                }
+                2 => block[0][0] = (next() % 4096) as i32 - 2048,
+                3 => {
+                    let v = (next() % 8) as usize;
+                    for cell in block[v].iter_mut() {
+                        *cell = (next() % 512) as i32 - 256;
+                    }
+                }
+                4 => {
+                    let u = (next() % 8) as usize;
+                    for row in block.iter_mut() {
+                        row[u] = (next() % 512) as i32 - 256;
+                    }
+                }
+                _ => {
+                    // Multiples of four on the DC cell and one AC
+                    // cell: frequent exact half-integers.
+                    block[0][0] = 4 * ((next() % 512) as i32 - 256);
+                    let (v, u) = ((next() % 8) as usize, (next() % 8) as usize);
+                    block[v][u] += 4 * ((next() % 64) as i32 - 32);
+                }
+            }
+            for rounding in [
+                HalfIntegerRounding::AwayFromZero,
+                HalfIntegerRounding::ToEven,
+            ] {
+                assert_eq!(
+                    idct_8x8_rounded(&block, 8, rounding),
+                    idct_8x8_reference(&block, 8, rounding),
+                    "round {round}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn restructured_1d_pass_is_value_identical_to_the_defining_sum() {

@@ -277,14 +277,23 @@ pub(crate) fn candidate_sad(
     mb_y: i32,
     mode: BVopSampleMode,
 ) -> u32 {
-    let recon = cand
-        .decode
-        .reconstruct(anchors, &InterMacroblock::zero(), mb_x, mb_y, 0, mode, 8);
+    // Only the luminance is scored: form just that prediction (with a
+    // zero residual the §7.3 reconstruction is the prediction itself).
+    let mut pred = [0u8; 256];
+    crate::bvop_prediction::generate_b_vop_luma_prediction_into(
+        anchors.forward_luma,
+        anchors.backward_luma,
+        &cand.decode.mvs,
+        mb_x,
+        mb_y,
+        0,
+        mode,
+        cand.decode.prediction_mode,
+        &mut pred,
+    );
     let mut sad = 0u32;
-    for (j, row) in src.iter().enumerate() {
-        for (i, &s) in row.iter().enumerate() {
-            sad += (s - recon.luma[j][i]).unsigned_abs();
-        }
+    for (row, pred_row) in src.iter().zip(pred.as_chunks::<16>().0) {
+        sad += crate::pvop_encode::row_sad(row, pred_row);
     }
     sad
 }
