@@ -6,6 +6,15 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.11](https://github.com/OxideAV/oxideav-mpeg4video/compare/v0.1.10...v0.1.11) - 2026-11-13
+
+### Other
+
+- crate-level needless_range_loop allowance (clippy 1.100 extends the lint to nested spec-indexed loops)
+- inverse-transform selection — fuzz coverage, bench switches, README / fixture notes
+- inverse-transform selection — exact by default, from stream evidence under ecosystem-compat, forceable either way
+- integer row-column inverse transform (variant RC) — 64/64 staged vectors, worked examples, empty-row rule
+
 ### Added
 
 - **Integer row–column inverse transform ("variant RC")** —
