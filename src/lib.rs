@@ -302,6 +302,11 @@
 //! `docs/video/mpeg4-visual/ISO_IEC_14496-2-2004-3rd-edition.txt`.
 //! No third-party MPEG-4 source was consulted.
 
+// Sample and coefficient loops index by the specification's own
+// `x` / `y` / `u` / `v` / block-number notation throughout the crate
+// (several modules document the same allowance locally); the iterator
+// forms clippy proposes hide that correspondence.
+#![allow(clippy::needless_range_loop)]
 #![warn(missing_debug_implementations)]
 #![warn(missing_docs)]
 
