@@ -727,3 +727,16 @@ aadaa7fd85f1455ad6a5a75a416c41b1906db567393439151a55803d9c699154  ties_q6_96x64.
 (Note: `aic_ipb_64x64.yuv` and `altscan_ipb_64x64.yuv` are
 byte-identical — the two encodes quantise the same source to the same
 reconstruction — as are the two interlaced-intra decodes.)
+
+## `integer-idct-vectors/vectors.txt`
+
+Byte-for-byte copy of the staged
+`docs/video/mpeg4-visual/fixtures/integer-idct-vectors/vectors.txt`
+(format and block classes in that directory's `notes.md`): 64
+input / expected-output block pairs of the integer row–column inverse
+transform, black-box input/output data, raw 16-bit results without
+output saturation. Consumed by `tests/variant_rc_vectors.rs`.
+
+```
+b55e863cd3367a77496f95cc9aa57a171eaa89edd6bc6c4cf696dc2efc5da45e  integer-idct-vectors/vectors.txt
+```

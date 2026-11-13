@@ -13,6 +13,9 @@
 //! streams; each is decoded `MPEG4VIDEO_BENCH_REPEAT` times (default 3)
 //! and the best wall time is reported together with an FNV-1a hash of
 //! every decoded sample (the bit-identity witness across changes).
+//! `MPEG4VIDEO_BENCH_COMPAT=1` decodes in the ecosystem-compat mode and
+//! `MPEG4VIDEO_BENCH_INVERSE_TRANSFORM=exact|variant-rc|from-stream`
+//! forces the inverse-transform selection (default: the mode's own).
 //! `MPEG4VIDEO_BENCH_ENCODE` names a raw `yuv420p` file with its
 //! dimensions and optional encoder options; the hash covers the
 //! emitted bytes.
@@ -20,6 +23,7 @@
 use std::time::Instant;
 
 use oxideav_core::{CodecId, CodecOptions, CodecParameters, Error, Frame, VideoFrame, VideoPlane};
+use oxideav_mpeg4video::compat::{DecodeOptions, InverseTransformSelection};
 use oxideav_mpeg4video::decoder::Mpeg4VideoDecoder;
 
 fn fnv1a(hash: &mut u64, bytes: &[u8]) {
@@ -36,6 +40,19 @@ fn repeats() -> usize {
         .unwrap_or(3)
 }
 
+/// The decode options selected by the environment (see the file
+/// header).
+fn decode_options() -> DecodeOptions {
+    let compat = std::env::var("MPEG4VIDEO_BENCH_COMPAT").is_ok_and(|v| v == "1");
+    let options = DecodeOptions::spec().with_ecosystem_compat(compat);
+    match std::env::var("MPEG4VIDEO_BENCH_INVERSE_TRANSFORM").as_deref() {
+        Ok("exact") => options.with_inverse_transform(InverseTransformSelection::Exact),
+        Ok("variant-rc") => options.with_inverse_transform(InverseTransformSelection::VariantRc),
+        Ok("from-stream") => options.with_inverse_transform(InverseTransformSelection::FromStream),
+        _ => options,
+    }
+}
+
 fn bench_decode(path: &str) {
     let Ok(stream) = std::fs::read(path) else {
         println!("decode {path}: unreadable, skipped");
@@ -46,7 +63,7 @@ fn bench_decode(path: &str) {
     let mut hash = 0u64;
     for _ in 0..repeats() {
         let start = Instant::now();
-        let mut dec = Mpeg4VideoDecoder::new();
+        let mut dec = Mpeg4VideoDecoder::with_options(decode_options());
         let mut frames = match dec.decode(&stream) {
             Ok(f) => f,
             Err(e) => {

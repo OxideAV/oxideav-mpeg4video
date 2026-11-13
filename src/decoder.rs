@@ -78,6 +78,10 @@ const ENCODER_SIGNATURE: &[u8; 4] = b"XviD";
 /// The match is anchored at payload offset 0 and case-sensitive; a
 /// digit run that does not fit 32 bits is no match; bytes after the
 /// digit run are ignored.
+///
+/// The payload is one §6.2.2.1 `user_data()`: its bytes run to the
+/// next start-code prefix, so a signature split over two units (or
+/// over two calls of the decoder) is never assembled.
 fn encoder_build_of(payload: &[u8]) -> Option<u32> {
     let rest = payload.strip_prefix(ENCODER_SIGNATURE)?;
     let digits = rest.iter().take_while(|b| b.is_ascii_digit()).count();

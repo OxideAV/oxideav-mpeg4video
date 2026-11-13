@@ -351,8 +351,48 @@ The remaining distance to a *default* reference decode is that
 decoder's own integer IDCT, which differs from its floating-point one
 by the same amount (peak 1 per intra pass, 0.25–0.6 % of samples,
 drifting to peak 3 inside a 12-frame GOP) — inside the Annex A bound.
-Both modes keep the mathematical Annex A.1 transform; no integer IDCT
-is offered.
+
+Also within tolerance: **which inverse transform.** One widespread
+encoder family — the one that signs its streams with a user-data
+string beginning `XviD` — reconstructs with a specific integer
+row–column transform, so the exact transform decodes those streams a
+level off here and there and drifts along each chain of predicted
+pictures until the next intra picture. The decoder implements that
+transform ("variant RC", `variant_rc`, written from
+`docs/video/mpeg4-visual/integer-idct-ecosystem-variant.md`; all 64
+staged black-box vectors and every worked example reproduce) and
+selects it through `InverseTransformSelection`:
+
+| Selection | Transform |
+|---|---|
+| `Exact` | Annex A.1 for every stream. The literal-spec default — **it never switches on stream content.** |
+| `FromStream` | Annex A.1 until a user-data unit (`00 00 01 B2`) whose payload *begins* with `XviD` immediately followed by decimal digits (the build number) has been decoded; variant RC for every texture block from then on, for the rest of the decoder's life. What ecosystem-compat selects. |
+| `VariantRc` | Variant RC for every stream. |
+
+`DecodeOptions::with_inverse_transform(..)` (registry key
+`inverse-transform` = `exact` / `variant-rc` / `from-stream`) forces a
+selection in either mode; `Mpeg4VideoDecoder::detected_encoder_build()`
+reports the parsed build number (in every mode) and
+`active_inverse_transform()` the transform in effect. Variant RC
+replaces the inverse DCT call only — intra and inter blocks, luminance
+and chrominance, I-/P-/B-/S(GMC)-VOPs and the static-sprite I-VOP,
+combined and data-partitioned syntax, progressive and interlaced;
+short-header pictures keep the exact transform, and mismatch control /
+the intra exemption keep their own switches (the half-integer rule is
+unused while it is active). A later non-matching user-data unit, a
+repeated configuration header or `Decoder::reset` does not revert the
+choice. Every other stream decodes byte-identically to before: the
+whole committed corpus is pinned signed and unsigned in both modes
+(`tests/inverse_transform_selection.rs`).
+
+Not verified against the encoder family itself: no encoder of that
+family was available to produce a signed stream, so the stream-level
+claim (bit-exact decode of such streams) rests on the specification
+document; the transform is verified against its staged vectors, the
+selection rule against the document's evidence table. The "empty row"
+rule (a row 0 of `(−4, 0, …, 0)` passes the row stage unchanged) is
+exercised by no staged vector and is pinned from the document's worked
+example alone.
 
 Not a divergence: §7.6.9.5.1 makes a co-located S(GMC) macroblock with
 `mcsel == 1` — coded or skipped — supply its §7.8.7.3 averaged motion
@@ -364,10 +404,12 @@ Selection is wired through every decode surface:
 * typed: `Mpeg4VideoDecoder::with_options(DecodeOptions::ecosystem())`
   (default `new()` / `DecodeOptions::spec()` is the literal spec);
   every `vop_decode` macroblock walk takes the same `DecodeOptions`;
-* registry / options bag: key **`ecosystem-compat`** (bool, default
-  `false`) on `CodecParameters::options`, declared by the
-  `Mpeg4DecoderOptions` schema and parsed in `make_decoder`; the
-  selection survives `Decoder::reset`.
+* registry / options bag: keys **`ecosystem-compat`** (bool, default
+  `false`) and **`inverse-transform`** (`exact` / `variant-rc` /
+  `from-stream`, default unset = the mode's own) on
+  `CodecParameters::options`, declared by the `Mpeg4DecoderOptions`
+  schema and parsed in `make_decoder`; the selection — and the stream
+  evidence already gathered — survives `Decoder::reset`.
 
 Measured effect (`tests/conformance.rs` `compat_*` pins): the
 `mpeg_quant` I/P/B stream collapses from a 3062-sample envelope to 4
@@ -696,8 +738,19 @@ its exact term order but skips zero inputs and advances eight
 accumulators together. Each restructured path is pinned against its
 defining per-sample form by an exhaustive or randomised unit test.
 
+The integer row–column transform (`variant_rc`) accumulates one
+fixed-point basis vector per non-zero input over eight independent
+32-bit lanes and advances the eight columns together, so both passes
+vectorise: 30 ns per dense block against 172 ns for the exact
+transform (25 / 92 ns on sparse blocks). Adding the selection left the
+existing paths where they were — 704×480 I/P/B test pattern 1120 →
+1112 fps (run-to-run noise, same output hash); the same stream forced
+through variant RC decodes at 1199 fps, a dense fractal stream at 682
+against 634 fps.
+
 ```text
 MPEG4VIDEO_BENCH_DECODE=a.m4v:b.m4v cargo bench --bench throughput
+MPEG4VIDEO_BENCH_INVERSE_TRANSFORM=variant-rc MPEG4VIDEO_BENCH_DECODE=a.m4v cargo bench --bench throughput
 MPEG4VIDEO_BENCH_ENCODE='1280x720:src.yuv:qp=5,bf=2' cargo bench --bench throughput
 ```
 
@@ -722,7 +775,11 @@ VOLs with fitted trajectories included. `stream_decode` additionally
 places its bytes behind complete static-sprite heads (every
 warping-point count, two warp accuracies) so they become
 trajectory-only S-VOPs driving the §7.8 warps with arbitrary reference
-points. The `Fuzz`
+points; its decode options rotate with the input over both modes and
+the forced inverse-transform selections, one run decodes the stream
+behind a signed user-data unit (integer transform on every walk), and
+one hands the bytes over as a user-data payload, checking the
+signature rule against an independent reading. The `Fuzz`
 workflow runs all four daily through the org-level reusable job.
 
 ## Provenance

@@ -60,6 +60,18 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
     variant decode differs from its exact decode by at most 1 level on
     the intra picture and 3 overall.
 
+- Inverse-transform selection, follow-ups: the `stream_decode` fuzz
+  target rotates its decode options over both modes and the forced
+  selections, decodes every input behind a signed user-data unit and
+  feeds the raw bytes as a user-data payload (signature rule checked
+  against an independent reading; the literal-spec decoder asserted to
+  stay on the exact transform); `benches/throughput.rs` takes
+  `MPEG4VIDEO_BENCH_COMPAT` / `MPEG4VIDEO_BENCH_INVERSE_TRANSFORM`;
+  README "Compatibility modes" documents the selection, what is and is
+  not verified (no encoder of the signing family was available for a
+  black-box stream check), and the measured cost (existing paths
+  unchanged, variant RC 30 ns per dense block against 172 ns exact).
+
 ## [0.1.10](https://github.com/OxideAV/oxideav-mpeg4video/compare/v0.1.9...v0.1.10) - 2026-11-10
 
 ### Other
