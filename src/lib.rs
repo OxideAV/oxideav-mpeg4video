@@ -480,7 +480,7 @@ pub use chroma_shape::{
 };
 pub use decoder::{Mpeg4VideoDecoder, StreamDecodeError};
 
-pub use compat::DecodeOptions;
+pub use compat::{DecodeOptions, InverseTransformSelection};
 pub use data_partition::DataPartitionError;
 #[doc(hidden)]
 pub use data_partition::{
@@ -521,7 +521,8 @@ pub use half_sample::{
     interpolate_pixel, split_half_pel,
 };
 pub use idct::{
-    HalfIntegerRounding, idct_8x8, idct_8x8_rounded, idct_saturation_bounds, saturate_idct_sample,
+    BlockTransform, HalfIntegerRounding, idct_8x8, idct_8x8_rounded, idct_saturation_bounds,
+    saturate_idct_sample,
 };
 #[doc(hidden)]
 pub use interlaced_information::{

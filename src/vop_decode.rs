@@ -422,7 +422,7 @@ pub fn decode_i_vop_macroblocks(
                 ac_pred_flag: header.ac_pred_flag,
                 alternate_vertical_scan: vop.alternate_vertical_scan,
                 intra_mismatch_exempt: opts.ecosystem_compat,
-                idct_rounding: opts.idct_rounding(),
+                transform: opts.block_transform(),
             };
             let coded = pattern_code(header.cbpy, header.cbpc);
             let mb = decode_intra_mb_with_grid(
@@ -627,7 +627,7 @@ pub fn decode_i_vop_macroblocks_dp(
                 ac_pred_flag: tex.ac_pred_flag,
                 alternate_vertical_scan: vop.alternate_vertical_scan,
                 intra_mismatch_exempt: opts.ecosystem_compat,
-                idct_rounding: opts.idct_rounding(),
+                transform: opts.block_transform(),
             };
             let coded = pattern_code(tex.cbpy, mb.cbpc);
             let imb = decode_intra_mb_partitioned(
@@ -763,7 +763,7 @@ pub fn decode_p_vop_macroblocks_dp(
                         ac_pred_flag: tex.ac_pred_flag,
                         alternate_vertical_scan: vop.alternate_vertical_scan,
                         intra_mismatch_exempt: opts.ecosystem_compat,
-                        idct_rounding: opts.idct_rounding(),
+                        transform: opts.block_transform(),
                     };
                     let imb = decode_intra_mb_partitioned(
                         br,
@@ -787,7 +787,7 @@ pub fn decode_p_vop_macroblocks_dp(
                         ac_pred_flag: false,
                         alternate_vertical_scan: vop.alternate_vertical_scan,
                         intra_mismatch_exempt: opts.ecosystem_compat,
-                        idct_rounding: opts.idct_rounding(),
+                        transform: opts.block_transform(),
                     };
                     let residual = decode_inter_mb_partitioned(
                         br,
@@ -1000,7 +1000,7 @@ pub fn decode_s_gmc_vop_macroblocks_dp(
                     ac_pred_flag: tex.ac_pred_flag,
                     alternate_vertical_scan: vop.alternate_vertical_scan,
                     intra_mismatch_exempt: opts.ecosystem_compat,
-                    idct_rounding: opts.idct_rounding(),
+                    transform: opts.block_transform(),
                 };
                 match motions[k] {
                     SMotion::Intra => {
@@ -1208,7 +1208,7 @@ fn recover_dp_p_packet_texture(
             ac_pred_flag: false,
             alternate_vertical_scan: vop.alternate_vertical_scan,
             intra_mismatch_exempt: opts.ecosystem_compat,
-            idct_rounding: opts.idct_rounding(),
+            transform: opts.block_transform(),
         };
         let residual = stitched[k]
             .as_ref()
@@ -1327,7 +1327,7 @@ pub fn decode_p_vop_macroblocks(
                 ac_pred_flag: header.ac_pred_flag,
                 alternate_vertical_scan: vop.alternate_vertical_scan,
                 intra_mismatch_exempt: opts.ecosystem_compat,
-                idct_rounding: opts.idct_rounding(),
+                transform: opts.block_transform(),
             };
 
             let is_intra = header.mb_type.map(|t| t.is_intra()).unwrap_or(false);
@@ -1453,7 +1453,7 @@ pub fn decode_b_vop_macroblocks(
         max_quantiser_scale: max_qp,
         bits_per_pixel: u32::from(vol.bits_per_pixel),
         quant_type: vol.quant_type,
-        idct_rounding: opts.idct_rounding(),
+        transform: opts.block_transform(),
     };
     // Resync-aware raster loop — the video-packet analogue of
     // `BVopMvDriver::decode_vop`: per §7.6.8 a resync marker resets the
@@ -1536,7 +1536,7 @@ pub fn decode_b_vop_macroblocks(
                 ac_pred_flag: false,
                 alternate_vertical_scan: vop.alternate_vertical_scan,
                 intra_mismatch_exempt: opts.ecosystem_compat,
-                idct_rounding: opts.idct_rounding(),
+                transform: opts.block_transform(),
             };
             let residual = decode_b_vop_inter_macroblock(br, motion.cbpb, ctx, &quant_matrix)
                 .map_err(|e| VopDecodeError::BVop(BVopMvDriverError::Texture(e)))?;
@@ -1734,7 +1734,7 @@ pub fn decode_b_vop_interlaced_macroblocks(
                 ac_pred_flag: false,
                 alternate_vertical_scan: vop.alternate_vertical_scan,
                 intra_mismatch_exempt: opts.ecosystem_compat,
-                idct_rounding: opts.idct_rounding(),
+                transform: opts.block_transform(),
             };
             let mut residual = decode_b_vop_inter_macroblock(br, motion.cbpb(), ctx, &quant_matrix)
                 .map_err(|e| VopDecodeError::BVop(BVopMvDriverError::Texture(e)))?;
@@ -1942,7 +1942,7 @@ pub fn decode_s_gmc_vop_macroblocks(
                 ac_pred_flag: header.ac_pred_flag,
                 alternate_vertical_scan: vop.alternate_vertical_scan,
                 intra_mismatch_exempt: opts.ecosystem_compat,
-                idct_rounding: opts.idct_rounding(),
+                transform: opts.block_transform(),
             };
 
             let is_intra = header.mb_type.map(|t| t.is_intra()).unwrap_or(false);

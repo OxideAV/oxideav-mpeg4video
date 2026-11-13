@@ -79,6 +79,39 @@
 //! vector as the direct-mode MV, and both modes do exactly that; the
 //! reference decodes of GMC streams with B-VOPs agree.
 //!
+//! ## Inverse-transform selection
+//!
+//! Also inside the Annex A tolerance: *which* inverse transform. One
+//! widespread encoder family — the one that signs its streams with a
+//! user-data string beginning `XviD` — reconstructs with a specific
+//! integer row–column transform ([`crate::variant_rc`], "variant RC"),
+//! so a decode of those streams with the exact transform is off by a
+//! level here and there and drifts along each chain of predicted
+//! pictures. [`InverseTransformSelection`] chooses between the two:
+//!
+//! * `Exact` — the Annex A.1 transform for every stream. The
+//!   literal-spec default; **it never switches on stream content**.
+//! * `FromStream` — what the ecosystem-compat mode selects: the exact
+//!   transform until a user-data unit (`00 00 01 B2`) is seen whose
+//!   payload begins with the four bytes `XviD` immediately followed by
+//!   at least one decimal digit (the digit run, read as an unsigned
+//!   32-bit decimal number, is the encoder's build number); from then
+//!   on variant RC for every texture block — intra and inter, luminance
+//!   and chrominance, I-/P-/B-/S(GMC)-VOPs, combined and
+//!   data-partitioned syntax, progressive and interlaced — for the
+//!   rest of the decoder's life. A later non-matching unit, a new
+//!   configuration header or a seek does not revert it. Short-header
+//!   pictures keep the exact transform.
+//! * `VariantRc` — variant RC for every stream.
+//!
+//! Callers force either transform in either mode through
+//! [`DecodeOptions::with_inverse_transform`] (registry key
+//! `inverse-transform`). The selection changes the transform only:
+//! mismatch control, the intra mismatch exemption and the other compat
+//! behaviours keep their own switches, and the half-integer rule is
+//! simply unused while variant RC is active (integer arithmetic has no
+//! ties).
+//!
 //! Everything else decodes identically in both modes. The switch is
 //! wired through every public decode surface: the
 //! [`crate::vop_decode`] macroblock walks take a [`DecodeOptions`]
@@ -87,6 +120,27 @@
 //! [`crate::decoder::make_decoder`] path reads the `ecosystem-compat`
 //! key from [`CodecParameters::options`](oxideav_core::CodecParameters)
 //! (see [`crate::decoder::Mpeg4DecoderOptions`]).
+
+/// Which §7.4.5 inverse transform the decoder reconstructs texture
+/// blocks with (see the module docs, "Inverse-transform selection").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
+pub enum InverseTransformSelection {
+    /// The exact Annex A.1 transform, rounded to nearest, for every
+    /// stream. What a literal-spec decode uses.
+    #[default]
+    Exact,
+    /// The integer row–column transform ([`crate::variant_rc`]) for
+    /// every stream, whatever its user data says.
+    VariantRc,
+    /// Decide from stream evidence: the exact transform until a
+    /// user-data unit carrying the encoder signature with a build
+    /// number has been seen
+    /// ([`crate::decoder::Mpeg4VideoDecoder::detected_encoder_build`]),
+    /// the integer row–column transform from then on for the rest of
+    /// the decoder's life.
+    FromStream,
+}
 
 /// Options selecting the decoder's behaviour on the spec-vs-ecosystem
 /// divergences documented at [`crate::compat`] (module docs).
@@ -113,17 +167,39 @@ pub struct DecodeOptions {
     /// It also resolves exact half-integer IDCT results to the even
     /// neighbour ([`crate::idct::HalfIntegerRounding::ToEven`]), a
     /// choice inside the Annex A accuracy tolerance rather than a
-    /// divergence from the text.
+    /// divergence from the text, and — unless
+    /// [`DecodeOptions::inverse_transform`] says otherwise — selects
+    /// the inverse transform from stream evidence
+    /// ([`InverseTransformSelection::FromStream`]).
     ///
     /// When `false` (the default) all three clauses follow the printed
-    /// specification text.
+    /// specification text and the exact inverse transform is used for
+    /// every stream.
     pub ecosystem_compat: bool,
+    /// Explicit inverse-transform selection. `None` (the default)
+    /// follows the mode: [`InverseTransformSelection::Exact`] for the
+    /// literal-spec decode, [`InverseTransformSelection::FromStream`]
+    /// under `ecosystem_compat`. `Some(_)` forces that selection in
+    /// either mode. See
+    /// [`DecodeOptions::inverse_transform_selection`].
+    pub inverse_transform: Option<InverseTransformSelection>,
 }
 
 impl DecodeOptions {
     /// Set `ecosystem_compat`.
     pub fn with_ecosystem_compat(mut self, v: bool) -> Self {
         self.ecosystem_compat = v;
+        self
+    }
+
+    /// Set `inverse_transform`: an [`InverseTransformSelection`] (or
+    /// `Some(_)`) forces that selection, `None` returns to the mode's
+    /// own choice.
+    pub fn with_inverse_transform(
+        mut self,
+        selection: impl Into<Option<InverseTransformSelection>>,
+    ) -> Self {
+        self.inverse_transform = selection.into();
         self
     }
 }
@@ -133,6 +209,7 @@ impl DecodeOptions {
     pub const fn spec() -> Self {
         Self {
             ecosystem_compat: false,
+            inverse_transform: None,
         }
     }
 
@@ -140,6 +217,7 @@ impl DecodeOptions {
     pub const fn ecosystem() -> Self {
         Self {
             ecosystem_compat: true,
+            inverse_transform: None,
         }
     }
 
@@ -149,6 +227,33 @@ impl DecodeOptions {
             crate::idct::HalfIntegerRounding::ToEven
         } else {
             crate::idct::HalfIntegerRounding::AwayFromZero
+        }
+    }
+
+    /// The inverse-transform selection in effect: the explicit
+    /// [`DecodeOptions::inverse_transform`] when one is set, otherwise
+    /// the mode's own — `Exact` for the literal-spec decode,
+    /// `FromStream` under `ecosystem_compat`.
+    pub const fn inverse_transform_selection(self) -> InverseTransformSelection {
+        match self.inverse_transform {
+            Some(selection) => selection,
+            None if self.ecosystem_compat => InverseTransformSelection::FromStream,
+            None => InverseTransformSelection::Exact,
+        }
+    }
+
+    /// The transform a macroblock walk run with these options applies
+    /// to every block. `FromStream` cannot be decided at this level —
+    /// the evidence lives in the stream decoder, which resolves it to
+    /// `Exact` or `VariantRc` before each VOP — so here it reads as
+    /// the exact transform.
+    #[doc(hidden)]
+    pub const fn block_transform(self) -> crate::idct::BlockTransform {
+        match self.inverse_transform_selection() {
+            InverseTransformSelection::VariantRc => crate::idct::BlockTransform::VariantRc,
+            InverseTransformSelection::Exact | InverseTransformSelection::FromStream => {
+                crate::idct::BlockTransform::Exact(self.idct_rounding())
+            }
         }
     }
 }
@@ -167,5 +272,52 @@ mod tests {
     fn ecosystem_constructor_sets_the_switch() {
         assert!(DecodeOptions::ecosystem().ecosystem_compat);
         assert_ne!(DecodeOptions::ecosystem(), DecodeOptions::spec());
+    }
+
+    #[test]
+    fn inverse_transform_follows_the_mode_unless_forced() {
+        use crate::idct::{BlockTransform, HalfIntegerRounding};
+        // Literal spec: exact, never from the stream.
+        let spec = DecodeOptions::spec();
+        assert_eq!(spec.inverse_transform, None);
+        assert_eq!(
+            spec.inverse_transform_selection(),
+            InverseTransformSelection::Exact
+        );
+        assert_eq!(spec.block_transform(), BlockTransform::SPEC);
+        // Ecosystem-compat: from stream evidence; without evidence the
+        // walks see the exact transform with the compat tie rule.
+        let eco = DecodeOptions::ecosystem();
+        assert_eq!(
+            eco.inverse_transform_selection(),
+            InverseTransformSelection::FromStream
+        );
+        assert_eq!(
+            eco.block_transform(),
+            BlockTransform::Exact(HalfIntegerRounding::ToEven)
+        );
+        assert_eq!(
+            DecodeOptions::default()
+                .with_ecosystem_compat(true)
+                .inverse_transform_selection(),
+            InverseTransformSelection::FromStream
+        );
+        // Forced either way in either mode.
+        for base in [spec, eco] {
+            let forced = base.with_inverse_transform(InverseTransformSelection::VariantRc);
+            assert_eq!(forced.block_transform(), BlockTransform::VariantRc);
+            assert_eq!(forced.ecosystem_compat, base.ecosystem_compat);
+            let exact = base.with_inverse_transform(InverseTransformSelection::Exact);
+            assert_eq!(
+                exact.block_transform(),
+                BlockTransform::Exact(base.idct_rounding())
+            );
+            assert_eq!(forced.with_inverse_transform(None), base);
+        }
+        assert_eq!(
+            spec.with_inverse_transform(InverseTransformSelection::FromStream)
+                .inverse_transform_selection(),
+            InverseTransformSelection::FromStream
+        );
     }
 }

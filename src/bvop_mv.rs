@@ -369,9 +369,9 @@ pub struct BVopTextureParams {
     /// §6.3.2 `quant_type` — `true` selects §7.4.4.1 method 1 (with a
     /// quantisation matrix), `false` selects §7.4.4.2 method 2.
     pub quant_type: bool,
-    /// IDCT half-integer rounding for the residuals (see
-    /// [`MacroblockTextureContext::idct_rounding`]).
-    pub idct_rounding: crate::idct::HalfIntegerRounding,
+    /// The inverse transform for the residuals (see
+    /// [`MacroblockTextureContext::transform`]).
+    pub transform: crate::idct::BlockTransform,
 }
 
 /// One fully-decoded progressive B-VOP macroblock: the §7.6.8 motion
@@ -1362,7 +1362,7 @@ impl BVopMvDriver {
                     // B-VOP residuals are inter blocks only; the intra
                     // mismatch exemption is never consulted here.
                     intra_mismatch_exempt: false,
-                    idct_rounding: texture.idct_rounding,
+                    transform: texture.transform,
                 };
                 let mut residual =
                     decode_b_vop_inter_macroblock(br, motion.cbpb(), ctx, &quant_matrix)?;
@@ -1511,7 +1511,7 @@ impl BVopMvDriver {
                     // B-VOP residuals are inter blocks only; the intra
                     // mismatch exemption is never consulted here.
                     intra_mismatch_exempt: false,
-                    idct_rounding: texture.idct_rounding,
+                    transform: texture.transform,
                 };
                 let residual = decode_b_vop_inter_macroblock(br, motion.cbpb, ctx, &quant_matrix)?;
 
@@ -2447,7 +2447,7 @@ mod tests {
             max_quantiser_scale: 31,
             bits_per_pixel: 8,
             quant_type: false,
-            idct_rounding: crate::idct::HalfIntegerRounding::AwayFromZero,
+            transform: crate::idct::BlockTransform::SPEC,
         }
     }
 

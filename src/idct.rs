@@ -242,6 +242,46 @@ pub enum HalfIntegerRounding {
     ToEven,
 }
 
+/// The §7.4.5 inverse transform a decode path applies to one
+/// dequantised block.
+///
+/// Annex A admits any transform within its accuracy tolerance; two are
+/// implemented. [`BlockTransform::Exact`] is the mathematical Annex A.1
+/// transform rounded to nearest (the default, with its half-integer
+/// rule); [`BlockTransform::VariantRc`] is the integer row–column
+/// transform of [`crate::variant_rc`], which has no ties and therefore
+/// no rounding rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum BlockTransform {
+    /// [`idct_8x8_rounded`] with the given half-integer rule.
+    Exact(HalfIntegerRounding),
+    /// [`crate::variant_rc::idct_8x8_variant_rc`].
+    VariantRc,
+}
+
+impl Default for BlockTransform {
+    fn default() -> Self {
+        Self::SPEC
+    }
+}
+
+impl BlockTransform {
+    /// The literal-spec default: the exact transform, half-integers
+    /// away from zero.
+    pub const SPEC: Self = Self::Exact(HalfIntegerRounding::AwayFromZero);
+
+    /// Inverse-transform `coefficients[v][u]` and saturate to
+    /// `[-2^bits_per_pixel, 2^bits_per_pixel - 1]`.
+    #[inline]
+    pub fn apply(self, coefficients: &[[i32; 8]; 8], bits_per_pixel: u32) -> [[i32; 8]; 8] {
+        match self {
+            Self::Exact(rounding) => idct_8x8_rounded(coefficients, bits_per_pixel, rounding),
+            Self::VariantRc => crate::variant_rc::idct_8x8_variant_rc(coefficients, bits_per_pixel),
+        }
+    }
+}
+
 /// Distance from one half below which a transformed `f64` value is
 /// treated as an exact half-integer. A true half-integer comes out of
 /// the two `f64` passes within a few hundred ulps of the value

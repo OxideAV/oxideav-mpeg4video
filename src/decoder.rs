@@ -41,7 +41,7 @@
 use crate::bitreader::BitReader;
 use crate::block::InterMacroblock;
 use crate::bvop_prediction::BVopSampleMode;
-use crate::compat::DecodeOptions;
+use crate::compat::{DecodeOptions, InverseTransformSelection};
 use crate::frame_decode::{FrameDecodeError, PVopMbContent, SGmcMbContent};
 use crate::framestore::DecodedFrame;
 use crate::pvop_mv::PvopMbMotion;
@@ -64,6 +64,30 @@ use crate::vop_decode::{
 
 /// §6.2.1 `user_data_start_code`.
 const USER_DATA_START_CODE: u32 = 0x0000_01B2;
+
+/// The four bytes a user-data payload must begin with for the
+/// inverse-transform stream evidence (see [`encoder_build_of`]).
+const ENCODER_SIGNATURE: &[u8; 4] = b"XviD";
+
+/// The inverse-transform stream evidence of one user-data payload (the
+/// bytes after the four start-code bytes): `Some(build)` when the
+/// payload begins with the signature bytes immediately followed by at
+/// least one ASCII decimal digit — `build` being the maximal digit
+/// run read as an unsigned decimal number — and `None` otherwise.
+///
+/// The match is anchored at payload offset 0 and case-sensitive; a
+/// digit run that does not fit 32 bits is no match; bytes after the
+/// digit run are ignored.
+fn encoder_build_of(payload: &[u8]) -> Option<u32> {
+    let rest = payload.strip_prefix(ENCODER_SIGNATURE)?;
+    let digits = rest.iter().take_while(|b| b.is_ascii_digit()).count();
+    if digits == 0 {
+        return None;
+    }
+    rest[..digits].iter().try_fold(0u32, |build, &digit| {
+        build.checked_mul(10)?.checked_add(u32::from(digit - b'0'))
+    })
+}
 
 /// Errors raised by the elementary-stream decoder.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,6 +216,10 @@ pub struct Mpeg4VideoDecoder {
     /// §7.8.2 sprite memory of a basic static-sprite VOL: the
     /// reconstructed initial I-VOP (never displayed).
     sprite: Option<crate::static_sprite::SpritePlanes>,
+    /// The build number of the most recent user-data unit carrying the
+    /// encoder signature ([`encoder_build_of`]). Once set it is never
+    /// cleared.
+    encoder_build: Option<u32>,
 }
 
 /// The short-header picture clock (see
@@ -228,6 +256,55 @@ impl Mpeg4VideoDecoder {
     /// built with.
     pub fn options(&self) -> DecodeOptions {
         self.options
+    }
+
+    /// The encoder build number found in the stream's user data, if
+    /// any: a user-data unit (`00 00 01 B2`) whose payload begins with
+    /// the bytes `XviD` immediately followed by decimal digits has been
+    /// decoded, and this is its digit run as a number (the most recent
+    /// one when several units matched). Units are examined wherever
+    /// they appear in the data handed to [`Mpeg4VideoDecoder::decode`],
+    /// configuration data included, and in every mode — this accessor
+    /// reports the evidence even when the options do not act on it.
+    ///
+    /// Under [`InverseTransformSelection::FromStream`] (what the
+    /// ecosystem-compat mode selects) a detected build switches the
+    /// decoder to the integer row–column inverse transform for every
+    /// texture block decoded afterwards; the value itself does not
+    /// influence the transform. It is never cleared.
+    pub fn detected_encoder_build(&self) -> Option<u32> {
+        self.encoder_build
+    }
+
+    /// The inverse transform the next VOP's texture blocks will be
+    /// reconstructed with: [`InverseTransformSelection::Exact`] or
+    /// [`InverseTransformSelection::VariantRc`] — the options'
+    /// selection with `FromStream` resolved against
+    /// [`Mpeg4VideoDecoder::detected_encoder_build`]. (Short-header
+    /// pictures always use the exact transform.)
+    pub fn active_inverse_transform(&self) -> InverseTransformSelection {
+        match self.options.inverse_transform_selection() {
+            InverseTransformSelection::VariantRc => InverseTransformSelection::VariantRc,
+            InverseTransformSelection::FromStream if self.encoder_build.is_some() => {
+                InverseTransformSelection::VariantRc
+            }
+            _ => InverseTransformSelection::Exact,
+        }
+    }
+
+    /// The options one VOP's macroblock walk runs with: the decoder's
+    /// own, with the inverse-transform selection resolved to the
+    /// transform currently in effect.
+    fn vop_options(&self) -> DecodeOptions {
+        self.options
+            .with_inverse_transform(self.active_inverse_transform())
+    }
+
+    /// Carry stream evidence over from a previous decoder instance of
+    /// the same stream (a seek rebuilds the decoder; the selection
+    /// lasts for the stream).
+    fn inherit_stream_evidence(&mut self, previous: &Self) {
+        self.encoder_build = previous.encoder_build;
     }
 
     /// Return each VOP's frame from the call that decodes it, in coding
@@ -385,7 +462,12 @@ impl Mpeg4VideoDecoder {
                 self.profile_level = parse_visual_object_sequence_header(unit)?;
             }
             VISUAL_OBJECT_SEQUENCE_END_CODE => {}
-            USER_DATA_START_CODE => {}
+            USER_DATA_START_CODE => {
+                // Inverse-transform stream evidence: sticky once seen.
+                if let Some(build) = encoder_build_of(&unit[4..]) {
+                    self.encoder_build = Some(build);
+                }
+            }
             VISUAL_OBJECT_START_CODE => {
                 let _ = parse_visual_object_header(unit)?;
             }
@@ -500,10 +582,10 @@ impl Mpeg4VideoDecoder {
                         &mut br,
                         &vol,
                         &vop,
-                        self.options,
+                        self.vop_options(),
                     )?
                 } else {
-                    decode_i_vop_macroblocks(&mut br, &vol, &vop, self.options)?
+                    decode_i_vop_macroblocks(&mut br, &vol, &vop, self.vop_options())?
                 };
                 out.extend(self.sequence.push_i_vop(mb_width, mb_height, &mbs)?);
                 self.anchor_motion = None;
@@ -517,10 +599,10 @@ impl Mpeg4VideoDecoder {
                         &mut br,
                         &vol,
                         &vop,
-                        self.options,
+                        self.vop_options(),
                     )?
                 } else {
-                    decode_p_vop_macroblocks(&mut br, &vol, &vop, self.options)?
+                    decode_p_vop_macroblocks(&mut br, &vol, &vop, self.vop_options())?
                 };
                 self.anchor_motion = Some(motion_of_p_entries(&entries));
                 out.extend(if vol.obmc_disable {
@@ -554,10 +636,10 @@ impl Mpeg4VideoDecoder {
                         &mut br,
                         &vol,
                         &vop,
-                        self.options,
+                        self.vop_options(),
                     )?
                 } else {
-                    decode_s_gmc_vop_macroblocks(&mut br, &vol, &vop, self.options)?
+                    decode_s_gmc_vop_macroblocks(&mut br, &vol, &vop, self.vop_options())?
                 };
                 self.anchor_motion = Some(motion_of_s_entries(&entries));
                 out.extend(self.sequence.push_s_gmc_vop(
@@ -580,7 +662,7 @@ impl Mpeg4VideoDecoder {
                         trb,
                         trd,
                         self.anchor_motion.as_deref(),
-                        self.options,
+                        self.vop_options(),
                     )?;
                     let field_mode = if vol.quarter_sample {
                         crate::bvop_field_motion::FieldSampleMode::QuarterSample {
@@ -611,7 +693,7 @@ impl Mpeg4VideoDecoder {
                         trb,
                         trd,
                         self.anchor_motion.as_deref().map(|_| &progressive[..]),
-                        self.options,
+                        self.vop_options(),
                     )?;
                     out.extend(self.sequence.push_b_vop(
                         mb_width,
@@ -687,10 +769,10 @@ impl Mpeg4VideoDecoder {
                         br,
                         &sprite_vol,
                         vop,
-                        self.options,
+                        self.vop_options(),
                     )?
                 } else {
-                    decode_i_vop_macroblocks(br, &sprite_vol, vop, self.options)?
+                    decode_i_vop_macroblocks(br, &sprite_vol, vop, self.vop_options())?
                 };
                 let mut frame = DecodedFrame::new(mb_width * 16, mb_height * 16, VopCodingType::I)
                     .map_err(FrameDecodeError::from)?;
@@ -1031,6 +1113,19 @@ fn to_core_error(e: StreamDecodeError) -> oxideav_core::Error {
 }
 
 impl Mpeg4PacketDecoder {
+    /// The encoder build number found in the stream's user data so far
+    /// (see [`Mpeg4VideoDecoder::detected_encoder_build`]); kept across
+    /// [`Decoder::reset`](oxideav_core::Decoder::reset).
+    pub fn detected_encoder_build(&self) -> Option<u32> {
+        self.inner.detected_encoder_build()
+    }
+
+    /// The inverse transform currently in effect (see
+    /// [`Mpeg4VideoDecoder::active_inverse_transform`]).
+    pub fn active_inverse_transform(&self) -> InverseTransformSelection {
+        self.inner.active_inverse_transform()
+    }
+
     /// Enforce the `max_pixels_per_frame` cap once a VOL is known.
     fn check_limits(&self) -> oxideav_core::Result<()> {
         if let Some(vol) = self.inner.vol() {
@@ -1130,8 +1225,11 @@ impl oxideav_core::Decoder for Mpeg4PacketDecoder {
     }
 
     fn reset(&mut self) -> oxideav_core::Result<()> {
-        // Preserve the compat behaviour selection across seeks.
-        self.inner = Mpeg4VideoDecoder::with_options(self.inner.options());
+        // Preserve the compat behaviour selection — and the stream
+        // evidence that selected the inverse transform — across seeks.
+        let mut inner = Mpeg4VideoDecoder::with_options(self.inner.options());
+        inner.inherit_stream_evidence(&self.inner);
+        self.inner = inner;
         self.ready.clear();
         self.flushed = false;
         if !self.extradata.is_empty() {
@@ -1148,7 +1246,7 @@ impl oxideav_core::Decoder for Mpeg4PacketDecoder {
 /// Typed options struct for the registry / options-bag construction
 /// path ([`oxideav_core::CodecParameters::options`]).
 ///
-/// One key is recognised:
+/// Two keys are recognised:
 ///
 /// * `ecosystem-compat` (bool, default `false`) — decode with the
 ///   ecosystem-compat behaviour on the three documented spec
@@ -1158,15 +1256,22 @@ impl oxideav_core::Decoder for Mpeg4PacketDecoder {
 ///   blocks, and non-positive §7.8.7.3 GMC averaged-MV components of a
 ///   half-sample translational warp derive one MV-grid unit lower.
 ///   The default is the literal spec text.
+/// * `inverse-transform` (`exact` / `variant-rc` / `from-stream`,
+///   default unset) — force the
+///   [`InverseTransformSelection`]. Unset follows the mode: `exact`
+///   for the literal-spec decode, `from-stream` under
+///   `ecosystem-compat`.
 ///
-/// Typed consumers can skip the bag and pass
-/// [`DecodeOptions`](crate::compat::DecodeOptions) to
+/// Typed consumers can skip the bag and pass [`DecodeOptions`] to
 /// [`Mpeg4VideoDecoder::with_options`] directly.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Mpeg4DecoderOptions {
     /// The [`crate::compat`] ecosystem-compat switch.
     pub ecosystem_compat: bool,
+    /// Explicit inverse-transform selection (`None` follows the mode;
+    /// see [`DecodeOptions::inverse_transform`]).
+    pub inverse_transform: Option<InverseTransformSelection>,
 }
 
 impl Mpeg4DecoderOptions {
@@ -1175,31 +1280,66 @@ impl Mpeg4DecoderOptions {
         self.ecosystem_compat = v;
         self
     }
+
+    /// Set `inverse_transform` (an [`InverseTransformSelection`] forces
+    /// it, `None` follows the mode).
+    pub fn with_inverse_transform(
+        mut self,
+        selection: impl Into<Option<InverseTransformSelection>>,
+    ) -> Self {
+        self.inverse_transform = selection.into();
+        self
+    }
 }
 
 impl From<Mpeg4DecoderOptions> for DecodeOptions {
     fn from(o: Mpeg4DecoderOptions) -> Self {
-        DecodeOptions {
-            ecosystem_compat: o.ecosystem_compat,
-        }
+        DecodeOptions::spec()
+            .with_ecosystem_compat(o.ecosystem_compat)
+            .with_inverse_transform(o.inverse_transform)
     }
 }
 
 impl oxideav_core::CodecOptionsStruct for Mpeg4DecoderOptions {
-    const SCHEMA: &'static [oxideav_core::OptionField] = &[oxideav_core::OptionField {
-        name: "ecosystem-compat",
-        kind: oxideav_core::OptionKind::Bool,
-        default: oxideav_core::OptionValue::Bool(false),
-        help: "match the black-box-observed ecosystem behaviour on the three documented \
-               ISO/IEC 14496-2 divergences (interlaced-direct co-located MVs read as zero; \
-               §7.4.4.5 mismatch control skipped on intra blocks; half-sample translational \
-               GMC averaged MVs lowered on non-positive components) instead of the literal \
-               spec text",
-    }];
+    const SCHEMA: &'static [oxideav_core::OptionField] = &[
+        oxideav_core::OptionField {
+            name: "ecosystem-compat",
+            kind: oxideav_core::OptionKind::Bool,
+            default: oxideav_core::OptionValue::Bool(false),
+            help: "match the black-box-observed ecosystem behaviour on the three documented \
+                   ISO/IEC 14496-2 divergences (interlaced-direct co-located MVs read as zero; \
+                   §7.4.4.5 mismatch control skipped on intra blocks; half-sample translational \
+                   GMC averaged MVs lowered on non-positive components) instead of the literal \
+                   spec text; also selects the inverse transform from stream evidence unless \
+                   inverse-transform is set",
+        },
+        oxideav_core::OptionField {
+            name: "inverse-transform",
+            kind: oxideav_core::OptionKind::Enum(&["exact", "variant-rc", "from-stream"]),
+            default: oxideav_core::OptionValue::String(String::new()),
+            help: "inverse transform for texture blocks: exact (Annex A, every stream), \
+                   variant-rc (the integer row-column transform, every stream) or from-stream \
+                   (variant-rc once a user-data unit carries the encoder signature with a build \
+                   number, for the rest of the stream); unset = exact, or from-stream under \
+                   ecosystem-compat",
+        },
+    ];
 
     fn apply(&mut self, key: &str, value: &oxideav_core::OptionValue) -> oxideav_core::Result<()> {
         match key {
             "ecosystem-compat" => self.ecosystem_compat = value.as_bool()?,
+            "inverse-transform" => {
+                self.inverse_transform = Some(match value.as_str()? {
+                    "exact" => InverseTransformSelection::Exact,
+                    "variant-rc" => InverseTransformSelection::VariantRc,
+                    "from-stream" => InverseTransformSelection::FromStream,
+                    other => {
+                        return Err(oxideav_core::Error::invalid(format!(
+                            "mpeg4video: inverse-transform: unknown value {other:?}"
+                        )));
+                    }
+                })
+            }
             _ => unreachable!("guarded by SCHEMA"),
         }
         Ok(())
@@ -1414,6 +1554,83 @@ mod tests {
     pub(crate) fn write_vos(w: &mut BitWriter) {
         w.write_bits(VISUAL_OBJECT_SEQUENCE_START_CODE, 32);
         w.write_bits(0x01, 8); // profile_and_level_indication
+    }
+
+    #[test]
+    fn encoder_build_needs_the_signature_and_a_digit_run_at_offset_zero() {
+        assert_eq!(encoder_build_of(b"XviD0050"), Some(50));
+        assert_eq!(encoder_build_of(b"XviD0073 anything"), Some(73));
+        assert_eq!(encoder_build_of(b"XviD7"), Some(7));
+        assert_eq!(encoder_build_of(b"XviD"), None);
+        assert_eq!(encoder_build_of(b"XviD-beta"), None);
+        assert_eq!(encoder_build_of(b"xvid0050"), None);
+        assert_eq!(encoder_build_of(b" XviD0050"), None);
+        assert_eq!(encoder_build_of(b""), None);
+        assert_eq!(encoder_build_of(b"XviD4294967295"), Some(u32::MAX));
+        assert_eq!(encoder_build_of(b"XviD4294967296"), None);
+        assert_eq!(encoder_build_of(b"XviD00000000000000000001"), Some(1));
+    }
+
+    #[test]
+    fn user_data_evidence_is_recorded_but_only_acted_on_by_selection() {
+        // VOS + user data + VOL + I + P: the build is reported in
+        // every mode; only a from-stream selection turns it into the
+        // integer transform, and nothing turns it off again.
+        let mut w = BitWriter::default();
+        write_vos(&mut w);
+        w.write_bits(USER_DATA_START_CODE, 32);
+        for &b in b"XviD0064" {
+            w.write_bits(u32::from(b), 8);
+        }
+        write_vol(&mut w, 32, 16);
+        write_i_vop(&mut w, 2, 0);
+        write_skipped_p_vop(&mut w, 2, 1);
+        let stream = w.finish();
+
+        let mut spec = Mpeg4VideoDecoder::new();
+        assert_eq!(spec.detected_encoder_build(), None);
+        let frames = spec.decode(&stream).unwrap();
+        assert_eq!(frames.len() + spec.flush().len(), 2);
+        assert_eq!(spec.detected_encoder_build(), Some(64));
+        assert_eq!(
+            spec.active_inverse_transform(),
+            InverseTransformSelection::Exact
+        );
+        assert_eq!(
+            spec.vop_options(),
+            DecodeOptions::spec().with_inverse_transform(InverseTransformSelection::Exact)
+        );
+
+        let mut eco = Mpeg4VideoDecoder::with_options(DecodeOptions::ecosystem());
+        assert_eq!(
+            eco.active_inverse_transform(),
+            InverseTransformSelection::Exact
+        );
+        let mut frames = eco.decode(&stream).unwrap();
+        frames.extend(eco.flush());
+        assert_eq!(eco.detected_encoder_build(), Some(64));
+        assert_eq!(
+            eco.active_inverse_transform(),
+            InverseTransformSelection::VariantRc
+        );
+        assert_eq!(
+            eco.vop_options().block_transform(),
+            crate::idct::BlockTransform::VariantRc
+        );
+        // The caller's options are untouched by the resolution.
+        assert_eq!(eco.options(), DecodeOptions::ecosystem());
+        // Flat mid-grey intra blocks (F[0][0] = 1024) are 128 under
+        // either transform.
+        assert_eq!(frames[0].luma_at(0, 0), Some(128));
+        assert_eq!(frames[1].luma_at(31, 15), Some(128));
+
+        let forced = Mpeg4VideoDecoder::with_options(
+            DecodeOptions::ecosystem().with_inverse_transform(InverseTransformSelection::Exact),
+        );
+        assert_eq!(
+            forced.active_inverse_transform(),
+            InverseTransformSelection::Exact
+        );
     }
 
     #[test]

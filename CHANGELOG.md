@@ -24,6 +24,42 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   with both rules cross-checks the lane evaluation on 60 000 blocks
   over the legal, the full 16-bit and the saturating input ranges.
 
+- **Inverse-transform selection** — the decoder can reconstruct
+  texture with the integer row–column transform, chosen per the
+  standing "specification default, ecosystem behaviour opt-in" rule.
+  - `compat::InverseTransformSelection` (`Exact` / `VariantRc` /
+    `FromStream`, `#[non_exhaustive]`);
+    `DecodeOptions::inverse_transform: Option<_>` with
+    `DecodeOptions::with_inverse_transform` and
+    `DecodeOptions::inverse_transform_selection`. Unset follows the
+    mode: the literal-spec decode is `Exact` and **never switches on
+    stream content**; `ecosystem_compat` is `FromStream`. A set value
+    forces that selection in either mode.
+  - `FromStream`: a user-data unit whose payload begins with `XviD`
+    immediately followed by a decimal digit run (the build number; a
+    run that overflows 32 bits is no match) switches the decoder to
+    variant RC for every texture block decoded afterwards — intra /
+    inter, luminance / chrominance, I-/P-/B-/S(GMC)-VOPs and the
+    static-sprite I-VOP, combined and data-partitioned syntax,
+    progressive and interlaced. Sticky for the decoder's life: a later
+    non-matching unit, a repeated configuration header or a registry
+    `reset()` does not revert it. Short-header pictures keep the exact
+    transform; mismatch control and the other compat behaviours keep
+    their own switches.
+  - `Mpeg4VideoDecoder::detected_encoder_build() -> Option<u32>` and
+    `Mpeg4VideoDecoder::active_inverse_transform()` (also on
+    `Mpeg4PacketDecoder`) report the evidence and the transform in
+    effect; the build number is reported in every mode.
+  - Registry: `Mpeg4DecoderOptions::inverse_transform` /
+    `with_inverse_transform`, option key `inverse-transform` =
+    `exact` | `variant-rc` | `from-stream`.
+  - `tests/inverse_transform_selection.rs` runs the whole committed
+    corpus (56 streams, both modes) signed and unsigned: unsigned and
+    literal-spec decodes are byte-identical to before, the signed
+    compat decode equals the forced-variant decode, every stream's
+    variant decode differs from its exact decode by at most 1 level on
+    the intra picture and 3 overall.
+
 ## [0.1.10](https://github.com/OxideAV/oxideav-mpeg4video/compare/v0.1.9...v0.1.10) - 2026-11-10
 
 ### Other

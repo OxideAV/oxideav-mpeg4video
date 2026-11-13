@@ -140,7 +140,6 @@
 //!   when no matrix was loaded (`quant_type == 1`).
 
 use crate::bitreader::BitReader;
-use crate::idct::idct_8x8_rounded;
 use crate::inverse_quant::{InverseQuantContext, inverse_quant_method1, inverse_quant_method2};
 use crate::macroblock::{DerivedMbType, MacroblockHeader};
 use crate::predictor::{
@@ -324,11 +323,12 @@ pub struct MacroblockTextureContext {
     /// on the non-intra decode paths or under method 2
     /// (`quant_type == false`).
     pub intra_mismatch_exempt: bool,
-    /// How the §7.4.5 / Annex A IDCT resolves exact half-integer
-    /// results ([`crate::idct::HalfIntegerRounding`]; ecosystem-compat
-    /// selects `ToEven`, the default `AwayFromZero`). Applies to intra
-    /// and inter blocks alike.
-    pub idct_rounding: crate::idct::HalfIntegerRounding,
+    /// Which §7.4.5 inverse transform reconstructs the block
+    /// ([`crate::idct::BlockTransform`]): the exact Annex A transform
+    /// with its half-integer rule (ecosystem-compat selects `ToEven`,
+    /// the default `AwayFromZero`) or the integer row–column variant.
+    /// Applies to intra and inter blocks alike.
+    pub transform: crate::idct::BlockTransform,
 }
 
 /// A reconstructed intra 4:2:0 macroblock: a 16×16 luminance plane plus
@@ -677,7 +677,7 @@ fn decode_intra_block_tail(
 
     // §7.4.5 + Annex A — inverse DCT (output saturated to
     // [-2^bpp, 2^bpp - 1]).
-    let spatial = idct_8x8_rounded(&f, ctx.bits_per_pixel, ctx.idct_rounding);
+    let spatial = ctx.transform.apply(&f, ctx.bits_per_pixel);
 
     // §6.3.2 / §7.6 — for an intra block there is no prediction to add,
     // so the reconstructed sample is the IDCT output clipped to the
@@ -954,9 +954,9 @@ pub fn inter_block_from_events(
         inverse_quant_method2(&qf, iq_ctx)
     };
 
-    // §7.4.5 + Annex A — inverse DCT. `idct_8x8` already saturates to
+    // §7.4.5 + Annex A — inverse DCT. The transform already saturates to
     // [-2^bpp, 2^bpp - 1]; the result is the §7.3 step-2 residual.
-    Ok(idct_8x8_rounded(&f, ctx.bits_per_pixel, ctx.idct_rounding))
+    Ok(ctx.transform.apply(&f, ctx.bits_per_pixel))
 }
 
 /// Decode and reconstruct one inter 4:2:0 macroblock's signed-residual
@@ -1154,7 +1154,7 @@ mod tests {
             ac_pred_flag: false,
             alternate_vertical_scan: false,
             intra_mismatch_exempt: false,
-            idct_rounding: crate::idct::HalfIntegerRounding::AwayFromZero,
+            transform: crate::idct::BlockTransform::SPEC,
         };
         let predictors = BlockPredictors::outside(8, 8);
 
@@ -1239,7 +1239,7 @@ mod tests {
             ac_pred_flag: false,
             alternate_vertical_scan: false,
             intra_mismatch_exempt: false,
-            idct_rounding: crate::idct::HalfIntegerRounding::AwayFromZero,
+            transform: crate::idct::BlockTransform::SPEC,
         };
         let predictors = BlockPredictors::outside(8, 8);
 
@@ -1287,7 +1287,7 @@ mod tests {
             ac_pred_flag: false,
             alternate_vertical_scan: false,
             intra_mismatch_exempt: false,
-            idct_rounding: crate::idct::HalfIntegerRounding::AwayFromZero,
+            transform: crate::idct::BlockTransform::SPEC,
         };
         let predictors = BlockPredictors::outside(8, 8);
 
@@ -1332,7 +1332,7 @@ mod tests {
             ac_pred_flag: false,
             alternate_vertical_scan: false,
             intra_mismatch_exempt: false,
-            idct_rounding: crate::idct::HalfIntegerRounding::AwayFromZero,
+            transform: crate::idct::BlockTransform::SPEC,
         };
         let predictors = BlockPredictors::outside(8, 8);
         let data = [0xAAu8; 4]; // arbitrary — must remain unread
@@ -1375,7 +1375,7 @@ mod tests {
             ac_pred_flag: false,
             alternate_vertical_scan: false,
             intra_mismatch_exempt: false,
-            idct_rounding: crate::idct::HalfIntegerRounding::AwayFromZero,
+            transform: crate::idct::BlockTransform::SPEC,
         };
         let predictors = BlockPredictors::outside(8, 8);
         let mut w = BitWriter::default();
@@ -1414,7 +1414,7 @@ mod tests {
             ac_pred_flag: false,
             alternate_vertical_scan: false,
             intra_mismatch_exempt: false,
-            idct_rounding: crate::idct::HalfIntegerRounding::AwayFromZero,
+            transform: crate::idct::BlockTransform::SPEC,
         };
         let predictors = BlockPredictors::outside(8, 8);
         let mut w = BitWriter::default();
@@ -1467,7 +1467,7 @@ mod tests {
             ac_pred_flag: false,
             alternate_vertical_scan: false,
             intra_mismatch_exempt: false,
-            idct_rounding: crate::idct::HalfIntegerRounding::AwayFromZero,
+            transform: crate::idct::BlockTransform::SPEC,
         };
         let predictors = BlockPredictors::outside(8, 8);
 
@@ -1529,7 +1529,7 @@ mod tests {
             ac_pred_flag: false,
             alternate_vertical_scan: false,
             intra_mismatch_exempt: false,
-            idct_rounding: crate::idct::HalfIntegerRounding::AwayFromZero,
+            transform: crate::idct::BlockTransform::SPEC,
         };
         let predictors = BlockPredictors::outside(8, 8);
 
@@ -1581,7 +1581,7 @@ mod tests {
             ac_pred_flag: false,
             alternate_vertical_scan: false,
             intra_mismatch_exempt: false,
-            idct_rounding: crate::idct::HalfIntegerRounding::AwayFromZero,
+            transform: crate::idct::BlockTransform::SPEC,
         };
         let data = [0u8; 4];
         let mut br = BitReader::new(&data);
@@ -1615,7 +1615,7 @@ mod tests {
             ac_pred_flag: false,
             alternate_vertical_scan: false,
             intra_mismatch_exempt: false,
-            idct_rounding: crate::idct::HalfIntegerRounding::AwayFromZero,
+            transform: crate::idct::BlockTransform::SPEC,
         };
         let data = [0u8; 4];
         let mut br = BitReader::new(&data);
@@ -1642,7 +1642,7 @@ mod tests {
             ac_pred_flag: false,
             alternate_vertical_scan: false,
             intra_mismatch_exempt: false,
-            idct_rounding: crate::idct::HalfIntegerRounding::AwayFromZero,
+            transform: crate::idct::BlockTransform::SPEC,
         };
         // Two bytes of garbage — none of it should be consumed because
         // `coded == false` short-circuits before the bit reader is touched.
@@ -1676,7 +1676,7 @@ mod tests {
             ac_pred_flag: false,
             alternate_vertical_scan: false,
             intra_mismatch_exempt: false,
-            idct_rounding: crate::idct::HalfIntegerRounding::AwayFromZero,
+            transform: crate::idct::BlockTransform::SPEC,
         };
 
         let mut w = BitWriter::default();
@@ -1715,7 +1715,7 @@ mod tests {
             ac_pred_flag: false,
             alternate_vertical_scan: false,
             intra_mismatch_exempt: false,
-            idct_rounding: crate::idct::HalfIntegerRounding::AwayFromZero,
+            transform: crate::idct::BlockTransform::SPEC,
         };
 
         let mut w = BitWriter::default();
@@ -1759,7 +1759,7 @@ mod tests {
             ac_pred_flag: false,
             alternate_vertical_scan: false,
             intra_mismatch_exempt: false,
-            idct_rounding: crate::idct::HalfIntegerRounding::AwayFromZero,
+            transform: crate::idct::BlockTransform::SPEC,
         };
         let data = [0u8; 4];
         let mut br = BitReader::new(&data);
@@ -1805,7 +1805,7 @@ mod tests {
             ac_pred_flag: false,
             alternate_vertical_scan: false,
             intra_mismatch_exempt: false,
-            idct_rounding: crate::idct::HalfIntegerRounding::AwayFromZero,
+            transform: crate::idct::BlockTransform::SPEC,
         };
 
         let mut w = BitWriter::default();
@@ -1872,7 +1872,7 @@ mod tests {
             ac_pred_flag: false,
             alternate_vertical_scan: false,
             intra_mismatch_exempt: false,
-            idct_rounding: crate::idct::HalfIntegerRounding::AwayFromZero,
+            transform: crate::idct::BlockTransform::SPEC,
         };
         let data = [0u8; 4];
         let mut br = BitReader::new(&data);
@@ -1911,7 +1911,7 @@ mod tests {
             ac_pred_flag: false,
             alternate_vertical_scan: false,
             intra_mismatch_exempt: false,
-            idct_rounding: crate::idct::HalfIntegerRounding::AwayFromZero,
+            transform: crate::idct::BlockTransform::SPEC,
         };
         let data = [0u8; 4];
         let mut br = BitReader::new(&data);
@@ -1944,7 +1944,7 @@ mod tests {
             ac_pred_flag: false,
             alternate_vertical_scan: false,
             intra_mismatch_exempt: false,
-            idct_rounding: crate::idct::HalfIntegerRounding::AwayFromZero,
+            transform: crate::idct::BlockTransform::SPEC,
         };
         let mut w = BitWriter::default();
         // Block 0 — one positive (LAST=1, RUN=0, LEVEL=1) inter EVENT.
@@ -2006,7 +2006,7 @@ mod tests {
             ac_pred_flag: false,
             alternate_vertical_scan: false,
             intra_mismatch_exempt: false,
-            idct_rounding: crate::idct::HalfIntegerRounding::AwayFromZero,
+            transform: crate::idct::BlockTransform::SPEC,
         };
         let data = [0u8; 4];
         let mut br = BitReader::new(&data);
@@ -2045,7 +2045,7 @@ mod tests {
             ac_pred_flag: false,
             alternate_vertical_scan: false,
             intra_mismatch_exempt: false,
-            idct_rounding: crate::idct::HalfIntegerRounding::AwayFromZero,
+            transform: crate::idct::BlockTransform::SPEC,
         };
 
         let mut w = BitWriter::default();
@@ -2086,7 +2086,7 @@ mod tests {
             ac_pred_flag: false,
             alternate_vertical_scan: false,
             intra_mismatch_exempt: false,
-            idct_rounding: crate::idct::HalfIntegerRounding::AwayFromZero,
+            transform: crate::idct::BlockTransform::SPEC,
         };
         let predictors = BlockPredictors::outside(8, 8);
 
@@ -2136,7 +2136,7 @@ mod tests {
             ac_pred_flag: false,
             alternate_vertical_scan: false,
             intra_mismatch_exempt: true,
-            idct_rounding: crate::idct::HalfIntegerRounding::AwayFromZero,
+            transform: crate::idct::BlockTransform::SPEC,
         };
         let predictors = BlockPredictors::outside(8, 8);
         let mut w = BitWriter::default();
