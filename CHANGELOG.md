@@ -6,6 +6,24 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Integer row–column inverse transform ("variant RC")** —
+  `variant_rc::variant_rc_raw` / `variant_rc::idct_8x8_variant_rc`,
+  the 16-bit-oriented fixed-point 8×8 inverse transform specified in
+  `docs/video/mpeg4-visual/integer-idct-ecosystem-variant.md`: the row
+  pass accumulates one fixed-point basis vector per non-zero input over
+  eight independent 32-bit lanes (multiplier sets and per-row rounding
+  terms of §4.1, 11-bit floor shift, 16-bit truncation), the column
+  pass is the tangent-rotation factorisation of §5 with floor shifts
+  and 32-bit wrapping products; the "empty row" rule keeps a row 0 of
+  `(−4, 0, …, 0)` in place. Reproduces all 64 staged black-box vectors
+  (`tests/variant_rc_vectors.rs`, vendored
+  `tests/fixtures/integer-idct-vectors/vectors.txt`) plus every worked
+  example of the document; a transcription of the printed equations
+  with both rules cross-checks the lane evaluation on 60 000 blocks
+  over the legal, the full 16-bit and the saturating input ranges.
+
 ## [0.1.10](https://github.com/OxideAV/oxideav-mpeg4video/compare/v0.1.9...v0.1.10) - 2026-11-10
 
 ### Other

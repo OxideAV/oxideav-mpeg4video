@@ -407,6 +407,8 @@ pub mod svop_encode;
 pub mod texture; // mixed: `TextureParseError` stays visible
 #[doc(hidden)]
 pub mod transform_select;
+#[doc(hidden)]
+pub mod variant_rc;
 pub mod vector_padding; // mixed: `VectorPaddingError` stays visible
 #[doc(hidden)]
 pub mod vertical_padding;
