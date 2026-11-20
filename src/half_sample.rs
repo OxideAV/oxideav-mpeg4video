@@ -78,6 +78,8 @@
 //!   vertically interpolated between two successive lines of the same
 //!   field" — that needs a field-aware sample fetcher, deferred.
 
+use crate::sample::Sample;
+
 /// Split a half-pel motion-vector component into the integer-pel
 /// offset and the half-pel fractional bit.
 ///
@@ -199,19 +201,19 @@ pub fn interpolate_pixel(
 /// product fits in `samples.len()` with the stride taken into account.
 /// [`ReferenceVop::new`] checks the invariant.
 #[derive(Debug, Clone, Copy)]
-pub struct ReferenceVop<'a> {
-    samples: &'a [u8],
+pub struct ReferenceVop<'a, S: Sample = u8> {
+    samples: &'a [S],
     width: i32,
     height: i32,
     stride: i32,
 }
 
-impl<'a> ReferenceVop<'a> {
+impl<'a, S: Sample> ReferenceVop<'a, S> {
     /// Create a reference plane with stride equal to width.
     ///
     /// Returns `None` if `width == 0`, `height == 0`, or
     /// `samples.len() < width * height`.
-    pub fn new(samples: &'a [u8], width: usize, height: usize) -> Option<Self> {
+    pub fn new(samples: &'a [S], width: usize, height: usize) -> Option<Self> {
         Self::with_stride(samples, width, height, width)
     }
 
@@ -221,7 +223,7 @@ impl<'a> ReferenceVop<'a> {
     ///
     /// Returns `None` on any invariant violation.
     pub fn with_stride(
-        samples: &'a [u8],
+        samples: &'a [S],
         width: usize,
         height: usize,
         stride: usize,
@@ -270,7 +272,7 @@ impl<'a> ReferenceVop<'a> {
     /// pel clamping. `x` and `y` are signed so callers can pass MV
     /// components directly.
     #[inline]
-    pub fn fetch_clamped(&self, x: i32, y: i32) -> u8 {
+    pub fn fetch_clamped(&self, x: i32, y: i32) -> S {
         let cx = x.clamp(0, self.width - 1);
         let cy = y.clamp(0, self.height - 1);
         let idx = (cy as usize) * (self.stride as usize) + (cx as usize);
@@ -281,7 +283,7 @@ impl<'a> ReferenceVop<'a> {
     /// whole run lies inside the plane (no §7.6.4 clamp involved);
     /// `None` otherwise.
     #[inline]
-    pub(crate) fn row_run(&self, x: i32, y: i32, len: usize) -> Option<&'a [u8]> {
+    pub(crate) fn row_run(&self, x: i32, y: i32, len: usize) -> Option<&'a [S]> {
         if x < 0 || y < 0 || y >= self.height || (x as usize) + len > self.width as usize {
             return None;
         }
@@ -312,14 +314,14 @@ impl<'a> ReferenceVop<'a> {
 /// neighbour fetches needed by the §7.6.2.1 equation: just `A` for
 /// the integer-pel case, `A` + `B` (or `A` + `C`) for the
 /// half-pel-cardinal case, and all four for the diagonal case.
-pub fn fetch_clamped_sample(
-    vop: &ReferenceVop<'_>,
+pub fn fetch_clamped_sample<S: Sample>(
+    vop: &ReferenceVop<'_, S>,
     int_x: i32,
     int_y: i32,
     half_x: bool,
     half_y: bool,
     rounding_control: u8,
-) -> u8 {
+) -> S {
     let a = vop.fetch_clamped(int_x, int_y);
     let b = if half_x {
         vop.fetch_clamped(int_x + 1, int_y)
@@ -336,7 +338,13 @@ pub fn fetch_clamped_sample(
     } else {
         a
     };
-    interpolate_pixel(a, b, c, d, half_x, half_y, rounding_control)
+    let rc = u32::from(rounding_control & 1);
+    match (half_x, half_y) {
+        (false, false) => a,
+        (true, false) => S::average2(a, b, rc),
+        (false, true) => S::average2(a, c, rc),
+        (true, true) => S::average4(a, b, c, d, rc),
+    }
 }
 
 /// Half-sample-interpolate an entire `block_w × block_h` prediction
@@ -360,8 +368,8 @@ pub fn fetch_clamped_sample(
 // rounding_control bit). Bundling them into a struct would add a
 // shim layer without simplifying the call site.
 #[allow(clippy::too_many_arguments)]
-pub fn interpolate_block(
-    vop: &ReferenceVop<'_>,
+pub fn interpolate_block<S: Sample>(
+    vop: &ReferenceVop<'_, S>,
     mv_x: i32,
     mv_y: i32,
     origin_x: i32,
@@ -369,8 +377,8 @@ pub fn interpolate_block(
     block_w: usize,
     block_h: usize,
     vop_rounding_type: u8,
-) -> Vec<u8> {
-    let mut out = vec![0u8; block_w * block_h];
+) -> Vec<S> {
+    let mut out = vec![S::ZERO; block_w * block_h];
     interpolate_block_into(
         vop,
         mv_x,
@@ -398,8 +406,8 @@ pub fn interpolate_block(
 // directly to a §7.6.2.1 input. The buffer-out variant adds one
 // `&mut [u8]` parameter for the caller-supplied output.
 #[allow(clippy::too_many_arguments)]
-pub fn interpolate_block_into(
-    vop: &ReferenceVop<'_>,
+pub fn interpolate_block_into<S: Sample>(
+    vop: &ReferenceVop<'_, S>,
     mv_x: i32,
     mv_y: i32,
     origin_x: i32,
@@ -407,7 +415,7 @@ pub fn interpolate_block_into(
     block_w: usize,
     block_h: usize,
     vop_rounding_type: u8,
-    out: &mut [u8],
+    out: &mut [S],
 ) {
     assert!(
         out.len() >= block_w * block_h,
@@ -426,7 +434,7 @@ pub fn interpolate_block_into(
     let (x0, y0) = (origin_x + mvx_int, origin_y + mvy_int);
     let (need_w, need_h) = (block_w + usize::from(half_x), block_h + usize::from(half_y));
     if block_w > 0 && vop.contains_rect(x0, y0, need_w, need_h) {
-        let rc16 = u16::from(rc);
+        let rc32 = u32::from(rc);
         for (j, dst) in out.chunks_exact_mut(block_w).take(block_h).enumerate() {
             let y = y0 + j as i32;
             let top = vop.row_run(x0, y, need_w).expect("row inside the plane");
@@ -434,7 +442,7 @@ pub fn interpolate_block_into(
                 (false, false) => dst.copy_from_slice(top),
                 (true, false) => {
                     for ((d, &a), &b) in dst.iter_mut().zip(top).zip(&top[1..]) {
-                        *d = ((u16::from(a) + u16::from(b) + 1 - rc16) >> 1) as u8;
+                        *d = S::average2(a, b, rc32);
                     }
                 }
                 (false, true) => {
@@ -442,7 +450,7 @@ pub fn interpolate_block_into(
                         .row_run(x0, y + 1, need_w)
                         .expect("row inside the plane");
                     for ((d, &a), &c) in dst.iter_mut().zip(top).zip(bot) {
-                        *d = ((u16::from(a) + u16::from(c) + 1 - rc16) >> 1) as u8;
+                        *d = S::average2(a, c, rc32);
                     }
                 }
                 (true, true) => {
@@ -450,11 +458,7 @@ pub fn interpolate_block_into(
                         .row_run(x0, y + 1, need_w)
                         .expect("row inside the plane");
                     for (i, d) in dst.iter_mut().enumerate() {
-                        let sum = u16::from(top[i])
-                            + u16::from(top[i + 1])
-                            + u16::from(bot[i])
-                            + u16::from(bot[i + 1]);
-                        *d = ((sum + 2 - rc16) >> 2) as u8;
+                        *d = S::average4(top[i], top[i + 1], bot[i], bot[i + 1], rc32);
                     }
                 }
             }
@@ -659,7 +663,7 @@ mod tests {
     fn ref_vop_with_stride_padded_rows() {
         // 3x2 plane with stride 5 — rows padded with garbage.
         let buf = [
-            10, 11, 12, 99, 99, // row 0
+            10u8, 11, 12, 99, 99, // row 0
             20, 21, 22, 99, 99, // row 1
         ];
         let vop = ReferenceVop::with_stride(&buf, 3, 2, 5).unwrap();
@@ -689,7 +693,7 @@ mod tests {
         // 2x2 plane:
         //   10 12
         //   14 16
-        let buf = [10, 12, 14, 16];
+        let buf = [10u8, 12, 14, 16];
         let vop = ReferenceVop::new(&buf, 2, 2).unwrap();
         // Diagonal at (0,0) integer position: (10+12+14+16+2-rc)/4.
         // rc=0: 54/4 = 13. rc=1: 53/4 = 13.

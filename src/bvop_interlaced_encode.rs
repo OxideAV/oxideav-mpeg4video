@@ -311,6 +311,7 @@ pub fn encode_b_vop_interlaced(
             time_increment_bits: vop_time_increment_bits(cfg.time_increment_resolution),
             intra_dc_vlc_thr: cfg.intra_dc_vlc_thr,
             total_macroblocks: (mb_width * mb_height) as u32,
+            quant_precision: vol.quant_precision,
             interlaced: true,
             sprite_trajectory: None,
         },
@@ -321,7 +322,7 @@ pub fn encode_b_vop_interlaced(
     let vop_qp = qp;
     let mut running_qp = vop_qp;
     let regulator = cfg.mb_budget.map(|budget| {
-        let activities = crate::pvop_encode::activity_profile(frame, mb_width, mb_height);
+        let activities = crate::pvop_encode::activity_profile(frame, mb_width, mb_height, 8);
         crate::mb_quant::MbRegulator::new(budget, vop_qp, &activities, cfg.adaptive_quant)
     });
     for mb_row in 0..mb_height {

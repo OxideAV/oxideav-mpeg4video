@@ -396,6 +396,7 @@ pub mod rvlc_recovery;
 #[doc(hidden)]
 pub mod s_gmc_recon;
 #[doc(hidden)]
+pub mod sample;
 pub mod sample_padding;
 pub mod scan; // mixed: `InverseScanError` stays visible
 #[doc(hidden)]

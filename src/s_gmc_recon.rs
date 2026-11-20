@@ -26,19 +26,20 @@
 use crate::gmc::{gmc_chroma_prediction, gmc_luma_prediction};
 use crate::half_sample::ReferenceVop;
 use crate::reconstruct::{InterPredictionMacroblock, MACROBLOCK_CHROMA_SIDE, MACROBLOCK_LUMA_SIDE};
+use crate::sample::Sample;
 use crate::warp::WarpGeometry;
 
 /// The reference VOP planes (luma + the two chroma components) an
 /// S(GMC)-VOP warps from. Each plane is a reconstructed reference frame
 /// with §7.6.4 edge clamping handled by [`ReferenceVop`].
 #[derive(Debug)]
-pub struct GmcReferencePlanes<'a> {
+pub struct GmcReferencePlanes<'a, S: Sample = u8> {
     /// Luminance reference plane (full resolution).
-    pub luma: ReferenceVop<'a>,
+    pub luma: ReferenceVop<'a, S>,
     /// Cb reference plane (half resolution, 4:2:0).
-    pub cb: ReferenceVop<'a>,
+    pub cb: ReferenceVop<'a, S>,
     /// Cr reference plane (half resolution, 4:2:0).
-    pub cr: ReferenceVop<'a>,
+    pub cr: ReferenceVop<'a, S>,
 }
 
 /// Build the §7.8.7.1 GMC prediction macroblock whose top-left luminance
@@ -47,9 +48,9 @@ pub struct GmcReferencePlanes<'a> {
 ///
 /// `rounding_control` is the VOP-header `vop_rounding_type` (§7.6.2);
 /// `bits_per_pixel` is from the VOL header.
-pub fn gmc_prediction_macroblock(
+pub fn gmc_prediction_macroblock<S: Sample>(
     geometry: &WarpGeometry,
-    reference: &GmcReferencePlanes<'_>,
+    reference: &GmcReferencePlanes<'_, S>,
     mb_x: i64,
     mb_y: i64,
     rounding_control: u8,
@@ -85,13 +86,13 @@ pub fn gmc_prediction_macroblock(
     let mut out = InterPredictionMacroblock::zero();
     for y in 0..MACROBLOCK_LUMA_SIDE {
         for x in 0..MACROBLOCK_LUMA_SIDE {
-            out.luma[y][x] = i32::from(luma_pred[y * MACROBLOCK_LUMA_SIDE + x]);
+            out.luma[y][x] = luma_pred[y * MACROBLOCK_LUMA_SIDE + x].working();
         }
     }
     for y in 0..MACROBLOCK_CHROMA_SIDE {
         for x in 0..MACROBLOCK_CHROMA_SIDE {
-            out.cb[y][x] = i32::from(cb_pred[y * MACROBLOCK_CHROMA_SIDE + x]);
-            out.cr[y][x] = i32::from(cr_pred[y * MACROBLOCK_CHROMA_SIDE + x]);
+            out.cb[y][x] = cb_pred[y * MACROBLOCK_CHROMA_SIDE + x].working();
+            out.cr[y][x] = cr_pred[y * MACROBLOCK_CHROMA_SIDE + x].working();
         }
     }
     out
@@ -110,10 +111,10 @@ pub fn gmc_prediction_macroblock(
 /// `rounding_control` / `bits_per_pixel` as in
 /// [`gmc_prediction_macroblock`].
 #[allow(clippy::too_many_arguments)]
-pub fn s_gmc_prediction_macroblock(
+pub fn s_gmc_prediction_macroblock<S: Sample>(
     mcsel: bool,
     geometry: &WarpGeometry,
-    reference: &GmcReferencePlanes<'_>,
+    reference: &GmcReferencePlanes<'_, S>,
     mb_x: i64,
     mb_y: i64,
     rounding_control: u8,

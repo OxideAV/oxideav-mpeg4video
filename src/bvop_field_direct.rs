@@ -61,6 +61,7 @@
 
 use crate::interlaced_information::FieldReference;
 use crate::motion::MotionVector;
+use crate::sample::Sample;
 
 /// One field of the §7.7.2.2 interlaced-direct derivation: the future
 /// macroblock's forward field motion vector `MV[i]` and the reference
@@ -263,11 +264,11 @@ pub fn interlaced_direct_mvs(
 /// the derived quarter-pel field MVs compensate through the §7.6.2.2
 /// field cascade exactly like the explicit field-prediction modes.
 #[allow(clippy::too_many_arguments)]
-pub fn interlaced_direct_prediction(
+pub fn interlaced_direct_prediction<S: Sample>(
     mvs: InterlacedDirectMvs,
     forward_top_ref: FieldReference,
     forward_bottom_ref: FieldReference,
-    references: &crate::bvop_field_motion::BVopFieldReferences<'_>,
+    references: &crate::bvop_field_motion::BVopFieldReferences<'_, S>,
     mb_x: i32,
     mb_y: i32,
     rounding_type: u8,
@@ -280,9 +281,9 @@ pub fn interlaced_direct_prediction(
     };
     use crate::reconstruct::{MACROBLOCK_CHROMA_SIDE, MACROBLOCK_LUMA_SIDE};
 
-    let compensate = |luma: &crate::half_sample::ReferenceVop<'_>,
-                      cb: &crate::half_sample::ReferenceVop<'_>,
-                      cr: &crate::half_sample::ReferenceVop<'_>,
+    let compensate = |luma: &crate::half_sample::ReferenceVop<'_, S>,
+                      cb: &crate::half_sample::ReferenceVop<'_, S>,
+                      cr: &crate::half_sample::ReferenceVop<'_, S>,
                       mvs: FieldMotionVectors,
                       top_ref: bool,
                       bottom_ref: bool| match sample_mode {

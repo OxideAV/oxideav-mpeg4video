@@ -160,6 +160,15 @@ pub struct Mpeg4EncoderOptions {
     /// intra macroblock's DC differentials switch from the DC VLC to
     /// the AC VLC. Default 0 (DC VLC throughout).
     pub dc_vlc_thr: u32,
+    /// `bits-per-pixel` — the §6.3.3 sample depth (4..=12). 0
+    /// (default) takes the depth of the input pixel format: 8 for
+    /// `Yuv420P`, 10 for `Yuv420P10Le`, 12 for `Yuv420P12Le`. Any depth
+    /// other than 8 codes an N-bit VOL (`not_8_bit`); a depth below
+    /// its format's is read from the format's most significant bits.
+    pub bits_per_pixel: u32,
+    /// `quant-precision` — the §6.3.3 `quant_precision` of an N-bit
+    /// VOL (3..=9, default 5): `qp` may reach `2^quant-precision - 1`.
+    pub quant_precision: u32,
     /// `auto-dc-vlc` — elect `intra_dc_vlc_thr` per I-VOP by measured
     /// cost (the VOP is coded under 0 and 7, the smaller kept) and
     /// carry the winner to the following P/S-VOPs. Default off.
@@ -211,6 +220,8 @@ impl Default for Mpeg4EncoderOptions {
             short_header: false,
             gob_headers: true,
             dc_vlc_thr: 0,
+            bits_per_pixel: 0,
+            quant_precision: 5,
             auto_dc_vlc: false,
             rc_mode: RcMode::Budget,
             rc_band: 6,
@@ -391,6 +402,18 @@ impl oxideav_core::CodecOptionsStruct for Mpeg4EncoderOptions {
                    GOB after the first",
         },
         oxideav_core::OptionField {
+            name: "bits-per-pixel",
+            kind: oxideav_core::OptionKind::U32,
+            default: oxideav_core::OptionValue::U32(0),
+            help: "ISO/IEC 14496-2 bits_per_pixel (4..=12; 0 = the input pixel format's                    depth); any depth but 8 codes an N-bit VOL",
+        },
+        oxideav_core::OptionField {
+            name: "quant-precision",
+            kind: oxideav_core::OptionKind::U32,
+            default: oxideav_core::OptionValue::U32(5),
+            help: "N-bit VOL only: quant_precision (3..=9), bounding qp at                    2^quant-precision - 1",
+        },
+        oxideav_core::OptionField {
             name: "dc-vlc-thr",
             kind: oxideav_core::OptionKind::U32,
             default: oxideav_core::OptionValue::U32(0),
@@ -439,8 +462,11 @@ impl oxideav_core::CodecOptionsStruct for Mpeg4EncoderOptions {
         match key {
             "qp" => {
                 let qp = value.as_u32()?;
-                if !(1..=31).contains(&qp) {
-                    return Err(Error::invalid("qp must be in 1..=31"));
+                // The upper bound is the VOL's 2^quant_precision - 1
+                // (31 unless an N-bit VOL widens it), checked once the
+                // whole option set is known.
+                if !(1..=511).contains(&qp) {
+                    return Err(Error::invalid("qp must be in 1..=31 (N-bit: up to 511)"));
                 }
                 self.qp = qp;
             }
@@ -503,6 +529,20 @@ impl oxideav_core::CodecOptionsStruct for Mpeg4EncoderOptions {
             "ecosystem-compat" => self.ecosystem_compat = value.as_bool()?,
             "short-header" => self.short_header = value.as_bool()?,
             "gob-headers" => self.gob_headers = value.as_bool()?,
+            "bits-per-pixel" => {
+                let b = value.as_u32()?;
+                if b != 0 && !(4..=12).contains(&b) {
+                    return Err(Error::invalid("bits-per-pixel must be 0 or in 4..=12"));
+                }
+                self.bits_per_pixel = b;
+            }
+            "quant-precision" => {
+                let p = value.as_u32()?;
+                if !(3..=9).contains(&p) {
+                    return Err(Error::invalid("quant-precision must be in 3..=9"));
+                }
+                self.quant_precision = p;
+            }
             "dc-vlc-thr" => {
                 let t = value.as_u32()?;
                 if t > 7 {
@@ -546,6 +586,9 @@ struct PendingFrame {
     y: Vec<u8>,
     cb: Vec<u8>,
     cr: Vec<u8>,
+    /// The planes of a picture deeper than 8 bits (`y` / `cb` / `cr`
+    /// are then empty).
+    wide: Option<[Vec<u16>; 3]>,
     /// §6.3.5 composed VOP time in ticks.
     ticks: u64,
     /// Caller-supplied presentation stamp.
@@ -702,12 +745,61 @@ impl Mpeg4VideoEncoder {
                 ));
             }
         }
-        if let Some(pf) = params.pixel_format
-            && pf != PixelFormat::Yuv420P
-        {
-            return Err(Error::unsupported(
-                "mpeg4video encoder accepts Yuv420P input only",
+        // Input layout: planar 4:2:0 at 8, 10 or 12 bits; the coded
+        // depth is the format's unless `bits-per-pixel` names a
+        // shallower one of the same storage class.
+        let pixel_format = params.pixel_format.unwrap_or(PixelFormat::Yuv420P);
+        let format_bits: u32 = match pixel_format {
+            PixelFormat::Yuv420P => 8,
+            PixelFormat::Yuv420P10Le => 10,
+            PixelFormat::Yuv420P12Le => 12,
+            _ => {
+                return Err(Error::unsupported(
+                    "mpeg4video encoder accepts Yuv420P, Yuv420P10Le or Yuv420P12Le input",
+                ));
+            }
+        };
+        let bits_per_pixel = if options.bits_per_pixel == 0 {
+            format_bits
+        } else {
+            options.bits_per_pixel
+        };
+        let depth_fits = match format_bits {
+            8 => bits_per_pixel <= 8,
+            10 => (9..=10).contains(&bits_per_pixel),
+            _ => (11..=12).contains(&bits_per_pixel),
+        };
+        if !depth_fits {
+            return Err(Error::invalid(
+                "bits-per-pixel must match the input format: 4..=8 for Yuv420P, 9..=10 \
+                 for Yuv420P10Le, 11..=12 for Yuv420P12Le",
             ));
+        }
+        let n_bit = bits_per_pixel != 8;
+        if !n_bit && options.quant_precision != 5 {
+            return Err(Error::invalid(
+                "quant-precision is an N-bit VOL field (ISO/IEC 14496-2 §6.3.3): it stays 5 \
+                 at 8 bits per pixel",
+            ));
+        }
+        if n_bit
+            && (options.qpel
+                || options.gmc
+                || options.interlaced
+                || options.static_sprite
+                || options.short_header)
+        {
+            return Err(Error::invalid(
+                "the N-bit object type (ISO/IEC 14496-2 Table 9-1) has no qpel, gmc, \
+                 interlaced, static-sprite or short-header tool",
+            ));
+        }
+        let max_qp = (1u32 << options.quant_precision) - 1;
+        if options.qp > max_qp {
+            return Err(Error::invalid(format!(
+                "qp {} exceeds the VOL's quantiser range 1..={max_qp}",
+                options.qp
+            )));
         }
         let frame_rate = params.frame_rate.unwrap_or(Rational::new(25, 1));
         if frame_rate.num <= 0 || frame_rate.den <= 0 || frame_rate.num > 65_535 {
@@ -766,6 +858,8 @@ impl Mpeg4VideoEncoder {
                 crate::ivop_encode::StaticSpriteVol::new(width as u16, height as u16)
                     .with_warping_points(options.sprite_points as u8)
             }),
+            bits_per_pixel: bits_per_pixel as u8,
+            quant_precision: options.quant_precision as u8,
         };
         let (config_headers, vol) = if cfg.short_header {
             // §6.2.5.2: no configuration headers at all.
@@ -784,7 +878,7 @@ impl Mpeg4VideoEncoder {
         let mut output_params = CodecParameters::video(params.codec_id.clone());
         output_params.width = Some(width);
         output_params.height = Some(height);
-        output_params.pixel_format = Some(PixelFormat::Yuv420P);
+        output_params.pixel_format = Some(pixel_format);
         output_params.frame_rate = Some(frame_rate);
         output_params.extradata = config_headers.clone();
         output_params.tag = Some(oxideav_core::CodecTag::fourcc(if cfg.short_header {
@@ -813,6 +907,7 @@ impl Mpeg4VideoEncoder {
                 },
                 config_headers.len() as u64 * 8,
             )
+            .with_max_qp(max_qp)
         });
         let planner = (vbv.is_some() && options.rc_mode == RcMode::Budget).then(|| {
             let planner = BudgetPlanner::new(
@@ -821,7 +916,8 @@ impl Mpeg4VideoEncoder {
                 options.gop_size,
                 options.bf,
                 options.qp,
-            );
+            )
+            .with_max_qp(max_qp);
             match first_pass {
                 Some(stats) => planner.with_first_pass(stats),
                 None => planner,
@@ -882,6 +978,68 @@ impl Mpeg4VideoEncoder {
         }
         Ok(out)
     }
+
+    /// [`Self::tight_plane`] for a plane of 16-bit little-endian
+    /// samples (`stride` in bytes): each sample is shifted right by
+    /// `shift` and must then fit `bits_per_pixel` bits.
+    fn tight_plane16(
+        plane: &oxideav_core::VideoPlane,
+        w: usize,
+        h: usize,
+        shift: u32,
+        bits_per_pixel: u32,
+        label: &str,
+    ) -> Result<Vec<u16>> {
+        let stride = plane.stride;
+        if stride < 2 * w || plane.data.len() < stride * (h - 1) + 2 * w {
+            return Err(Error::invalid(format!("{label} plane too small")));
+        }
+        let max = (1u16 << bits_per_pixel) - 1;
+        let mut out = Vec::with_capacity(w * h);
+        for row in 0..h {
+            let bytes = &plane.data[row * stride..row * stride + 2 * w];
+            for pair in bytes.as_chunks::<2>().0 {
+                let v = u16::from_le_bytes(*pair) >> shift;
+                if v > max {
+                    return Err(Error::invalid(format!(
+                        "{label} sample exceeds the input format's range"
+                    )));
+                }
+                out.push(v);
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Evaluate `$body` with `$view` bound to the picture's
+/// [`FrameView`] in its own sample store (bytes up to 8 bits per
+/// sample, 16-bit words above).
+macro_rules! with_picture_view {
+    ($frame:expr, $w:expr, $h:expr, |$view:ident| $body:expr) => {
+        match &$frame.wide {
+            Some(planes) => {
+                let $view = FrameView {
+                    y: &planes[0][..],
+                    cb: &planes[1][..],
+                    cr: &planes[2][..],
+                    width: $w,
+                    height: $h,
+                };
+                $body
+            }
+            None => {
+                let $view = FrameView {
+                    y: &$frame.y[..],
+                    cb: &$frame.cb[..],
+                    cr: &$frame.cr[..],
+                    width: $w,
+                    height: $h,
+                };
+                $body
+            }
+        }
+    };
 }
 
 impl oxideav_core::Encoder for Mpeg4VideoEncoder {
@@ -907,12 +1065,42 @@ impl oxideav_core::Encoder for Mpeg4VideoEncoder {
         if planes.len() != 3 {
             return Err(Error::invalid("expected 3 Yuv420P planes"));
         }
-        let pending = PendingFrame {
-            y: Self::tight_plane(&planes[0], w, h, "luma")?,
-            cb: Self::tight_plane(&planes[1], cw, ch, "cb")?,
-            cr: Self::tight_plane(&planes[2], cw, ch, "cr")?,
-            ticks: self.next_ticks,
-            pts: video.pts,
+        let bpp = u32::from(self.cfg.bits_per_pixel);
+        let pending = if bpp > 8 {
+            // 16-bit little-endian words of the 10- or 12-bit format;
+            // a shallower coded depth reads the most significant bits.
+            let shift = if bpp > 10 { 12 - bpp } else { 10 - bpp };
+            PendingFrame {
+                y: Vec::new(),
+                cb: Vec::new(),
+                cr: Vec::new(),
+                wide: Some([
+                    Self::tight_plane16(&planes[0], w, h, shift, bpp, "luma")?,
+                    Self::tight_plane16(&planes[1], cw, ch, shift, bpp, "cb")?,
+                    Self::tight_plane16(&planes[2], cw, ch, shift, bpp, "cr")?,
+                ]),
+                ticks: self.next_ticks,
+                pts: video.pts,
+            }
+        } else {
+            let shift = 8 - bpp;
+            let narrow = |plane, pw, ph, label| -> Result<Vec<u8>> {
+                let mut out = Self::tight_plane(plane, pw, ph, label)?;
+                if shift != 0 {
+                    for v in out.iter_mut() {
+                        *v >>= shift;
+                    }
+                }
+                Ok(out)
+            };
+            PendingFrame {
+                y: narrow(&planes[0], w, h, "luma")?,
+                cb: narrow(&planes[1], cw, ch, "cb")?,
+                cr: narrow(&planes[2], cw, ch, "cr")?,
+                wide: None,
+                ticks: self.next_ticks,
+                pts: video.pts,
+            }
         };
         self.next_ticks += self.ticks_per_frame;
         let display_index = self.frames_seen;
@@ -1211,20 +1399,21 @@ impl Mpeg4VideoEncoder {
                 let (unit, recon, stats) = if self.options.auto_dc_vlc {
                     // Elect intra_dc_vlc_thr by measured cost and carry
                     // it to the following P/S-VOP headers.
-                    let (unit, recon, thr, stats) =
-                        encode_i_vop_elect_thr_full(&vol, &self.cfg, &view, modulo, increment, qp);
+                    let (unit, recon, thr, stats) = with_picture_view!(frame, w, h, |v| {
+                        encode_i_vop_elect_thr_full(&vol, &self.cfg, &v, modulo, increment, qp)
+                    });
                     self.cfg.intra_dc_vlc_thr = thr;
                     (unit, recon, stats)
                 } else {
-                    encode_i_vop_full(
+                    with_picture_view!(frame, w, h, |v| encode_i_vop_full(
                         &vol,
                         &self.cfg,
-                        &view,
+                        &v,
                         modulo,
                         increment,
                         qp,
                         self.cfg.intra_dc_vlc_thr,
-                    )
+                    ))
                 };
                 let mean_qp = if stats.qp_mbs == 0 {
                     f64::from(qp)
@@ -1280,8 +1469,9 @@ impl Mpeg4VideoEncoder {
                 .clone();
             let mut qp = self.plan_vop(VopClass::P);
             let unit = loop {
-                let (unit, stats) =
-                    encode_p_vop(&vol, &self.cfg, &view, &reference, modulo, increment, qp);
+                let (unit, stats) = with_picture_view!(frame, w, h, |v| {
+                    encode_p_vop(&vol, &self.cfg, &v, &reference, modulo, increment, qp)
+                });
                 let mean_qp = stats.mean_qp_or(qp);
                 if let Some(q) = self.calibrate_vop(VopClass::P, unit.len(), mean_qp) {
                     qp = q;
@@ -1369,10 +1559,10 @@ impl Mpeg4VideoEncoder {
                         );
                     (unit, stats.mean_qp_or(qp))
                 } else {
-                    let (unit, _recon, stats) = encode_b_vop(
+                    let (unit, _recon, stats) = with_picture_view!(b, w, h, |v| encode_b_vop(
                         &vol,
                         &self.cfg,
-                        &view,
+                        &v,
                         &self.store,
                         progressive.as_deref(),
                         trb,
@@ -1380,7 +1570,7 @@ impl Mpeg4VideoEncoder {
                         modulo,
                         increment,
                         qp,
-                    );
+                    ));
                     (unit, stats.mean_qp_or(qp))
                 };
                 if let Some(q) = self.calibrate_vop(VopClass::B, unit.len(), mean_qp) {

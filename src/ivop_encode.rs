@@ -48,6 +48,7 @@ use crate::neighbour::{BlockNeighbour, IntraBlockGrid};
 use crate::packet_encode::{InterlacedMbInfo, Layout, MbFields, PacketVopInfo, PacketWriter};
 use crate::predictor::{dc_scaler, predict_intra_dc, select_dc_direction};
 use crate::quantise::{quantise_intra_dc, quantise_method1_intra, quantise_method2_intra};
+use crate::sample::Sample;
 use crate::scan::{DcPredictionDirection, ScanType, inverse_scan, select_scan_type};
 use crate::texture::{AcEvent, DcComponent};
 use crate::vop::{VopCodingType, vop_time_increment_bits};
@@ -164,6 +165,19 @@ pub struct EncoderConfig {
     /// `sprite_trajectory()` (see [`crate::sprite_encode`]). Selects
     /// the Main profile. `None` (default) = no sprite.
     pub static_sprite: Option<StaticSpriteVol>,
+    /// §6.3.3 `bits_per_pixel` (4..=12; default 8). Any other value
+    /// than 8 sets `not_8_bit` and selects the N-bit object type and
+    /// profile, whose tool set (Table 9-1) is I-/P-/B-VOPs, AC/DC
+    /// prediction, 4MV, both quantisation methods and the error
+    /// resilience tools — not quarter-sample, GMC, sprites, interlace
+    /// or the short header. Pictures deeper than 8 bits are supplied
+    /// as 16-bit samples ([`FrameView`] over `u16`).
+    pub bits_per_pixel: u8,
+    /// §6.3.3 `quant_precision` (3..=9; default 5): the width of
+    /// `vop_quant` / `quant_scale`, bounding the quantiser scale at
+    /// `2^quant_precision - 1`. Transmitted only when `not_8_bit`, so
+    /// it must stay 5 for an 8-bit VOL.
+    pub quant_precision: u8,
 }
 
 /// The §6.2.3 static-sprite fields of a VOL (basic sprite).
@@ -347,6 +361,26 @@ impl EncoderConfig {
         self
     }
 
+    /// Set the §6.3.3 sample depth (4..=12) and quantiser precision
+    /// (3..=9) — see [`Self::bits_per_pixel`] /
+    /// [`Self::quant_precision`].
+    pub fn with_bit_depth(mut self, bits_per_pixel: u8, quant_precision: u8) -> Self {
+        self.bits_per_pixel = bits_per_pixel;
+        self.quant_precision = quant_precision;
+        self
+    }
+
+    /// `true` when the VOL sets `not_8_bit` (N-bit object type).
+    pub fn n_bit(&self) -> bool {
+        self.bits_per_pixel != 8
+    }
+
+    /// Largest quantiser scale the VOL can signal:
+    /// `2^quant_precision - 1` (§6.3.3).
+    pub fn max_quantiser(&self) -> u32 {
+        (1u32 << self.quant_precision) - 1
+    }
+
     /// Set `intra_dc_vlc_thr`.
     pub fn with_intra_dc_vlc_thr(mut self, v: u8) -> Self {
         self.intra_dc_vlc_thr = v;
@@ -458,6 +492,8 @@ impl Default for EncoderConfig {
             gob_headers: true,
             intra_dc_vlc_thr: 0,
             static_sprite: None,
+            bits_per_pixel: 8,
+            quant_precision: 5,
         }
     }
 }
@@ -498,7 +534,10 @@ impl EncoderConfig {
     /// once an ASP tool (method-1 quantisation, quarter-sample) is
     /// selected.
     pub fn profile_and_level(&self) -> u8 {
-        if self.static_sprite.is_some() {
+        if self.n_bit() {
+            // Table G.1: N-bit Profile / Level 2.
+            0x42
+        } else if self.static_sprite.is_some() {
             // Table G.1: Main Profile / Level 2 (the sprite tool).
             0x32
         } else if self.uses_asp_tools() {
@@ -512,7 +551,10 @@ impl EncoderConfig {
     /// Advanced Simple (`0x11`), matching
     /// [`Self::profile_and_level`].
     pub fn video_object_type(&self) -> u8 {
-        if self.static_sprite.is_some() {
+        if self.n_bit() {
+            // Table 6-11: N-bit Object Type.
+            0x05
+        } else if self.static_sprite.is_some() {
             // Table 6-11: Main Object Type.
             0x04
         } else if self.uses_asp_tools() {
@@ -674,7 +716,29 @@ pub fn write_configuration_headers(cfg: &EncoderConfig) -> Vec<u8> {
     } else {
         bw.write_bit(false); // sprite_enable = 0 (verid 1 → 1 bit)
     }
-    bw.write_bit(false); // not_8_bit = 0
+    if cfg.n_bit() {
+        assert!(
+            (4..=12).contains(&cfg.bits_per_pixel),
+            "bits_per_pixel takes values between 4 and 12 (§6.3.3)"
+        );
+        assert!(
+            (3..=9).contains(&cfg.quant_precision),
+            "quant_precision takes values between 3 and 9 (§6.3.3)"
+        );
+        assert!(
+            !cfg.quarter_sample && !cfg.gmc && !cfg.interlaced && cfg.static_sprite.is_none(),
+            "the N-bit object type has no quarter-sample, GMC, sprite or interlace tool (Table 9-1)"
+        );
+        bw.write_bit(true); // not_8_bit = 1
+        bw.write_bits(u32::from(cfg.quant_precision), 4);
+        bw.write_bits(u32::from(cfg.bits_per_pixel), 4);
+    } else {
+        assert!(
+            cfg.quant_precision == 5,
+            "quant_precision is transmitted only when not_8_bit (§6.3.3)"
+        );
+        bw.write_bit(false); // not_8_bit = 0
+    }
     bw.write_bit(cfg.quant_type); // quant_type
     if cfg.quant_type {
         bw.write_bit(false); // load_intra_quant_mat = 0 (default matrix)
@@ -717,6 +781,46 @@ pub fn write_i_vop_header(
     interlace: Option<VopInterlaceFlags>,
     intra_dc_vlc_thr: u8,
 ) {
+    write_i_vop_header_precision(
+        bw,
+        resolution,
+        modulo_time_base,
+        time_increment,
+        quant,
+        interlace,
+        intra_dc_vlc_thr,
+        5,
+    );
+}
+
+/// Write `vop_quant` (or a video packet's `quant_scale`): a
+/// `quant_precision`-bit quantiser scale in `1..=2^quant_precision - 1`
+/// (§6.3.5).
+pub(crate) fn write_quantiser_scale(bw: &mut BitWriter, quant: u32, quant_precision: u8) {
+    assert!(
+        (3..=9).contains(&quant_precision),
+        "quant_precision {quant_precision} out of range"
+    );
+    assert!(
+        quant >= 1 && quant < (1 << quant_precision),
+        "quantiser scale {quant} out of the {quant_precision}-bit range"
+    );
+    bw.write_bits(quant, usize::from(quant_precision));
+}
+
+/// [`write_i_vop_header`] for a VOL of the given §6.3.3
+/// `quant_precision`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_i_vop_header_precision(
+    bw: &mut BitWriter,
+    resolution: u16,
+    modulo_time_base: u32,
+    time_increment: u16,
+    quant: u32,
+    interlace: Option<VopInterlaceFlags>,
+    intra_dc_vlc_thr: u8,
+    quant_precision: u8,
+) {
     bw.write_start_code(VOP_START_CODE);
     bw.write_bits(0b00, 2); // vop_coding_type = I
     for _ in 0..modulo_time_base {
@@ -735,27 +839,26 @@ pub fn write_i_vop_header(
     if let Some(flags) = interlace {
         flags.write(bw); // top_field_first + alternate_vertical_scan_flag
     }
-    assert!((1..=31).contains(&quant), "vop_quant {quant} out of range");
-    bw.write_bits(quant, 5);
+    write_quantiser_scale(bw, quant, quant_precision);
 }
 
 /// A borrowed planar 4:2:0 input picture (stride == width; chroma
 /// planes are `(width/2 rounded up) × (height/2 rounded up)`).
 #[derive(Debug, Clone, Copy)]
-pub struct FrameView<'a> {
-    /// Luma plane, `width * height` bytes.
-    pub y: &'a [u8],
+pub struct FrameView<'a, S: Sample = u8> {
+    /// Luma plane, `width * height` samples.
+    pub y: &'a [S],
     /// Cb plane.
-    pub cb: &'a [u8],
+    pub cb: &'a [S],
     /// Cr plane.
-    pub cr: &'a [u8],
+    pub cr: &'a [S],
     /// Visible luma width in samples.
     pub width: usize,
     /// Visible luma height in samples.
     pub height: usize,
 }
 
-impl<'a> FrameView<'a> {
+impl<'a, S: Sample> FrameView<'a, S> {
     /// Chroma plane dimensions (4:2:0 — rounded up).
     fn chroma_dims(&self) -> (usize, usize) {
         (self.width.div_ceil(2), self.height.div_ceil(2))
@@ -764,13 +867,13 @@ impl<'a> FrameView<'a> {
     /// Fetch one 8×8 block from a plane with edge replication for
     /// samples beyond the visible area (the encoder's padding choice
     /// for the partial edge macroblocks §6.3.3 requires it to code).
-    fn block_from(plane: &[u8], pw: usize, ph: usize, y0: usize, x0: usize) -> [[i32; 8]; 8] {
+    fn block_from(plane: &[S], pw: usize, ph: usize, y0: usize, x0: usize) -> [[i32; 8]; 8] {
         let mut out = [[0i32; 8]; 8];
         for (dy, row) in out.iter_mut().enumerate() {
             let sy = (y0 + dy).min(ph.saturating_sub(1));
             for (dx, cell) in row.iter_mut().enumerate() {
                 let sx = (x0 + dx).min(pw.saturating_sub(1));
-                *cell = i32::from(plane[sy * pw + sx]);
+                *cell = plane[sy * pw + sx].working();
             }
         }
         out
@@ -888,12 +991,17 @@ pub(crate) fn quantise_intra_block(
     qp: u32,
     quant_type: bool,
     w_intra: &[[u8; 8]; 8],
+    bits_per_pixel: u32,
 ) -> PreparedBlock {
     let mut qf = [[0i32; 8]; 8];
     for v in 0..8 {
         for u in 0..8 {
             qf[v][u] = if (v, u) == (0, 0) {
-                quantise_intra_dc(f[0][0], component, qp)
+                // §7.4.3.4 saturates the decoded QF[0][0] like every
+                // other quantised coefficient, so a level outside
+                // [-2048, 2047] is not representable (it can only
+                // arise above 11 bits per sample).
+                quantise_intra_dc(f[0][0], component, qp).clamp(-2048, 2047)
             } else if quant_type {
                 quantise_method1_intra(f[v][u], w_intra[v][u], qp)
             } else {
@@ -901,7 +1009,10 @@ pub(crate) fn quantise_intra_block(
             };
         }
     }
-    let dc_f = saturate_fprime(inverse_quant_intra_dc(qf[0][0], component, qp, false), 8);
+    let dc_f = saturate_fprime(
+        inverse_quant_intra_dc(qf[0][0], component, qp, false),
+        bits_per_pixel,
+    );
     PreparedBlock { qf, dc_f }
 }
 
@@ -1050,10 +1161,10 @@ pub(crate) fn intra_mb_cbp(plans: &[BlockPlan; 6]) -> (u8, u8) {
 /// [`write_configuration_headers`] for the same config (see
 /// [`crate::encoder`] for the packaged pairing); `qp` is the VOP
 /// quantiser (1..=31).
-pub fn encode_i_vop(
+pub fn encode_i_vop<S: Sample>(
     vol: &crate::vol::VolHeader,
     cfg: &EncoderConfig,
-    frame: &FrameView<'_>,
+    frame: &FrameView<'_, S>,
     modulo_time_base: u32,
     time_increment: u16,
     qp: u32,
@@ -1085,10 +1196,10 @@ pub fn encode_i_vop(
 /// depend on the spend (constant / activity-classed quantisers);
 /// under budget regulation the probe's quantiser sequence is the
 /// threshold-0 one, so the winner is a measured estimate.
-pub fn encode_i_vop_elect_thr(
+pub fn encode_i_vop_elect_thr<S: Sample>(
     vol: &crate::vol::VolHeader,
     cfg: &EncoderConfig,
-    frame: &FrameView<'_>,
+    frame: &FrameView<'_, S>,
     modulo_time_base: u32,
     time_increment: u16,
     qp: u32,
@@ -1099,10 +1210,10 @@ pub fn encode_i_vop_elect_thr(
 }
 
 /// [`encode_i_vop_elect_thr`] returning the encode statistics as well.
-pub fn encode_i_vop_elect_thr_full(
+pub fn encode_i_vop_elect_thr_full<S: Sample>(
     vol: &crate::vol::VolHeader,
     cfg: &EncoderConfig,
-    frame: &FrameView<'_>,
+    frame: &FrameView<'_, S>,
     modulo_time_base: u32,
     time_increment: u16,
     qp: u32,
@@ -1201,10 +1312,10 @@ impl IVopEncodeStats {
 /// stream (scan position 0) otherwise — exactly the decoder's
 /// `use_intra_dc_vlc` rule.
 #[allow(clippy::too_many_arguments)]
-pub fn encode_i_vop_with_thr(
+pub fn encode_i_vop_with_thr<S: Sample>(
     vol: &crate::vol::VolHeader,
     cfg: &EncoderConfig,
-    frame: &FrameView<'_>,
+    frame: &FrameView<'_, S>,
     modulo_time_base: u32,
     time_increment: u16,
     qp: u32,
@@ -1217,10 +1328,10 @@ pub fn encode_i_vop_with_thr(
 
 /// [`encode_i_vop_with_thr`] returning the encode statistics as well.
 #[allow(clippy::too_many_arguments)]
-pub fn encode_i_vop_full(
+pub fn encode_i_vop_full<S: Sample>(
     vol: &crate::vol::VolHeader,
     cfg: &EncoderConfig,
-    frame: &FrameView<'_>,
+    frame: &FrameView<'_, S>,
     modulo_time_base: u32,
     time_increment: u16,
     qp: u32,
@@ -1242,23 +1353,29 @@ pub fn encode_i_vop_full(
 /// [`DcVlcProbe`] costs under both DC-differential VLCs (the Table
 /// 6-25 election input).
 #[allow(clippy::too_many_arguments)]
-fn encode_i_vop_probe(
+fn encode_i_vop_probe<S: Sample>(
     vol: &crate::vol::VolHeader,
     cfg: &EncoderConfig,
-    frame: &FrameView<'_>,
+    frame: &FrameView<'_, S>,
     modulo_time_base: u32,
     time_increment: u16,
     qp: u32,
     thr: u8,
     mut probe: Option<&mut Vec<DcVlcProbe>>,
 ) -> (Vec<u8>, DecodedFrame, IVopEncodeStats) {
-    assert!((1..=31).contains(&qp), "vop_quant {qp} out of range");
+    let max_qp = (1u32 << vol.quant_precision) - 1;
+    let bpp = u32::from(vol.bits_per_pixel);
+    assert!((1..=max_qp).contains(&qp), "vop_quant {qp} out of range");
     assert!(thr <= 7, "intra_dc_vlc_thr {thr} out of range");
+    assert!(
+        (bpp > 8) == (S::MAX_BITS > 8),
+        "pictures deeper than 8 bits are supplied as 16-bit samples, the others as bytes"
+    );
     let (mb_width, mb_height) = cfg.mb_dimensions();
     let w_intra = intra_quant_matrix(vol);
 
     let mut bw = BitWriter::new();
-    write_i_vop_header(
+    write_i_vop_header_precision(
         &mut bw,
         cfg.time_increment_resolution,
         modulo_time_base,
@@ -1266,6 +1383,7 @@ fn encode_i_vop_probe(
         qp,
         cfg.vop_interlace(),
         thr,
+        vol.quant_precision,
     );
     let forced_scan = cfg.forced_scan();
     let layout = if cfg.resilience.data_partitioned {
@@ -1285,6 +1403,7 @@ fn encode_i_vop_probe(
             time_increment_bits: vop_time_increment_bits(cfg.time_increment_resolution),
             intra_dc_vlc_thr: thr,
             total_macroblocks: (mb_width * mb_height) as u32,
+            quant_precision: vol.quant_precision,
             interlaced: cfg.interlaced,
             sprite_trajectory: None,
         },
@@ -1300,14 +1419,19 @@ fn encode_i_vop_probe(
     let regulator = cfg.mb_budget.map(|budget| {
         let activities: Vec<u32> = (0..mb_height * mb_width)
             .map(|i| {
-                crate::pvop_encode::intra_activity(&crate::pvop_encode::source_luma_mb(
-                    frame,
-                    i / mb_width,
-                    i % mb_width,
-                ))
+                crate::pvop_encode::intra_activity_at(
+                    &crate::pvop_encode::source_luma_mb(frame, i / mb_width, i % mb_width),
+                    bpp,
+                )
             })
             .collect();
-        crate::mb_quant::MbRegulator::new(budget, vop_qp, &activities, cfg.adaptive_quant)
+        crate::mb_quant::MbRegulator::with_max_qp(
+            budget,
+            vop_qp,
+            &activities,
+            cfg.adaptive_quant,
+            max_qp,
+        )
     });
     // §6.3.7 running quantiser (seeded by vop_quant, moved by dquant,
     // re-seeded by each video packet's quant_scale).
@@ -1324,14 +1448,15 @@ fn encode_i_vop_probe(
             // quantiser).
             let (qp, dquant) = if regulator.is_some() || cfg.adaptive_quant {
                 let src = crate::pvop_encode::source_luma_mb(frame, mb_row, mb_col);
-                crate::mb_quant::plan_mb_dquant(
+                crate::mb_quant::plan_mb_dquant_bounded(
                     regulator.as_ref(),
                     cfg.adaptive_quant,
                     running_qp,
                     vop_qp,
                     mb_index,
                     pw.total_bits(),
-                    crate::pvop_encode::intra_activity(&src),
+                    crate::pvop_encode::intra_activity_at(&src, bpp),
+                    max_qp,
                 )
             } else {
                 (qp, None)
@@ -1356,13 +1481,14 @@ fn encode_i_vop_probe(
             let mut prepared: Vec<PreparedBlock> = Vec::with_capacity(6);
             for i in 0..6 {
                 let samples = frame.block_with_field_dct(mb_row, mb_col, i, field_dct);
-                let f = forward_dct_8x8(&samples, 8);
+                let f = forward_dct_8x8(&samples, bpp);
                 prepared.push(quantise_intra_block(
                     &f,
                     DcComponent::from_block_index(i),
                     qp,
                     cfg.quant_type,
                     &w_intra,
+                    bpp,
                 ));
             }
 
@@ -1388,7 +1514,7 @@ fn encode_i_vop_probe(
             };
             for (i, prep) in prepared.iter().enumerate() {
                 let component = DcComponent::from_block_index(i);
-                let predictors = grid.predictors_for(mb_row, mb_col, i, 8, qp);
+                let predictors = grid.predictors_for(mb_row, mb_col, i, bpp, qp);
                 let direction =
                     select_dc_direction(predictors.fa_dc, predictors.fb_dc, predictors.fc_dc);
                 let off = plan_block(
@@ -1546,8 +1672,13 @@ fn decode_own_i_vop(
         decode_i_vop_macroblocks(&mut br, vol, &vop, DecodeOptions::spec())
     }
     .expect("own I-VOP payload must decode");
-    let mut frame = DecodedFrame::new(mb_width * 16, mb_height * 16, VopCodingType::I)
-        .expect("frame dimensions are valid");
+    let mut frame = DecodedFrame::with_bit_depth(
+        mb_width * 16,
+        mb_height * 16,
+        VopCodingType::I,
+        u32::from(vol.bits_per_pixel),
+    )
+    .expect("frame dimensions and depth are valid");
     for (idx, mb) in mbs.iter().enumerate() {
         frame
             .blit_macroblock(idx % mb_width, idx / mb_width, mb)

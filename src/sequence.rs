@@ -98,6 +98,18 @@ impl SequenceDecoder {
         mb_height: usize,
         macroblocks: &[ReconstructedMacroblock],
     ) -> Result<Vec<DecodedFrame>, FrameDecodeError> {
+        self.push_i_vop_depth(mb_width, mb_height, macroblocks, 8)
+    }
+
+    /// [`SequenceDecoder::push_i_vop`] at a §6.3.3 `bits_per_pixel`
+    /// of 4..=12.
+    pub fn push_i_vop_depth(
+        &mut self,
+        mb_width: usize,
+        mb_height: usize,
+        macroblocks: &[ReconstructedMacroblock],
+        bits_per_pixel: u32,
+    ) -> Result<Vec<DecodedFrame>, FrameDecodeError> {
         let expected = mb_width * mb_height;
         if macroblocks.len() != expected {
             return Err(FrameDecodeError::MacroblockCountMismatch {
@@ -105,8 +117,12 @@ impl SequenceDecoder {
                 expected,
             });
         }
-        let mut frame =
-            DecodedFrame::new(mb_width * 16, mb_height * 16, crate::vop::VopCodingType::I)?;
+        let mut frame = DecodedFrame::with_bit_depth(
+            mb_width * 16,
+            mb_height * 16,
+            crate::vop::VopCodingType::I,
+            bits_per_pixel,
+        )?;
         for (idx, mb) in macroblocks.iter().enumerate() {
             frame.blit_macroblock(idx % mb_width, idx / mb_width, mb)?;
         }

@@ -51,6 +51,7 @@ use crate::packet_encode::{InterlacedMbInfo, Layout, MbFields, PacketVopInfo, Pa
 use crate::predictor::select_dc_direction;
 use crate::pvop_mv::{PvopMbMotion, predict_inter_macroblock};
 use crate::quantise::{quantise_method1_inter, quantise_method2_inter};
+use crate::sample::Sample;
 use crate::scan::ScanType;
 use crate::texture::{AcEvent, DcComponent};
 use crate::vop::{VopCodingType, VopContext, parse_vop_header_body, vop_time_increment_bits};
@@ -102,6 +103,32 @@ pub fn write_p_vop_header(
     interlace: Option<VopInterlaceFlags>,
     intra_dc_vlc_thr: u8,
 ) {
+    write_p_vop_header_precision(
+        bw,
+        resolution,
+        modulo_time_base,
+        time_increment,
+        quant,
+        fcode,
+        interlace,
+        intra_dc_vlc_thr,
+        5,
+    );
+}
+
+/// [`write_p_vop_header`] for a VOL of the given §6.3.3 `quant_precision`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_p_vop_header_precision(
+    bw: &mut BitWriter,
+    resolution: u16,
+    modulo_time_base: u32,
+    time_increment: u16,
+    quant: u32,
+    fcode: u8,
+    interlace: Option<VopInterlaceFlags>,
+    intra_dc_vlc_thr: u8,
+    quant_precision: u8,
+) {
     bw.write_start_code(VOP_START_CODE);
     bw.write_bits(0b01, 2); // vop_coding_type = P
     for _ in 0..modulo_time_base {
@@ -121,8 +148,7 @@ pub fn write_p_vop_header(
     if let Some(flags) = interlace {
         flags.write(bw); // top_field_first + alternate_vertical_scan_flag
     }
-    assert!((1..=31).contains(&quant), "vop_quant {quant} out of range");
-    bw.write_bits(quant, 5);
+    crate::ivop_encode::write_quantiser_scale(bw, quant, quant_precision);
     assert!(
         (1..=7).contains(&fcode),
         "vop_fcode_forward {fcode} out of range"
@@ -170,19 +196,25 @@ impl PVopEncodeStats {
 
 /// The activity profile of every macroblock of `frame` (row-major),
 /// the `crate::mb_quant::MbRegulator` expected-spend input.
-pub(crate) fn activity_profile(
-    frame: &FrameView<'_>,
+pub(crate) fn activity_profile<S: Sample>(
+    frame: &FrameView<'_, S>,
     mb_width: usize,
     mb_height: usize,
+    bits_per_pixel: u32,
 ) -> Vec<u32> {
     (0..mb_height * mb_width)
-        .map(|i| intra_activity(&source_luma_mb(frame, i / mb_width, i % mb_width)))
+        .map(|i| {
+            intra_activity_at(
+                &source_luma_mb(frame, i / mb_width, i % mb_width),
+                bits_per_pixel,
+            )
+        })
         .collect()
 }
 
 /// 16×16 source luma of one macroblock (edge-replicated), as rows.
-pub(crate) fn source_luma_mb(
-    frame: &FrameView<'_>,
+pub(crate) fn source_luma_mb<S: Sample>(
+    frame: &FrameView<'_, S>,
     mb_row: usize,
     mb_col: usize,
 ) -> [[i32; 16]; 16] {
@@ -207,15 +239,15 @@ pub(crate) fn source_luma_mb(
 /// value `>= limit`), so `result < limit` is always the exact
 /// comparison. Pass `u32::MAX` for the exact SAD.
 #[allow(clippy::too_many_arguments)]
-fn sad_full_pel(
+fn sad_full_pel<S: Sample>(
     src: &[[i32; 16]; 16],
-    reference: &crate::half_sample::ReferenceVop<'_>,
+    reference: &crate::half_sample::ReferenceVop<'_, S>,
     mb_x: i32,
     mb_y: i32,
     dx: i32,
     dy: i32,
     limit: u32,
-    narrow: Option<&[[u8; 16]; 16]>,
+    narrow: Option<&[[S; 16]; 16]>,
 ) -> u32 {
     let mut sad = 0u32;
     // Interior position: whole reference rows, no §7.6.4 clamp.
@@ -224,9 +256,9 @@ fn sad_full_pel(
             let run = reference
                 .row_run(mb_x + dx, mb_y + dy + j as i32, 16)
                 .expect("row inside the plane");
-            let run: &[u8; 16] = run.try_into().expect("sixteen samples");
+            let run: &[S; 16] = run.try_into().expect("sixteen samples");
             sad += match narrow {
-                Some(rows) => row_sad_u8(&rows[j], run),
+                Some(rows) => S::row_sad16(&rows[j], run),
                 None => row_sad(row, run),
             };
             // A partial sum that already reaches the limit cannot
@@ -240,41 +272,32 @@ fn sad_full_pel(
     for (j, row) in src.iter().enumerate() {
         for (i, &s) in row.iter().enumerate() {
             let r = reference.fetch_clamped(mb_x + i as i32 + dx, mb_y + j as i32 + dy);
-            sad += (s - i32::from(r)).unsigned_abs();
+            sad += (s - r.working()).unsigned_abs();
         }
     }
     sad
 }
 
-/// The source rows as 8-bit samples, when every sample is one (a
-/// picture source always is): the byte SAD kernel then applies.
-pub(crate) fn narrow_rows<const R: usize>(src: &[[i32; 16]; R]) -> Option<[[u8; 16]; R]> {
-    let mut out = [[0u8; 16]; R];
+/// The source rows as stored samples, when every sample is one (a
+/// picture source always is): the stored-sample SAD kernel then
+/// applies.
+pub(crate) fn narrow_rows<S: Sample, const R: usize>(src: &[[i32; 16]; R]) -> Option<[[S; 16]; R]> {
+    let mut out = [[S::ZERO; 16]; R];
     for (dst, row) in out.iter_mut().zip(src.iter()) {
         for (d, &s) in dst.iter_mut().zip(row.iter()) {
-            *d = u8::try_from(s).ok()?;
+            *d = S::try_narrow(s)?;
         }
     }
     Some(out)
 }
 
-/// [`row_sad`] over 8-bit source samples.
-#[inline]
-pub(crate) fn row_sad_u8(src: &[u8; 16], reference: &[u8; 16]) -> u32 {
-    let mut sad = 0u32;
-    for i in 0..16 {
-        sad += u32::from(src[i].abs_diff(reference[i]));
-    }
-    sad
-}
-
 /// Sum of absolute differences of one source row against one
 /// reference row.
 #[inline]
-pub(crate) fn row_sad<const N: usize>(src: &[i32; N], reference: &[u8; N]) -> u32 {
+pub(crate) fn row_sad<S: Sample, const N: usize>(src: &[i32; N], reference: &[S; N]) -> u32 {
     let mut sad = 0u32;
     for i in 0..N {
-        sad += (src[i] - i32::from(reference[i])).unsigned_abs();
+        sad += (src[i] - reference[i].working()).unsigned_abs();
     }
     sad
 }
@@ -292,9 +315,9 @@ fn units_per_pel(mode: BVopSampleMode) -> i32 {
 /// SAD of the source macroblock against a sub-pel motion vector (in
 /// `mode`'s units), through the decoder's own §7.6.2.1 / §7.6.2.2
 /// interpolator.
-fn sad_subpel(
+fn sad_subpel<S: Sample>(
     src: &[[i32; 16]; 16],
-    reference: &crate::half_sample::ReferenceVop<'_>,
+    reference: &crate::half_sample::ReferenceVop<'_, S>,
     mb_x: i32,
     mb_y: i32,
     mv: MotionVector,
@@ -312,7 +335,7 @@ fn sad_subpel(
     let mut sad = 0u32;
     for (j, row) in src.iter().enumerate() {
         for (i, &s) in row.iter().enumerate() {
-            sad += (s - i32::from(pred[j * 16 + i])).unsigned_abs();
+            sad += (s - pred[j * 16 + i].working()).unsigned_abs();
         }
     }
     sad
@@ -384,9 +407,9 @@ fn refine_subpel<F: FnMut(MotionVector) -> u32>(
 /// without an exhaustive walk of the (up to ±1024-pel) window. Lattice
 /// points whose 16×16 block lies entirely beyond the §7.6.4 padded
 /// reference edge are skipped (they only duplicate the edge sample).
-pub(crate) fn estimate_motion(
+pub(crate) fn estimate_motion<S: Sample>(
     src: &[[i32; 16]; 16],
-    reference: &crate::half_sample::ReferenceVop<'_>,
+    reference: &crate::half_sample::ReferenceVop<'_, S>,
     mb_x: i32,
     mb_y: i32,
     mode: BVopSampleMode,
@@ -453,9 +476,9 @@ pub(crate) fn estimate_motion(
 
 /// SAD of one 8×8 luminance sub-block (Figure 6-8 index `i`, luma
 /// blocks 0..=3) against a full-pel reference position.
-fn sad_full_pel_block8(
+fn sad_full_pel_block8<S: Sample>(
     src: &[[i32; 16]; 16],
-    reference: &crate::half_sample::ReferenceVop<'_>,
+    reference: &crate::half_sample::ReferenceVop<'_, S>,
     mb_x: i32,
     mb_y: i32,
     block: usize,
@@ -470,7 +493,7 @@ fn sad_full_pel_block8(
             let run = reference
                 .row_run(bx + dx, by + dy + j as i32, 8)
                 .expect("row inside the plane");
-            let run: &[u8; 8] = run.try_into().expect("eight samples");
+            let run: &[S; 8] = run.try_into().expect("eight samples");
             let row: &[i32; 8] = src[row0 + j][col0..col0 + 8]
                 .try_into()
                 .expect("eight samples");
@@ -482,7 +505,7 @@ fn sad_full_pel_block8(
         for i in 0..8 {
             let s = src[row0 + j][col0 + i];
             let r = reference.fetch_clamped(bx + i as i32 + dx, by + j as i32 + dy);
-            sad += (s - i32::from(r)).unsigned_abs();
+            sad += (s - r.working()).unsigned_abs();
         }
     }
     sad
@@ -493,9 +516,9 @@ fn sad_full_pel_block8(
 /// per-block interpolator (the 8×8 §7.6.2.2 path carries its own
 /// Figure 7-30 boundary mirroring, exactly as a decoded inter4v block
 /// does).
-fn sad_subpel_block8(
+fn sad_subpel_block8<S: Sample>(
     src: &[[i32; 16]; 16],
-    reference: &crate::half_sample::ReferenceVop<'_>,
+    reference: &crate::half_sample::ReferenceVop<'_, S>,
     mb_x: i32,
     mb_y: i32,
     block: usize,
@@ -504,7 +527,7 @@ fn sad_subpel_block8(
 ) -> u32 {
     let (row0, col0) = (8 * (block / 2), 8 * (block % 2));
     let (bx, by) = (mb_x + col0 as i32, mb_y + row0 as i32);
-    let mut pred = [0u8; 64];
+    let mut pred = [S::ZERO; 64];
     match mode {
         BVopSampleMode::HalfPel => {
             crate::half_sample::interpolate_block_into(
@@ -529,7 +552,7 @@ fn sad_subpel_block8(
     let mut sad = 0u32;
     for j in 0..8 {
         for i in 0..8 {
-            sad += (src[row0 + j][col0 + i] - i32::from(pred[j * 8 + i])).unsigned_abs();
+            sad += (src[row0 + j][col0 + i] - pred[j * 8 + i].working()).unsigned_abs();
         }
     }
     sad
@@ -539,9 +562,9 @@ fn sad_subpel_block8(
 /// full-pel search over a window around the 1-MV winner (plus the zero
 /// vector), then the sub-pel refinement. Returns the four Figure
 /// 6-8-ordered block MVs (in `mode`'s units) and the summed SAD.
-pub(crate) fn estimate_motion_4mv(
+pub(crate) fn estimate_motion_4mv<S: Sample>(
     src: &[[i32; 16]; 16],
-    reference: &crate::half_sample::ReferenceVop<'_>,
+    reference: &crate::half_sample::ReferenceVop<'_, S>,
     mb_x: i32,
     mb_y: i32,
     seed: MotionVector,
@@ -585,6 +608,33 @@ pub(crate) fn estimate_motion_4mv(
 /// Mean-removed activity of the source macroblock — the classic
 /// intra/inter decision statistic (also the `crate::mb_quant`
 /// activity-class input).
+pub(crate) fn intra_activity_at(src: &[[i32; 16]; 16], bits_per_pixel: u32) -> u32 {
+    to_eight_bit_scale(intra_activity(src), bits_per_pixel)
+}
+
+/// Bring a sum of sample differences measured at `bits_per_pixel` to
+/// the scale it would have on 8-bit samples (the scale the activity
+/// classes and mode biases are stated in).
+pub(crate) fn to_eight_bit_scale(value: u32, bits_per_pixel: u32) -> u32 {
+    if bits_per_pixel >= 8 {
+        value >> (bits_per_pixel - 8)
+    } else {
+        value << (8 - bits_per_pixel)
+    }
+}
+
+/// Bring a bias stated on the 8-bit sample scale to the scale of
+/// sample differences at `bits_per_pixel`.
+pub(crate) fn from_eight_bit_scale(value: u32, bits_per_pixel: u32) -> u32 {
+    if bits_per_pixel >= 8 {
+        value << (bits_per_pixel - 8)
+    } else {
+        value >> (8 - bits_per_pixel)
+    }
+}
+
+/// Sum of absolute deviations of the 256 source samples from their
+/// mean, on the samples' own scale.
 pub(crate) fn intra_activity(src: &[[i32; 16]; 16]) -> u32 {
     let sum: i32 = src.iter().flatten().sum();
     let mean = sum / 256;
@@ -603,7 +653,20 @@ pub(crate) fn quantise_inter_block(
     w_inter: &[[u8; 8]; 8],
     scan: ScanType,
 ) -> (Vec<AcEvent>, [[i32; 8]; 8]) {
-    let f = forward_dct_8x8(residual, 8);
+    quantise_inter_block_depth(residual, qp, quant_type, w_inter, scan, 8)
+}
+
+/// [`quantise_inter_block`] at a §6.3.3 `bits_per_pixel` (the
+/// §7.4.4.4 coefficient range follows the sample depth).
+pub(crate) fn quantise_inter_block_depth(
+    residual: &[[i32; 8]; 8],
+    qp: u32,
+    quant_type: bool,
+    w_inter: &[[u8; 8]; 8],
+    scan: ScanType,
+    bits_per_pixel: u32,
+) -> (Vec<AcEvent>, [[i32; 8]; 8]) {
+    let f = forward_dct_8x8(residual, bits_per_pixel);
     let mut qf = [[0i32; 8]; 8];
     for v in 0..8 {
         for u in 0..8 {
@@ -637,6 +700,21 @@ pub(crate) fn quantise_inter_residual(
     w_inter: &[[u8; 8]; 8],
     scan: ScanType,
 ) -> Vec<Vec<AcEvent>> {
+    quantise_inter_residual_depth(luma, cb, cr, qp, quant_type, w_inter, scan, 8)
+}
+
+/// [`quantise_inter_residual`] at a §6.3.3 `bits_per_pixel`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn quantise_inter_residual_depth(
+    luma: &[[i32; 16]; 16],
+    cb: &[[i32; 8]; 8],
+    cr: &[[i32; 8]; 8],
+    qp: u32,
+    quant_type: bool,
+    w_inter: &[[u8; 8]; 8],
+    scan: ScanType,
+    bits_per_pixel: u32,
+) -> Vec<Vec<AcEvent>> {
     let mut events: Vec<Vec<AcEvent>> = Vec::with_capacity(6);
     for i in 0..4 {
         let (row0, col0) = (8 * (i / 2), 8 * (i % 2));
@@ -644,10 +722,12 @@ pub(crate) fn quantise_inter_residual(
         for (y, row) in block.iter_mut().enumerate() {
             row.copy_from_slice(&luma[row0 + y][col0..col0 + 8]);
         }
-        events.push(quantise_inter_block(&block, qp, quant_type, w_inter, scan).0);
+        events.push(
+            quantise_inter_block_depth(&block, qp, quant_type, w_inter, scan, bits_per_pixel).0,
+        );
     }
-    events.push(quantise_inter_block(cb, qp, quant_type, w_inter, scan).0);
-    events.push(quantise_inter_block(cr, qp, quant_type, w_inter, scan).0);
+    events.push(quantise_inter_block_depth(cb, qp, quant_type, w_inter, scan, bits_per_pixel).0);
+    events.push(quantise_inter_block_depth(cr, qp, quant_type, w_inter, scan, bits_per_pixel).0);
     events
 }
 
@@ -657,8 +737,8 @@ pub(crate) type MacroblockResidual = ([[i32; 16]; 16], [[i32; 8]; 8], [[i32; 8];
 
 /// Source-minus-prediction residual of one macroblock: the 16×16
 /// luminance plus the two 8×8 chroma residuals.
-pub(crate) fn macroblock_residual(
-    frame: &FrameView<'_>,
+pub(crate) fn macroblock_residual<S: Sample>(
+    frame: &FrameView<'_, S>,
     mb_row: usize,
     mb_col: usize,
     prediction: &crate::reconstruct::InterPredictionMacroblock,
@@ -699,27 +779,29 @@ pub(crate) fn inter_cbp(events: &[Vec<AcEvent>]) -> (u8, u8) {
 /// emitted unit (start-code delimited, stuffed) and the mode
 /// statistics.
 #[allow(clippy::too_many_arguments)]
-pub fn encode_p_vop(
+pub fn encode_p_vop<S: Sample>(
     vol: &crate::vol::VolHeader,
     cfg: &EncoderConfig,
-    frame: &FrameView<'_>,
+    frame: &FrameView<'_, S>,
     reference: &DecodedFrame,
     modulo_time_base: u32,
     time_increment: u16,
     qp: u32,
 ) -> (Vec<u8>, PVopEncodeStats) {
-    assert!((1..=31).contains(&qp), "vop_quant {qp} out of range");
+    let max_qp = (1u32 << vol.quant_precision) - 1;
+    let bpp = u32::from(vol.bits_per_pixel);
+    assert!((1..=max_qp).contains(&qp), "vop_quant {qp} out of range");
     let (mb_width, mb_height) = cfg.mb_dimensions();
     let w_intra = crate::block::intra_quant_matrix(vol);
     let w_inter = nonintra_quant_matrix(vol);
     let mode = sample_mode_of(vol);
     let fcode = cfg.fcode;
-    let luma_ref = reference.luma_reference();
-    let cb_ref = reference.cb_reference();
-    let cr_ref = reference.cr_reference();
+    let [luma_ref, cb_ref, cr_ref] = reference
+        .references_as::<S>()
+        .expect("the reference picture is held in the source's sample store");
 
     let mut bw = BitWriter::new();
-    write_p_vop_header(
+    write_p_vop_header_precision(
         &mut bw,
         cfg.time_increment_resolution,
         modulo_time_base,
@@ -728,6 +810,7 @@ pub fn encode_p_vop(
         fcode,
         cfg.vop_interlace(),
         cfg.intra_dc_vlc_thr,
+        vol.quant_precision,
     );
     let scan = inter_scan(cfg);
 
@@ -748,6 +831,7 @@ pub fn encode_p_vop(
             time_increment_bits: vop_time_increment_bits(cfg.time_increment_resolution),
             intra_dc_vlc_thr: cfg.intra_dc_vlc_thr,
             total_macroblocks: (mb_width * mb_height) as u32,
+            quant_precision: vol.quant_precision,
             interlaced: cfg.interlaced,
             sprite_trajectory: None,
         },
@@ -763,8 +847,14 @@ pub fn encode_p_vop(
     let vop_qp = qp;
     let mut running_qp = vop_qp;
     let regulator = cfg.mb_budget.map(|budget| {
-        let activities = activity_profile(frame, mb_width, mb_height);
-        crate::mb_quant::MbRegulator::new(budget, vop_qp, &activities, cfg.adaptive_quant)
+        let activities = activity_profile(frame, mb_width, mb_height, bpp);
+        crate::mb_quant::MbRegulator::with_max_qp(
+            budget,
+            vop_qp,
+            &activities,
+            cfg.adaptive_quant,
+            max_qp,
+        )
     });
 
     for mb_row in 0..mb_height {
@@ -781,14 +871,15 @@ pub fn encode_p_vop(
             let activity = intra_activity(&src);
             let bits_spent = pw.total_bits();
             let plan_quant = |running: u32| -> (u32, Option<i8>) {
-                crate::mb_quant::plan_mb_dquant(
+                crate::mb_quant::plan_mb_dquant_bounded(
                     regulator.as_ref(),
                     cfg.adaptive_quant,
                     running,
                     vop_qp,
                     mb_index,
                     bits_spent,
-                    activity,
+                    to_eight_bit_scale(activity, bpp),
+                    max_qp,
                 )
             };
 
@@ -803,7 +894,7 @@ pub fn encode_p_vop(
             let four = if cfg.four_mv {
                 let (mvs, sad4) = estimate_motion_4mv(&src, &luma_ref, mb_x, mb_y, mv, mode, fcode);
                 let distinct = mvs.iter().any(|&m| m != mvs[0]);
-                if distinct && sad4 + 256 < one_mv_sad {
+                if distinct && sad4 + from_eight_bit_scale(256, bpp) < one_mv_sad {
                     Some((mvs, sad4))
                 } else {
                     None
@@ -831,7 +922,7 @@ pub fn encode_p_vop(
                 None
             };
             let inter_sad = field.map_or(frame_sad, |(_, t, b)| t.sad + b.sad);
-            let choose_intra = activity + 512 < inter_sad;
+            let choose_intra = activity + from_eight_bit_scale(512, bpp) < inter_sad;
 
             if choose_intra {
                 stats.intra += 1;
@@ -930,7 +1021,7 @@ pub fn encode_p_vop(
             } else {
                 res_luma
             };
-            let events = quantise_inter_residual(
+            let events = quantise_inter_residual_depth(
                 &res_luma,
                 &res_cb,
                 &res_cr,
@@ -938,6 +1029,7 @@ pub fn encode_p_vop(
                 cfg.quant_type,
                 &w_inter,
                 scan,
+                bpp,
             );
             let all_zero = events.iter().all(|e| e.is_empty());
 
@@ -1070,9 +1162,9 @@ pub fn encode_p_vop(
 /// the cost-decided `ac_pred_flag` measured under the writer's
 /// layout).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn intra_mb_in_p_fields(
+pub(crate) fn intra_mb_in_p_fields<S: Sample>(
     pw: &PacketWriter,
-    frame: &FrameView<'_>,
+    frame: &FrameView<'_, S>,
     grid: &mut IntraBlockGrid,
     mb_row: usize,
     mb_col: usize,
@@ -1098,9 +1190,11 @@ pub(crate) fn intra_mb_in_p_fields(
     for i in 0..6 {
         let component = DcComponent::from_block_index(i);
         let samples = frame.block_with_field_dct(mb_row, mb_col, i, field_dct);
-        let f = forward_dct_8x8(&samples, 8);
-        let prep: PreparedBlock = quantise_intra_block(&f, component, qp, cfg.quant_type, w_intra);
-        let predictors = grid.predictors_for(mb_row, mb_col, i, 8, qp);
+        let bpp = u32::from(cfg.bits_per_pixel);
+        let f = forward_dct_8x8(&samples, bpp);
+        let prep: PreparedBlock =
+            quantise_intra_block(&f, component, qp, cfg.quant_type, w_intra, bpp);
+        let predictors = grid.predictors_for(mb_row, mb_col, i, u32::from(cfg.bits_per_pixel), qp);
         let direction = select_dc_direction(predictors.fa_dc, predictors.fb_dc, predictors.fc_dc);
         let off = plan_block(
             &prep,
@@ -1238,7 +1332,7 @@ pub fn reconstruct_own_p_vop_with_anchor_motion(
         &entries,
         vop.rounding_type,
         sample_mode_of(vol),
-        8,
+        u32::from(vol.bits_per_pixel),
     )
     .expect("own P-VOP must assemble")
     .clone();

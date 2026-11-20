@@ -35,6 +35,7 @@
 
 use crate::half_sample::ReferenceVop;
 use crate::reconstruct::{MACROBLOCK_CHROMA_SIDE, MACROBLOCK_LUMA_SIDE, ReconstructedMacroblock};
+use crate::sample::Sample;
 use crate::vop::VopCodingType;
 
 /// Errors from frame-store construction and macroblock blitting.
@@ -51,6 +52,12 @@ pub enum FrameStoreError {
         /// Requested luma height in samples.
         height: usize,
     },
+    /// A sample depth outside the §6.3.3 `bits_per_pixel` range 4..=12
+    /// was requested.
+    InvalidBitDepth {
+        /// Requested bits per sample.
+        bits_per_pixel: u32,
+    },
     /// A macroblock blit addressed a column/row outside the frame's
     /// macroblock grid.
     MacroblockOutOfBounds {
@@ -65,6 +72,23 @@ pub enum FrameStoreError {
     },
 }
 
+/// The three sample planes of one picture: one byte per sample up to
+/// 8 bits, 16-bit words for the deeper N-bit pictures (§6.3.3
+/// `bits_per_pixel` 9..=12).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Planes {
+    Narrow {
+        luma: Vec<u8>,
+        cb: Vec<u8>,
+        cr: Vec<u8>,
+    },
+    Wide {
+        luma: Vec<u16>,
+        cb: Vec<u16>,
+        cr: Vec<u16>,
+    },
+}
+
 /// One fully-decoded 4:2:0 VOP held in the decoded-picture buffer.
 ///
 /// The luma plane is `width × height` samples; the two chroma planes
@@ -74,13 +98,18 @@ pub enum FrameStoreError {
 /// bottom edge still has full backing storage to blit into and to read
 /// back from during the next VOP's §7.6.4 last-pel-clamped motion
 /// compensation.
+///
+/// Sample depth is the VOL's §6.3.3 `bits_per_pixel`
+/// ([`DecodedFrame::bits_per_pixel`]). Pictures of up to 8 bits are
+/// read through [`DecodedFrame::luma_samples`] and its chroma
+/// siblings; deeper (N-bit, 9..=12) pictures through
+/// [`DecodedFrame::luma_samples16`] and its siblings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodedFrame {
-    luma: Vec<u8>,
-    cb: Vec<u8>,
-    cr: Vec<u8>,
+    planes: Planes,
     width: usize,
     height: usize,
+    bits_per_pixel: u8,
     coding_type: VopCodingType,
     /// Presentation timestamps attached by the stream decoder — see
     /// [`DecodedFrame::pts`] / [`DecodedFrame::pts_ticks`].
@@ -89,7 +118,7 @@ pub struct DecodedFrame {
 }
 
 impl DecodedFrame {
-    /// Allocate a mid-grey frame of `width × height` luma samples
+    /// Allocate a mid-grey 8-bit frame of `width × height` luma samples
     /// (chroma `width/2 × height/2`), tagged with its `coding_type`.
     ///
     /// `width` and `height` must be non-zero multiples of
@@ -103,6 +132,20 @@ impl DecodedFrame {
         height: usize,
         coding_type: VopCodingType,
     ) -> Result<Self, FrameStoreError> {
+        Self::with_bit_depth(width, height, coding_type, 8)
+    }
+
+    /// [`DecodedFrame::new`] at a §6.3.3 `bits_per_pixel` of 4..=12:
+    /// the planes are filled with the mid-grey `2^(bits_per_pixel - 1)`
+    /// and stored one byte per sample up to 8 bits, in 16-bit words
+    /// above. A depth outside 4..=12 is an
+    /// [`FrameStoreError::InvalidBitDepth`].
+    pub fn with_bit_depth(
+        width: usize,
+        height: usize,
+        coding_type: VopCodingType,
+        bits_per_pixel: u32,
+    ) -> Result<Self, FrameStoreError> {
         if width == 0
             || height == 0
             || !width.is_multiple_of(MACROBLOCK_LUMA_SIDE)
@@ -110,14 +153,30 @@ impl DecodedFrame {
         {
             return Err(FrameStoreError::InvalidDimensions { width, height });
         }
-        let chroma_w = width / 2;
-        let chroma_h = height / 2;
+        if !(4..=12).contains(&bits_per_pixel) {
+            return Err(FrameStoreError::InvalidBitDepth { bits_per_pixel });
+        }
+        let chroma = (width / 2) * (height / 2);
+        let grey = 1u16 << (bits_per_pixel - 1);
+        let planes = if bits_per_pixel <= 8 {
+            let grey = grey as u8;
+            Planes::Narrow {
+                luma: vec![grey; width * height],
+                cb: vec![grey; chroma],
+                cr: vec![grey; chroma],
+            }
+        } else {
+            Planes::Wide {
+                luma: vec![grey; width * height],
+                cb: vec![grey; chroma],
+                cr: vec![grey; chroma],
+            }
+        };
         Ok(Self {
-            luma: vec![128u8; width * height],
-            cb: vec![128u8; chroma_w * chroma_h],
-            cr: vec![128u8; chroma_w * chroma_h],
+            planes,
             width,
             height,
+            bits_per_pixel: bits_per_pixel as u8,
             coding_type,
             pts: None,
             pts_ticks: None,
@@ -135,15 +194,11 @@ impl DecodedFrame {
         cr: Vec<u8>,
     ) -> Result<Self, FrameStoreError> {
         let mut frame = Self::new(width, height, coding_type)?;
-        if luma.len() != frame.luma.len()
-            || cb.len() != frame.cb.len()
-            || cr.len() != frame.cr.len()
-        {
+        let chroma = (width / 2) * (height / 2);
+        if luma.len() != width * height || cb.len() != chroma || cr.len() != chroma {
             return Err(FrameStoreError::InvalidDimensions { width, height });
         }
-        frame.luma = luma;
-        frame.cb = cb;
-        frame.cr = cr;
+        frame.planes = Planes::Narrow { luma, cb, cr };
         Ok(frame)
     }
 
@@ -212,48 +267,140 @@ impl DecodedFrame {
         self.coding_type
     }
 
+    /// The §6.3.3 sample depth of this picture (4..=12; 8 unless the
+    /// VOL set `not_8_bit`).
+    #[inline]
+    pub const fn bits_per_pixel(&self) -> u32 {
+        self.bits_per_pixel as u32
+    }
+
+    /// `true` when the samples are stored in 16-bit words
+    /// (`bits_per_pixel > 8`): read them through
+    /// [`DecodedFrame::luma_samples16`] and its siblings.
+    #[inline]
+    pub const fn is_wide(&self) -> bool {
+        matches!(self.planes, Planes::Wide { .. })
+    }
+
     /// Borrow the luma plane samples (row-major, stride == width).
+    /// Empty for a picture deeper than 8 bits — see
+    /// [`DecodedFrame::luma_samples16`].
     #[inline]
     pub fn luma_samples(&self) -> &[u8] {
-        &self.luma
+        match &self.planes {
+            Planes::Narrow { luma, .. } => luma,
+            Planes::Wide { .. } => &[],
+        }
     }
 
     /// Borrow the Cb plane samples (row-major, stride == width/2).
+    /// Empty for a picture deeper than 8 bits.
     #[inline]
     pub fn cb_samples(&self) -> &[u8] {
-        &self.cb
+        match &self.planes {
+            Planes::Narrow { cb, .. } => cb,
+            Planes::Wide { .. } => &[],
+        }
     }
 
     /// Borrow the Cr plane samples (row-major, stride == width/2).
+    /// Empty for a picture deeper than 8 bits.
     #[inline]
     pub fn cr_samples(&self) -> &[u8] {
-        &self.cr
+        match &self.planes {
+            Planes::Narrow { cr, .. } => cr,
+            Planes::Wide { .. } => &[],
+        }
+    }
+
+    /// The luma plane of a picture deeper than 8 bits (row-major,
+    /// stride == width, each sample in `[0, 2^bits_per_pixel - 1]`);
+    /// `None` for a picture of up to 8 bits.
+    #[inline]
+    pub fn luma_samples16(&self) -> Option<&[u16]> {
+        match &self.planes {
+            Planes::Narrow { .. } => None,
+            Planes::Wide { luma, .. } => Some(luma),
+        }
+    }
+
+    /// The Cb plane of a picture deeper than 8 bits (stride ==
+    /// width/2); `None` for a picture of up to 8 bits.
+    #[inline]
+    pub fn cb_samples16(&self) -> Option<&[u16]> {
+        match &self.planes {
+            Planes::Narrow { .. } => None,
+            Planes::Wide { cb, .. } => Some(cb),
+        }
+    }
+
+    /// The Cr plane of a picture deeper than 8 bits (stride ==
+    /// width/2); `None` for a picture of up to 8 bits.
+    #[inline]
+    pub fn cr_samples16(&self) -> Option<&[u16]> {
+        match &self.planes {
+            Planes::Narrow { .. } => None,
+            Planes::Wide { cr, .. } => Some(cr),
+        }
+    }
+
+    /// Plane `index` (0 luma, 1 Cb, 2 Cr) in the store `S`, when the
+    /// picture is held in that store.
+    fn plane_as<S: Sample>(&self, index: usize) -> Option<&[S]> {
+        match &self.planes {
+            Planes::Narrow { luma, cb, cr } => S::pick(Some([luma, cb, cr][index]), None),
+            Planes::Wide { luma, cb, cr } => S::pick(None, Some([luma, cb, cr][index])),
+        }
+    }
+
+    /// [`ReferenceVop`] views over the luma, Cb and Cr planes in the
+    /// store `S`; `None` when the picture is held in the other store.
+    #[doc(hidden)] // internal decode plumbing, not the crate's stable public API
+    pub fn references_as<S: Sample>(&self) -> Option<[ReferenceVop<'_, S>; 3]> {
+        let (cw, ch) = (self.width / 2, self.height / 2);
+        Some([
+            ReferenceVop::new(self.plane_as::<S>(0)?, self.width, self.height)?,
+            ReferenceVop::new(self.plane_as::<S>(1)?, cw, ch)?,
+            ReferenceVop::new(self.plane_as::<S>(2)?, cw, ch)?,
+        ])
     }
 
     /// A [`ReferenceVop`] view over the luma plane for motion
     /// compensation of the next VOP.
+    ///
+    /// # Panics
+    ///
+    /// Panics for a picture deeper than 8 bits (use
+    /// [`DecodedFrame::references_as`]).
     #[inline]
     #[doc(hidden)] // internal decode plumbing, not the crate's stable public API
     pub fn luma_reference(&self) -> ReferenceVop<'_> {
         // dimensions validated in `new`, so the view is always Some.
-        ReferenceVop::new(&self.luma, self.width, self.height)
+        ReferenceVop::new(self.narrow_plane(0), self.width, self.height)
             .expect("luma dimensions validated at construction")
     }
 
-    /// A [`ReferenceVop`] view over the Cb plane.
+    /// A [`ReferenceVop`] view over the Cb plane (8-bit store; panics
+    /// like [`DecodedFrame::luma_reference`]).
     #[inline]
     #[doc(hidden)] // internal decode plumbing, not the crate's stable public API
     pub fn cb_reference(&self) -> ReferenceVop<'_> {
-        ReferenceVop::new(&self.cb, self.width / 2, self.height / 2)
+        ReferenceVop::new(self.narrow_plane(1), self.width / 2, self.height / 2)
             .expect("chroma dimensions validated at construction")
     }
 
-    /// A [`ReferenceVop`] view over the Cr plane.
+    /// A [`ReferenceVop`] view over the Cr plane (8-bit store; panics
+    /// like [`DecodedFrame::luma_reference`]).
     #[inline]
     #[doc(hidden)] // internal decode plumbing, not the crate's stable public API
     pub fn cr_reference(&self) -> ReferenceVop<'_> {
-        ReferenceVop::new(&self.cr, self.width / 2, self.height / 2)
+        ReferenceVop::new(self.narrow_plane(2), self.width / 2, self.height / 2)
             .expect("chroma dimensions validated at construction")
+    }
+
+    fn narrow_plane(&self, index: usize) -> &[u8] {
+        self.plane_as::<u8>(index)
+            .expect("an 8-bit reference view of a picture deeper than 8 bits")
     }
 
     /// Blit one reconstructed macroblock into this frame at macroblock
@@ -262,9 +409,9 @@ impl DecodedFrame {
     /// The 16×16 luma block lands at luma pixel `(16 * mb_col,
     /// 16 * mb_row)`; the two 8×8 chroma blocks land at chroma pixel
     /// `(8 * mb_col, 8 * mb_row)`. Each `i32` sample is clamped into
-    /// `[0, 255]` defensively before storing — [`ReconstructedMacroblock`]
-    /// already guarantees the §7.3 display range for `bits_per_pixel ==
-    /// 8`, so the clamp is a no-op on valid input.
+    /// `[0, 2^bits_per_pixel - 1]` defensively before storing —
+    /// [`ReconstructedMacroblock`] already guarantees the §7.3 display
+    /// range, so the clamp is a no-op on valid input.
     #[doc(hidden)] // internal decode plumbing, not the crate's stable public API
     pub fn blit_macroblock(
         &mut self,
@@ -282,44 +429,68 @@ impl DecodedFrame {
                 mb_height: mb_h,
             });
         }
-
-        // Luma: 16×16 at (16*col, 16*row), stride == width.
-        let luma_x0 = mb_col * MACROBLOCK_LUMA_SIDE;
-        let luma_y0 = mb_row * MACROBLOCK_LUMA_SIDE;
-        for (dy, row) in mb.luma.iter().enumerate() {
-            let base = (luma_y0 + dy) * self.width + luma_x0;
-            let dst = &mut self.luma[base..base + MACROBLOCK_LUMA_SIDE];
-            for (d, &sample) in dst.iter_mut().zip(row.iter()) {
-                *d = sample.clamp(0, 255) as u8;
+        let max = (1i32 << self.bits_per_pixel) - 1;
+        let width = self.width;
+        match &mut self.planes {
+            Planes::Narrow { luma, cb, cr } => {
+                blit_planes(luma, cb, cr, width, mb_col, mb_row, mb, max)
             }
-        }
-
-        // Chroma: 8×8 at (8*col, 8*row), stride == width/2.
-        let chroma_w = self.width / 2;
-        let chroma_x0 = mb_col * MACROBLOCK_CHROMA_SIDE;
-        let chroma_y0 = mb_row * MACROBLOCK_CHROMA_SIDE;
-        for (dy, (cb_row, cr_row)) in mb.cb.iter().zip(mb.cr.iter()).enumerate() {
-            let base = (chroma_y0 + dy) * chroma_w + chroma_x0;
-            let cb_dst = &mut self.cb[base..base + MACROBLOCK_CHROMA_SIDE];
-            for (d, &sample) in cb_dst.iter_mut().zip(cb_row.iter()) {
-                *d = sample.clamp(0, 255) as u8;
-            }
-            let cr_dst = &mut self.cr[base..base + MACROBLOCK_CHROMA_SIDE];
-            for (d, &sample) in cr_dst.iter_mut().zip(cr_row.iter()) {
-                *d = sample.clamp(0, 255) as u8;
+            Planes::Wide { luma, cb, cr } => {
+                blit_planes(luma, cb, cr, width, mb_col, mb_row, mb, max)
             }
         }
         Ok(())
     }
 
-    /// Read back a single luma sample (debug / test helper). Returns
-    /// `None` if out of bounds.
+    /// Read back a single luma sample of a picture of up to 8 bits
+    /// (debug / test helper). Returns `None` if out of bounds or for a
+    /// deeper picture.
     #[inline]
     pub fn luma_at(&self, x: usize, y: usize) -> Option<u8> {
         if x >= self.width || y >= self.height {
             return None;
         }
-        Some(self.luma[y * self.width + x])
+        self.luma_samples().get(y * self.width + x).copied()
+    }
+}
+
+/// [`DecodedFrame::blit_macroblock`] over one store.
+#[allow(clippy::too_many_arguments)]
+fn blit_planes<S: Sample>(
+    luma: &mut [S],
+    cb: &mut [S],
+    cr: &mut [S],
+    width: usize,
+    mb_col: usize,
+    mb_row: usize,
+    mb: &ReconstructedMacroblock,
+    max: i32,
+) {
+    // Luma: 16×16 at (16*col, 16*row), stride == width.
+    let luma_x0 = mb_col * MACROBLOCK_LUMA_SIDE;
+    let luma_y0 = mb_row * MACROBLOCK_LUMA_SIDE;
+    for (dy, row) in mb.luma.iter().enumerate() {
+        let base = (luma_y0 + dy) * width + luma_x0;
+        let dst = &mut luma[base..base + MACROBLOCK_LUMA_SIDE];
+        for (d, &sample) in dst.iter_mut().zip(row.iter()) {
+            *d = S::narrow(sample.clamp(0, max));
+        }
+    }
+
+    // Chroma: 8×8 at (8*col, 8*row), stride == width/2.
+    let chroma_w = width / 2;
+    let chroma_x0 = mb_col * MACROBLOCK_CHROMA_SIDE;
+    let chroma_y0 = mb_row * MACROBLOCK_CHROMA_SIDE;
+    for (dy, (cb_row, cr_row)) in mb.cb.iter().zip(mb.cr.iter()).enumerate() {
+        let base = (chroma_y0 + dy) * chroma_w + chroma_x0;
+        let cb_dst = &mut cb[base..base + MACROBLOCK_CHROMA_SIDE];
+        for (d, &sample) in cb_dst.iter_mut().zip(cb_row.iter()) {
+            *d = S::narrow(sample.clamp(0, max));
+        }
+        let cr_dst = &mut cr[base..base + MACROBLOCK_CHROMA_SIDE];
+        for (d, &sample) in cr_dst.iter_mut().zip(cr_row.iter()) {
+            *d = S::narrow(sample.clamp(0, max));
+        }
     }
 }
 

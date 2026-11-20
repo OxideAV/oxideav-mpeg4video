@@ -84,6 +84,7 @@ use crate::motion::{
     DirectCoLocatedMv, DirectModeMv, DirectMvError, DirectMvUnits, MotionVector, MotionVectorDelta,
     direct_mode_motion_vector, reconstruct_motion_vector,
 };
+use crate::sample::Sample;
 use crate::vol::VolHeader;
 use crate::vop::VopCodingType;
 
@@ -211,19 +212,19 @@ pub struct BVopMbDecode {
 /// VOP's planes, `backward_*` the temporally next anchor's.
 #[derive(Debug, Clone, Copy)]
 #[doc(hidden)] // internal decode plumbing, not the crate's stable public API
-pub struct BVopAnchorPlanes<'a> {
+pub struct BVopAnchorPlanes<'a, S: Sample = u8> {
     /// Forward (previous anchor) luma plane.
-    pub forward_luma: &'a crate::half_sample::ReferenceVop<'a>,
+    pub forward_luma: &'a crate::half_sample::ReferenceVop<'a, S>,
     /// Backward (next anchor) luma plane.
-    pub backward_luma: &'a crate::half_sample::ReferenceVop<'a>,
+    pub backward_luma: &'a crate::half_sample::ReferenceVop<'a, S>,
     /// Forward Cb plane.
-    pub forward_cb: &'a crate::half_sample::ReferenceVop<'a>,
+    pub forward_cb: &'a crate::half_sample::ReferenceVop<'a, S>,
     /// Backward Cb plane.
-    pub backward_cb: &'a crate::half_sample::ReferenceVop<'a>,
+    pub backward_cb: &'a crate::half_sample::ReferenceVop<'a, S>,
     /// Forward Cr plane.
-    pub forward_cr: &'a crate::half_sample::ReferenceVop<'a>,
+    pub forward_cr: &'a crate::half_sample::ReferenceVop<'a, S>,
     /// Backward Cr plane.
-    pub backward_cr: &'a crate::half_sample::ReferenceVop<'a>,
+    pub backward_cr: &'a crate::half_sample::ReferenceVop<'a, S>,
 }
 
 impl BVopMbDecode {
@@ -247,9 +248,9 @@ impl BVopMbDecode {
     /// * `mode` — half-pel vs quarter-pel luma interpolation.
     /// * `bits_per_pixel` — §6.3.3 sample depth for the §7.3 step-3 clip.
     #[allow(clippy::too_many_arguments)]
-    pub fn reconstruct(
+    pub fn reconstruct<S: Sample>(
         &self,
-        anchors: &BVopAnchorPlanes<'_>,
+        anchors: &BVopAnchorPlanes<'_, S>,
         residual: &crate::block::InterMacroblock,
         mb_origin_x: i32,
         mb_origin_y: i32,
@@ -449,9 +450,9 @@ impl BVopFieldMbDecode {
     /// * `sample_mode` — half- vs quarter-sample luma interpolation.
     /// * `bits_per_pixel` — §6.3.3 sample depth for the §7.3 clip.
     #[allow(clippy::too_many_arguments)]
-    pub fn reconstruct(
+    pub fn reconstruct<S: Sample>(
         &self,
-        references: &BVopFieldReferences<'_>,
+        references: &BVopFieldReferences<'_, S>,
         residual: &InterMacroblock,
         mb_origin_x: i32,
         mb_origin_y: i32,
@@ -596,9 +597,9 @@ impl BVopInterlacedDirectMbDecode {
     ///
     /// Direct-mode B-VOP MC always uses rounding control `0`
     /// (§7.7.2.2 pseudo code's final `mc` argument).
-    pub fn reconstruct(
+    pub fn reconstruct<S: Sample>(
         &self,
-        references: &BVopFieldReferences<'_>,
+        references: &BVopFieldReferences<'_, S>,
         residual: &InterMacroblock,
         mb_origin_x: i32,
         mb_origin_y: i32,
@@ -720,11 +721,11 @@ impl BVopInterlacedTexturedDecode {
     ///   path; the field / interlaced-direct B-VOP MC always rounds with 0).
     /// * `bits_per_pixel` — §6.3.3 sample depth for the §7.3 clip.
     #[allow(clippy::too_many_arguments)]
-    pub fn reconstruct(
+    pub fn reconstruct<S: Sample>(
         &self,
-        progressive_anchors: &BVopAnchorPlanes<'_>,
+        progressive_anchors: &BVopAnchorPlanes<'_, S>,
         progressive_mode: crate::bvop_prediction::BVopSampleMode,
-        field_references: &BVopFieldReferences<'_>,
+        field_references: &BVopFieldReferences<'_, S>,
         field_mode: FieldSampleMode,
         mb_origin_x: i32,
         mb_origin_y: i32,

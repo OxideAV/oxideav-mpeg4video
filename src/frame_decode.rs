@@ -31,6 +31,7 @@ use crate::framestore::{DecodedFrame, FrameStore, FrameStoreError};
 use crate::pvop_mv::{PvopMbMotion, predict_inter_macroblock, reconstruct_pvop_macroblock};
 use crate::reconstruct::{ReconstructedMacroblock, reconstruct_inter_macroblock};
 use crate::s_gmc_recon::{GmcReferencePlanes, gmc_prediction_macroblock};
+use crate::sample::Sample;
 use crate::vop::VopCodingType;
 use crate::warp::WarpGeometry;
 
@@ -138,6 +139,40 @@ pub fn assemble_p_vop_frame(
     sample_mode: BVopSampleMode,
     bits_per_pixel: u32,
 ) -> Result<DecodedFrame, FrameDecodeError> {
+    if bits_per_pixel > 8 {
+        assemble_p_vop_frame_in::<u16>(
+            store,
+            mb_width,
+            mb_height,
+            entries,
+            vop_rounding_type,
+            sample_mode,
+            bits_per_pixel,
+        )
+    } else {
+        assemble_p_vop_frame_in::<u8>(
+            store,
+            mb_width,
+            mb_height,
+            entries,
+            vop_rounding_type,
+            sample_mode,
+            bits_per_pixel,
+        )
+    }
+}
+
+/// [`assemble_p_vop_frame`] over one sample store.
+#[allow(clippy::too_many_arguments)]
+fn assemble_p_vop_frame_in<S: Sample>(
+    store: &FrameStore,
+    mb_width: usize,
+    mb_height: usize,
+    entries: &[PVopMbContent],
+    vop_rounding_type: u8,
+    sample_mode: BVopSampleMode,
+    bits_per_pixel: u32,
+) -> Result<DecodedFrame, FrameDecodeError> {
     let expected = mb_width * mb_height;
     if entries.len() != expected {
         return Err(FrameDecodeError::MacroblockCountMismatch {
@@ -148,11 +183,16 @@ pub fn assemble_p_vop_frame(
     let reference = store
         .p_vop_reference()
         .ok_or(FrameDecodeError::MissingReference)?;
-    let luma_ref = reference.luma_reference();
-    let cb_ref = reference.cb_reference();
-    let cr_ref = reference.cr_reference();
+    let [luma_ref, cb_ref, cr_ref] = reference
+        .references_as::<S>()
+        .ok_or(FrameDecodeError::MissingReference)?;
 
-    let mut frame = DecodedFrame::new(mb_width * 16, mb_height * 16, VopCodingType::P)?;
+    let mut frame = DecodedFrame::with_bit_depth(
+        mb_width * 16,
+        mb_height * 16,
+        VopCodingType::P,
+        bits_per_pixel,
+    )?;
 
     for (idx, entry) in entries.iter().enumerate() {
         let mb_col = idx % mb_width;
@@ -317,6 +357,37 @@ pub fn assemble_p_vop_frame_obmc(
     vop_rounding_type: u8,
     bits_per_pixel: u32,
 ) -> Result<DecodedFrame, FrameDecodeError> {
+    if bits_per_pixel > 8 {
+        assemble_p_vop_frame_obmc_in::<u16>(
+            store,
+            mb_width,
+            mb_height,
+            entries,
+            vop_rounding_type,
+            bits_per_pixel,
+        )
+    } else {
+        assemble_p_vop_frame_obmc_in::<u8>(
+            store,
+            mb_width,
+            mb_height,
+            entries,
+            vop_rounding_type,
+            bits_per_pixel,
+        )
+    }
+}
+
+/// [`assemble_p_vop_frame_obmc`] over one sample store.
+#[allow(clippy::too_many_arguments)]
+fn assemble_p_vop_frame_obmc_in<S: Sample>(
+    store: &FrameStore,
+    mb_width: usize,
+    mb_height: usize,
+    entries: &[PVopMbContent],
+    vop_rounding_type: u8,
+    bits_per_pixel: u32,
+) -> Result<DecodedFrame, FrameDecodeError> {
     use crate::half_sample::{fetch_clamped_sample, split_half_pel};
     use crate::obmc::{ObmcConfig, ObmcMv, ObmcNeighbourhood, obmc_predict_block};
     use crate::reconstruct::InterPredictionMacroblock;
@@ -331,15 +402,20 @@ pub fn assemble_p_vop_frame_obmc(
     let reference = store
         .p_vop_reference()
         .ok_or(FrameDecodeError::MissingReference)?;
-    let luma_ref = reference.luma_reference();
-    let cb_ref = reference.cb_reference();
-    let cr_ref = reference.cr_reference();
+    let [luma_ref, cb_ref, cr_ref] = reference
+        .references_as::<S>()
+        .ok_or(FrameDecodeError::MissingReference)?;
 
     let field = obmc_block_field(entries, mb_width);
     let bw = 2 * mb_width;
     let bh = 2 * mb_height;
 
-    let mut frame = DecodedFrame::new(mb_width * 16, mb_height * 16, VopCodingType::P)?;
+    let mut frame = DecodedFrame::with_bit_depth(
+        mb_width * 16,
+        mb_height * 16,
+        VopCodingType::P,
+        bits_per_pixel,
+    )?;
     for (idx, entry) in entries.iter().enumerate() {
         let mb_col = idx % mb_width;
         let mb_row = idx / mb_width;
@@ -406,7 +482,7 @@ pub fn assemble_p_vop_frame_obmc(
                     let row0 = 8 * (b >> 1);
                     for (j, row) in block.iter().enumerate() {
                         for (i, &px) in row.iter().enumerate() {
-                            pred.luma[row0 + j][col0 + i] = i32::from(px);
+                            pred.luma[row0 + j][col0 + i] = px.working();
                         }
                     }
                 }
@@ -435,8 +511,8 @@ pub fn assemble_p_vop_frame_obmc(
                 .ok_or(FrameDecodeError::InterPredictionFailed { mb_col, mb_row })?;
                 for y in 0..8 {
                     for x in 0..8 {
-                        pred.cb[y][x] = i32::from(cb[y * 8 + x]);
-                        pred.cr[y][x] = i32::from(cr[y * 8 + x]);
+                        pred.cb[y][x] = cb[y * 8 + x].working();
+                        pred.cr[y][x] = cr[y * 8 + x].working();
                     }
                 }
                 reconstruct_inter_macroblock(&pred, residual, bits_per_pixel)
@@ -491,6 +567,18 @@ pub fn decode_i_vop<'a>(
     mb_height: usize,
     macroblocks: &[ReconstructedMacroblock],
 ) -> Result<&'a DecodedFrame, FrameDecodeError> {
+    decode_i_vop_depth(store, mb_width, mb_height, macroblocks, 8)
+}
+
+/// [`decode_i_vop`] at a §6.3.3 `bits_per_pixel` of 4..=12.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
+pub fn decode_i_vop_depth<'a>(
+    store: &'a mut FrameStore,
+    mb_width: usize,
+    mb_height: usize,
+    macroblocks: &[ReconstructedMacroblock],
+    bits_per_pixel: u32,
+) -> Result<&'a DecodedFrame, FrameDecodeError> {
     let expected = mb_width * mb_height;
     if macroblocks.len() != expected {
         return Err(FrameDecodeError::MacroblockCountMismatch {
@@ -498,7 +586,12 @@ pub fn decode_i_vop<'a>(
             expected,
         });
     }
-    let mut frame = DecodedFrame::new(mb_width * 16, mb_height * 16, VopCodingType::I)?;
+    let mut frame = DecodedFrame::with_bit_depth(
+        mb_width * 16,
+        mb_height * 16,
+        VopCodingType::I,
+        bits_per_pixel,
+    )?;
     for (idx, mb) in macroblocks.iter().enumerate() {
         let mb_col = idx % mb_width;
         let mb_row = idx / mb_width;
@@ -538,6 +631,40 @@ pub fn assemble_b_vop_frame(
     sample_mode: BVopSampleMode,
     bits_per_pixel: u32,
 ) -> Result<DecodedFrame, FrameDecodeError> {
+    if bits_per_pixel > 8 {
+        assemble_b_vop_frame_in::<u16>(
+            store,
+            mb_width,
+            mb_height,
+            entries,
+            vop_rounding_type,
+            sample_mode,
+            bits_per_pixel,
+        )
+    } else {
+        assemble_b_vop_frame_in::<u8>(
+            store,
+            mb_width,
+            mb_height,
+            entries,
+            vop_rounding_type,
+            sample_mode,
+            bits_per_pixel,
+        )
+    }
+}
+
+/// [`assemble_b_vop_frame`] over one sample store.
+#[allow(clippy::too_many_arguments)]
+fn assemble_b_vop_frame_in<S: Sample>(
+    store: &FrameStore,
+    mb_width: usize,
+    mb_height: usize,
+    entries: &[BVopMbTexturedDecode],
+    vop_rounding_type: u8,
+    sample_mode: BVopSampleMode,
+    bits_per_pixel: u32,
+) -> Result<DecodedFrame, FrameDecodeError> {
     let expected = mb_width * mb_height;
     if entries.len() != expected {
         return Err(FrameDecodeError::MacroblockCountMismatch {
@@ -548,12 +675,12 @@ pub fn assemble_b_vop_frame(
     let (forward, backward) = store
         .b_vop_references()
         .ok_or(FrameDecodeError::MissingReference)?;
-    let fwd_luma = forward.luma_reference();
-    let bwd_luma = backward.luma_reference();
-    let fwd_cb = forward.cb_reference();
-    let bwd_cb = backward.cb_reference();
-    let fwd_cr = forward.cr_reference();
-    let bwd_cr = backward.cr_reference();
+    let [fwd_luma, fwd_cb, fwd_cr] = forward
+        .references_as::<S>()
+        .ok_or(FrameDecodeError::MissingReference)?;
+    let [bwd_luma, bwd_cb, bwd_cr] = backward
+        .references_as::<S>()
+        .ok_or(FrameDecodeError::MissingReference)?;
     let anchors = BVopAnchorPlanes {
         forward_luma: &fwd_luma,
         backward_luma: &bwd_luma,
@@ -563,7 +690,12 @@ pub fn assemble_b_vop_frame(
         backward_cr: &bwd_cr,
     };
 
-    let mut frame = DecodedFrame::new(mb_width * 16, mb_height * 16, VopCodingType::B)?;
+    let mut frame = DecodedFrame::with_bit_depth(
+        mb_width * 16,
+        mb_height * 16,
+        VopCodingType::B,
+        bits_per_pixel,
+    )?;
     for (idx, entry) in entries.iter().enumerate() {
         let mb_col = idx % mb_width;
         let mb_row = idx / mb_width;
@@ -607,6 +739,43 @@ pub fn assemble_b_vop_interlaced_frame(
     field_mode: crate::bvop_field_motion::FieldSampleMode,
     bits_per_pixel: u32,
 ) -> Result<DecodedFrame, FrameDecodeError> {
+    if bits_per_pixel > 8 {
+        assemble_b_vop_interlaced_frame_in::<u16>(
+            store,
+            mb_width,
+            mb_height,
+            entries,
+            vop_rounding_type,
+            progressive_mode,
+            field_mode,
+            bits_per_pixel,
+        )
+    } else {
+        assemble_b_vop_interlaced_frame_in::<u8>(
+            store,
+            mb_width,
+            mb_height,
+            entries,
+            vop_rounding_type,
+            progressive_mode,
+            field_mode,
+            bits_per_pixel,
+        )
+    }
+}
+
+/// [`assemble_b_vop_interlaced_frame`] over one sample store.
+#[allow(clippy::too_many_arguments)]
+fn assemble_b_vop_interlaced_frame_in<S: Sample>(
+    store: &FrameStore,
+    mb_width: usize,
+    mb_height: usize,
+    entries: &[crate::bvop_mv::BVopInterlacedTexturedDecode],
+    vop_rounding_type: u8,
+    progressive_mode: BVopSampleMode,
+    field_mode: crate::bvop_field_motion::FieldSampleMode,
+    bits_per_pixel: u32,
+) -> Result<DecodedFrame, FrameDecodeError> {
     let expected = mb_width * mb_height;
     if entries.len() != expected {
         return Err(FrameDecodeError::MacroblockCountMismatch {
@@ -617,12 +786,12 @@ pub fn assemble_b_vop_interlaced_frame(
     let (forward, backward) = store
         .b_vop_references()
         .ok_or(FrameDecodeError::MissingReference)?;
-    let fwd_luma = forward.luma_reference();
-    let bwd_luma = backward.luma_reference();
-    let fwd_cb = forward.cb_reference();
-    let bwd_cb = backward.cb_reference();
-    let fwd_cr = forward.cr_reference();
-    let bwd_cr = backward.cr_reference();
+    let [fwd_luma, fwd_cb, fwd_cr] = forward
+        .references_as::<S>()
+        .ok_or(FrameDecodeError::MissingReference)?;
+    let [bwd_luma, bwd_cb, bwd_cr] = backward
+        .references_as::<S>()
+        .ok_or(FrameDecodeError::MissingReference)?;
     let anchors = BVopAnchorPlanes {
         forward_luma: &fwd_luma,
         backward_luma: &bwd_luma,
@@ -640,7 +809,12 @@ pub fn assemble_b_vop_interlaced_frame(
         backward_cr: &bwd_cr,
     };
 
-    let mut frame = DecodedFrame::new(mb_width * 16, mb_height * 16, VopCodingType::B)?;
+    let mut frame = DecodedFrame::with_bit_depth(
+        mb_width * 16,
+        mb_height * 16,
+        VopCodingType::B,
+        bits_per_pixel,
+    )?;
     for (idx, entry) in entries.iter().enumerate() {
         let mb_col = idx % mb_width;
         let mb_row = idx / mb_width;
@@ -737,6 +911,43 @@ pub fn assemble_s_gmc_vop_frame(
     sample_mode: BVopSampleMode,
     bits_per_pixel: u32,
 ) -> Result<DecodedFrame, FrameDecodeError> {
+    if bits_per_pixel > 8 {
+        assemble_s_gmc_vop_frame_in::<u16>(
+            store,
+            mb_width,
+            mb_height,
+            entries,
+            geometry,
+            vop_rounding_type,
+            sample_mode,
+            bits_per_pixel,
+        )
+    } else {
+        assemble_s_gmc_vop_frame_in::<u8>(
+            store,
+            mb_width,
+            mb_height,
+            entries,
+            geometry,
+            vop_rounding_type,
+            sample_mode,
+            bits_per_pixel,
+        )
+    }
+}
+
+/// [`assemble_s_gmc_vop_frame`] over one sample store.
+#[allow(clippy::too_many_arguments)]
+fn assemble_s_gmc_vop_frame_in<S: Sample>(
+    store: &FrameStore,
+    mb_width: usize,
+    mb_height: usize,
+    entries: &[SGmcMbContent],
+    geometry: &WarpGeometry,
+    vop_rounding_type: u8,
+    sample_mode: BVopSampleMode,
+    bits_per_pixel: u32,
+) -> Result<DecodedFrame, FrameDecodeError> {
     let expected = mb_width * mb_height;
     if entries.len() != expected {
         return Err(FrameDecodeError::MacroblockCountMismatch {
@@ -747,16 +958,21 @@ pub fn assemble_s_gmc_vop_frame(
     let reference = store
         .p_vop_reference()
         .ok_or(FrameDecodeError::MissingReference)?;
-    let luma_ref = reference.luma_reference();
-    let cb_ref = reference.cb_reference();
-    let cr_ref = reference.cr_reference();
+    let [luma_ref, cb_ref, cr_ref] = reference
+        .references_as::<S>()
+        .ok_or(FrameDecodeError::MissingReference)?;
     let gmc_planes = GmcReferencePlanes {
         luma: luma_ref,
         cb: cb_ref,
         cr: cr_ref,
     };
 
-    let mut frame = DecodedFrame::new(mb_width * 16, mb_height * 16, VopCodingType::S)?;
+    let mut frame = DecodedFrame::with_bit_depth(
+        mb_width * 16,
+        mb_height * 16,
+        VopCodingType::S,
+        bits_per_pixel,
+    )?;
     for (idx, entry) in entries.iter().enumerate() {
         let mb_col = idx % mb_width;
         let mb_row = idx / mb_width;

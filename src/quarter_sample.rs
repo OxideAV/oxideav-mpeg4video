@@ -127,6 +127,7 @@
 //!   reconstructed and padded reference plane.
 
 use crate::half_sample::ReferenceVop;
+use crate::sample::Sample;
 
 /// A sample source for the §7.6.2.2 quarter-pel cascade. Both the
 /// progressive (frame) reference and the [`FieldRefView`] same-field
@@ -136,25 +137,30 @@ use crate::half_sample::ReferenceVop;
 /// source's `(x, y)`; for [`FieldRefView`] the `y` axis is a single
 /// field's line index.
 trait QpelSource {
-    fn fetch(&self, x: i32, y: i32) -> u8;
+    /// The stored sample type of the source.
+    type Px: Sample;
+
+    fn fetch(&self, x: i32, y: i32) -> Self::Px;
 
     /// The `len` samples of source row `y` from column `x`, when the
     /// run needs no §7.6.4 clamp; `None` otherwise (the caller falls
     /// back to per-sample [`QpelSource::fetch`]).
     #[inline]
-    fn row_run(&self, _x: i32, _y: i32, _len: usize) -> Option<&[u8]> {
+    fn row_run(&self, _x: i32, _y: i32, _len: usize) -> Option<&[Self::Px]> {
         None
     }
 }
 
-impl QpelSource for ReferenceVop<'_> {
+impl<P: Sample> QpelSource for ReferenceVop<'_, P> {
+    type Px = P;
+
     #[inline]
-    fn fetch(&self, x: i32, y: i32) -> u8 {
+    fn fetch(&self, x: i32, y: i32) -> P {
         self.fetch_clamped(x, y)
     }
 
     #[inline]
-    fn row_run(&self, x: i32, y: i32, len: usize) -> Option<&[u8]> {
+    fn row_run(&self, x: i32, y: i32, len: usize) -> Option<&[P]> {
         ReferenceVop::row_run(self, x, y, len)
     }
 }
@@ -166,19 +172,19 @@ impl QpelSource for ReferenceVop<'_> {
 /// plane lands on the edge sample exactly as in the half-sample field
 /// `mc` routine.
 #[derive(Debug, Clone, Copy)]
-pub struct FieldRefView<'a, 'b> {
-    vop: &'b ReferenceVop<'a>,
+pub struct FieldRefView<'a, 'b, P: Sample = u8> {
+    vop: &'b ReferenceVop<'a, P>,
     /// Frame-line offset of this field's first line: 0 = top field
     /// (even frame lines), 1 = bottom field (odd frame lines).
     field_y0: i32,
 }
 
-impl<'a, 'b> FieldRefView<'a, 'b> {
+impl<'a, 'b, P: Sample> FieldRefView<'a, 'b, P> {
     /// Build a field view selecting the top (`field_y0 = 0`) or bottom
     /// (`field_y0 = 1`) field of `vop`. `field_y0` is masked to its low
     /// bit.
     #[inline]
-    pub fn new(vop: &'b ReferenceVop<'a>, field_y0: i32) -> Self {
+    pub fn new(vop: &'b ReferenceVop<'a, P>, field_y0: i32) -> Self {
         Self {
             vop,
             field_y0: field_y0 & 1,
@@ -186,9 +192,11 @@ impl<'a, 'b> FieldRefView<'a, 'b> {
     }
 }
 
-impl QpelSource for FieldRefView<'_, '_> {
+impl<P: Sample> QpelSource for FieldRefView<'_, '_, P> {
+    type Px = P;
+
     #[inline]
-    fn fetch(&self, x: i32, y_field: i32) -> u8 {
+    fn fetch(&self, x: i32, y_field: i32) -> P {
         // Map the field line to its frame line, then apply the §7.6.4
         // last-full-pel clamp on the *frame* grid (the rectangular-VOP
         // edge sample, whatever its parity) — the same clamp the
@@ -202,7 +210,7 @@ impl QpelSource for FieldRefView<'_, '_> {
     }
 
     #[inline]
-    fn row_run(&self, x: i32, y_field: i32, len: usize) -> Option<&[u8]> {
+    fn row_run(&self, x: i32, y_field: i32, len: usize) -> Option<&[P]> {
         self.vop.row_run(x, self.field_y0 + 2 * y_field, len)
     }
 }
@@ -351,20 +359,20 @@ pub const fn reduce_qpel_to_half_pel_chroma(c: i32) -> i32 {
 /// // Flat input → output equals the constant (the FIR coefficients
 /// // sum to 256 — symmetric pair sums: 160+160 - 48-48 + 24+24 - 8-8
 /// // = 320 - 96 + 48 - 16 = 256).
-/// assert_eq!(fir_8tap_clip(&[100; 8], 0, 8), 100);
-/// assert_eq!(fir_8tap_clip(&[100; 8], 1, 8), 100);
+/// assert_eq!(fir_8tap_clip(&[100u8; 8], 0, 8), 100);
+/// assert_eq!(fir_8tap_clip(&[100u8; 8], 1, 8), 100);
 /// ```
 #[inline]
-pub fn fir_8tap_clip(s: &[u8; 8], rounding_control: u8, bits_per_pixel: u32) -> u8 {
+pub fn fir_8tap_clip<P: Sample>(s: &[P; 8], rounding_control: u8, bits_per_pixel: u32) -> P {
     let rc = (rounding_control & 1) as i32;
     let c = QPEL_FIR_C;
-    let acc: i32 = c[0] * (s[3] as i32 + s[4] as i32)
-        + c[1] * (s[2] as i32 + s[5] as i32)
-        + c[2] * (s[1] as i32 + s[6] as i32)
-        + c[3] * (s[0] as i32 + s[7] as i32);
+    let acc: i32 = c[0] * (s[3].working() + s[4].working())
+        + c[1] * (s[2].working() + s[5].working())
+        + c[2] * (s[1].working() + s[6].working())
+        + c[3] * (s[0].working() + s[7].working());
     let v = (acc + 128 - rc) / 256;
     let max = (1i32 << bits_per_pixel) - 1;
-    v.clamp(0, max) as u8
+    P::narrow(v.clamp(0, max))
 }
 
 /// Read eight horizontal samples centred on the half-pel position
@@ -376,8 +384,8 @@ pub fn fir_8tap_clip(s: &[u8; 8], rounding_control: u8, bits_per_pixel: u32) -> 
 /// position; in plane coordinates the eight `x` indices are
 /// `int_x - 3 .. int_x + 5`).
 #[inline]
-fn horiz_taps<S: QpelSource>(vop: &S, int_x: i32, int_y: i32) -> [u8; 8] {
-    let mut out = [0u8; 8];
+fn horiz_taps<S: QpelSource>(vop: &S, int_x: i32, int_y: i32) -> [S::Px; 8] {
+    let mut out = [<S::Px as Sample>::ZERO; 8];
     for (k, dx) in (-3i32..=4).enumerate() {
         out[k] = vop.fetch(int_x + dx, int_y);
     }
@@ -389,8 +397,8 @@ fn horiz_taps<S: QpelSource>(vop: &S, int_x: i32, int_y: i32) -> [u8; 8] {
 /// For a [`FieldRefView`] the `int_y` axis is field-line indices, so
 /// the taps are eight lines of the same field.
 #[inline]
-fn vert_taps<S: QpelSource>(vop: &S, int_x: i32, int_y: i32) -> [u8; 8] {
-    let mut out = [0u8; 8];
+fn vert_taps<S: QpelSource>(vop: &S, int_x: i32, int_y: i32) -> [S::Px; 8] {
+    let mut out = [<S::Px as Sample>::ZERO; 8];
     for (k, dy) in (-3i32..=4).enumerate() {
         out[k] = vop.fetch(int_x, int_y + dy);
     }
@@ -403,13 +411,13 @@ fn vert_taps<S: QpelSource>(vop: &S, int_x: i32, int_y: i32) -> [u8; 8] {
 /// int_y)`. Equivalent to `(Σ C[j] * (A_{-j, 0} + A_{+j, 0}) + 128 -
 /// rc) / 256`, then clipped to `[0, 2^bpp - 1]`.
 #[inline]
-pub fn half_pel_b(
-    vop: &ReferenceVop<'_>,
+pub fn half_pel_b<P: Sample>(
+    vop: &ReferenceVop<'_, P>,
     int_x: i32,
     int_y: i32,
     rounding_control: u8,
     bits_per_pixel: u32,
-) -> u8 {
+) -> P {
     half_pel_b_src(vop, int_x, int_y, rounding_control, bits_per_pixel)
 }
 
@@ -420,7 +428,7 @@ fn half_pel_b_src<S: QpelSource>(
     int_y: i32,
     rounding_control: u8,
     bits_per_pixel: u32,
-) -> u8 {
+) -> S::Px {
     let taps = horiz_taps(vop, int_x, int_y);
     fir_8tap_clip(&taps, rounding_control, bits_per_pixel)
 }
@@ -431,13 +439,13 @@ fn half_pel_b_src<S: QpelSource>(
 /// + 1)`. Equivalent to `(Σ C[j] * (A_{0, -j} + A_{0, +j}) + 128 -
 ///   rc) / 256`, then clipped.
 #[inline]
-pub fn half_pel_c(
-    vop: &ReferenceVop<'_>,
+pub fn half_pel_c<P: Sample>(
+    vop: &ReferenceVop<'_, P>,
     int_x: i32,
     int_y: i32,
     rounding_control: u8,
     bits_per_pixel: u32,
-) -> u8 {
+) -> P {
     half_pel_c_src(vop, int_x, int_y, rounding_control, bits_per_pixel)
 }
 
@@ -448,7 +456,7 @@ fn half_pel_c_src<S: QpelSource>(
     int_y: i32,
     rounding_control: u8,
     bits_per_pixel: u32,
-) -> u8 {
+) -> S::Px {
     let taps = vert_taps(vop, int_x, int_y);
     fir_8tap_clip(&taps, rounding_control, bits_per_pixel)
 }
@@ -459,13 +467,13 @@ fn half_pel_c_src<S: QpelSource>(
 /// `b` values `b_{-3} .. b_4`. Each `b_i` is independently computed
 /// and clipped before entering the second-stage FIR.
 #[inline]
-pub fn half_pel_d(
-    vop: &ReferenceVop<'_>,
+pub fn half_pel_d<P: Sample>(
+    vop: &ReferenceVop<'_, P>,
     int_x: i32,
     int_y: i32,
     rounding_control: u8,
     bits_per_pixel: u32,
-) -> u8 {
+) -> P {
     half_pel_d_src(vop, int_x, int_y, rounding_control, bits_per_pixel)
 }
 
@@ -476,8 +484,8 @@ fn half_pel_d_src<S: QpelSource>(
     int_y: i32,
     rounding_control: u8,
     bits_per_pixel: u32,
-) -> u8 {
-    let mut col = [0u8; 8];
+) -> S::Px {
+    let mut col = [<S::Px as Sample>::ZERO; 8];
     for (k, dy) in (-3i32..=4).enumerate() {
         col[k] = half_pel_b_src(vop, int_x, int_y + dy, rounding_control, bits_per_pixel);
     }
@@ -489,11 +497,11 @@ fn half_pel_d_src<S: QpelSource>(
 /// `(x, y)` input range `[0, 2^bpp - 1]` the numerator is in
 /// `[0, 2^(bpp+1)]` so truncation is equivalent to `floor`.
 #[inline]
-fn bilinear(x: u8, y: u8, rounding_control: u8, bits_per_pixel: u32) -> u8 {
-    let rc = (rounding_control & 1) as u32;
-    let v = (x as u32 + y as u32 + 1 - rc) / 2;
-    let max = (1u32 << bits_per_pixel) - 1;
-    v.min(max) as u8
+fn bilinear<P: Sample>(x: P, y: P, rounding_control: u8, bits_per_pixel: u32) -> P {
+    let rc = i32::from(rounding_control & 1);
+    let v = (x.working() + y.working() + 1 - rc) / 2;
+    let max = (1i32 << bits_per_pixel) - 1;
+    P::narrow(v.min(max))
 }
 
 /// Interpolate one luma quarter-sample-mode pixel at sub-pel position
@@ -513,15 +521,15 @@ fn bilinear(x: u8, y: u8, rounding_control: u8, bits_per_pixel: u32) -> u8 {
 /// fetch via [`ReferenceVop::fetch_clamped`].
 #[inline]
 #[allow(clippy::too_many_arguments)]
-pub fn interpolate_quarter_pixel(
-    vop: &ReferenceVop<'_>,
+pub fn interpolate_quarter_pixel<P: Sample>(
+    vop: &ReferenceVop<'_, P>,
     int_x: i32,
     int_y: i32,
     qfrac_x: u8,
     qfrac_y: u8,
     rounding_control: u8,
     bits_per_pixel: u32,
-) -> u8 {
+) -> P {
     interpolate_quarter_pixel_src(
         vop,
         int_x,
@@ -548,7 +556,7 @@ fn interpolate_quarter_pixel_src<S: QpelSource>(
     qfrac_y: u8,
     rounding_control: u8,
     bits_per_pixel: u32,
-) -> u8 {
+) -> S::Px {
     // Figure 7-32 origin: A_{-1,-1} is the integer-pel anchor and
     // sits at plane coordinate (int_x, int_y); A_{1,-1} is at
     // (int_x + 1, int_y); A_{-1, 1} is at (int_x, int_y + 1); and
@@ -661,8 +669,8 @@ fn interpolate_quarter_pixel_src<S: QpelSource>(
 /// `k = (Σ C[j] * (e_{-j} + e_{+j}) + 128 - rc) / 256`, where each
 /// `e_i = (A_{-1, i} + b_i + 1 - rc) / 2` is the left-column quarter
 /// at row `i ∈ {-3..=4}` relative to the integer anchor.
-fn compute_k<S: QpelSource>(vop: &S, int_x: i32, int_y: i32, rc: u8, bpp: u32) -> u8 {
-    let mut col = [0u8; 8];
+fn compute_k<S: QpelSource>(vop: &S, int_x: i32, int_y: i32, rc: u8, bpp: u32) -> S::Px {
+    let mut col = [<S::Px as Sample>::ZERO; 8];
     for (k, dy) in (-3i32..=4).enumerate() {
         let a = vop.fetch(int_x, int_y + dy);
         let b = half_pel_b_src(vop, int_x, int_y + dy, rc, bpp);
@@ -676,8 +684,8 @@ fn compute_k<S: QpelSource>(vop: &S, int_x: i32, int_y: i32, rc: u8, bpp: u32) -
 /// `l = (Σ C[j] * (f_{-j} + f_{+j}) + 128 - rc) / 256`, where each
 /// `f_i = (b_i + A_{1, i} + 1 - rc) / 2` is the right-column quarter
 /// at row `i ∈ {-3..=4}`.
-fn compute_l<S: QpelSource>(vop: &S, int_x: i32, int_y: i32, rc: u8, bpp: u32) -> u8 {
-    let mut col = [0u8; 8];
+fn compute_l<S: QpelSource>(vop: &S, int_x: i32, int_y: i32, rc: u8, bpp: u32) -> S::Px {
+    let mut col = [<S::Px as Sample>::ZERO; 8];
     for (k, dy) in (-3i32..=4).enumerate() {
         let b = half_pel_b_src(vop, int_x, int_y + dy, rc, bpp);
         let a = vop.fetch(int_x + 1, int_y + dy);
@@ -704,20 +712,20 @@ fn compute_l<S: QpelSource>(vop: &S, int_x: i32, int_y: i32, rc: u8, bpp: u32) -
 /// 7-30 mirrors about the boundary *between* samples (the sample
 /// adjacent to the boundary is repeated first): `E[-k] = R[k-1]` and
 /// `E[size-1+k] = R[size-k]` for `k = 1..=3`.
-struct MirroredRefBlock {
+struct MirroredRefBlock<P: Sample> {
     /// Row-major `(M+1)×(N+1)` interior samples.
-    data: Vec<u8>,
+    data: Vec<P>,
     /// Interior width `M + 1`.
     w: i32,
     /// Interior height `N + 1`.
     h: i32,
 }
 
-impl MirroredRefBlock {
+impl<P: Sample> MirroredRefBlock<P> {
     /// Read the `(w)×(h)` interior block whose top-left integer-pel
     /// sits at source coordinate `(x0, y0)`.
-    fn read<S: QpelSource>(src: &S, x0: i32, y0: i32, w: usize, h: usize) -> Self {
-        let mut data = vec![0u8; w * h];
+    fn read<S: QpelSource<Px = P>>(src: &S, x0: i32, y0: i32, w: usize, h: usize) -> Self {
+        let mut data = vec![P::ZERO; w * h];
         for (j, row) in data.chunks_exact_mut(w).enumerate() {
             for (i, px) in row.iter_mut().enumerate() {
                 *px = src.fetch(x0 + i as i32, y0 + j as i32);
@@ -745,9 +753,11 @@ const fn mirror_index(t: i32, size: i32) -> i32 {
     }
 }
 
-impl QpelSource for MirroredRefBlock {
+impl<P: Sample> QpelSource for MirroredRefBlock<P> {
+    type Px = P;
+
     #[inline]
-    fn fetch(&self, x: i32, y: i32) -> u8 {
+    fn fetch(&self, x: i32, y: i32) -> P {
         let mx = mirror_index(x, self.w);
         let my = mirror_index(y, self.h);
         self.data[(my * self.w + mx) as usize]
@@ -758,21 +768,21 @@ impl QpelSource for MirroredRefBlock {
 /// FIR of `taps[0][i] ..= taps[7][i]` (the eight tap rows), rounded
 /// and clipped exactly as the scalar form.
 #[inline]
-fn fir_rows(
-    taps: &[&[u8; CASCADE_MAX_SIDE]; 8],
+fn fir_rows<P: Sample>(
+    taps: &[&[P; CASCADE_MAX_SIDE]; 8],
     rounding_control: u8,
     bits_per_pixel: u32,
-    out: &mut [u8; CASCADE_MAX_SIDE],
+    out: &mut [P; CASCADE_MAX_SIDE],
 ) {
     let rc = i32::from(rounding_control & 1);
     let c = QPEL_FIR_C;
     let max = (1i32 << bits_per_pixel) - 1;
     for i in 0..CASCADE_MAX_SIDE {
-        let acc = c[0] * (i32::from(taps[3][i]) + i32::from(taps[4][i]))
-            + c[1] * (i32::from(taps[2][i]) + i32::from(taps[5][i]))
-            + c[2] * (i32::from(taps[1][i]) + i32::from(taps[6][i]))
-            + c[3] * (i32::from(taps[0][i]) + i32::from(taps[7][i]));
-        out[i] = ((acc + 128 - rc) / 256).clamp(0, max) as u8;
+        let acc = c[0] * (taps[3][i].working() + taps[4][i].working())
+            + c[1] * (taps[2][i].working() + taps[5][i].working())
+            + c[2] * (taps[1][i].working() + taps[6][i].working())
+            + c[3] * (taps[0][i].working() + taps[7][i].working());
+        out[i] = P::narrow(((acc + 128 - rc) / 256).clamp(0, max));
     }
 }
 
@@ -805,7 +815,7 @@ fn cascade_block<S: QpelSource>(
     qfy: u8,
     rc: u8,
     bpp: u32,
-    out: &mut [u8],
+    out: &mut [S::Px],
 ) {
     debug_assert!((1..=CASCADE_MAX_SIDE).contains(&w) && (1..=CASCADE_MAX_SIDE).contains(&h));
     if qfx & 3 == 0 && qfy & 3 == 0 {
@@ -825,9 +835,9 @@ fn cascade_block<S: QpelSource>(
     }
     let (w1, h1) = (w + 1, h + 1);
     // Stage 1: the horizontal position of every interior row.
-    let mut stage = [[0u8; CASCADE_MAX_SIDE]; CASCADE_MAX_SIDE + 1];
+    let mut stage = [[<S::Px as Sample>::ZERO; CASCADE_MAX_SIDE]; CASCADE_MAX_SIDE + 1];
     // One interior row extended by the three mirrored samples per side.
-    let mut ext = [0u8; CASCADE_MAX_SIDE + 1 + 6];
+    let mut ext = [<S::Px as Sample>::ZERO; CASCADE_MAX_SIDE + 1 + 6];
     for (r, stage_row) in stage.iter_mut().enumerate().take(h1) {
         let y = y0 + r as i32;
         match src.row_run(x0, y, w1) {
@@ -845,9 +855,9 @@ fn cascade_block<S: QpelSource>(
         }
         // The half-sample row `b` over the full stack width (columns
         // past `w` read zero padding and are never used).
-        let mut half = [0u8; CASCADE_MAX_SIDE];
+        let mut half = [<S::Px as Sample>::ZERO; CASCADE_MAX_SIDE];
         if qfx & 3 != 0 {
-            let taps: [&[u8; CASCADE_MAX_SIDE]; 8] = core::array::from_fn(|k| {
+            let taps: [&[S::Px; CASCADE_MAX_SIDE]; 8] = core::array::from_fn(|k| {
                 ext[k..k + CASCADE_MAX_SIDE]
                     .try_into()
                     .expect("sixteen samples")
@@ -876,10 +886,10 @@ fn cascade_block<S: QpelSource>(
             dst.copy_from_slice(&stage[j][..w]);
             continue;
         }
-        let rows: [&[u8; CASCADE_MAX_SIDE]; 8] = core::array::from_fn(|k| {
+        let rows: [&[S::Px; CASCADE_MAX_SIDE]; 8] = core::array::from_fn(|k| {
             &stage[mirror_index(j as i32 + k as i32 - 3, h1 as i32) as usize]
         });
-        let mut line = [0u8; CASCADE_MAX_SIDE];
+        let mut line = [<S::Px as Sample>::ZERO; CASCADE_MAX_SIDE];
         fir_rows(&rows, rc, bpp, &mut line);
         match qfy {
             1 => {
@@ -922,8 +932,8 @@ fn cascade_block<S: QpelSource>(
 // The signature reflects the §7.6.2.2 inputs one-for-one (motion
 // vector x/y, block origin x/y, block w/h, rounding control, bpp).
 #[allow(clippy::too_many_arguments)]
-pub fn interpolate_block_qpel(
-    vop: &ReferenceVop<'_>,
+pub fn interpolate_block_qpel<P: Sample>(
+    vop: &ReferenceVop<'_, P>,
     mv_x: i32,
     mv_y: i32,
     origin_x: i32,
@@ -932,8 +942,8 @@ pub fn interpolate_block_qpel(
     block_h: usize,
     vop_rounding_type: u8,
     bits_per_pixel: u32,
-) -> Vec<u8> {
-    let mut out = vec![0u8; block_w * block_h];
+) -> Vec<P> {
+    let mut out = vec![P::ZERO; block_w * block_h];
     interpolate_block_qpel_into(
         vop,
         mv_x,
@@ -959,8 +969,8 @@ pub fn interpolate_block_qpel(
 ///
 /// Panics if `out.len() < block_w * block_h`.
 #[allow(clippy::too_many_arguments)]
-pub fn interpolate_block_qpel_into(
-    vop: &ReferenceVop<'_>,
+pub fn interpolate_block_qpel_into<P: Sample>(
+    vop: &ReferenceVop<'_, P>,
     mv_x: i32,
     mv_y: i32,
     origin_x: i32,
@@ -969,7 +979,7 @@ pub fn interpolate_block_qpel_into(
     block_h: usize,
     vop_rounding_type: u8,
     bits_per_pixel: u32,
-    out: &mut [u8],
+    out: &mut [P],
 ) {
     assert!(
         out.len() >= block_w * block_h,
@@ -1052,8 +1062,8 @@ pub fn interpolate_block_qpel_into(
 ///
 /// Panics if `out.len() < block_w * block_h`.
 #[allow(clippy::too_many_arguments)]
-pub fn interpolate_block_qpel_field_into(
-    vop: &ReferenceVop<'_>,
+pub fn interpolate_block_qpel_field_into<P: Sample>(
+    vop: &ReferenceVop<'_, P>,
     mv_x: i32,
     mv_y: i32,
     origin_x: i32,
@@ -1063,7 +1073,7 @@ pub fn interpolate_block_qpel_field_into(
     ref_field_y0: i32,
     vop_rounding_type: u8,
     bits_per_pixel: u32,
-    out: &mut [u8],
+    out: &mut [P],
 ) {
     assert!(
         out.len() >= block_w * block_h,
@@ -1129,8 +1139,8 @@ pub fn interpolate_block_qpel_field_into(
 /// allocated `Vec`. See [`interpolate_block_qpel_field_into`] for
 /// parameter semantics.
 #[allow(clippy::too_many_arguments)]
-pub fn interpolate_block_qpel_field(
-    vop: &ReferenceVop<'_>,
+pub fn interpolate_block_qpel_field<P: Sample>(
+    vop: &ReferenceVop<'_, P>,
     mv_x: i32,
     mv_y: i32,
     origin_x: i32,
@@ -1140,8 +1150,8 @@ pub fn interpolate_block_qpel_field(
     ref_field_y0: i32,
     vop_rounding_type: u8,
     bits_per_pixel: u32,
-) -> Vec<u8> {
-    let mut out = vec![0u8; block_w * block_h];
+) -> Vec<P> {
+    let mut out = vec![P::ZERO; block_w * block_h];
     interpolate_block_qpel_field_into(
         vop,
         mv_x,
@@ -1165,7 +1175,7 @@ mod tests {
     /// The per-sample Figure 7-32 evaluation over a mirrored block —
     /// the definition the block cascade must reproduce.
     #[allow(clippy::too_many_arguments)]
-    fn per_sample_block<S: QpelSource>(
+    fn per_sample_block<S: QpelSource<Px = u8>>(
         src: &S,
         x0: i32,
         y0: i32,
@@ -1341,7 +1351,7 @@ mod tests {
         //       = 255 * (160 - 48 + 24 - 8) = 255 * 128 = 32640.
         //   (32640 + 128 - 0)/256 = 32768/256 = 128.
         //   (32640 + 128 - 1)/256 = 32767/256 = 127.99... → 127.
-        let s = [0, 0, 0, 0, 255, 255, 255, 255];
+        let s = [0u8, 0, 0, 0, 255, 255, 255, 255];
         assert_eq!(fir_8tap_clip(&s, 0, 8), 128);
         assert_eq!(fir_8tap_clip(&s, 1, 8), 127);
     }
@@ -1355,7 +1365,7 @@ mod tests {
         // toward zero, but for negative dividend / positive divisor
         // truncation toward zero equals -ceil(|...|) which equals
         // -16; verify with the runtime kernel below).
-        let s = [255, 0, 0, 0, 0, 0, 0, 255];
+        let s = [255u8, 0, 0, 0, 0, 0, 0, 255];
         let pre_clip = (-4080_i32 + 128) / 256;
         assert!(pre_clip < 0, "expected negative pre-clip, got {pre_clip}");
         assert_eq!(fir_8tap_clip(&s, 0, 8), 0);
@@ -1366,7 +1376,7 @@ mod tests {
         // s = [0, 0, 0, 255, 255, 0, 0, 0]; only the centre tap
         // pair contributes: acc = 160 * (255 + 255) = 81600.
         // (81600 + 128) / 256 = 81728 / 256 = 319 → clip to 255.
-        let s = [0, 0, 0, 255, 255, 0, 0, 0];
+        let s = [0u8, 0, 0, 255, 255, 0, 0, 0];
         let pre_clip = (81_600_i32 + 128) / 256;
         assert!(pre_clip > 255, "expected > 255 pre-clip, got {pre_clip}");
         assert_eq!(fir_8tap_clip(&s, 0, 8), 255);

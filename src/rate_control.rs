@@ -99,6 +99,9 @@ pub struct RateController {
     buf: f64,
     /// Running quantiser scale for the next VOP.
     qp: u32,
+    /// Largest quantiser scale the VOL can signal
+    /// (`2^quant_precision - 1`; 31 by default).
+    max_qp: u32,
     /// Count of item-9 violations (a VOP that could not be shrunk
     /// under the occupancy even at quantiser 31). Zero on any feasible
     /// configuration; exposed for observability.
@@ -113,13 +116,23 @@ impl RateController {
     pub fn new(cfg: RateControlConfig, config_bits: u64) -> Self {
         assert!(cfg.bit_rate > 0, "rate control needs a positive bit rate");
         assert!(cfg.vbv_buffer_units > 0, "vbv_buffer_size 0 is forbidden");
-        assert!((1..=31).contains(&cfg.initial_qp));
+        assert!(cfg.initial_qp >= 1);
         Self {
             buf: 64.0 * f64::from(cfg.occupancy_64) + config_bits as f64,
             qp: cfg.initial_qp,
+            max_qp: cfg.initial_qp.max(31),
             cfg,
             underflows: 0,
         }
+    }
+
+    /// Plan under a VOL whose quantiser scale tops out at `max_qp`
+    /// (`2^quant_precision - 1`, §6.3.3) instead of the default 31.
+    pub fn with_max_qp(mut self, max_qp: u32) -> Self {
+        assert!(max_qp >= 1, "the quantiser scale starts at 1");
+        self.max_qp = max_qp;
+        self.qp = self.qp.min(max_qp);
+        self
     }
 
     /// The VBV buffer size `B` in bits (item 2).
@@ -144,10 +157,10 @@ impl RateController {
     /// (the caller then commits the oversized VOP and the violation is
     /// counted).
     pub fn escalate(&mut self) -> bool {
-        if self.qp >= 31 {
+        if self.qp >= self.max_qp {
             return false;
         }
-        self.qp = (self.qp + 4).min(31);
+        self.qp = (self.qp + 4).min(self.max_qp);
         true
     }
 
@@ -160,7 +173,7 @@ impl RateController {
     /// Override the quantiser the next VOP is coded with (the
     /// budget-driven planner's choice).
     pub fn set_qp(&mut self, qp: u32) {
-        assert!((1..=31).contains(&qp));
+        assert!((1..=self.max_qp).contains(&qp));
         self.qp = qp;
     }
 
@@ -200,7 +213,7 @@ impl RateController {
         let ratio = (d / budget).clamp(0.5, 2.0);
         let scaled = (f64::from(self.qp) * ratio).round();
         let bounded = scaled.clamp(f64::from(self.qp) - 2.0, f64::from(self.qp) + 2.0);
-        self.qp = (bounded as i64).clamp(1, 31) as u32;
+        self.qp = (bounded as i64).clamp(1, i64::from(self.max_qp)) as u32;
 
         // Channel refill until the next decoding time: the peak-rate
         // channel idles against a full buffer, so the fill saturates
@@ -333,7 +346,7 @@ impl FirstPassStats {
             let mean_qp: f64 = it
                 .next()
                 .and_then(|t| t.parse().ok())
-                .filter(|q: &f64| (1.0..=31.0).contains(q))
+                .filter(|q: &f64| (1.0..=511.0).contains(q))
                 .ok_or_else(|| format!("record {n}: bad mean quantiser"))?;
             frames.push(FrameStat {
                 class,
@@ -396,6 +409,8 @@ pub struct BudgetPlanner {
     spent: f64,
     /// The VOP currently planned (class + plan), for `escalate`.
     current: Option<(VopClass, VopPlan)>,
+    /// Largest quantiser scale the VOL can signal (31 by default).
+    max_qp: u32,
 }
 
 impl BudgetPlanner {
@@ -409,7 +424,7 @@ impl BudgetPlanner {
         bf: u32,
         initial_qp: u32,
     ) -> Self {
-        assert!(bit_rate > 0 && gop_size > 0 && (1..=31).contains(&initial_qp));
+        assert!(bit_rate > 0 && gop_size > 0 && initial_qp >= 1);
         Self {
             bit_rate: bit_rate as f64,
             bits_per_frame: bit_rate as f64 * seconds_per_vop,
@@ -427,7 +442,19 @@ impl BudgetPlanner {
             sequence_budget: 0.0,
             spent: 0.0,
             current: None,
+            max_qp: initial_qp.max(31),
         }
+    }
+
+    /// Plan under a VOL whose quantiser scale tops out at `max_qp`
+    /// (`2^quant_precision - 1`, §6.3.3) instead of the default 31.
+    pub fn with_max_qp(mut self, max_qp: u32) -> Self {
+        assert!(max_qp >= 1, "the quantiser scale starts at 1");
+        self.max_qp = max_qp;
+        for q in self.last_qp.iter_mut() {
+            *q = (*q).min(max_qp);
+        }
+        self
     }
 
     /// Attach a two-pass plan: the sequence budget is
@@ -530,7 +557,9 @@ impl BudgetPlanner {
                 },
             };
             let last = f64::from(self.last_qp[idx]);
-            let qp = qp.clamp(last - 4.0, last + 4.0).clamp(1.0, 31.0) as u32;
+            let qp = qp
+                .clamp(last - 4.0, last + 4.0)
+                .clamp(1.0, f64::from(self.max_qp)) as u32;
             let plan = VopPlan {
                 qp,
                 target_bits: target.round() as u32,
@@ -570,7 +599,9 @@ impl BudgetPlanner {
         } else {
             f64::from(self.seed_qp(class))
         };
-        let qp = qp.clamp(last - 4.0, last + 4.0).clamp(1.0, 31.0) as u32;
+        let qp = qp
+            .clamp(last - 4.0, last + 4.0)
+            .clamp(1.0, f64::from(self.max_qp)) as u32;
         let plan = VopPlan {
             qp,
             target_bits: target.round() as u32,
@@ -647,7 +678,7 @@ impl BudgetPlanner {
         match class {
             VopClass::I => self.last_qp[0],
             VopClass::P => self.last_qp[1].max(self.last_qp[0]),
-            VopClass::B => (self.last_qp[1].max(self.last_qp[0]) + 1).min(31),
+            VopClass::B => (self.last_qp[1].max(self.last_qp[0]) + 1).min(self.max_qp),
         }
     }
 
@@ -671,9 +702,11 @@ impl BudgetPlanner {
         if (0.75..=1.25).contains(&ratio) {
             return None;
         }
-        let measured = bits as f64 * mean_qp.clamp(1.0, 31.0);
+        let measured = bits as f64 * mean_qp.clamp(1.0, f64::from(self.max_qp));
         self.complexity[idx] = Some(measured);
-        let qp = (measured / target).round().clamp(1.0, 31.0) as u32;
+        let qp = (measured / target)
+            .round()
+            .clamp(1.0, f64::from(self.max_qp)) as u32;
         if qp == plan.qp {
             return None;
         }
@@ -692,10 +725,10 @@ impl BudgetPlanner {
     /// `None` at quantiser 31.
     pub fn escalate(&mut self) -> Option<VopPlan> {
         let (class, mut plan) = self.current?;
-        if plan.qp >= 31 {
+        if plan.qp >= self.max_qp {
             return None;
         }
-        plan.qp = (plan.qp + 4).min(31);
+        plan.qp = (plan.qp + 4).min(self.max_qp);
         self.current = Some((class, plan));
         Some(plan)
     }
@@ -706,7 +739,7 @@ impl BudgetPlanner {
     /// and the two-pass bookkeeping.
     pub fn commit(&mut self, class: VopClass, bits: u64, mean_qp: f64) {
         let idx = class.index();
-        let measured = bits as f64 * mean_qp.clamp(1.0, 31.0);
+        let measured = bits as f64 * mean_qp.clamp(1.0, f64::from(self.max_qp));
         self.complexity[idx] = Some(match self.complexity[idx] {
             Some(prev) => 0.5 * prev + 0.5 * measured,
             None => measured,

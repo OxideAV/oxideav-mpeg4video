@@ -270,7 +270,7 @@ Two-pass on a 60-frame GOP-12 / bf-2 run at 250 kb/s lands at 1.000
 `sprite-points`, `interlaced`, `top-field-first`,
 `alt-scan`, `ecosystem-compat`, `short-header`, `gob-headers`,
 `dc-vlc-thr`, `auto-dc-vlc`, `rc-mode`, `rc-band`, `pass`,
-`stats-file`) is the dual-API sibling of `make_decoder`;
+`stats-file`, `bits-per-pixel`, `quant-precision`) is the dual-API sibling of `make_decoder`;
 `Mpeg4VideoEncoder::first_pass_stats` / `with_first_pass_stats` are the
 direct-API two-pass round trip.
 
@@ -297,6 +297,58 @@ decodes sample-exact against the encoder's closed loop
 (`tests/static_sprite.rs`). This pair is verified against itself
 only: the black-box decoder used elsewhere reads the VOL as a static
 sprite and then declines it, so no independent decode exists yet.
+
+## N-bit video
+
+`not_8_bit` VOLs (§6.3.3: `bits_per_pixel` 4..=12, `quant_precision`
+3..=9) decode and encode. Pictures of up to 8 bits are stored one byte
+per sample, deeper ones in 16-bit words: `DecodedFrame::bits_per_pixel`
+gives the depth, `luma_samples` / `cb_samples` / `cr_samples` the byte
+planes and `luma_samples16` / `cb_samples16` / `cr_samples16` the wide
+ones. The registry decoder labels 9- and 10-bit streams `Yuv420P10Le`
+and 11- and 12-bit streams `Yuv420P12Le` (a depth below its format's
+is scaled by a left shift, so black and full scale sit where the
+format expects them; the native API returns the coded values
+untouched).
+
+Everything the 8-bit decoder does is available at every depth except
+static sprites (typed error): the motion-compensation routines are
+written once over the sample type, and the texture path takes the
+depth where the specification does — the default DC predictor
+`2^(bits_per_pixel + 2)`, the coefficient saturation
+`±2^(bits_per_pixel + 3)`, the inverse-transform and display clips, the
+`quant_precision`-bit quantiser fields and their `2^quant_precision − 1`
+ceiling, and DC sizes up to 12 with their marker bit.
+
+The encoder (`bits-per-pixel`, `quant-precision`; input `Yuv420P`,
+`Yuv420P10Le` or `Yuv420P12Le`; direct API
+`EncoderConfig::with_bit_depth` + `FrameView` over `u16`) codes the
+N-bit object type's tool set (Table 9-1): I-/P-/B-VOPs, AC/DC
+prediction, 4MV, both quantisation methods, per-macroblock quantiser
+modulation, rate control, video packets, data partitioning and
+reversible VLCs. Quarter-sample, GMC, sprites, interlace and the short
+header belong to other object types and are refused. `qp` ranges up
+to `2^quant-precision − 1` (511 at most): 12-bit content needs
+quantisers sixteen times those of 8-bit content for the same relative
+step, and the rate controller uses the whole range.
+
+Measured on a 64×48 translating texture, I/B/P, the same relative
+quantiser at each depth (`tests/nbit.rs`; decoded output identical to
+the encoder's closed loop at every depth):
+
+| bits | 4 | 5 | 6 | 7 | 9 | 10 | 11 | 12 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `qp` | 1 | 1 | 1 | 2 | 8 | 16 | 31 | 31 |
+| luma PSNR (dB) | 25.8 | 31.4 | 36.8 | 36.7 | 36.7 | 36.8 | 36.8 | 42.9 |
+
+One property of the syntax to know about: §7.4.3.4 saturates every
+quantised coefficient — the intra DC included — to [−2048, 2047], and
+at 12 bits a DC scaler of 8 (quantisers 1..=4) would need levels up to
+4095. A 12-bit picture brighter than half scale therefore cannot be
+coded exactly at those quantisers; the encoder clamps the level and
+the closed loop carries the difference. No stream from another N-bit
+encoder was available, so this pair is verified against itself and
+against the 8-bit behaviour of the shared code.
 
 ## Compatibility modes
 
@@ -677,11 +729,6 @@ both modes' envelopes are pinned).
   decoding each piece's `sprite_shape_texture()` macroblock body into
   sprite memory (the object-piece I-VOP / update-piece P-VOP
   macroblock texture subset).
-- N-bit video (`not_8_bit == 1` with `bits_per_pixel != 8`, §6.3.3):
-  the VOL parses, the stream decoder declines its VOPs with a typed
-  error (the picture store, the motion-compensation paths and the
-  encoder input are 8-bit; a wider VOL would otherwise be clipped
-  silently). Neither direction codes N-bit pictures.
 - Scalability enhancement layers, Studio Profile, and non-rectangular
   shapes (rejected with typed errors). GMC global-motion warping *is*
   supported; the §6.3.6 `mcsel` flag is now routed into the §7.3 recon

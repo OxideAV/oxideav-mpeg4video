@@ -23,6 +23,7 @@
 //! (the rectangular-S(GMC)-VOP bounding-rectangle case).
 
 use crate::half_sample::ReferenceVop;
+use crate::sample::Sample;
 use crate::warp::WarpGeometry;
 
 /// One 16×16 luminance macroblock of GMC prediction samples.
@@ -46,8 +47,8 @@ fn div_floor(n: i64, d: i64) -> i64 {
 /// `s` is the sprite-warping denominator, `rc` the `vop_rounding_type`.
 /// Returns the clamped 8-bit (well, `[0, 2^bpp - 1]`-ranged) sample.
 #[inline]
-fn reconstruct_sample(
-    reference: &ReferenceVop<'_>,
+fn reconstruct_sample<S: Sample>(
+    reference: &ReferenceVop<'_, S>,
     cap_f: i64,
     cap_g: i64,
     s: i64,
@@ -61,10 +62,22 @@ fn reconstruct_sample(
     let rj = cap_g - fy * s;
 
     // The four neighbour samples (with §7.6.4 last-full-pel clamping).
-    let y00 = i64::from(reference.fetch_clamped(fx as i32, fy as i32));
-    let y01 = i64::from(reference.fetch_clamped((fx + 1) as i32, fy as i32));
-    let y10 = i64::from(reference.fetch_clamped(fx as i32, (fy + 1) as i32));
-    let y11 = i64::from(reference.fetch_clamped((fx + 1) as i32, (fy + 1) as i32));
+    let y00 = i64::from(reference.fetch_clamped(fx as i32, fy as i32).working());
+    let y01 = i64::from(
+        reference
+            .fetch_clamped((fx + 1) as i32, fy as i32)
+            .working(),
+    );
+    let y10 = i64::from(
+        reference
+            .fetch_clamped(fx as i32, (fy + 1) as i32)
+            .working(),
+    );
+    let y11 = i64::from(
+        reference
+            .fetch_clamped((fx + 1) as i32, (fy + 1) as i32)
+            .working(),
+    );
 
     // GMC bilinear blend.
     let numer =
@@ -84,15 +97,15 @@ fn reconstruct_sample(
 /// pixel `(mb_x + x, mb_y + y)`. `rounding_control` is the VOP-header
 /// `vop_rounding_type`; `bits_per_pixel` is from the VOL header
 /// (typically 8).
-pub fn gmc_luma_prediction(
+pub fn gmc_luma_prediction<S: Sample>(
     geometry: &WarpGeometry,
-    reference: &ReferenceVop<'_>,
+    reference: &ReferenceVop<'_, S>,
     mb_x: i64,
     mb_y: i64,
     rounding_control: u8,
     bits_per_pixel: u32,
-) -> [u8; MB_LUMA_SIDE * MB_LUMA_SIDE] {
-    let mut out = [0u8; MB_LUMA_SIDE * MB_LUMA_SIDE];
+) -> [S; MB_LUMA_SIDE * MB_LUMA_SIDE] {
+    let mut out = [S::ZERO; MB_LUMA_SIDE * MB_LUMA_SIDE];
     let s = geometry.s;
     let rc = i64::from(rounding_control);
     for y in 0..MB_LUMA_SIDE {
@@ -101,7 +114,7 @@ pub fn gmc_luma_prediction(
             let j = mb_y + y as i64;
             let [cap_f, cap_g] = geometry.luma_fg(i, j);
             let sample = reconstruct_sample(reference, cap_f, cap_g, s, rc, bits_per_pixel);
-            out[y * MB_LUMA_SIDE + x] = sample as u8;
+            out[y * MB_LUMA_SIDE + x] = S::narrow(i32::from(sample));
         }
     }
     out
@@ -113,15 +126,15 @@ pub fn gmc_luma_prediction(
 ///
 /// Fills a `MB_CHROMA_SIDE × MB_CHROMA_SIDE` block in row-major order
 /// using the §7.8.5 chroma warp `(Fc, Gc)`.
-pub fn gmc_chroma_prediction(
+pub fn gmc_chroma_prediction<S: Sample>(
     geometry: &WarpGeometry,
-    reference: &ReferenceVop<'_>,
+    reference: &ReferenceVop<'_, S>,
     cb_x: i64,
     cb_y: i64,
     rounding_control: u8,
     bits_per_pixel: u32,
-) -> [u8; MB_CHROMA_SIDE * MB_CHROMA_SIDE] {
-    let mut out = [0u8; MB_CHROMA_SIDE * MB_CHROMA_SIDE];
+) -> [S; MB_CHROMA_SIDE * MB_CHROMA_SIDE] {
+    let mut out = [S::ZERO; MB_CHROMA_SIDE * MB_CHROMA_SIDE];
     let s = geometry.s;
     let rc = i64::from(rounding_control);
     for y in 0..MB_CHROMA_SIDE {
@@ -130,7 +143,7 @@ pub fn gmc_chroma_prediction(
             let jc = cb_y + y as i64;
             let [cap_fc, cap_gc] = geometry.chroma_fg(ic, jc);
             let sample = reconstruct_sample(reference, cap_fc, cap_gc, s, rc, bits_per_pixel);
-            out[y * MB_CHROMA_SIDE + x] = sample as u8;
+            out[y * MB_CHROMA_SIDE + x] = S::narrow(i32::from(sample));
         }
     }
     out

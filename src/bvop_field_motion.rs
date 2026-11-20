@@ -71,6 +71,7 @@ use crate::half_sample::ReferenceVop;
 use crate::interlaced_information::FieldReference;
 use crate::motion::MotionVector;
 use crate::reconstruct::{InterPredictionMacroblock, MACROBLOCK_CHROMA_SIDE, MACROBLOCK_LUMA_SIDE};
+use crate::sample::Sample;
 
 /// The four §7.7.2.2 field motion-vector differentials of one macroblock,
 /// in the bitstream order `MVD[0..4]` (top-fwd, bot-fwd, top-bwd,
@@ -122,19 +123,19 @@ impl FieldReferenceFlags {
 /// field and odd lines the bottom field (§7.7.2.1). `forward_*` are the
 /// past anchor's planes, `backward_*` the future anchor's.
 #[derive(Debug, Clone, Copy)]
-pub struct BVopFieldReferences<'a> {
+pub struct BVopFieldReferences<'a, S: Sample = u8> {
     /// Forward (past) luminance reference plane.
-    pub forward_luma: &'a ReferenceVop<'a>,
+    pub forward_luma: &'a ReferenceVop<'a, S>,
     /// Forward (past) Cb reference plane.
-    pub forward_cb: &'a ReferenceVop<'a>,
+    pub forward_cb: &'a ReferenceVop<'a, S>,
     /// Forward (past) Cr reference plane.
-    pub forward_cr: &'a ReferenceVop<'a>,
+    pub forward_cr: &'a ReferenceVop<'a, S>,
     /// Backward (future) luminance reference plane.
-    pub backward_luma: &'a ReferenceVop<'a>,
+    pub backward_luma: &'a ReferenceVop<'a, S>,
     /// Backward (future) Cb reference plane.
-    pub backward_cb: &'a ReferenceVop<'a>,
+    pub backward_cb: &'a ReferenceVop<'a, S>,
     /// Backward (future) Cr reference plane.
-    pub backward_cr: &'a ReferenceVop<'a>,
+    pub backward_cr: &'a ReferenceVop<'a, S>,
 }
 
 /// Sample-accuracy selector for the §7.7.2.2 luma field interpolation.
@@ -174,10 +175,10 @@ fn average_into(
 /// Compensate one prediction direction from a single reference, choosing
 /// the half- or quarter-sample luma interpolator.
 #[allow(clippy::too_many_arguments)]
-fn compensate_one(
-    luma_ref: &ReferenceVop<'_>,
-    cb_ref: &ReferenceVop<'_>,
-    cr_ref: &ReferenceVop<'_>,
+fn compensate_one<S: Sample>(
+    luma_ref: &ReferenceVop<'_, S>,
+    cb_ref: &ReferenceVop<'_, S>,
+    cr_ref: &ReferenceVop<'_, S>,
     mvs: FieldMotionVectors,
     top_field_ref: FieldReference,
     bottom_field_ref: FieldReference,
@@ -222,10 +223,10 @@ fn compensate_one(
 /// (updating PMV slots 0,1) and compensates from the forward reference.
 /// `deltas` carries `MVD[0]` (top) / `MVD[1]` (bottom).
 #[allow(clippy::too_many_arguments)]
-pub fn field_forward_prediction(
+pub fn field_forward_prediction<S: Sample>(
     bank: &mut FieldPmvBank,
     deltas: FieldMvDeltas,
-    references: &BVopFieldReferences<'_>,
+    references: &BVopFieldReferences<'_, S>,
     refs: FieldReferenceFlags,
     mb_x: i32,
     mb_y: i32,
@@ -254,10 +255,10 @@ pub fn field_forward_prediction(
 /// (updating PMV slots 2,3 — with the §7.7.2.2 bottom-x quirk that reads
 /// PMV[1].x) and compensates from the backward reference.
 #[allow(clippy::too_many_arguments)]
-pub fn field_backward_prediction(
+pub fn field_backward_prediction<S: Sample>(
     bank: &mut FieldPmvBank,
     deltas: FieldMvDeltas,
-    references: &BVopFieldReferences<'_>,
+    references: &BVopFieldReferences<'_, S>,
     refs: FieldReferenceFlags,
     mb_x: i32,
     mb_y: i32,
@@ -288,10 +289,10 @@ pub fn field_backward_prediction(
 /// `(fwd + bak + 1) >> 1`. `mvd` is the four differentials in bitstream
 /// order `MVD[0..4]` (top-fwd, bot-fwd, top-bwd, bot-bwd).
 #[allow(clippy::too_many_arguments)]
-pub fn field_bidirectional_prediction(
+pub fn field_bidirectional_prediction<S: Sample>(
     bank: &mut FieldPmvBank,
     mvd: [MotionVector; 4],
-    references: &BVopFieldReferences<'_>,
+    references: &BVopFieldReferences<'_, S>,
     refs: FieldReferenceFlags,
     mb_x: i32,
     mb_y: i32,

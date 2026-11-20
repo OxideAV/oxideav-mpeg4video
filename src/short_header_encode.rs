@@ -325,7 +325,7 @@ pub fn encode_short_header_picture(
     let vop_qp = qp;
     let mut running_qp = vop_qp;
     let regulator = cfg.mb_budget.map(|budget| {
-        let activities = crate::pvop_encode::activity_profile(frame, mb_width, mb_height);
+        let activities = crate::pvop_encode::activity_profile(frame, mb_width, mb_height, 8);
         crate::mb_quant::MbRegulator::new(budget, vop_qp, &activities, cfg.adaptive_quant)
     });
     let no_matrix = [[0u8; 8]; 8];

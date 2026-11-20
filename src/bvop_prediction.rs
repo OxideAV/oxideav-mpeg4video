@@ -73,6 +73,7 @@
 use crate::half_sample::{ReferenceVop, interpolate_block_into};
 use crate::motion::MotionVector;
 use crate::quarter_sample::interpolate_block_qpel_into;
+use crate::sample::Sample;
 
 /// Side length, in luminance samples, of one B-VOP MC sub-block.
 ///
@@ -181,7 +182,7 @@ pub struct BVopMvPair {
 /// // (0+0+1)>>1=0, (100+102+1)>>1=101, (255+255+1)>>1=255, (1+2+1)>>1=2
 /// assert_eq!(out, [0, 101, 255, 2]);
 /// ```
-pub fn average_bidirectional_into(a: &[u8], b: &[u8], out: &mut [u8]) {
+pub fn average_bidirectional_into<S: Sample>(a: &[S], b: &[S], out: &mut [S]) {
     assert!(
         a.len() == b.len(),
         "average_bidirectional_into: a.len() ({}) != b.len() ({})",
@@ -195,16 +196,15 @@ pub fn average_bidirectional_into(a: &[u8], b: &[u8], out: &mut [u8]) {
         a.len(),
     );
     for (k, slot) in out.iter_mut().enumerate().take(a.len()) {
-        // u16 keeps `255 + 255 + 1 = 511` well within range.
-        let sum = u16::from(a[k]) + u16::from(b[k]) + 1;
-        *slot = (sum >> 1) as u8;
+        // `(a + b + 1) >> 1`: the two-sample average, rounding up.
+        *slot = S::average2(a[k], b[k], 0);
     }
 }
 
 /// Convenience wrapper around [`average_bidirectional_into`] that
 /// returns a freshly allocated `Vec<u8>`.
-pub fn average_bidirectional(a: &[u8], b: &[u8]) -> Vec<u8> {
-    let mut out = vec![0u8; a.len()];
+pub fn average_bidirectional<S: Sample>(a: &[S], b: &[S]) -> Vec<S> {
+    let mut out = vec![S::ZERO; a.len()];
     average_bidirectional_into(a, b, &mut out);
     out
 }
@@ -216,14 +216,14 @@ pub fn average_bidirectional(a: &[u8], b: &[u8]) -> Vec<u8> {
 // Inputs map one-for-one to the §7.6.2 interpolation primitives —
 // a struct wrapper would obscure the call site.
 #[allow(clippy::too_many_arguments)]
-fn interpolate_sub_block(
-    reference: &ReferenceVop<'_>,
+fn interpolate_sub_block<S: Sample>(
+    reference: &ReferenceVop<'_, S>,
     mv: MotionVector,
     origin_x: i32,
     origin_y: i32,
     mode: BVopSampleMode,
     vop_rounding_type: u8,
-    out: &mut [u8],
+    out: &mut [S],
 ) {
     match mode {
         BVopSampleMode::HalfPel => {
@@ -272,7 +272,7 @@ pub const SUB_BLOCK_OFFSETS: [(i32, i32); MB_SUB_BLOCKS] = [
 /// Copy an 8×8 sub-block laid out row-major (length 64) into the
 /// `MB_LUMA_SIDE × MB_LUMA_SIDE` macroblock buffer at sub-block index
 /// `sub_block_index`.
-fn place_sub_block(sub: &[u8], sub_block_index: usize, mb_buf: &mut [u8]) {
+fn place_sub_block<S: Sample>(sub: &[S], sub_block_index: usize, mb_buf: &mut [S]) {
     let (dx, dy) = SUB_BLOCK_OFFSETS[sub_block_index];
     let dx = dx as usize;
     let dy = dy as usize;
@@ -330,16 +330,16 @@ fn place_sub_block(sub: &[u8], sub_block_index: usize, mb_buf: &mut [u8]) {
 // config struct would force the caller into a builder pattern for a
 // one-shot per-macroblock call.
 #[allow(clippy::too_many_arguments)]
-pub fn generate_b_vop_luma_prediction_into(
-    forward_ref: &ReferenceVop<'_>,
-    backward_ref: &ReferenceVop<'_>,
+pub fn generate_b_vop_luma_prediction_into<S: Sample>(
+    forward_ref: &ReferenceVop<'_, S>,
+    backward_ref: &ReferenceVop<'_, S>,
     mvs: &[BVopMvPair; MB_SUB_BLOCKS],
     mb_origin_x: i32,
     mb_origin_y: i32,
     vop_rounding_type: u8,
     mode: BVopSampleMode,
     prediction_mode: BVopPredictionMode,
-    out: &mut [u8],
+    out: &mut [S],
 ) {
     assert!(
         out.len() >= MB_LUMA_PIXELS,
@@ -380,8 +380,8 @@ pub fn generate_b_vop_luma_prediction_into(
             );
         }
         BVopPredictionMode::Bidirectional => {
-            let mut buf_f = [0u8; MB_LUMA_PIXELS];
-            let mut buf_b = [0u8; MB_LUMA_PIXELS];
+            let mut buf_f = [S::ZERO; MB_LUMA_PIXELS];
+            let mut buf_b = [S::ZERO; MB_LUMA_PIXELS];
             interpolate_mb_block(
                 forward_ref,
                 mvs[0].forward,
@@ -407,9 +407,9 @@ pub fn generate_b_vop_luma_prediction_into(
         // — and, in quarter-sample mode, with the §7.6.2.2 mirroring at
         // each 8×8 block boundary.
         BVopPredictionMode::Direct => {
-            let mut sub_buf_f = [0u8; SUB_BLOCK_SIDE * SUB_BLOCK_SIDE];
-            let mut sub_buf_b = [0u8; SUB_BLOCK_SIDE * SUB_BLOCK_SIDE];
-            let mut sub_buf_avg = [0u8; SUB_BLOCK_SIDE * SUB_BLOCK_SIDE];
+            let mut sub_buf_f = [S::ZERO; SUB_BLOCK_SIDE * SUB_BLOCK_SIDE];
+            let mut sub_buf_b = [S::ZERO; SUB_BLOCK_SIDE * SUB_BLOCK_SIDE];
+            let mut sub_buf_avg = [S::ZERO; SUB_BLOCK_SIDE * SUB_BLOCK_SIDE];
             for (i, &(dx, dy)) in SUB_BLOCK_OFFSETS.iter().enumerate() {
                 let origin_x = mb_origin_x + dx;
                 let origin_y = mb_origin_y + dy;
@@ -446,14 +446,14 @@ pub fn generate_b_vop_luma_prediction_into(
 // Inputs map one-for-one to the §7.6.2 interpolation primitives —
 // a struct wrapper would obscure the call site.
 #[allow(clippy::too_many_arguments)]
-fn interpolate_mb_block(
-    reference: &ReferenceVop<'_>,
+fn interpolate_mb_block<S: Sample>(
+    reference: &ReferenceVop<'_, S>,
     mv: MotionVector,
     origin_x: i32,
     origin_y: i32,
     mode: BVopSampleMode,
     vop_rounding_type: u8,
-    out: &mut [u8],
+    out: &mut [S],
 ) {
     match mode {
         BVopSampleMode::HalfPel => {
@@ -490,17 +490,17 @@ fn interpolate_mb_block(
 /// that returns a freshly allocated `Vec<u8>` of length
 /// [`MB_LUMA_PIXELS`].
 #[allow(clippy::too_many_arguments)]
-pub fn generate_b_vop_luma_prediction(
-    forward_ref: &ReferenceVop<'_>,
-    backward_ref: &ReferenceVop<'_>,
+pub fn generate_b_vop_luma_prediction<S: Sample>(
+    forward_ref: &ReferenceVop<'_, S>,
+    backward_ref: &ReferenceVop<'_, S>,
     mvs: &[BVopMvPair; MB_SUB_BLOCKS],
     mb_origin_x: i32,
     mb_origin_y: i32,
     vop_rounding_type: u8,
     mode: BVopSampleMode,
     prediction_mode: BVopPredictionMode,
-) -> Vec<u8> {
-    let mut out = vec![0u8; MB_LUMA_PIXELS];
+) -> Vec<S> {
+    let mut out = vec![S::ZERO; MB_LUMA_PIXELS];
     generate_b_vop_luma_prediction_into(
         forward_ref,
         backward_ref,
@@ -599,16 +599,16 @@ pub const CHROMA_BLOCK_PIXELS: usize = CHROMA_BLOCK_SIDE * CHROMA_BLOCK_SIDE;
 // Bundling into a struct would force a builder pattern around a
 // one-shot per-macroblock call.
 #[allow(clippy::too_many_arguments)]
-pub fn generate_b_vop_chroma_prediction_into(
-    forward_chroma_ref: &ReferenceVop<'_>,
-    backward_chroma_ref: &ReferenceVop<'_>,
+pub fn generate_b_vop_chroma_prediction_into<S: Sample>(
+    forward_chroma_ref: &ReferenceVop<'_, S>,
+    backward_chroma_ref: &ReferenceVop<'_, S>,
     forward_chroma_mv: MotionVector,
     backward_chroma_mv: MotionVector,
     chroma_mb_origin_x: i32,
     chroma_mb_origin_y: i32,
     vop_rounding_type: u8,
     prediction_mode: BVopPredictionMode,
-    out: &mut [u8],
+    out: &mut [S],
 ) {
     assert!(
         out.len() >= CHROMA_BLOCK_PIXELS,
@@ -620,8 +620,8 @@ pub fn generate_b_vop_chroma_prediction_into(
     // Reusable scratch buffers for the per-side interpolation. Held in
     // local arrays so the function stays allocation-free in the steady
     // state — the caller-supplied `out` is filled at the end.
-    let mut buf_f = [0u8; CHROMA_BLOCK_PIXELS];
-    let mut buf_b = [0u8; CHROMA_BLOCK_PIXELS];
+    let mut buf_f = [S::ZERO; CHROMA_BLOCK_PIXELS];
+    let mut buf_b = [S::ZERO; CHROMA_BLOCK_PIXELS];
 
     match prediction_mode {
         BVopPredictionMode::ForwardOnly => {
@@ -682,17 +682,17 @@ pub fn generate_b_vop_chroma_prediction_into(
 /// that returns a freshly allocated `Vec<u8>` of length
 /// [`CHROMA_BLOCK_PIXELS`].
 #[allow(clippy::too_many_arguments)]
-pub fn generate_b_vop_chroma_prediction(
-    forward_chroma_ref: &ReferenceVop<'_>,
-    backward_chroma_ref: &ReferenceVop<'_>,
+pub fn generate_b_vop_chroma_prediction<S: Sample>(
+    forward_chroma_ref: &ReferenceVop<'_, S>,
+    backward_chroma_ref: &ReferenceVop<'_, S>,
     forward_chroma_mv: MotionVector,
     backward_chroma_mv: MotionVector,
     chroma_mb_origin_x: i32,
     chroma_mb_origin_y: i32,
     vop_rounding_type: u8,
     prediction_mode: BVopPredictionMode,
-) -> Vec<u8> {
-    let mut out = vec![0u8; CHROMA_BLOCK_PIXELS];
+) -> Vec<S> {
+    let mut out = vec![S::ZERO; CHROMA_BLOCK_PIXELS];
     generate_b_vop_chroma_prediction_into(
         forward_chroma_ref,
         backward_chroma_ref,
@@ -736,13 +736,13 @@ pub fn generate_b_vop_chroma_prediction(
 /// * `mode` — half-pel vs. quarter-pel luma interpolation.
 /// * `prediction_mode` — one of the four §7.6.9 modes.
 #[allow(clippy::too_many_arguments)]
-pub fn predict_b_vop_macroblock(
-    forward_ref: &ReferenceVop<'_>,
-    backward_ref: &ReferenceVop<'_>,
-    forward_cb_ref: &ReferenceVop<'_>,
-    backward_cb_ref: &ReferenceVop<'_>,
-    forward_cr_ref: &ReferenceVop<'_>,
-    backward_cr_ref: &ReferenceVop<'_>,
+pub fn predict_b_vop_macroblock<S: Sample>(
+    forward_ref: &ReferenceVop<'_, S>,
+    backward_ref: &ReferenceVop<'_, S>,
+    forward_cb_ref: &ReferenceVop<'_, S>,
+    backward_cb_ref: &ReferenceVop<'_, S>,
+    forward_cr_ref: &ReferenceVop<'_, S>,
+    backward_cr_ref: &ReferenceVop<'_, S>,
     mvs: &[BVopMvPair; MB_SUB_BLOCKS],
     forward_chroma_mv: MotionVector,
     backward_chroma_mv: MotionVector,
@@ -793,13 +793,13 @@ pub fn predict_b_vop_macroblock(
     let mut out = InterPredictionMacroblock::zero();
     for y in 0..MACROBLOCK_LUMA_SIDE {
         for x in 0..MACROBLOCK_LUMA_SIDE {
-            out.luma[y][x] = luma_flat[y * MACROBLOCK_LUMA_SIDE + x] as i32;
+            out.luma[y][x] = luma_flat[y * MACROBLOCK_LUMA_SIDE + x].working();
         }
     }
     for y in 0..MACROBLOCK_CHROMA_SIDE {
         for x in 0..MACROBLOCK_CHROMA_SIDE {
-            out.cb[y][x] = cb_flat[y * MACROBLOCK_CHROMA_SIDE + x] as i32;
-            out.cr[y][x] = cr_flat[y * MACROBLOCK_CHROMA_SIDE + x] as i32;
+            out.cb[y][x] = cb_flat[y * MACROBLOCK_CHROMA_SIDE + x].working();
+            out.cr[y][x] = cr_flat[y * MACROBLOCK_CHROMA_SIDE + x].working();
         }
     }
     out
@@ -820,13 +820,13 @@ pub fn predict_b_vop_macroblock(
 /// (§6.3.3). See [`predict_b_vop_macroblock`] for the argument
 /// semantics.
 #[allow(clippy::too_many_arguments)]
-pub fn reconstruct_b_vop_macroblock(
-    forward_ref: &ReferenceVop<'_>,
-    backward_ref: &ReferenceVop<'_>,
-    forward_cb_ref: &ReferenceVop<'_>,
-    backward_cb_ref: &ReferenceVop<'_>,
-    forward_cr_ref: &ReferenceVop<'_>,
-    backward_cr_ref: &ReferenceVop<'_>,
+pub fn reconstruct_b_vop_macroblock<S: Sample>(
+    forward_ref: &ReferenceVop<'_, S>,
+    backward_ref: &ReferenceVop<'_, S>,
+    forward_cb_ref: &ReferenceVop<'_, S>,
+    backward_cb_ref: &ReferenceVop<'_, S>,
+    forward_cr_ref: &ReferenceVop<'_, S>,
+    backward_cr_ref: &ReferenceVop<'_, S>,
     mvs: &[BVopMvPair; MB_SUB_BLOCKS],
     forward_chroma_mv: MotionVector,
     backward_chroma_mv: MotionVector,
@@ -886,10 +886,10 @@ mod tests {
     fn average_bidirectional_rounds_up_on_ties() {
         // §7.6.9.4 averaging rounds up on the half-tie because of the
         // `+ 1` in the formula. (100 + 101 + 1) >> 1 = 202 >> 1 = 101.
-        let out = average_bidirectional(&[100], &[101]);
+        let out = average_bidirectional(&[100u8], &[101]);
         assert_eq!(out, vec![101]);
         // (101 + 100 + 1) >> 1 = same as above by commutativity.
-        let out2 = average_bidirectional(&[101], &[100]);
+        let out2 = average_bidirectional(&[101u8], &[100]);
         assert_eq!(out2, vec![101]);
     }
 

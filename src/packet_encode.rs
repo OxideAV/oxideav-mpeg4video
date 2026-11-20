@@ -355,6 +355,8 @@ pub(crate) struct PacketVopInfo {
     pub time_increment_bits: u8,
     pub intra_dc_vlc_thr: u8,
     pub total_macroblocks: u32,
+    /// The VOL's §6.3.3 `quant_precision` (width of `quant_scale`).
+    pub quant_precision: u8,
     /// The VOL's `interlaced` flag: every pushed [`MbFields`] must
     /// carry (or omit) its `interlaced_information()` accordingly.
     pub interlaced: bool,
@@ -468,8 +470,7 @@ impl PacketWriter {
         bw.write_bits(1, usize::from(len));
         let mb_bits = macroblock_number_bit_width(self.info.total_macroblocks);
         bw.write_bits(macroblock_number, usize::from(mb_bits));
-        assert!((1..=31).contains(&quant_scale));
-        bw.write_bits(quant_scale, 5); // quant_precision 5
+        crate::ivop_encode::write_quantiser_scale(bw, quant_scale, self.info.quant_precision);
         let hec = self.packets_cut % 2 == 1;
         bw.write_bit(hec); // header_extension_code
         if hec {
@@ -578,6 +579,7 @@ mod tests {
             time_increment_bits: 5,
             intra_dc_vlc_thr: 0,
             total_macroblocks: 12,
+            quant_precision: 5,
             interlaced: false,
             sprite_trajectory: None,
         }

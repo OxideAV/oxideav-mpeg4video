@@ -87,6 +87,7 @@ use crate::half_sample::ReferenceVop;
 use crate::motion::{FieldMvPair, MotionVector};
 use crate::quarter_sample::interpolate_block_qpel_field_into;
 use crate::reconstruct::{InterPredictionMacroblock, MACROBLOCK_CHROMA_SIDE, MACROBLOCK_LUMA_SIDE};
+use crate::sample::Sample;
 
 /// `Div2Round(x) = (x >> 1) | (x & 1)` (§7.7.2.1).
 ///
@@ -218,10 +219,10 @@ pub fn reconstruct_field_motion_vectors_wrapped(
 ///
 /// Panics if a written sample index would fall outside `pred`.
 #[allow(clippy::too_many_arguments)]
-pub fn mc(
-    pred: &mut [u8],
+pub fn mc<S: Sample>(
+    pred: &mut [S],
     pred_stride: usize,
-    reference: &ReferenceVop<'_>,
+    reference: &ReferenceVop<'_, S>,
     x: i32,
     y: i32,
     width: usize,
@@ -246,7 +247,7 @@ pub fn mc(
     // §7.6.1.5 per-field rule governs arbitrary-shape padding inside
     // the bounding rectangle, not the rectangular-VOP edge read) —
     // black-box-confirmed on the interlaced conformance corpus.
-    let fetch = |xr: i32, yr: i32| -> i32 { i32::from(reference.fetch_clamped(xr, yr)) };
+    let fetch = |xr: i32, yr: i32| -> i32 { reference.fetch_clamped(xr, yr).working() };
 
     // Interior block (every sample read lies inside the plane, so the
     // clamp is the identity): whole-row arithmetic over plane slices,
@@ -260,7 +261,7 @@ pub fn mc(
         && reference.row_run(x0, y_first, need_w).is_some()
         && reference.row_run(x0, y_last, need_w).is_some()
     {
-        let rc16 = rc as u16;
+        let rc32 = rc as u32;
         for r in 0..rows {
             let y_ref = y_first + r as i32 * y_incr;
             let top = reference
@@ -272,7 +273,7 @@ pub fn mc(
                 (false, false) => dst.copy_from_slice(&top[..width]),
                 (false, true) => {
                     for ((d, &a), &b) in dst.iter_mut().zip(top).zip(&top[1..]) {
-                        *d = ((u16::from(a) + u16::from(b) + 1 - rc16) >> 1) as u8;
+                        *d = S::average2(a, b, rc32);
                     }
                 }
                 (true, false) => {
@@ -280,7 +281,7 @@ pub fn mc(
                         .row_run(x0, y_ref + y_incr, need_w)
                         .expect("row inside the plane");
                     for ((d, &a), &c) in dst.iter_mut().zip(top).zip(bot) {
-                        *d = ((u16::from(a) + u16::from(c) + 1 - rc16) >> 1) as u8;
+                        *d = S::average2(a, c, rc32);
                     }
                 }
                 (true, true) => {
@@ -288,11 +289,7 @@ pub fn mc(
                         .row_run(x0, y_ref + y_incr, need_w)
                         .expect("row inside the plane");
                     for (i, d) in dst.iter_mut().enumerate() {
-                        let sum = u16::from(top[i])
-                            + u16::from(top[i + 1])
-                            + u16::from(bot[i])
-                            + u16::from(bot[i + 1]);
-                        *d = ((sum + 2 - rc16) >> 2) as u8;
+                        *d = S::average4(top[i], top[i + 1], bot[i], bot[i + 1], rc32);
                     }
                 }
             }
@@ -320,7 +317,7 @@ pub fn mc(
                 (false, false) => fetch(x_ref, y_ref),
             };
             let dst_row = iy + pred_y0;
-            pred[dst_row * pred_stride + ix] = value as u8;
+            pred[dst_row * pred_stride + ix] = S::narrow(value);
         }
         iy += y_incr_u;
     }
@@ -345,10 +342,10 @@ pub fn mc(
 /// the display range), ready for the §7.3 residual add in
 /// [`crate::reconstruct::reconstruct_inter_macroblock_into`].
 #[allow(clippy::too_many_arguments)]
-pub fn field_motion_compensate_one_reference(
-    luma_ref: &ReferenceVop<'_>,
-    cb_ref: &ReferenceVop<'_>,
-    cr_ref: &ReferenceVop<'_>,
+pub fn field_motion_compensate_one_reference<S: Sample>(
+    luma_ref: &ReferenceVop<'_, S>,
+    cb_ref: &ReferenceVop<'_, S>,
+    cr_ref: &ReferenceVop<'_, S>,
     mvs: FieldMotionVectors,
     top_field_ref: bool,
     bottom_field_ref: bool,
@@ -359,9 +356,9 @@ pub fn field_motion_compensate_one_reference(
     let top_ref_y0 = top_field_ref as i32;
     let bot_ref_y0 = bottom_field_ref as i32;
 
-    let mut luma = [0u8; MACROBLOCK_LUMA_SIDE * MACROBLOCK_LUMA_SIDE];
-    let mut cb = [0u8; MACROBLOCK_CHROMA_SIDE * MACROBLOCK_CHROMA_SIDE];
-    let mut cr = [0u8; MACROBLOCK_CHROMA_SIDE * MACROBLOCK_CHROMA_SIDE];
+    let mut luma = [S::ZERO; MACROBLOCK_LUMA_SIDE * MACROBLOCK_LUMA_SIDE];
+    let mut cb = [S::ZERO; MACROBLOCK_CHROMA_SIDE * MACROBLOCK_CHROMA_SIDE];
+    let mut cr = [S::ZERO; MACROBLOCK_CHROMA_SIDE * MACROBLOCK_CHROMA_SIDE];
 
     // Luma: top field (pred_y0 = 0) then bottom field (pred_y0 = 1).
     mc(
@@ -438,13 +435,13 @@ pub fn field_motion_compensate_one_reference(
     let mut out = InterPredictionMacroblock::zero();
     for row in 0..MACROBLOCK_LUMA_SIDE {
         for col in 0..MACROBLOCK_LUMA_SIDE {
-            out.luma[row][col] = luma[row * MACROBLOCK_LUMA_SIDE + col] as i32;
+            out.luma[row][col] = luma[row * MACROBLOCK_LUMA_SIDE + col].working();
         }
     }
     for row in 0..MACROBLOCK_CHROMA_SIDE {
         for col in 0..MACROBLOCK_CHROMA_SIDE {
-            out.cb[row][col] = cb[row * MACROBLOCK_CHROMA_SIDE + col] as i32;
-            out.cr[row][col] = cr[row * MACROBLOCK_CHROMA_SIDE + col] as i32;
+            out.cb[row][col] = cb[row * MACROBLOCK_CHROMA_SIDE + col].working();
+            out.cr[row][col] = cr[row * MACROBLOCK_CHROMA_SIDE + col].working();
         }
     }
     out
@@ -556,10 +553,10 @@ pub const fn field_chroma_dy_qpel(luma_field_mvy_qpel: i32) -> i32 {
 /// `bits_per_pixel` is the VOL `bits_per_pixel` (8 for `not_8_bit ==
 /// 0`); it drives the §7.6.2.2.1 FIR clip.
 #[allow(clippy::too_many_arguments)]
-pub fn field_motion_compensate_one_reference_qpel(
-    luma_ref: &ReferenceVop<'_>,
-    cb_ref: &ReferenceVop<'_>,
-    cr_ref: &ReferenceVop<'_>,
+pub fn field_motion_compensate_one_reference_qpel<S: Sample>(
+    luma_ref: &ReferenceVop<'_, S>,
+    cb_ref: &ReferenceVop<'_, S>,
+    cr_ref: &ReferenceVop<'_, S>,
     mvs: FieldMotionVectors,
     top_field_ref: bool,
     bottom_field_ref: bool,
@@ -578,15 +575,15 @@ pub fn field_motion_compensate_one_reference_qpel(
     // destination rows, the bottom field's on odd rows.
     let half_h = MACROBLOCK_LUMA_SIDE / 2;
     let sub_w = MACROBLOCK_LUMA_SIDE / 2;
-    let mut top_field = [0u8; MACROBLOCK_LUMA_SIDE * (MACROBLOCK_LUMA_SIDE / 2)];
-    let mut bot_field = [0u8; MACROBLOCK_LUMA_SIDE * (MACROBLOCK_LUMA_SIDE / 2)];
+    let mut top_field = [S::ZERO; MACROBLOCK_LUMA_SIDE * (MACROBLOCK_LUMA_SIDE / 2)];
+    let mut bot_field = [S::ZERO; MACROBLOCK_LUMA_SIDE * (MACROBLOCK_LUMA_SIDE / 2)];
     for (field_buf, mv, ref_y0) in [
         (&mut top_field, mvs.top, top_ref_y0),
         (&mut bot_field, mvs.bottom, bot_ref_y0),
     ] {
         for sub in 0..2 {
             let x_off = sub * sub_w;
-            let mut sub_buf = [0u8; (MACROBLOCK_LUMA_SIDE / 2) * (MACROBLOCK_LUMA_SIDE / 2)];
+            let mut sub_buf = [S::ZERO; (MACROBLOCK_LUMA_SIDE / 2) * (MACROBLOCK_LUMA_SIDE / 2)];
             interpolate_block_qpel_field_into(
                 luma_ref,
                 mv.x,
@@ -616,8 +613,8 @@ pub fn field_motion_compensate_one_reference_qpel(
     let bot_cy = field_chroma_dy_qpel(mvs.bottom.y);
     let cx = x / 2;
     let cy = y / 2;
-    let mut cb = [0u8; MACROBLOCK_CHROMA_SIDE * MACROBLOCK_CHROMA_SIDE];
-    let mut cr = [0u8; MACROBLOCK_CHROMA_SIDE * MACROBLOCK_CHROMA_SIDE];
+    let mut cb = [S::ZERO; MACROBLOCK_CHROMA_SIDE * MACROBLOCK_CHROMA_SIDE];
+    let mut cr = [S::ZERO; MACROBLOCK_CHROMA_SIDE * MACROBLOCK_CHROMA_SIDE];
     for (plane, reference) in [(&mut cb, cb_ref), (&mut cr, cr_ref)] {
         mc(
             plane,
@@ -655,15 +652,15 @@ pub fn field_motion_compensate_one_reference_qpel(
     for r in 0..half_h {
         for col in 0..MACROBLOCK_LUMA_SIDE {
             // Top field's line r → destination even row 2r.
-            out.luma[2 * r][col] = top_field[r * MACROBLOCK_LUMA_SIDE + col] as i32;
+            out.luma[2 * r][col] = top_field[r * MACROBLOCK_LUMA_SIDE + col].working();
             // Bottom field's line r → destination odd row 2r + 1.
-            out.luma[2 * r + 1][col] = bot_field[r * MACROBLOCK_LUMA_SIDE + col] as i32;
+            out.luma[2 * r + 1][col] = bot_field[r * MACROBLOCK_LUMA_SIDE + col].working();
         }
     }
     for row in 0..MACROBLOCK_CHROMA_SIDE {
         for col in 0..MACROBLOCK_CHROMA_SIDE {
-            out.cb[row][col] = cb[row * MACROBLOCK_CHROMA_SIDE + col] as i32;
-            out.cr[row][col] = cr[row * MACROBLOCK_CHROMA_SIDE + col] as i32;
+            out.cb[row][col] = cb[row * MACROBLOCK_CHROMA_SIDE + col].working();
+            out.cr[row][col] = cr[row * MACROBLOCK_CHROMA_SIDE + col].working();
         }
     }
     out
@@ -696,7 +693,7 @@ mod tests {
         let dy = y_incr * (dy_halfpel >> y_incr);
         let half_x = (dx_halfpel & 1) != 0;
         let half_y = (dy_halfpel & y_incr) != 0;
-        let fetch = |xr: i32, yr: i32| -> i32 { i32::from(reference.fetch_clamped(xr, yr)) };
+        let fetch = |xr: i32, yr: i32| -> i32 { reference.fetch_clamped(xr, yr).working() };
         let mut iy = 0usize;
         while iy < height {
             for ix in 0..width {

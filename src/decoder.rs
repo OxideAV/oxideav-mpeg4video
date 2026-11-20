@@ -516,12 +516,10 @@ impl Mpeg4VideoDecoder {
         out: &mut Vec<DecodedFrame>,
     ) -> Result<(), StreamDecodeError> {
         let vol = self.vol.ok_or(StreamDecodeError::MissingVol)?;
-        if vol.bits_per_pixel != 8 {
-            // §6.3.3 `not_8_bit`: the picture store holds 8-bit
-            // samples; an N-bit VOL would be clipped into it, so it is
-            // declined instead.
+        if !(4..=12).contains(&vol.bits_per_pixel) {
+            // §6.3.3: `bits_per_pixel` takes values between 4 and 12.
             return Err(StreamDecodeError::Vol(VolParseError::UnsupportedBranch(
-                "not_8_bit with bits_per_pixel != 8",
+                "bits_per_pixel outside 4..=12",
             )));
         }
         let (mb_width, mb_height) = vop_mb_dimensions(&vol);
@@ -591,7 +589,12 @@ impl Mpeg4VideoDecoder {
                 } else {
                     decode_i_vop_macroblocks(&mut br, &vol, &vop, self.vop_options())?
                 };
-                out.extend(self.sequence.push_i_vop(mb_width, mb_height, &mbs)?);
+                out.extend(self.sequence.push_i_vop_depth(
+                    mb_width,
+                    mb_height,
+                    &mbs,
+                    u32::from(vol.bits_per_pixel),
+                )?);
                 self.anchor_motion = None;
             }
             VopCodingType::P => {
@@ -751,6 +754,10 @@ impl Mpeg4VideoDecoder {
         let unsupported = |what| StreamDecodeError::Vop(VopParseError::UnsupportedBranch(what));
         if vol.low_latency_sprite_enable.unwrap_or(false) {
             return Err(unsupported("low_latency_sprite_enable"));
+        }
+        if vol.bits_per_pixel != 8 {
+            // The §7.8.2 sprite memory is an 8-bit store.
+            return Err(unsupported("static sprite with bits_per_pixel != 8"));
         }
         let geometry = vol
             .sprite_geometry
@@ -1164,23 +1171,74 @@ impl Mpeg4PacketDecoder {
     /// base for a raw MPEG-4 Visual elementary stream).
     fn frame_to_video(frame: &DecodedFrame) -> oxideav_core::VideoFrame {
         let w = frame.width();
-        oxideav_core::VideoFrame {
-            pts: frame.pts().or(frame.pts_ticks()),
-            planes: vec![
+        let bpp = frame.bits_per_pixel();
+        let (_, target) = registry_format(bpp);
+        let shift = target - bpp;
+        let narrow = |plane: &[u8]| -> Vec<u8> {
+            if shift == 0 {
+                plane.to_vec()
+            } else {
+                plane.iter().map(|&v| v << shift).collect()
+            }
+        };
+        let wide = |plane: &[u16]| -> Vec<u8> {
+            plane
+                .iter()
+                .flat_map(|&v| (v << shift).to_le_bytes())
+                .collect()
+        };
+        let planes = match (
+            frame.luma_samples16(),
+            frame.cb_samples16(),
+            frame.cr_samples16(),
+        ) {
+            (Some(y), Some(cb), Some(cr)) => vec![
+                oxideav_core::VideoPlane {
+                    stride: 2 * w,
+                    data: wide(y),
+                },
                 oxideav_core::VideoPlane {
                     stride: w,
-                    data: frame.luma_samples().to_vec(),
+                    data: wide(cb),
                 },
                 oxideav_core::VideoPlane {
-                    stride: w / 2,
-                    data: frame.cb_samples().to_vec(),
-                },
-                oxideav_core::VideoPlane {
-                    stride: w / 2,
-                    data: frame.cr_samples().to_vec(),
+                    stride: w,
+                    data: wide(cr),
                 },
             ],
+            _ => vec![
+                oxideav_core::VideoPlane {
+                    stride: w,
+                    data: narrow(frame.luma_samples()),
+                },
+                oxideav_core::VideoPlane {
+                    stride: w / 2,
+                    data: narrow(frame.cb_samples()),
+                },
+                oxideav_core::VideoPlane {
+                    stride: w / 2,
+                    data: narrow(frame.cr_samples()),
+                },
+            ],
+        };
+        oxideav_core::VideoFrame {
+            pts: frame.pts().or(frame.pts_ticks()),
+            planes,
         }
+    }
+}
+
+/// The framework pixel format carrying a §6.3.3 `bits_per_pixel`
+/// picture, with that format's sample depth: 8-bit planar 4:2:0 up to
+/// 8 bits, the 10-bit format for 9 and 10, the 12-bit format for 11
+/// and 12. A picture shallower than its format is scaled up by a left
+/// shift of the difference (exactly undone by the same right shift),
+/// so black and full scale land where the format expects them.
+fn registry_format(bits_per_pixel: u32) -> (oxideav_core::PixelFormat, u32) {
+    match bits_per_pixel {
+        0..=8 => (oxideav_core::PixelFormat::Yuv420P, 8),
+        9 | 10 => (oxideav_core::PixelFormat::Yuv420P10Le, 10),
+        _ => (oxideav_core::PixelFormat::Yuv420P12Le, 12),
     }
 }
 
@@ -1213,19 +1271,25 @@ impl oxideav_core::Decoder for Mpeg4PacketDecoder {
         Ok(())
     }
 
-    /// Planar 4:2:0 at 8 bits per sample, known before the first
-    /// packet so a pipeline needs no pre-roll to label the frames.
+    /// Planar 4:2:0, known before the first packet whenever the
+    /// configuration headers arrived as extradata, so a pipeline needs
+    /// no pre-roll to label the frames.
     ///
-    /// Every layout this decoder emits is fixed by the syntax rather
-    /// than by a per-picture choice: the VOL's `chroma_format` has a
-    /// single defined value, 4:2:0 (§6.3.3 Table 6-15 — the others are
-    /// reserved), and §6.2.5.2 short-header pictures are 4:2:0 as well;
-    /// the frame conversion always builds the Y, Cb,
-    /// Cr planes at full / half / half resolution with one byte per
-    /// sample. A VOL that arrives later (in-band, after a seek, or a
-    /// new one mid-stream) cannot change the answer.
+    /// The layout is fixed by the syntax rather than by a per-picture
+    /// choice: the VOL's `chroma_format` has a single defined value,
+    /// 4:2:0 (§6.3.3 Table 6-15 — the others are reserved), and
+    /// §6.2.5.2 short-header pictures are 4:2:0 as well. The sample
+    /// depth is the VOL's: one byte per sample unless `not_8_bit`
+    /// selects more than 8 bits, in which case the planes are 16-bit
+    /// little-endian words of the 10-bit (9 or 10 bits) or 12-bit (11
+    /// or 12 bits) format. Before any VOL is known the answer is the
+    /// 8-bit layout every non-N-bit object type uses.
     fn output_pixel_format(&self) -> Option<oxideav_core::PixelFormat> {
-        Some(oxideav_core::PixelFormat::Yuv420P)
+        let bpp = self
+            .inner
+            .vol()
+            .map_or(8, |vol| u32::from(vol.bits_per_pixel));
+        Some(registry_format(bpp).0)
     }
 
     fn reset(&mut self) -> oxideav_core::Result<()> {

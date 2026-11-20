@@ -55,7 +55,13 @@ pub fn activity_class(activity: u32) -> i32 {
 /// The macroblock's target quantiser: `vop_qp + class`, clipped to
 /// `[1, MAX_QP]`.
 pub fn target_qp(vop_qp: u32, class: i32) -> u32 {
-    (vop_qp as i64 + i64::from(class)).clamp(1, i64::from(MAX_QP)) as u32
+    target_qp_bounded(vop_qp, class, MAX_QP)
+}
+
+/// [`target_qp`] under a VOL whose quantiser scale tops out at
+/// `max_qp` (`2^quant_precision - 1`, §6.3.3).
+pub fn target_qp_bounded(vop_qp: u32, class: i32, max_qp: u32) -> u32 {
+    (vop_qp as i64 + i64::from(class)).clamp(1, i64::from(max_qp)) as u32
 }
 
 /// Plan an I-/P-VOP macroblock's `dquant` towards `target` from the
@@ -63,11 +69,18 @@ pub fn target_qp(vop_qp: u32, class: i32) -> u32 {
 /// with and the Table 6-32 delta to emit (`None` = no `dquant`, plain
 /// macroblock type). Steps are limited to ±2 per macroblock.
 pub fn plan_dquant(running: u32, target: u32) -> (u32, Option<i8>) {
+    plan_dquant_bounded(running, target, MAX_QP)
+}
+
+/// [`plan_dquant`] under a VOL whose quantiser scale tops out at
+/// `max_qp`: the decoder clips the stepped value to `[1, max_qp]`
+/// (§6.3.6), and so does this plan.
+pub fn plan_dquant_bounded(running: u32, target: u32, max_qp: u32) -> (u32, Option<i8>) {
     let delta = (target as i64 - running as i64).clamp(-2, 2);
     if delta == 0 {
         (running, None)
     } else {
-        let qp = (running as i64 + delta).clamp(1, i64::from(MAX_QP)) as u32;
+        let qp = (running as i64 + delta).clamp(1, i64::from(max_qp)) as u32;
         (qp, Some(delta as i8))
     }
 }
@@ -79,8 +92,14 @@ pub fn plan_dquant(running: u32, target: u32) -> (u32, Option<i8>) {
 /// `dbquant` (non-direct, `cbpb != 0`) and commits the new running
 /// value in that case alone.
 pub fn plan_dbquant(running: u32, target: u32) -> (u32, Option<i8>) {
+    plan_dbquant_bounded(running, target, MAX_QP)
+}
+
+/// [`plan_dbquant`] under a VOL whose quantiser scale tops out at
+/// `max_qp`.
+pub fn plan_dbquant_bounded(running: u32, target: u32, max_qp: u32) -> (u32, Option<i8>) {
     let distance = target as i64 - running as i64;
-    if distance >= 2 && running + 2 <= MAX_QP {
+    if distance >= 2 && running + 2 <= max_qp {
         (running + 2, Some(2))
     } else if distance <= -2 && running >= 3 {
         (running - 2, Some(-2))
@@ -136,6 +155,7 @@ pub struct MbRegulator {
     /// `0..j` (so `prefix[0] == 0`, `prefix[n] == 1`).
     prefix: Vec<f64>,
     activity_classes: bool,
+    max_qp: u32,
     qp_sum: u64,
     qp_count: u64,
 }
@@ -147,7 +167,19 @@ impl MbRegulator {
     /// of the budget-derived target (the `mb-aq` behaviour inside the
     /// budget mode).
     pub fn new(budget: MbBudget, vop_qp: u32, activities: &[u32], activity_classes: bool) -> Self {
-        assert!((1..=MAX_QP).contains(&vop_qp));
+        Self::with_max_qp(budget, vop_qp, activities, activity_classes, MAX_QP)
+    }
+
+    /// [`MbRegulator::new`] under a VOL whose quantiser scale tops out
+    /// at `max_qp` (`2^quant_precision - 1`, §6.3.3).
+    pub fn with_max_qp(
+        budget: MbBudget,
+        vop_qp: u32,
+        activities: &[u32],
+        activity_classes: bool,
+        max_qp: u32,
+    ) -> Self {
+        assert!((1..=max_qp).contains(&vop_qp));
         let mut prefix = Vec::with_capacity(activities.len() + 1);
         let mut acc = 0.0f64;
         prefix.push(0.0);
@@ -166,6 +198,7 @@ impl MbRegulator {
             band: i64::from(budget.band),
             prefix,
             activity_classes,
+            max_qp,
             qp_sum: 0,
             qp_count: 0,
         }
@@ -182,13 +215,18 @@ impl MbRegulator {
         let scale = (expected_remaining / remaining).clamp(0.25, 4.0);
         let scaled = (f64::from(self.vop_qp) * scale).round() as i64;
         let lo = (i64::from(self.vop_qp) - self.band).max(1);
-        let hi = (i64::from(self.vop_qp) + self.band).min(i64::from(MAX_QP));
+        let hi = (i64::from(self.vop_qp) + self.band).min(i64::from(self.max_qp));
         let base = scaled.clamp(lo, hi) as u32;
         if self.activity_classes {
-            target_qp(base, activity_class(activity))
+            target_qp_bounded(base, activity_class(activity), self.max_qp)
         } else {
             base
         }
+    }
+
+    /// The quantiser ceiling this regulator plans under.
+    pub fn max_qp(&self) -> u32 {
+        self.max_qp
     }
 
     /// Record the quantiser a coded macroblock actually used (for
@@ -225,9 +263,35 @@ pub fn plan_mb_dquant(
     bits_spent: usize,
     activity: u32,
 ) -> (u32, Option<i8>) {
+    plan_mb_dquant_bounded(
+        regulator, adaptive, running, vop_qp, mb_index, bits_spent, activity, MAX_QP,
+    )
+}
+
+/// [`plan_mb_dquant`] under a VOL whose quantiser scale tops out at `max_qp`
+/// (a regulator plans under its own ceiling).
+#[allow(clippy::too_many_arguments)]
+pub fn plan_mb_dquant_bounded(
+    regulator: Option<&MbRegulator>,
+    adaptive: bool,
+    running: u32,
+    vop_qp: u32,
+    mb_index: usize,
+    bits_spent: usize,
+    activity: u32,
+    max_qp: u32,
+) -> (u32, Option<i8>) {
     match regulator {
-        Some(reg) => plan_dquant(running, reg.target_qp(mb_index, bits_spent, activity)),
-        None if adaptive => plan_dquant(running, target_qp(vop_qp, activity_class(activity))),
+        Some(reg) => plan_dquant_bounded(
+            running,
+            reg.target_qp(mb_index, bits_spent, activity),
+            reg.max_qp(),
+        ),
+        None if adaptive => plan_dquant_bounded(
+            running,
+            target_qp_bounded(vop_qp, activity_class(activity), max_qp),
+            max_qp,
+        ),
         None => (running, None),
     }
 }
@@ -244,9 +308,35 @@ pub fn plan_mb_dbquant(
     bits_spent: usize,
     activity: u32,
 ) -> (u32, Option<i8>) {
+    plan_mb_dbquant_bounded(
+        regulator, adaptive, running, vop_qp, mb_index, bits_spent, activity, MAX_QP,
+    )
+}
+
+/// [`plan_mb_dbquant`] under a VOL whose quantiser scale tops out at `max_qp`
+/// (a regulator plans under its own ceiling).
+#[allow(clippy::too_many_arguments)]
+pub fn plan_mb_dbquant_bounded(
+    regulator: Option<&MbRegulator>,
+    adaptive: bool,
+    running: u32,
+    vop_qp: u32,
+    mb_index: usize,
+    bits_spent: usize,
+    activity: u32,
+    max_qp: u32,
+) -> (u32, Option<i8>) {
     match regulator {
-        Some(reg) => plan_dbquant(running, reg.target_qp(mb_index, bits_spent, activity)),
-        None if adaptive => plan_dbquant(running, target_qp(vop_qp, activity_class(activity))),
+        Some(reg) => plan_dbquant_bounded(
+            running,
+            reg.target_qp(mb_index, bits_spent, activity),
+            reg.max_qp(),
+        ),
+        None if adaptive => plan_dbquant_bounded(
+            running,
+            target_qp_bounded(vop_qp, activity_class(activity), max_qp),
+            max_qp,
+        ),
         None => (running, None),
     }
 }

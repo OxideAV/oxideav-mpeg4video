@@ -87,6 +87,7 @@ use crate::motion::{
     reconstruct_motion_vector,
 };
 use crate::mv_predictor_grid::{LUMA_BLOCKS_PER_MB, MbMv, MbMvRecord, MvGrid, MvGridError};
+use crate::sample::Sample;
 
 /// One decoded P-VOP macroblock's motion-vector outcome, as recorded
 /// into the [`MvGrid`].
@@ -412,8 +413,8 @@ impl MvDriver {
 // One argument per §7.6.2 interpolation input, mirroring the two
 // wrapped primitives' signatures.
 #[allow(clippy::too_many_arguments)]
-fn interpolate_luma_block_into(
-    reference: &crate::half_sample::ReferenceVop<'_>,
+fn interpolate_luma_block_into<S: Sample>(
+    reference: &crate::half_sample::ReferenceVop<'_, S>,
     mv: MotionVector,
     origin_x: i32,
     origin_y: i32,
@@ -421,7 +422,7 @@ fn interpolate_luma_block_into(
     h: usize,
     vop_rounding_type: u8,
     mode: crate::bvop_prediction::BVopSampleMode,
-    out: &mut [u8],
+    out: &mut [S],
 ) {
     match mode {
         crate::bvop_prediction::BVopSampleMode::HalfPel => {
@@ -483,18 +484,18 @@ fn interpolate_luma_block_into(
 /// when `quarter_sample == 1`). Returns a row-major `[u8; 256]` 16×16
 /// block (length 256), laid out `block[16*j + i]`.
 #[doc(hidden)] // internal decode plumbing, not the crate's stable public API
-pub fn predict_luma_macroblock(
+pub fn predict_luma_macroblock<S: Sample>(
     motion: PvopMbMotion,
-    reference: &crate::half_sample::ReferenceVop<'_>,
+    reference: &crate::half_sample::ReferenceVop<'_, S>,
     mb_x: i32,
     mb_y: i32,
     vop_rounding_type: u8,
     mode: crate::bvop_prediction::BVopSampleMode,
-) -> Option<Vec<u8>> {
+) -> Option<Vec<S>> {
     match motion {
         PvopMbMotion::Intra => None,
         PvopMbMotion::Skipped => {
-            let mut out = vec![0u8; 256];
+            let mut out = vec![S::ZERO; 256];
             interpolate_luma_block_into(
                 reference,
                 MotionVector { x: 0, y: 0 },
@@ -509,7 +510,7 @@ pub fn predict_luma_macroblock(
             Some(out)
         }
         PvopMbMotion::OneMv(mv) => {
-            let mut out = vec![0u8; 256];
+            let mut out = vec![S::ZERO; 256];
             interpolate_luma_block_into(
                 reference,
                 mv,
@@ -524,8 +525,8 @@ pub fn predict_luma_macroblock(
             Some(out)
         }
         PvopMbMotion::FourMv(mvs) => {
-            let mut out = vec![0u8; 256];
-            let mut tile = vec![0u8; 64];
+            let mut out = vec![S::ZERO; 256];
+            let mut tile = vec![S::ZERO; 64];
             for (i, mv) in mvs.iter().enumerate() {
                 let bx = mb_x + 8 * (i as i32 & 1);
                 let by = mb_y + 8 * (i as i32 >> 1);
@@ -607,14 +608,14 @@ pub fn chroma_mv_for_macroblock(
 /// mb_col`, `8 * mb_row` for 4:2:0). Returns a row-major `[u8; 64]`
 /// block, or `None` for an intra macroblock (no §7.6.2 prediction).
 #[doc(hidden)] // internal decode plumbing, not the crate's stable public API
-pub fn predict_chroma_macroblock(
+pub fn predict_chroma_macroblock<S: Sample>(
     motion: PvopMbMotion,
-    reference: &crate::half_sample::ReferenceVop<'_>,
+    reference: &crate::half_sample::ReferenceVop<'_, S>,
     cmb_x: i32,
     cmb_y: i32,
     vop_rounding_type: u8,
     mode: crate::bvop_prediction::BVopSampleMode,
-) -> Option<Vec<u8>> {
+) -> Option<Vec<S>> {
     let mv = chroma_mv_for_macroblock(motion, mode)?;
     Some(crate::half_sample::interpolate_block(
         reference,
@@ -657,11 +658,11 @@ pub fn predict_chroma_macroblock(
 // The §7.6.2 / §7.3 inputs map one-for-one; see reconstruct_pvop_macroblock.
 #[allow(clippy::too_many_arguments)]
 #[doc(hidden)] // internal decode plumbing, not the crate's stable public API
-pub fn predict_inter_macroblock(
+pub fn predict_inter_macroblock<S: Sample>(
     motion: PvopMbMotion,
-    luma_ref: &crate::half_sample::ReferenceVop<'_>,
-    cb_ref: &crate::half_sample::ReferenceVop<'_>,
-    cr_ref: &crate::half_sample::ReferenceVop<'_>,
+    luma_ref: &crate::half_sample::ReferenceVop<'_, S>,
+    cb_ref: &crate::half_sample::ReferenceVop<'_, S>,
+    cr_ref: &crate::half_sample::ReferenceVop<'_, S>,
     mb_x: i32,
     mb_y: i32,
     vop_rounding_type: u8,
@@ -685,13 +686,13 @@ pub fn predict_inter_macroblock(
     let mut out = InterPredictionMacroblock::zero();
     for y in 0..MACROBLOCK_LUMA_SIDE {
         for x in 0..MACROBLOCK_LUMA_SIDE {
-            out.luma[y][x] = luma_flat[y * MACROBLOCK_LUMA_SIDE + x] as i32;
+            out.luma[y][x] = luma_flat[y * MACROBLOCK_LUMA_SIDE + x].working();
         }
     }
     for y in 0..MACROBLOCK_CHROMA_SIDE {
         for x in 0..MACROBLOCK_CHROMA_SIDE {
-            out.cb[y][x] = cb_flat[y * MACROBLOCK_CHROMA_SIDE + x] as i32;
-            out.cr[y][x] = cr_flat[y * MACROBLOCK_CHROMA_SIDE + x] as i32;
+            out.cb[y][x] = cb_flat[y * MACROBLOCK_CHROMA_SIDE + x].working();
+            out.cr[y][x] = cr_flat[y * MACROBLOCK_CHROMA_SIDE + x].working();
         }
     }
     Some(out)
@@ -731,11 +732,11 @@ pub fn predict_inter_macroblock(
 // struct would add a shim layer without simplifying the call site.
 #[allow(clippy::too_many_arguments)]
 #[doc(hidden)] // internal decode plumbing, not the crate's stable public API
-pub fn reconstruct_pvop_macroblock(
+pub fn reconstruct_pvop_macroblock<S: Sample>(
     motion: PvopMbMotion,
-    luma_ref: &crate::half_sample::ReferenceVop<'_>,
-    cb_ref: &crate::half_sample::ReferenceVop<'_>,
-    cr_ref: &crate::half_sample::ReferenceVop<'_>,
+    luma_ref: &crate::half_sample::ReferenceVop<'_, S>,
+    cb_ref: &crate::half_sample::ReferenceVop<'_, S>,
+    cr_ref: &crate::half_sample::ReferenceVop<'_, S>,
     residual: &crate::block::InterMacroblock,
     mb_x: i32,
     mb_y: i32,

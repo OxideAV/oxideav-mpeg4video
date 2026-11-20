@@ -8,6 +8,55 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **N-bit video** (§6.3.3 `not_8_bit`, `bits_per_pixel` 4..=12,
+  `quant_precision` 3..=9), decode and encode.
+  - Picture store: `DecodedFrame` holds one byte per sample up to 8
+    bits and 16-bit words above (`DecodedFrame::with_bit_depth`,
+    `bits_per_pixel()`, `is_wide()`, `luma_samples16()` /
+    `cb_samples16()` / `cr_samples16()`; the byte accessors return an
+    empty slice for a deeper picture). The mid-grey fill is
+    `2^(bits_per_pixel - 1)` and the blit clips to
+    `[0, 2^bits_per_pixel - 1]`.
+  - Motion compensation: `sample::Sample` (sealed, `u8` / `u16`) and
+    `ReferenceVop<'_, S = u8>`; the §7.6.2.1 half-sample, §7.6.2.2
+    quarter-sample (frame and field), §7.7.2.1 field, §7.6.6 overlapped,
+    §7.6.9 bidirectional and §7.8.6 warped predictions are written once
+    and instantiated for both stores — the 8-bit instantiation is the
+    code it was (same output hashes, same throughput).
+  - Decoder: the stream decoder no longer declines an N-bit VOL. Every
+    walk already carried the depth (the §7.4.3.1 default predictor
+    `2^(bits_per_pixel + 2)`, the §7.4.4.4 / §7.4.5 saturations, the
+    `quant_precision`-bit `vop_quant` / `quant_scale`, the `dquant` /
+    `dbquant` clip to `2^quant_precision - 1`, Table B.13 / B.14 sizes
+    up to 12 with the Table B.15 marker); the picture store was the
+    missing piece. The registry decoder states `Yuv420P10Le` for 9 and
+    10 bits and `Yuv420P12Le` for 11 and 12 (16-bit little-endian
+    planes), `Yuv420P` otherwise; a picture shallower than its format
+    is scaled by a left shift. An N-bit static sprite is declined with
+    a typed error (the sprite memory is an 8-bit store).
+  - Encoder: `EncoderConfig::with_bit_depth(bits_per_pixel,
+    quant_precision)` writes `not_8_bit` + both fields and signals the
+    N-bit object type (`0x05`) and profile (`0x42`); `FrameView<'_, S>`
+    carries 16-bit sources. I-/P-/B-VOPs with AC/DC prediction, 4MV,
+    both quantisation methods, per-macroblock quantiser modulation and
+    the error-resilience tools — the Table 9-1 tool set of that object
+    type; quarter-sample, GMC, sprites, interlace and the short header
+    are refused for an N-bit VOL. The intra DC level is kept inside
+    the §7.4.3.4 range, mode biases and activity classes are scaled to
+    the sample depth, and the quantiser plans (`mb_quant::*_bounded`,
+    `MbRegulator::with_max_qp`, `RateController::with_max_qp`,
+    `BudgetPlanner::with_max_qp`) follow the VOL's quantiser ceiling,
+    so rate control reaches quantisers up to 511. Registry options
+    `bits-per-pixel` and `quant-precision`; input `Yuv420P10Le` /
+    `Yuv420P12Le`.
+  - `tests/nbit.rs`: every depth 4..=12 round-trips sample-exact
+    through the crate's own decoder (the same relative quantiser lands
+    at 36.7–36.8 dB from 6 to 11 bits), every `quant_precision` at its
+    largest quantiser, tool combinations at 10 and 12 bits, the
+    registry path in both deep formats and at odd depths, rate control
+    at 12 bits, and the two sample stores agreeing on every
+    interpolation of 8-bit content.
+
 - **Integer row–column inverse transform ("variant RC")** —
   `variant_rc::variant_rc_raw` / `variant_rc::idct_8x8_variant_rc`,
   the 16-bit-oriented fixed-point 8×8 inverse transform specified in

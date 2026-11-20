@@ -280,16 +280,17 @@ impl ObmcConfig {
 /// # Panics
 ///
 /// Does not panic on its own; if `sample` panics that propagates.
-pub fn obmc_predict_block<S>(
+pub fn obmc_predict_block<P, S>(
     current_mv: ObmcMv,
     neighbours: ObmcNeighbourhood,
     cfg: ObmcConfig,
     mut sample: S,
-) -> [[u8; 8]; 8]
+) -> [[P; 8]; 8]
 where
-    S: FnMut(ObmcMv, usize, usize) -> u8,
+    P: crate::sample::Sample,
+    S: FnMut(ObmcMv, usize, usize) -> P,
 {
-    let mut block = [[0u8; 8]; 8];
+    let mut block = [[P::ZERO; 8]; 8];
     for j in 0..8 {
         for i in 0..8 {
             let q = sample(current_mv, i, j);
@@ -311,8 +312,11 @@ where
             // §7.6.6 equation pre-supplies the `+ 4` rounding term,
             // so plain truncating division on the non-negative
             // weighted sum yields the spec result.
-            let weighted = (q as u32) * h0 + (r as u32) * h1 + (s as u32) * h2 + 4;
-            block[j][i] = (weighted / 8) as u8;
+            let weighted = (q.working() as u32) * h0
+                + (r.working() as u32) * h1
+                + (s.working() as u32) * h2
+                + 4;
+            block[j][i] = P::narrow((weighted / 8) as i32);
         }
     }
     block
@@ -452,10 +456,11 @@ mod tests {
         // we recover the per-pixel `(MV1, MV2)` selection by checking
         // each pixel's three calls.
         let mut calls: Vec<(usize, usize, ObmcMv)> = Vec::new();
-        let _ = obmc_predict_block(mv0, neighbours, ObmcConfig::enabled(), |mv, i, j| {
-            calls.push((i, j, mv));
-            0
-        });
+        let _: [[u8; 8]; 8] =
+            obmc_predict_block(mv0, neighbours, ObmcConfig::enabled(), |mv, i, j| {
+                calls.push((i, j, mv));
+                0u8
+            });
         // Three calls per pixel, in order: (mv0, mv1, mv2).
         assert_eq!(calls.len(), 8 * 8 * 3);
         for j in 0..8 {
@@ -484,20 +489,21 @@ mod tests {
         };
         let mut mv1_at_0_0 = ObmcMv::new(99, 99);
         let mut mv2_at_0_0 = ObmcMv::new(99, 99);
-        let _ = obmc_predict_block(mv0, neighbours, ObmcConfig::enabled(), |mv, i, j| {
-            if (i, j) == (0, 0) {
-                // Three calls land at (0,0): q (mv0), r (mv1), s (mv2).
-                // Capture mv1 / mv2 by sentinel comparison.
-                if mv == mv0 {
-                    // first call — current MV
-                } else if mv1_at_0_0 == ObmcMv::new(99, 99) {
-                    mv1_at_0_0 = mv;
-                } else {
-                    mv2_at_0_0 = mv;
+        let _: [[u8; 8]; 8] =
+            obmc_predict_block(mv0, neighbours, ObmcConfig::enabled(), |mv, i, j| {
+                if (i, j) == (0, 0) {
+                    // Three calls land at (0,0): q (mv0), r (mv1), s (mv2).
+                    // Capture mv1 / mv2 by sentinel comparison.
+                    if mv == mv0 {
+                        // first call — current MV
+                    } else if mv1_at_0_0 == ObmcMv::new(99, 99) {
+                        mv1_at_0_0 = mv;
+                    } else {
+                        mv2_at_0_0 = mv;
+                    }
                 }
-            }
-            0
-        });
+                0
+            });
         assert_eq!(mv1_at_0_0, ObmcMv::ZERO);
         assert_eq!(mv2_at_0_0, ObmcMv::ZERO);
     }
@@ -517,10 +523,11 @@ mod tests {
         // Upper-right pixel (7, 0): MV1 from above (Intra → mv0), MV2
         // from right (Intra → mv0).
         let mut captured: Vec<(usize, usize, ObmcMv)> = Vec::new();
-        let _ = obmc_predict_block(mv0, neighbours, ObmcConfig::enabled(), |mv, i, j| {
-            captured.push((i, j, mv));
-            0
-        });
+        let _: [[u8; 8]; 8] =
+            obmc_predict_block(mv0, neighbours, ObmcConfig::enabled(), |mv, i, j| {
+                captured.push((i, j, mv));
+                0
+            });
         // pixel (0, 0): calls 0,1,2 → q, r, s
         assert_eq!(captured[1].2, mv0); // MV1 substituted Intra→mv0
         assert_eq!(captured[2].2, ObmcMv::new(2, 2));
@@ -542,10 +549,11 @@ mod tests {
             current_block_at_mb_bottom: false,
         };
         let mut captured: Vec<(usize, usize, ObmcMv)> = Vec::new();
-        let _ = obmc_predict_block(mv0, neighbours, ObmcConfig::enabled(), |mv, i, j| {
-            captured.push((i, j, mv));
-            0
-        });
+        let _: [[u8; 8]; 8] =
+            obmc_predict_block(mv0, neighbours, ObmcConfig::enabled(), |mv, i, j| {
+                captured.push((i, j, mv));
+                0
+            });
         // pixel (0, 0): MV1 above absent → mv0; MV2 left absent → mv0.
         assert_eq!(captured[1].2, mv0);
         assert_eq!(captured[2].2, mv0);
@@ -564,10 +572,11 @@ mod tests {
             current_block_at_mb_bottom: true,
         };
         let mut captured: Vec<(usize, usize, ObmcMv)> = Vec::new();
-        let _ = obmc_predict_block(mv0, neighbours, ObmcConfig::enabled(), |mv, i, j| {
-            captured.push((i, j, mv));
-            0
-        });
+        let _: [[u8; 8]; 8] =
+            obmc_predict_block(mv0, neighbours, ObmcConfig::enabled(), |mv, i, j| {
+                captured.push((i, j, mv));
+                0
+            });
         // pixel (0, 4): three calls at index (4*8 + 0) * 3 = 96.
         // MV1 should be mv0 (rule 4 substitution), NOT (99, 99).
         assert_eq!(captured[96 + 1].2, mv0);

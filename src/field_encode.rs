@@ -38,6 +38,7 @@ use crate::half_sample::ReferenceVop;
 use crate::motion::MotionVector;
 use crate::pvop_encode::{SEARCH_RANGE, mv_range, search_window_pels};
 use crate::quarter_sample::interpolate_block_qpel_field_into;
+use crate::sample::Sample;
 
 /// The estimate for one output field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,8 +74,8 @@ pub(crate) fn source_field(src: &[[i32; 16]; 16], field: bool) -> [[i32; 16]; 8]
 /// does. (The output field parity does not enter the reference read —
 /// only the destination line offset differs — so one prediction serves
 /// both output fields.)
-pub(crate) fn field_luma_prediction(
-    reference: &ReferenceVop<'_>,
+pub(crate) fn field_luma_prediction<S: Sample>(
+    reference: &ReferenceVop<'_, S>,
     mv: MotionVector,
     ref_field: bool,
     mb_x: i32,
@@ -85,7 +86,7 @@ pub(crate) fn field_luma_prediction(
     let mut out = [[0i32; 16]; 8];
     match mode {
         BVopSampleMode::HalfPel => {
-            let mut buf = [0u8; 16 * 16];
+            let mut buf = [S::ZERO; 16 * 16];
             mc(
                 &mut buf,
                 16,
@@ -103,13 +104,13 @@ pub(crate) fn field_luma_prediction(
             );
             for (j, row) in out.iter_mut().enumerate() {
                 for (i, cell) in row.iter_mut().enumerate() {
-                    *cell = i32::from(buf[2 * j * 16 + i]);
+                    *cell = buf[2 * j * 16 + i].working();
                 }
             }
         }
         BVopSampleMode::QuarterPel { bits_per_pixel } => {
             for sub in 0..2usize {
-                let mut sub_buf = [0u8; 64];
+                let mut sub_buf = [S::ZERO; 64];
                 interpolate_block_qpel_field_into(
                     reference,
                     mv.x,
@@ -125,7 +126,7 @@ pub(crate) fn field_luma_prediction(
                 );
                 for (j, row) in out.iter_mut().enumerate() {
                     for i in 0..8 {
-                        row[sub * 8 + i] = i32::from(sub_buf[j * 8 + i]);
+                        row[sub * 8 + i] = sub_buf[j * 8 + i].working();
                     }
                 }
             }
@@ -150,16 +151,16 @@ fn field_sad(src: &[[i32; 16]; 8], pred: &[[i32; 16]; 8]) -> u32 {
 /// below `limit`; once a partial sum reaches `limit` the walk may
 /// stop and return it (`u32::MAX` asks for the exact SAD).
 #[allow(clippy::too_many_arguments)]
-fn field_sad_full_pel(
+fn field_sad_full_pel<S: Sample>(
     src: &[[i32; 16]; 8],
-    reference: &ReferenceVop<'_>,
+    reference: &ReferenceVop<'_, S>,
     ref_field: bool,
     mb_x: i32,
     mb_y: i32,
     dx: i32,
     dy: i32,
     limit: u32,
-    narrow: Option<&[[u8; 16]; 8]>,
+    narrow: Option<&[[S; 16]; 8]>,
 ) -> u32 {
     let mut sad = 0u32;
     let y0 = mb_y + i32::from(ref_field);
@@ -170,9 +171,9 @@ fn field_sad_full_pel(
             let run = reference
                 .row_run(mb_x + dx, y0 + 2 * (j as i32 + dy), 16)
                 .expect("row inside the plane");
-            let run: &[u8; 16] = run.try_into().expect("sixteen samples");
+            let run: &[S; 16] = run.try_into().expect("sixteen samples");
             sad += match narrow {
-                Some(rows) => crate::pvop_encode::row_sad_u8(&rows[j], run),
+                Some(rows) => S::row_sad16(&rows[j], run),
                 None => crate::pvop_encode::row_sad(row, run),
             };
             // A partial sum at the limit cannot beat it.
@@ -186,7 +187,7 @@ fn field_sad_full_pel(
         let ry = y0 + 2 * (j as i32 + dy);
         for (i, &s) in row.iter().enumerate() {
             let r = reference.fetch_clamped(mb_x + i as i32 + dx, ry);
-            sad += (s - i32::from(r)).unsigned_abs();
+            sad += (s - r.working()).unsigned_abs();
         }
     }
     sad
@@ -212,9 +213,9 @@ fn units_per_pel(mode: BVopSampleMode) -> i32 {
 /// range is a field-unit range), so the predictor the differentials
 /// are coded against does not narrow the window.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn estimate_field_motion(
+pub(crate) fn estimate_field_motion<S: Sample>(
     src: &[[i32; 16]; 16],
-    reference: &ReferenceVop<'_>,
+    reference: &ReferenceVop<'_, S>,
     mb_x: i32,
     mb_y: i32,
     field: bool,
