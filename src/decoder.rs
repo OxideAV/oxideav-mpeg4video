@@ -250,6 +250,8 @@ pub struct Mpeg4VideoDecoder {
     enhancement_vops_skipped: u64,
     /// What the opt-in error concealment did so far.
     concealment: ConcealmentStats,
+    /// The caller's worker budget (0 and 1 both mean serial).
+    threads: usize,
     /// The build number of the most recent user-data unit carrying the
     /// encoder signature ([`encoder_build_of`]). Once set it is never
     /// cleared.
@@ -427,6 +429,32 @@ impl Mpeg4VideoDecoder {
     /// ([`DecodedFrame::pts_ticks`], units of
     /// `1 / vop_time_increment_resolution`).
     pub fn decode_with_pts(
+        &mut self,
+        data: &[u8],
+        container_pts: Option<i64>,
+    ) -> Result<Vec<DecodedFrame>, StreamDecodeError> {
+        let threads = self.threads;
+        crate::frame_decode::with_assembly_threads(threads, || {
+            self.decode_units(data, container_pts)
+        })
+    }
+
+    /// Let the decoder use up to `threads` workers of its own (default
+    /// 1: everything runs on the calling thread). The budget goes to
+    /// the motion-compensated reconstruction of P- and B-VOPs, split
+    /// over bands of macroblock rows on scoped threads for the
+    /// duration of a call; the decoded pictures are the same at every
+    /// budget.
+    pub fn set_threads(&mut self, threads: usize) {
+        self.threads = threads.max(1);
+    }
+
+    /// The worker budget in effect ([`Mpeg4VideoDecoder::set_threads`]).
+    pub fn threads(&self) -> usize {
+        self.threads.max(1)
+    }
+
+    fn decode_units(
         &mut self,
         data: &[u8],
         container_pts: Option<i64>,
@@ -1572,11 +1600,19 @@ impl oxideav_core::Decoder for Mpeg4PacketDecoder {
         Some(registry_format(bpp).0)
     }
 
+    /// The caller's thread budget: see
+    /// [`Mpeg4VideoDecoder::set_threads`]. Without this call the
+    /// decoder is serial.
+    fn set_execution_context(&mut self, ctx: &oxideav_core::ExecutionContext) {
+        self.inner.set_threads(ctx.threads);
+    }
+
     fn reset(&mut self) -> oxideav_core::Result<()> {
         // Preserve the compat behaviour selection — and the stream
         // evidence that selected the inverse transform — across seeks.
         let mut inner = Mpeg4VideoDecoder::with_options(self.inner.options());
         inner.inherit_stream_evidence(&self.inner);
+        inner.set_threads(self.inner.threads());
         self.inner = inner;
         self.ready.clear();
         self.flushed = false;

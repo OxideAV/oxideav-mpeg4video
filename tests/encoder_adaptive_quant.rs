@@ -171,6 +171,8 @@ fn dquant_with_inter4v_and_qpel_round_trips() {
 /// non-direct coded macroblocks and the decode is sample-exact.
 #[test]
 fn b_vop_dbquant_round_trips_and_is_emitted() {
+    // A quantiser of 14: the activity classes reach the two units a
+    // Table 6-33 step needs (below 12 they are scaled down to one).
     let (w, h) = (96usize, 48usize);
     let cfg = EncoderConfig::default()
         .with_width(w as u16)
@@ -188,15 +190,15 @@ fn b_vop_dbquant_round_trips_and_is_emitted() {
         width: w,
         height: h,
     };
-    let (i_unit, i_recon) = encode_i_vop_any(&vol, &cfg, &view(0), 0, 0, 8);
+    let (i_unit, i_recon) = encode_i_vop_any(&vol, &cfg, &view(0), 0, 0, 14);
     store.push_anchor(i_recon.clone());
     stream.extend_from_slice(&i_unit);
     let reference = store.backward().unwrap().clone();
-    let (p_unit, _) = encode_p_vop_any(&vol, &cfg, &view(2), &reference, 0, 2, 8);
+    let (p_unit, _) = encode_p_vop_any(&vol, &cfg, &view(2), &reference, 0, 2, 14);
     let (p_recon, motion) = reconstruct_own_p_vop_with_motion(&vol, &p_unit, &mut store);
     stream.extend_from_slice(&p_unit);
     let (b_unit, b_recon, stats) =
-        encode_b_vop_any(&vol, &cfg, &view(1), &store, Some(&motion), 1, 2, 0, 1, 8);
+        encode_b_vop_any(&vol, &cfg, &view(1), &store, Some(&motion), 1, 2, 0, 1, 14);
     stream.extend_from_slice(&b_unit);
     assert!(
         stats.dbquant > 0,

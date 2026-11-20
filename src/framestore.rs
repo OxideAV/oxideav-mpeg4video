@@ -481,6 +481,68 @@ impl DecodedFrame {
         Ok(())
     }
 
+    /// Fill the whole picture from `reconstruct(index)` (macroblock
+    /// index in raster order) on `workers` scoped threads, each
+    /// writing its own band of macroblock rows. The first error (in
+    /// raster order of the bands) is returned.
+    pub(crate) fn fill_in_bands<E, F>(&mut self, workers: usize, reconstruct: F) -> Result<(), E>
+    where
+        E: Send,
+        F: Fn(usize) -> Result<ReconstructedMacroblock, E> + Sync,
+    {
+        let (mb_w, mb_h) = (self.mb_width(), self.mb_height());
+        let rows_per_band = mb_h.div_ceil(workers.clamp(1, mb_h));
+        let max = (1i32 << self.bits_per_pixel) - 1;
+        let width = self.width;
+        fn run<S: Sample, E: Send, F>(
+            luma: &mut [S],
+            cb: &mut [S],
+            cr: &mut [S],
+            (width, mb_w, rows_per_band, max): (usize, usize, usize, i32),
+            reconstruct: &F,
+        ) -> Result<(), E>
+        where
+            F: Fn(usize) -> Result<ReconstructedMacroblock, E> + Sync,
+        {
+            let luma_band = rows_per_band * MACROBLOCK_LUMA_SIDE * width;
+            let chroma_band = rows_per_band * MACROBLOCK_CHROMA_SIDE * (width / 2);
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = luma
+                    .chunks_mut(luma_band)
+                    .zip(cb.chunks_mut(chroma_band))
+                    .zip(cr.chunks_mut(chroma_band))
+                    .enumerate()
+                    .map(|(band, ((luma, cb), cr))| {
+                        scope.spawn(move || -> Result<(), E> {
+                            let rows = luma.len() / (MACROBLOCK_LUMA_SIDE * width);
+                            for row in 0..rows {
+                                for col in 0..mb_w {
+                                    let index = (band * rows_per_band + row) * mb_w + col;
+                                    let mb = reconstruct(index)?;
+                                    blit_planes(luma, cb, cr, width, col, row, &mb, max);
+                                }
+                            }
+                            Ok(())
+                        })
+                    })
+                    .collect();
+                let mut result = Ok(());
+                for handle in handles {
+                    let band = handle.join().expect("assembly worker panicked");
+                    if result.is_ok() {
+                        result = band;
+                    }
+                }
+                result
+            })
+        }
+        let shape = (width, mb_w, rows_per_band, max);
+        match &mut self.planes {
+            Planes::Narrow { luma, cb, cr } => run(luma, cb, cr, shape, &reconstruct),
+            Planes::Wide { luma, cb, cr } => run(luma, cb, cr, shape, &reconstruct),
+        }
+    }
+
     /// Read back a single luma sample of a picture of up to 8 bits
     /// (debug / test helper). Returns `None` if out of bounds or for a
     /// deeper picture.

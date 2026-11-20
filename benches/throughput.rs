@@ -68,6 +68,13 @@ fn bench_decode(path: &str) {
     for _ in 0..repeats() {
         let start = Instant::now();
         let mut dec = Mpeg4VideoDecoder::with_options(decode_options());
+        // MPEG4VIDEO_BENCH_THREADS=n: the worker budget (default 1).
+        if let Some(threads) = std::env::var("MPEG4VIDEO_BENCH_THREADS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            dec.set_threads(threads);
+        }
         let mut frames = match dec.decode(&stream) {
             Ok(f) => f,
             Err(e) => {
@@ -84,6 +91,25 @@ fn bench_decode(path: &str) {
                 fnv1a(&mut hash, f.luma_samples());
                 fnv1a(&mut hash, f.cb_samples());
                 fnv1a(&mut hash, f.cr_samples());
+            }
+            // MPEG4VIDEO_BENCH_DECODE_OUT=dir: the decoded pictures
+            // (macroblock-aligned planes, 8-bit streams) as raw
+            // yuv420p next to the stream's name.
+            if let Ok(dir) = std::env::var("MPEG4VIDEO_BENCH_DECODE_OUT") {
+                let name = std::path::Path::new(path)
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let mut raw = Vec::new();
+                for f in &frames {
+                    raw.extend_from_slice(f.luma_samples());
+                    raw.extend_from_slice(f.cb_samples());
+                    raw.extend_from_slice(f.cr_samples());
+                }
+                let out = std::path::Path::new(&dir).join(format!("{name}.yuv"));
+                if let Err(e) = std::fs::write(&out, &raw) {
+                    println!("decode {path}: cannot write {}: {e}", out.display());
+                }
             }
         }
     }

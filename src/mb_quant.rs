@@ -61,7 +61,17 @@ pub fn target_qp(vop_qp: u32, class: i32) -> u32 {
 /// [`target_qp`] under a VOL whose quantiser scale tops out at
 /// `max_qp` (`2^quant_precision - 1`, §6.3.3).
 pub fn target_qp_bounded(vop_qp: u32, class: i32, max_qp: u32) -> u32 {
-    (vop_qp as i64 + i64::from(class)).clamp(1, i64::from(max_qp)) as u32
+    // The class is a relative step: two quantiser units are a tenth
+    // of a quantiser of 20 but the whole of a quantiser of 2, where
+    // they would double the rate of every flat macroblock. Scale the
+    // offset with the quantiser (none below 4, one unit up to 11).
+    let reach = match vop_qp {
+        0..=3 => 0,
+        4..=11 => 1,
+        _ => 2,
+    };
+    let offset = i64::from(class).clamp(-reach, reach);
+    (vop_qp as i64 + offset).clamp(1, i64::from(max_qp)) as u32
 }
 
 /// Plan an I-/P-VOP macroblock's `dquant` towards `target` from the
@@ -366,6 +376,17 @@ mod tests {
     }
 
     #[test]
+    fn class_offsets_scale_with_the_quantiser() {
+        // Nothing below 4, one unit up to 11, the full class above.
+        assert_eq!(target_qp(2, -2), 2);
+        assert_eq!(target_qp(3, 2), 3);
+        assert_eq!(target_qp(4, -2), 3);
+        assert_eq!(target_qp(11, 2), 12);
+        assert_eq!(target_qp(12, -2), 10);
+        assert_eq!(target_qp(20, 1), 21);
+    }
+
+    #[test]
     fn dbquant_steps_are_even_and_clipped() {
         assert_eq!(plan_dbquant(10, 11), (10, None));
         assert_eq!(plan_dbquant(10, 12), (12, Some(2)));
@@ -421,7 +442,8 @@ mod tests {
         reg.record(6);
         reg.record(8);
         assert_eq!(reg.mean_qp(), 7.0);
-        // Activity classes ride on top of the budget target.
-        assert_eq!(reg.target_qp(0, 0, 0), 5);
+        // Activity classes ride on top of the budget target (one unit
+        // at a quantiser of 7).
+        assert_eq!(reg.target_qp(0, 0, 0), 6);
     }
 }

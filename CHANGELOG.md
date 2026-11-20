@@ -6,7 +6,44 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **Encoder motion search** — predictor-seeded and rate-aware
+  (`pvop_encode::estimate_motion_predictive`, `MvCost`): seeds from the
+  §7.6.5 median and its three candidates (B-VOPs: the running
+  predictor and the scaled co-located vector), a two-pel diamond /
+  one-pel cross descent, a ±2 check around the stopping point, a
+  four-pel lattice over the Table 7-9 window on a poor match, then the
+  sub-sample rings; every candidate pays the bits of its differential
+  at `quantiser / 4` SAD units per bit. Replaces the exhaustive ±8
+  search around the zero vector in the P- and B-VOP encoders. Emitted
+  streams change (still decoded sample-exact by the crate and by the
+  black-box decoder); the encoder-produced fixtures and their
+  reference decodes were regenerated.
+- **Constant-quantiser B-VOPs** are coded at `ceil(1.25 · qp) + 1`.
+- **`mb-aq` activity classes scale with the quantiser** (none below
+  4, one unit up to 11): at `qp` 2 and 3 the fixed ±2 step multiplied
+  the rate of flat macroblocks.
+- **P-VOP skip under pending B-VOPs**: a macroblock is not coded
+  `not_coded` where a picture queued as a B-VOP differs from the new
+  anchor, since §6.3.6 would drop that B-VOP macroblock altogether
+  (`pvop_encode::PVopHints::forbid_skip`, `encode_p_vop_hinted`).
+- **Annex A forced update**: the registry encoder intra-codes a
+  macroblock before its 132nd consecutive predictive coding
+  (`PVopHints::force_intra`).
+- Rate–distortion against a black-box encoder at the same tools (three
+  CIF clips, eight quantisers, average bitrate difference at equal
+  luma PSNR): default tools −25 % / +1 % / −4 % against the previous
+  encoder, `bf=2` −29 % / −27 % / −8 %; README table.
+
 ### Added
+
+- **Decoder thread budget** — `Mpeg4VideoDecoder::set_threads(n)` and
+  `Decoder::set_execution_context`: the motion-compensated
+  reconstruction of P- and B-VOPs runs on up to `n` scoped workers,
+  each writing its own band of macroblock rows. Serial by default; the
+  pictures are identical at every budget
+  (`the_thread_budget_does_not_change_the_pictures`).
 
 - **Visual object layer syntax sweep** — header blocks the decoder
   used to decline, now read as §6.2.3 / §6.2.5 define them.

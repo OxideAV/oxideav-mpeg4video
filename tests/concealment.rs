@@ -210,3 +210,29 @@ fn concealment_leaves_clean_streams_and_declined_tools_alone() {
     }
     assert_eq!(frames, 5);
 }
+
+#[test]
+fn the_thread_budget_does_not_change_the_pictures() {
+    // P- and B-VOPs with real motion, decoded serially and with
+    // budgets above and below the number of macroblock rows.
+    for extra in [
+        &[][..],
+        &[("bf", "2")][..],
+        &[("bf", "1"), ("qpel", "true"), ("four-mv", "true")][..],
+    ] {
+        let packets = encode(8, extra);
+        let stream: Vec<u8> = packets.concat();
+        let mut serial = Mpeg4VideoDecoder::new();
+        assert_eq!(serial.threads(), 1);
+        let mut want = serial.decode(&stream).unwrap();
+        want.extend(serial.flush());
+        assert_eq!(want.len(), 8);
+        for threads in [2usize, 3, 16] {
+            let mut dec = Mpeg4VideoDecoder::new();
+            dec.set_threads(threads);
+            let mut got = dec.decode(&stream).unwrap();
+            got.extend(dec.flush());
+            assert_eq!(got, want, "threads = {threads}, options {extra:?}");
+        }
+    }
+}

@@ -313,7 +313,10 @@ fn blackbox_our_short_header_stream_is_bit_exact() {
         .with_height(144)
         .with_short_header(true)
         .with_adaptive_quant(true);
-    let (stream, recons) = encode_stream(&cfg, 5, 3, (2, 1), 5);
+    // Quantiser 6: at this one no sample of the stream sits on an
+    // inverse-transform near-tie, where the reference decode's
+    // single-precision transform may round the other way.
+    let (stream, recons) = encode_stream(&cfg, 5, 3, (2, 1), 6);
     pin_fixture("enc_sh_ippip_176x144.h263", &stream);
     if std::env::var_os("OXIDEAV_MPEG4VIDEO_WRITE_FIXTURES").is_some() {
         return;

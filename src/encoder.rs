@@ -30,7 +30,7 @@ use crate::ivop_encode::{
     write_configuration_headers,
 };
 use crate::mb_quant::MbBudget;
-use crate::pvop_encode::{encode_p_vop_any, reconstruct_own_p_vop_with_anchor_motion};
+use crate::pvop_encode::reconstruct_own_p_vop_with_anchor_motion;
 use crate::rate_control::{BudgetPlanner, FirstPassStats, FrameStat, RateController, VopClass};
 use crate::vol::{VolHeader, parse_video_object_layer};
 
@@ -637,6 +637,10 @@ pub struct Mpeg4VideoEncoder {
     /// brackets (`None` after an intra anchor); field-predicted
     /// anchors keep their §7.7.2.2 field shape.
     anchor_motion: Option<Vec<crate::vop_decode::AnchorMbMotion>>,
+    /// Per macroblock: how many times it has been coded predictively
+    /// since it was last intra coded (the Annex A forced update keeps
+    /// this below 132).
+    predictive_codings: Vec<u8>,
     /// The Annex D VBV model + (in `vop` mode) the reactive quantiser
     /// controller (`Some` when a bitrate target is set).
     rc: Option<RateController>,
@@ -944,6 +948,7 @@ impl Mpeg4VideoEncoder {
             frames_coded: 0,
             pending_bs: Vec::new(),
             anchor_motion: None,
+            predictive_codings: Vec::new(),
             rc,
             planner,
             stats_log: FirstPassStats::default(),
@@ -1208,7 +1213,71 @@ impl Mpeg4VideoEncoder {
                 plan.qp
             }
             (None, Some(rc)) => rc.qp(),
+            // Constant quantiser: a B-VOP is never a reference, so the
+            // error it is coded with reaches no other picture — it
+            // takes a quantiser a quarter coarser (plus one).
+            _ if class == VopClass::B => {
+                let max_qp = self.cfg.max_quantiser();
+                ((5 * self.options.qp).div_ceil(4) + 1).min(max_qp)
+            }
             _ => self.options.qp,
+        }
+    }
+
+    /// The macroblocks of the P-VOP about to be coded from `anchor`
+    /// that must not be `not_coded`: those where a picture waiting to
+    /// be coded as a B-VOP between the two anchors differs from the
+    /// new anchor by more than the quantiser would hide (§6.3.6: the
+    /// B-VOP macroblock under a `not_coded` one is not transmitted).
+    fn skip_forbidden(&self, anchor: &PendingFrame) -> Option<Vec<bool>> {
+        if self.pending_bs.is_empty() {
+            return None;
+        }
+        let (w, h) = (usize::from(self.cfg.width), usize::from(self.cfg.height));
+        let (mb_width, mb_height) = self.cfg.mb_dimensions();
+        let bpp = u32::from(self.cfg.bits_per_pixel);
+        // Mean absolute difference of two levels plus a quarter of the
+        // quantiser, over the 256 samples.
+        let threshold =
+            256 * crate::pvop_encode::from_eight_bit_scale(2 + self.options.qp / 4, bpp);
+        let mut mask = vec![false; mb_width * mb_height];
+        for b in &self.pending_bs {
+            for (index, forbidden) in mask.iter_mut().enumerate() {
+                if *forbidden {
+                    continue;
+                }
+                let (row, col) = (index / mb_width, index % mb_width);
+                let of_anchor = with_picture_view!(anchor, w, h, |v| {
+                    crate::pvop_encode::source_luma_mb(&v, row, col)
+                });
+                let of_b = with_picture_view!(b, w, h, |v| {
+                    crate::pvop_encode::source_luma_mb(&v, row, col)
+                });
+                let difference: u32 = of_anchor
+                    .iter()
+                    .flatten()
+                    .zip(of_b.iter().flatten())
+                    .map(|(&a, &b)| (a - b).unsigned_abs())
+                    .sum();
+                *forbidden = difference > threshold;
+            }
+        }
+        Some(mask)
+    }
+
+    /// Annex A forced update: after a P-VOP coded with `motion`, count
+    /// each macroblock's consecutive predictive codings (an intra
+    /// macroblock restarts the count, a `not_coded` one leaves it).
+    fn count_predictive_codings(&mut self, motion: &[crate::vop_decode::AnchorMbMotion]) {
+        use crate::pvop_mv::PvopMbMotion;
+        use crate::vop_decode::AnchorMbMotion;
+        self.predictive_codings.resize(motion.len(), 0);
+        for (count, m) in self.predictive_codings.iter_mut().zip(motion) {
+            match m {
+                AnchorMbMotion::Frame(PvopMbMotion::Intra) => *count = 0,
+                AnchorMbMotion::Frame(PvopMbMotion::Skipped) => {}
+                _ => *count = count.saturating_add(1),
+            }
         }
     }
 
@@ -1431,6 +1500,7 @@ impl Mpeg4VideoEncoder {
             };
             self.store.push_anchor(recon);
             self.anchor_motion = None;
+            self.predictive_codings.clear();
             unit
         } else if self.cfg.gmc {
             // GMC: non-keyframe anchors are S(GMC)-VOPs.
@@ -1468,9 +1538,22 @@ impl Mpeg4VideoEncoder {
                 .expect("anchor present on the P path")
                 .clone();
             let mut qp = self.plan_vop(VopClass::P);
+            let forbid_skip = self.skip_forbidden(frame);
+            // 131 predictive codings: the next one has to be intra.
+            let force_intra: Vec<bool> = self
+                .predictive_codings
+                .iter()
+                .map(|&count| count >= 131)
+                .collect();
+            let hints = crate::pvop_encode::PVopHints {
+                forbid_skip: forbid_skip.as_deref(),
+                force_intra: (!force_intra.is_empty()).then_some(&force_intra[..]),
+            };
             let unit = loop {
                 let (unit, stats) = with_picture_view!(frame, w, h, |v| {
-                    encode_p_vop_any(&vol, &self.cfg, &v, &reference, modulo, increment, qp)
+                    crate::pvop_encode::encode_p_vop_hinted(
+                        &vol, &self.cfg, &v, &reference, modulo, increment, qp, hints,
+                    )
                 });
                 let mean_qp = stats.mean_qp_or(qp);
                 if let Some(q) = self.calibrate_vop(VopClass::P, unit.len(), mean_qp) {
@@ -1484,6 +1567,7 @@ impl Mpeg4VideoEncoder {
             };
             let (_recon, motion) =
                 reconstruct_own_p_vop_with_anchor_motion(&vol, &unit, &mut self.store);
+            self.count_predictive_codings(&motion);
             self.anchor_motion = Some(motion);
             unit
         };

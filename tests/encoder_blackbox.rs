@@ -679,8 +679,12 @@ fn method1_stream_decodes_against_reference_decoder_per_compat_contract() {
 
 #[test]
 fn ip_stream_reproduces_committed_fixture() {
+    let built = build_ip_stream();
+    if maybe_write_fixture("enc_ip_m2_64x64.m4v", &built) {
+        return;
+    }
     assert_eq!(
-        build_ip_stream(),
+        built,
         fixture("enc_ip_m2_64x64.m4v"),
         "encoder output drifted from the black-box-validated fixture; \
          regenerate the fixture AND its reference decode"

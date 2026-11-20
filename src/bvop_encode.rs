@@ -60,7 +60,7 @@ use crate::ivop_encode::{EncoderConfig, FrameView};
 use crate::motion::{
     DirectCoLocatedMv, DirectMvUnits, MotionVector, MotionVectorDelta, direct_mode_motion_vector,
 };
-use crate::pvop_encode::{estimate_motion, sample_mode_of, source_luma_mb};
+use crate::pvop_encode::{sample_mode_of, source_luma_mb};
 use crate::pvop_mv::PvopMbMotion;
 use crate::sample::Sample;
 use crate::texture::{AcEvent, TcoefTable};
@@ -426,6 +426,7 @@ pub fn encode_b_vop_any<S: Sample>(
     // on the macroblocks whose syntax carries it).
     let vop_qp = qp;
     let mut running_qp = vop_qp;
+    let mv_cost = crate::pvop_encode::MvCost::new(fcode, vop_qp, bpp);
     let regulator = cfg.mb_budget.map(|budget| {
         let activities = crate::pvop_encode::activity_profile(frame, mb_width, mb_height, bpp);
         crate::mb_quant::MbRegulator::with_max_qp(
@@ -493,8 +494,34 @@ pub fn encode_b_vop_any<S: Sample>(
             }
 
             // Forward / backward motion search against each anchor.
-            let (mv_f, _) = estimate_motion(&src, &fwd_luma, mb_x, mb_y, mode, fcode);
-            let (mv_b, _) = estimate_motion(&src, &bwd_luma, mb_x, mb_y, mode, fcode);
+            // Each direction starts from its §7.6.8 running predictor
+            // and from the vector the best direct candidate uses that
+            // way (the co-located motion scaled by TRB / TRD).
+            let direct_mvs = best.decode.mvs[0];
+            let mv_f = crate::pvop_encode::estimate_motion_predictive(
+                &src,
+                &fwd_luma,
+                mb_x,
+                mb_y,
+                mode,
+                fcode,
+                pred_f,
+                &[direct_mvs.forward],
+                &mv_cost,
+            )
+            .mv;
+            let mv_b = crate::pvop_encode::estimate_motion_predictive(
+                &src,
+                &bwd_luma,
+                mb_x,
+                mb_y,
+                mode,
+                fcode,
+                pred_b,
+                &[direct_mvs.backward],
+                &mv_cost,
+            )
+            .mv;
             let zero = MotionVector { x: 0, y: 0 };
             for cand in [
                 one_mv_candidate(BVopMbType::Forward, mv_f, zero, mode),

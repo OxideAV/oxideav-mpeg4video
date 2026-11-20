@@ -474,6 +474,233 @@ pub(crate) fn estimate_motion<S: Sample>(
     })
 }
 
+/// The rate side of the motion search: the length in bits of a
+/// `motion_vector()` differential under the VOP's `fcode` (Table B.12
+/// code plus the `fcode - 1` residual bits, after the §7.6.3 wrap into
+/// the coded range), weighted by a Lagrange multiplier on the SAD
+/// scale.
+#[derive(Debug, Clone)]
+pub(crate) struct MvCost {
+    fcode: u8,
+    /// SAD units per bit.
+    lambda: u32,
+    /// Bits of one component differential, indexed by `d - low` for
+    /// `d` in the coded range `[low, high]`.
+    component_bits: Vec<u8>,
+    low: i32,
+    /// SAD credit of the zero vector (keeps still areas skippable).
+    zero_bias: u32,
+}
+
+impl MvCost {
+    /// The cost model of a VOP coded at `quantiser` with `fcode`, on
+    /// the SAD scale of `bits_per_pixel` samples.
+    pub(crate) fn new(fcode: u8, quantiser: u32, bits_per_pixel: u32) -> Self {
+        let (low, high) = mv_range(fcode);
+        let component_bits = (low..=high)
+            .map(|d| {
+                let mut bw = BitWriter::new();
+                crate::vlc_encode::put_mv_component(&mut bw, d, fcode);
+                bw.bit_position() as u8
+            })
+            .collect();
+        Self {
+            fcode,
+            // One bit weighs about one quantiser step of error over a
+            // sample: a vector is only worth sending when it removes
+            // more residual than its own differential costs.
+            lambda: from_eight_bit_scale(quantiser.div_ceil(4), bits_per_pixel).max(1),
+            component_bits,
+            low,
+            zero_bias: from_eight_bit_scale(128, bits_per_pixel),
+        }
+    }
+
+    /// Bits of the differential `mv - predictor`.
+    #[inline]
+    pub(crate) fn bits(&self, mv: MotionVector, predictor: MotionVector) -> u32 {
+        let one = |d: i32| -> u32 {
+            let wrapped = crate::vlc_encode::wrap_mvd_component(d, self.fcode);
+            u32::from(self.component_bits[(wrapped - self.low) as usize])
+        };
+        one(mv.x - predictor.x) + one(mv.y - predictor.y)
+    }
+
+    /// The Lagrangian rate term of `mv` against `predictor`, in SAD
+    /// units, less the zero-vector credit.
+    #[inline]
+    pub(crate) fn of(&self, mv: MotionVector, predictor: MotionVector) -> u32 {
+        let rate = self.lambda * self.bits(mv, predictor);
+        if mv.x == 0 && mv.y == 0 {
+            rate.saturating_sub(self.zero_bias)
+        } else {
+            rate
+        }
+    }
+}
+
+/// Result of [`estimate_motion_predictive`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MotionEstimate {
+    /// The vector, in the sample mode's units.
+    pub(crate) mv: MotionVector,
+    /// Its SAD against the source macroblock (without the rate term
+    /// the search minimised alongside it).
+    pub(crate) sad: u32,
+}
+
+/// Predictor-seeded motion search: SAD plus the cost of the vector
+/// differential, minimised over
+///
+/// 1. the seed vectors — the zero vector, the §7.6.5 median
+///    `predictor` and whatever the caller supplies (the neighbours'
+///    vectors, a co-located or scaled vector);
+/// 2. a descent from the best seed on a two-pel diamond, then a
+///    one-pel cross, each repeated until it stops improving;
+/// 3. when the match is still poor, a four-pel lattice over the whole
+///    Table 7-9 window with the same descent from its winner;
+/// 4. the half-sample (and quarter-sample) rings around the full-pel
+///    winner, through the decoder's own interpolators.
+///
+/// A translating region is found from its neighbours' vectors in a
+/// handful of SADs; the rate term keeps the field smooth where the
+/// SAD surface is flat.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn estimate_motion_predictive<S: Sample>(
+    src: &[[i32; 16]; 16],
+    reference: &crate::half_sample::ReferenceVop<'_, S>,
+    mb_x: i32,
+    mb_y: i32,
+    mode: BVopSampleMode,
+    fcode: u8,
+    predictor: MotionVector,
+    seeds: &[MotionVector],
+    cost: &MvCost,
+) -> MotionEstimate {
+    let unit = units_per_pel(mode);
+    let window = full_pel_window(fcode, mode).max(search_window_pels(fcode, mode).min(16));
+    let (low, high) = mv_range(fcode);
+    // Full-pel positions whose vector stays inside the coded range.
+    let (pel_lo, pel_hi) = (low.div_euclid(unit) + 1, high.div_euclid(unit));
+    let (pel_lo, pel_hi) = (pel_lo.max(-window), pel_hi.min(window));
+    // Keep at least one block sample inside the padded reference.
+    let (ref_w, ref_h) = (reference.width() as i32, reference.height() as i32);
+    let (dx_lo, dx_hi) = (pel_lo.max(-mb_x - 15), pel_hi.min(ref_w - 1 - mb_x));
+    let (dy_lo, dy_hi) = (pel_lo.max(-mb_y - 15), pel_hi.min(ref_h - 1 - mb_y));
+    let narrow = narrow_rows(src);
+    let narrow = narrow.as_ref();
+    let rate = |dx: i32, dy: i32| -> u32 {
+        cost.of(
+            MotionVector {
+                x: dx * unit,
+                y: dy * unit,
+            },
+            predictor,
+        )
+    };
+
+    let mut best = (0i32, 0i32);
+    let mut best_cost =
+        sad_full_pel(src, reference, mb_x, mb_y, 0, 0, u32::MAX, narrow).saturating_add(rate(0, 0));
+    let mut consider = |dx: i32, dy: i32, best: &mut (i32, i32), best_cost: &mut u32| -> bool {
+        if (dx, dy) == *best || dx < dx_lo || dx > dx_hi || dy < dy_lo || dy > dy_hi {
+            return false;
+        }
+        let r = rate(dx, dy);
+        if r >= *best_cost {
+            return false;
+        }
+        let sad = sad_full_pel(src, reference, mb_x, mb_y, dx, dy, *best_cost - r, narrow);
+        if sad.saturating_add(r) < *best_cost {
+            *best_cost = sad + r;
+            *best = (dx, dy);
+            true
+        } else {
+            false
+        }
+    };
+    fn descend(
+        best: &mut (i32, i32),
+        best_cost: &mut u32,
+        consider: &mut impl FnMut(i32, i32, &mut (i32, i32), &mut u32) -> bool,
+    ) {
+        const DIAMOND: [(i32, i32); 8] = [
+            (2, 0),
+            (-2, 0),
+            (0, 2),
+            (0, -2),
+            (1, 1),
+            (1, -1),
+            (-1, 1),
+            (-1, -1),
+        ];
+        const CROSS: [(i32, i32); 4] = [(1, 0), (-1, 0), (0, 1), (0, -1)];
+        for (pattern, rounds) in [(&DIAMOND[..], 24), (&CROSS[..], 8)] {
+            for _ in 0..rounds {
+                let centre = *best;
+                let mut moved = false;
+                for &(ox, oy) in pattern {
+                    moved |= consider(centre.0 + ox, centre.1 + oy, best, best_cost);
+                }
+                if !moved {
+                    break;
+                }
+            }
+        }
+        // Every position within two pels of where the descent stopped
+        // (it follows the steepest neighbour, which periodic detail
+        // can lead one step aside of the minimum).
+        let centre = *best;
+        for oy in -2..=2 {
+            for ox in -2..=2 {
+                consider(centre.0 + ox, centre.1 + oy, best, best_cost);
+            }
+        }
+    }
+
+    // 1. Seeds (rounded to the full-pel grid).
+    let to_pel = |v: i32| -> i32 { (v + unit / 2).div_euclid(unit) };
+    consider(
+        to_pel(predictor.x),
+        to_pel(predictor.y),
+        &mut best,
+        &mut best_cost,
+    );
+    for seed in seeds {
+        consider(to_pel(seed.x), to_pel(seed.y), &mut best, &mut best_cost);
+    }
+    // 2. Descent.
+    descend(&mut best, &mut best_cost, &mut consider);
+    // 3. A poor match (more than about two levels of error per sample
+    // beyond half the quantiser's step): look everywhere, coarsely.
+    let poor = 256 * (2 * cost.zero_bias / 128 + cost.lambda / 2);
+    if best_cost > poor {
+        let mut coarse = best;
+        let mut coarse_cost = best_cost;
+        let mut dy = dy_lo;
+        while dy <= dy_hi {
+            let mut dx = dx_lo;
+            while dx <= dx_hi {
+                consider(dx, dy, &mut coarse, &mut coarse_cost);
+                dx += 4;
+            }
+            dy += 4;
+        }
+        if coarse != best {
+            descend(&mut coarse, &mut coarse_cost, &mut consider);
+            best = coarse;
+        }
+    }
+    // 4. Sub-pel rings, same cost.
+    let (mv, total) = refine_subpel(best, mode, fcode, |cand| {
+        sad_subpel(src, reference, mb_x, mb_y, cand, mode).saturating_add(cost.of(cand, predictor))
+    });
+    MotionEstimate {
+        mv,
+        sad: total.saturating_sub(cost.of(mv, predictor)),
+    }
+}
+
 /// SAD of one 8×8 luminance sub-block (Figure 6-8 index `i`, luma
 /// blocks 0..=3) against a full-pel reference position.
 fn sad_full_pel_block8<S: Sample>(
@@ -774,6 +1001,23 @@ pub(crate) fn inter_cbp(events: &[Vec<AcEvent>]) -> (u8, u8) {
     (cbpy, cbpc)
 }
 
+/// Per-macroblock constraints on a P-VOP's mode decision, in raster
+/// order (an absent mask constrains nothing).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PVopHints<'a> {
+    /// Macroblocks that must not be coded `not_coded`. §6.3.6: a
+    /// B-VOP macroblock whose co-located macroblock in the following
+    /// P-VOP is `not_coded` is not transmitted at all — it becomes a
+    /// copy of the past anchor. Where a B-VOP between the two anchors
+    /// shows something else than they do, the P-VOP macroblock has to
+    /// be coded (a zero vector and an empty pattern are enough).
+    pub forbid_skip: Option<&'a [bool]>,
+    /// Macroblocks that must be intra coded (the Annex A forced
+    /// update: every macroblock is refreshed before it has been coded
+    /// predictively 132 times).
+    pub force_intra: Option<&'a [bool]>,
+}
+
 /// Encode one rectangular progressive P-VOP against `reference` (the
 /// closed-loop reconstruction of the previous anchor). Returns the
 /// emitted unit (start-code delimited, stuffed) and the mode
@@ -787,6 +1031,31 @@ pub fn encode_p_vop_any<S: Sample>(
     modulo_time_base: u32,
     time_increment: u16,
     qp: u32,
+) -> (Vec<u8>, PVopEncodeStats) {
+    encode_p_vop_hinted(
+        vol,
+        cfg,
+        frame,
+        reference,
+        modulo_time_base,
+        time_increment,
+        qp,
+        PVopHints::default(),
+    )
+}
+
+/// [`encode_p_vop_any`] under per-macroblock mode constraints
+/// ([`PVopHints`]).
+#[allow(clippy::too_many_arguments)]
+pub fn encode_p_vop_hinted<S: Sample>(
+    vol: &crate::vol::VolHeader,
+    cfg: &EncoderConfig,
+    frame: &FrameView<'_, S>,
+    reference: &DecodedFrame,
+    modulo_time_base: u32,
+    time_increment: u16,
+    qp: u32,
+    hints: PVopHints<'_>,
 ) -> (Vec<u8>, PVopEncodeStats) {
     let max_qp = (1u32 << vol.quant_precision) - 1;
     let bpp = u32::from(vol.bits_per_pixel);
@@ -846,6 +1115,7 @@ pub fn encode_p_vop_any<S: Sample>(
     // macroblock leaves it untouched).
     let vop_qp = qp;
     let mut running_qp = vop_qp;
+    let mv_cost = MvCost::new(fcode, vop_qp, bpp);
     let regulator = cfg.mb_budget.map(|budget| {
         let activities = activity_profile(frame, mb_width, mb_height, bpp);
         crate::mb_quant::MbRegulator::with_max_qp(
@@ -883,8 +1153,26 @@ pub fn encode_p_vop_any<S: Sample>(
                 )
             };
 
-            // Motion estimation + mode decision.
-            let (mv, one_mv_sad) = estimate_motion(&src, &luma_ref, mb_x, mb_y, mode, fcode);
+            // Motion estimation + mode decision: the search starts
+            // from the §7.6.5 median predictor and the three
+            // neighbour vectors it is formed from, and weighs every
+            // vector's differential against that predictor.
+            let neighbours = mv_grid
+                .predictor_candidates(mb_row, mb_col, 0)
+                .expect("grid coordinates in range");
+            let seeds: Vec<MotionVector> = neighbours.iter().flatten().copied().collect();
+            let estimate = estimate_motion_predictive(
+                &src,
+                &luma_ref,
+                mb_x,
+                mb_y,
+                mode,
+                fcode,
+                predict_motion_vector(neighbours),
+                &seeds,
+                &mv_cost,
+            );
+            let (mv, one_mv_sad) = (estimate.mv, estimate.sad);
             // §6.3.7 inter4v: per-block refinement around the 1-MV
             // winner; chosen only when the summed block SADs undercut
             // the 1-MV SAD by a margin covering the three extra
@@ -922,7 +1210,9 @@ pub fn encode_p_vop_any<S: Sample>(
                 None
             };
             let inter_sad = field.map_or(frame_sad, |(_, t, b)| t.sad + b.sad);
-            let choose_intra = activity + from_eight_bit_scale(512, bpp) < inter_sad;
+            let forced_intra = hints.force_intra.is_some_and(|mask| mask[mb_index]);
+            let choose_intra =
+                forced_intra || activity + from_eight_bit_scale(512, bpp) < inter_sad;
 
             if choose_intra {
                 stats.intra += 1;
@@ -1036,6 +1326,7 @@ pub fn encode_p_vop_any<S: Sample>(
             if all_zero
                 && field.is_none()
                 && matches!(motion, PvopMbMotion::OneMv(m) if m == (MotionVector { x: 0, y: 0 }))
+                && !hints.forbid_skip.is_some_and(|mask| mask[mb_index])
             {
                 // §6.3.6 skip: not_coded = 1, zero MV, no residual (the
                 // running quantiser is untouched — no dquant is sent).

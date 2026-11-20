@@ -194,10 +194,11 @@ fn assemble_p_vop_frame_in<S: Sample>(
         bits_per_pixel,
     )?;
 
-    for (idx, entry) in entries.iter().enumerate() {
+    assemble_macroblocks(&mut frame, entries.len(), mb_width, |idx| {
+        let entry = &entries[idx];
         let mb_col = idx % mb_width;
         let mb_row = idx / mb_width;
-        let reconstructed = match entry {
+        Ok(match entry {
             PVopMbContent::Inter { motion, residual } => reconstruct_pvop_macroblock(
                 *motion,
                 &luma_ref,
@@ -252,11 +253,54 @@ fn assemble_p_vop_frame_in<S: Sample>(
                 reconstruct_inter_macroblock(&prediction, residual, bits_per_pixel)
             }
             PVopMbContent::Intra(mb) => mb.clone(),
-        };
-        frame.blit_macroblock(mb_col, mb_row, &reconstructed)?;
-    }
+        })
+    })?;
 
     Ok(frame)
+}
+
+std::thread_local! {
+    /// The worker budget frame assembly may use on this thread (see
+    /// [`with_assembly_threads`]); 1 = serial.
+    static ASSEMBLY_THREADS: std::cell::Cell<usize> = const { std::cell::Cell::new(1) };
+}
+
+/// Run `body` with frame assembly allowed up to `threads` workers
+/// (the caller's budget; 1 keeps it serial). The assembled pictures do
+/// not depend on the budget.
+#[doc(hidden)]
+pub fn with_assembly_threads<T>(threads: usize, body: impl FnOnce() -> T) -> T {
+    let previous = ASSEMBLY_THREADS.with(|cell| cell.replace(threads.max(1)));
+    let out = body();
+    ASSEMBLY_THREADS.with(|cell| cell.set(previous));
+    out
+}
+
+/// Reconstruct the `count` macroblocks of a picture with
+/// `reconstruct(index)` (raster order) and blit them into `frame`:
+/// one after the other, or — under a budget of more than one worker —
+/// on scoped threads, each filling its own band of macroblock rows.
+/// Every macroblock only reads the reference pictures and writes its
+/// own samples, so both orders build the same picture.
+fn assemble_macroblocks<F>(
+    frame: &mut DecodedFrame,
+    count: usize,
+    mb_width: usize,
+    reconstruct: F,
+) -> Result<(), FrameDecodeError>
+where
+    F: Fn(usize) -> Result<ReconstructedMacroblock, FrameDecodeError> + Sync,
+{
+    let rows = count / mb_width.max(1);
+    let workers = ASSEMBLY_THREADS.with(|cell| cell.get()).min(rows);
+    if workers <= 1 {
+        for index in 0..count {
+            let mb = reconstruct(index)?;
+            frame.blit_macroblock(index % mb_width, index / mb_width, &mb)?;
+        }
+        return Ok(());
+    }
+    frame.fill_in_bands(workers, reconstruct)
 }
 
 /// Per-8×8-luminance-block motion classification feeding the §7.6.6
@@ -696,12 +740,13 @@ fn assemble_b_vop_frame_in<S: Sample>(
         VopCodingType::B,
         bits_per_pixel,
     )?;
-    for (idx, entry) in entries.iter().enumerate() {
+    assemble_macroblocks(&mut frame, entries.len(), mb_width, |idx| {
+        let entry = &entries[idx];
         let mb_col = idx % mb_width;
         let mb_row = idx / mb_width;
         // §7.6.9.5.2: direct-mode vectors are half-pel even in a
         // quarter-sample VOL; every other mode follows the VOL grid.
-        let reconstructed = entry.motion.reconstruct(
+        Ok(entry.motion.reconstruct(
             &anchors,
             &entry.residual,
             (mb_col * 16) as i32,
@@ -709,9 +754,8 @@ fn assemble_b_vop_frame_in<S: Sample>(
             vop_rounding_type,
             entry.motion.luma_sample_mode(sample_mode),
             bits_per_pixel,
-        );
-        frame.blit_macroblock(mb_col, mb_row, &reconstructed)?;
-    }
+        ))
+    })?;
     Ok(frame)
 }
 

@@ -256,10 +256,10 @@ target over 50 frames of a 64×64 moving-texture scene, 25 fps,
 | GOP | bf | 150 kb/s budget | 150 kb/s vop | 400 kb/s budget | 400 kb/s vop |
 |----:|---:|---:|---:|---:|---:|
 | 1 | 0 | 1.002 | 0.989 | 1.003 | 0.989 |
-| 12 | 0 | 1.021 | 1.016 | 1.012 | 0.996 |
-| 12 | 2 | 1.038 | 1.083 | 1.022 | 1.051 |
-| 25 | 0 | 1.002 | 0.987 | 1.001 | 0.980 |
-| 25 | 2 | 1.001 | 1.050 | 1.001 | 1.033 |
+| 12 | 0 | 1.016 | 1.009 | 1.009 | 0.996 |
+| 12 | 2 | 1.038 | 1.042 | 1.022 | 1.001 |
+| 25 | 0 | 1.002 | 0.989 | 1.001 | 0.997 |
+| 25 | 2 | 1.001 | 1.013 | 1.000 | 1.001 |
 
 Two-pass on a 60-frame GOP-12 / bf-2 run at 250 kb/s lands at 1.000
 (single pass 1.009). The registry entry declares `encode`:
@@ -297,6 +297,77 @@ decodes sample-exact against the encoder's closed loop
 (`tests/static_sprite.rs`). This pair is verified against itself
 only: the black-box decoder used elsewhere reads the VOL as a static
 sprite and then declines it, so no independent decode exists yet.
+
+## Encoder decisions and rate–distortion
+
+How the encoder spends bits, beyond the tool list above:
+
+- **Motion search.** Each macroblock starts from the §7.6.5 median
+  predictor and the neighbour vectors it is made of (a B-VOP: from its
+  running predictor and the co-located vector scaled by TRB / TRD),
+  descends on a two-pel diamond and a one-pel cross, checks every
+  position within two pels of where it stopped, and falls back to a
+  four-pel lattice over the whole Table 7-9 window when the match is
+  still poor; half- and quarter-sample rings follow through the
+  decoder's interpolators. Every candidate is charged the bits of its
+  differential (`quantiser / 4` SAD units per bit), so the field stays
+  as smooth as the content allows and a translating region is found
+  in a handful of SADs.
+- **B-VOPs** take a quantiser a quarter coarser than the anchors (plus
+  one) under a constant `qp`: nothing is predicted from them.
+- **Skipped macroblocks and B-VOPs.** A B-VOP macroblock under a
+  `not_coded` macroblock of the following P-VOP is not transmitted
+  (§6.3.6). Where a picture waiting to be coded as a B-VOP differs
+  from the new anchor, the P-VOP macroblock is therefore coded (zero
+  vector, empty pattern) rather than skipped — otherwise whatever
+  only that picture shows would be lost.
+- **Forced update** (Annex A, NOTE 1): a macroblock is intra coded
+  before it has been coded predictively 132 times in a row.
+- **Activity classes** (`mb-aq`) scale with the quantiser: no step
+  below a quantiser of 4, one unit up to 11, two above.
+
+Measured against a black-box MPEG-4 Part 2 encoder (constant
+quantiser, the same tool switches) on three 352×288, 50-frame, GOP-50
+clips — `nat`: a panning, slowly rotating noise texture with a moving
+overlay and temporal grain; `tsrc`: a synthetic test pattern;
+`mandel`: a fractal zoom — at quantisers 2, 3, 4, 6, 8, 12, 16 and 24.
+The figure is the average bitrate difference at equal luma PSNR over
+the overlapping quality range (negative = fewer bits); quality is
+measured on a black-box decode of each stream with the inverse
+transform its encoder closes its loop on. All 168 streams of the
+"after" encoder decode in the black-box decoder without a diagnostic
+and bit-identically in this crate.
+
+| tools | clip | after vs before | after vs black box | before vs black box |
+|---|---|---:|---:|---:|
+| default (I/P, half-sample) | nat | −25.1 % | −11.9 % | +18.0 % |
+| | tsrc | +0.8 % | −24.6 % | −25.1 % |
+| | mandel | −4.1 % | −4.5 % | −0.4 % |
+| `four-mv` | nat | −24.9 % | −11.7 % | +18.0 % |
+| | tsrc | +1.4 % | −23.4 % | −24.2 % |
+| | mandel | −4.0 % | −3.9 % | +0.1 % |
+| `qpel` | nat | −21.5 % | +28.4 % | +64.0 % |
+| | tsrc | +0.6 % | −23.2 % | −23.2 % |
+| | mandel | −5.8 % | −3.4 % | +2.7 % |
+| `bf=2` | nat | −29.2 % | +17.0 % | +58.1 % |
+| | tsrc | −26.6 % | −17.4 % | +13.7 % |
+| | mandel | −7.6 % | −6.0 % | +0.2 % |
+| `mpeg-quant` | nat / tsrc / mandel | −27.2 / −0.1 / −5.2 % | | |
+| `mb-aq` | nat / tsrc / mandel | −34.9 / −5.1 / −7.7 % | | |
+| `four-mv` + `qpel` + `bf=2` | nat | −12.4 % | +66.9 % | +87.5 % |
+| | tsrc | −6.4 % | +9.3 % | +18.5 % |
+| | mandel | −8.1 % | −4.0 % | +3.1 % |
+
+What the table says: the default tool set and B-VOPs moved from
+behind the black-box encoder to ahead of it on two clips out of three.
+The test pattern gave back 1 % where the old exhaustive ±8 search was
+replaced (it is twice as fast). On the grainy clip quarter-sample
+prediction and B-VOPs still cost more than they save here — the
+eight-tap filter carries the reference's grain into the prediction
+where the half-sample average would smooth it, and mode decisions are
+made on SAD, not on the bits a mode will cost. That is the open part
+of the encoder: rate-aware mode decision (intra / inter / 4MV / direct)
+and coefficient-level optimisation.
 
 ## Layers, optional header blocks, damaged streams
 
@@ -840,8 +911,50 @@ existing paths where they were — 704×480 I/P/B test pattern 1120 →
 through variant RC decodes at 1199 fps, a dense fractal stream at 682
 against 634 fps.
 
+### This round: motion search and the decoder's thread budget
+
+Same harness, medians of three interleaved runs of the tree before and
+after the round on a machine shared with other builds (60-frame
+720×576 and 40-frame 1920×1080 I/P/B streams from a black-box encoder;
+the encodes read a raw fractal zoom at `qp=5`). Decode output hashes
+are unchanged; the encoder's output changed with its motion search
+(see the rate–distortion table).
+
+| Decode (fps) | before | after, serial | after, 4 workers |
+|---|---:|---:|---:|
+| 720×576 `ipb` | 852 | 829 | 774 |
+| 720×576 `qpel` | 485 | 488 | 532 |
+| 1920×1080 `ipb` | 192 | 193 | 222 |
+| 1920×1080 `qpel` | 130 | 127 | 163 |
+
+| Encode (fps) | before | after | × |
+|---|---:|---:|---:|
+| 720×576, default tools | 77.6 | 96.4 | 1.24 |
+| 720×576, `qpel` + `four-mv` + `bf=2` | 21.5 | 22.9 | 1.06 |
+| 1920×1080, default tools | 16.3 | 23.6 | 1.45 |
+| 1920×1080, `qpel` + `four-mv` + `bf=2` | 4.8 | 5.2 | 1.09 |
+
+On the 352×288 clips of the rate–distortion table the default-tools
+encode went from 232 to 422 fps (the grainy clip, where the old
+exhaustive search never terminated early).
+
+The serial decode is where it was (the sample-generic motion
+compensation compiles to the same 8-bit code). The thread budget —
+`Mpeg4VideoDecoder::set_threads` / `Decoder::set_execution_context`,
+serial unless the caller grants more — parallelises the
+motion-compensated reconstruction over bands of macroblock rows; the
+bitstream walk, which includes the inverse transform of every coded
+block, stays on the calling thread and bounds the gain at about 1.3×
+on these streams (nothing at 720×576 half-sample, where spawning the
+workers costs what they save). Moving the inverse transform behind
+the walk is the next step for decode scaling; on the encode side the
+sub-sample refinement (sixteen full-macroblock interpolations per
+macroblock) and the closed-loop decode of every VOP are now the
+largest items.
+
 ```text
 MPEG4VIDEO_BENCH_DECODE=a.m4v:b.m4v cargo bench --bench throughput
+MPEG4VIDEO_BENCH_THREADS=4 MPEG4VIDEO_BENCH_DECODE=a.m4v cargo bench --bench throughput
 MPEG4VIDEO_BENCH_INVERSE_TRANSFORM=variant-rc MPEG4VIDEO_BENCH_DECODE=a.m4v cargo bench --bench throughput
 MPEG4VIDEO_BENCH_ENCODE='1280x720:src.yuv:qp=5,bf=2' cargo bench --bench throughput
 ```
