@@ -61,7 +61,7 @@
 //!   [`crate::chroma_mv::chroma_mv_from_luma_blocks`].
 //! * **§7.6.2 interpolation primitives.** Delegated to
 //!   [`crate::half_sample::interpolate_block_into`] /
-//!   [`crate::quarter_sample::interpolate_block_qpel_into`].
+//!   [`crate::quarter_sample::interpolate_block_qpel_into_any`].
 //! * **Residual add and §7.3 step-3 clip.** The output of this module
 //!   is the §7.3 step-1 `p[y][x]` prediction; the caller adds the
 //!   §7.3 step-2 `f[y][x]` residual and applies the final
@@ -72,7 +72,7 @@
 
 use crate::half_sample::{ReferenceVop, interpolate_block_into};
 use crate::motion::MotionVector;
-use crate::quarter_sample::interpolate_block_qpel_into;
+use crate::quarter_sample::interpolate_block_qpel_into_any;
 use crate::sample::Sample;
 
 /// Side length, in luminance samples, of one B-VOP MC sub-block.
@@ -240,7 +240,7 @@ fn interpolate_sub_block<S: Sample>(
             );
         }
         BVopSampleMode::QuarterPel { bits_per_pixel } => {
-            interpolate_block_qpel_into(
+            interpolate_block_qpel_into_any(
                 reference,
                 mv.x,
                 mv.y,
@@ -470,7 +470,7 @@ fn interpolate_mb_block<S: Sample>(
             );
         }
         BVopSampleMode::QuarterPel { bits_per_pixel } => {
-            interpolate_block_qpel_into(
+            interpolate_block_qpel_into_any(
                 reference,
                 mv.x,
                 mv.y,

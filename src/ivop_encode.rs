@@ -1161,7 +1161,7 @@ pub(crate) fn intra_mb_cbp(plans: &[BlockPlan; 6]) -> (u8, u8) {
 /// [`write_configuration_headers`] for the same config (see
 /// [`crate::encoder`] for the packaged pairing); `qp` is the VOP
 /// quantiser (1..=31).
-pub fn encode_i_vop<S: Sample>(
+pub fn encode_i_vop_any<S: Sample>(
     vol: &crate::vol::VolHeader,
     cfg: &EncoderConfig,
     frame: &FrameView<'_, S>,
@@ -1169,7 +1169,7 @@ pub fn encode_i_vop<S: Sample>(
     time_increment: u16,
     qp: u32,
 ) -> (Vec<u8>, DecodedFrame) {
-    encode_i_vop_with_thr(
+    encode_i_vop_with_thr_any(
         vol,
         cfg,
         frame,
@@ -1196,7 +1196,7 @@ pub fn encode_i_vop<S: Sample>(
 /// depend on the spend (constant / activity-classed quantisers);
 /// under budget regulation the probe's quantiser sequence is the
 /// threshold-0 one, so the winner is a measured estimate.
-pub fn encode_i_vop_elect_thr<S: Sample>(
+pub fn encode_i_vop_elect_thr_any<S: Sample>(
     vol: &crate::vol::VolHeader,
     cfg: &EncoderConfig,
     frame: &FrameView<'_, S>,
@@ -1205,12 +1205,12 @@ pub fn encode_i_vop_elect_thr<S: Sample>(
     qp: u32,
 ) -> (Vec<u8>, DecodedFrame, u8) {
     let (unit, recon, thr, _stats) =
-        encode_i_vop_elect_thr_full(vol, cfg, frame, modulo_time_base, time_increment, qp);
+        encode_i_vop_elect_thr_full_any(vol, cfg, frame, modulo_time_base, time_increment, qp);
     (unit, recon, thr)
 }
 
 /// [`encode_i_vop_elect_thr`] returning the encode statistics as well.
-pub fn encode_i_vop_elect_thr_full<S: Sample>(
+pub fn encode_i_vop_elect_thr_full_any<S: Sample>(
     vol: &crate::vol::VolHeader,
     cfg: &EncoderConfig,
     frame: &FrameView<'_, S>,
@@ -1234,7 +1234,7 @@ pub fn encode_i_vop_elect_thr_full<S: Sample>(
         return (dc.0, dc.1, 0, dc.2);
     }
     let (unit, recon, stats) =
-        encode_i_vop_full(vol, cfg, frame, modulo_time_base, time_increment, qp, thr);
+        encode_i_vop_full_any(vol, cfg, frame, modulo_time_base, time_increment, qp, thr);
     (unit, recon, thr, stats)
 }
 
@@ -1312,7 +1312,7 @@ impl IVopEncodeStats {
 /// stream (scan position 0) otherwise — exactly the decoder's
 /// `use_intra_dc_vlc` rule.
 #[allow(clippy::too_many_arguments)]
-pub fn encode_i_vop_with_thr<S: Sample>(
+pub fn encode_i_vop_with_thr_any<S: Sample>(
     vol: &crate::vol::VolHeader,
     cfg: &EncoderConfig,
     frame: &FrameView<'_, S>,
@@ -1322,13 +1322,13 @@ pub fn encode_i_vop_with_thr<S: Sample>(
     thr: u8,
 ) -> (Vec<u8>, DecodedFrame) {
     let (unit, recon, _stats) =
-        encode_i_vop_full(vol, cfg, frame, modulo_time_base, time_increment, qp, thr);
+        encode_i_vop_full_any(vol, cfg, frame, modulo_time_base, time_increment, qp, thr);
     (unit, recon)
 }
 
 /// [`encode_i_vop_with_thr`] returning the encode statistics as well.
 #[allow(clippy::too_many_arguments)]
-pub fn encode_i_vop_full<S: Sample>(
+pub fn encode_i_vop_full_any<S: Sample>(
     vol: &crate::vol::VolHeader,
     cfg: &EncoderConfig,
     frame: &FrameView<'_, S>,
@@ -1685,6 +1685,75 @@ fn decode_own_i_vop(
             .expect("grid-shaped blit");
     }
     frame
+}
+
+/// [`encode_i_vop_any`] over 8-bit samples (the store of every VOL that is not
+/// N-bit with more than 8 bits per pixel).
+pub fn encode_i_vop(
+    vol: &crate::vol::VolHeader,
+    cfg: &EncoderConfig,
+    frame: &FrameView<'_>,
+    modulo_time_base: u32,
+    time_increment: u16,
+    qp: u32,
+) -> (Vec<u8>, DecodedFrame) {
+    encode_i_vop_any(vol, cfg, frame, modulo_time_base, time_increment, qp)
+}
+
+/// [`encode_i_vop_elect_thr_any`] over 8-bit samples (the store of every VOL that is not
+/// N-bit with more than 8 bits per pixel).
+pub fn encode_i_vop_elect_thr(
+    vol: &crate::vol::VolHeader,
+    cfg: &EncoderConfig,
+    frame: &FrameView<'_>,
+    modulo_time_base: u32,
+    time_increment: u16,
+    qp: u32,
+) -> (Vec<u8>, DecodedFrame, u8) {
+    encode_i_vop_elect_thr_any(vol, cfg, frame, modulo_time_base, time_increment, qp)
+}
+
+/// [`encode_i_vop_elect_thr_full_any`] over 8-bit samples (the store of every VOL that is not
+/// N-bit with more than 8 bits per pixel).
+pub fn encode_i_vop_elect_thr_full(
+    vol: &crate::vol::VolHeader,
+    cfg: &EncoderConfig,
+    frame: &FrameView<'_>,
+    modulo_time_base: u32,
+    time_increment: u16,
+    qp: u32,
+) -> (Vec<u8>, DecodedFrame, u8, IVopEncodeStats) {
+    encode_i_vop_elect_thr_full_any(vol, cfg, frame, modulo_time_base, time_increment, qp)
+}
+
+/// [`encode_i_vop_with_thr_any`] over 8-bit samples (the store of every VOL that is not
+/// N-bit with more than 8 bits per pixel).
+#[allow(clippy::too_many_arguments)]
+pub fn encode_i_vop_with_thr(
+    vol: &crate::vol::VolHeader,
+    cfg: &EncoderConfig,
+    frame: &FrameView<'_>,
+    modulo_time_base: u32,
+    time_increment: u16,
+    qp: u32,
+    thr: u8,
+) -> (Vec<u8>, DecodedFrame) {
+    encode_i_vop_with_thr_any(vol, cfg, frame, modulo_time_base, time_increment, qp, thr)
+}
+
+/// [`encode_i_vop_full_any`] over 8-bit samples (the store of every VOL that is not
+/// N-bit with more than 8 bits per pixel).
+#[allow(clippy::too_many_arguments)]
+pub fn encode_i_vop_full(
+    vol: &crate::vol::VolHeader,
+    cfg: &EncoderConfig,
+    frame: &FrameView<'_>,
+    modulo_time_base: u32,
+    time_increment: u16,
+    qp: u32,
+    thr: u8,
+) -> (Vec<u8>, DecodedFrame, IVopEncodeStats) {
+    encode_i_vop_full_any(vol, cfg, frame, modulo_time_base, time_increment, qp, thr)
 }
 
 #[cfg(test)]

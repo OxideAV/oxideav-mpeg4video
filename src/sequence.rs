@@ -59,6 +59,11 @@ pub struct SequenceDecoder {
     /// §6.1.3.8 reorder to the caller (a container's presentation
     /// times).
     coded_order: bool,
+    /// §7.14 NEWPRED: the reference picture the next P- or S(GMC)-VOP
+    /// predicts from instead of the previous anchor. Consumed by that
+    /// VOP; the anchor chain itself is untouched, so the B-VOPs around
+    /// it keep their display-order anchors.
+    reference_override: Option<DecodedFrame>,
 }
 
 impl SequenceDecoder {
@@ -80,6 +85,28 @@ impl SequenceDecoder {
     #[inline]
     pub fn coded_order(&self) -> bool {
         self.coded_order
+    }
+
+    /// Select (or clear) the §7.14 NEWPRED reference of the next P- or
+    /// S(GMC)-VOP: that VOP is predicted from `reference` instead of
+    /// the previous anchor.
+    #[doc(hidden)]
+    pub fn set_reference_override(&mut self, reference: Option<DecodedFrame>) {
+        self.reference_override = reference;
+    }
+
+    /// The chain a forward-predicted VOP reads its reference from: the
+    /// anchor chain, or a one-picture chain holding the pending
+    /// [`SequenceDecoder::set_reference_override`] picture.
+    fn forward_chain<T>(&mut self, assemble: impl FnOnce(&FrameStore) -> T) -> T {
+        match self.reference_override.take() {
+            Some(reference) => {
+                let mut selected = FrameStore::new();
+                selected.push_anchor(reference);
+                assemble(&selected)
+            }
+            None => assemble(&self.store),
+        }
     }
 
     /// Borrow the underlying reference-frame chain (e.g. to inspect the
@@ -149,15 +176,17 @@ impl SequenceDecoder {
         sample_mode: crate::bvop_prediction::BVopSampleMode,
         bits_per_pixel: u32,
     ) -> Result<Vec<DecodedFrame>, FrameDecodeError> {
-        let frame = assemble_p_vop_frame(
-            &self.store,
-            mb_width,
-            mb_height,
-            entries,
-            vop_rounding_type,
-            sample_mode,
-            bits_per_pixel,
-        )?;
+        let frame = self.forward_chain(|chain| {
+            assemble_p_vop_frame(
+                chain,
+                mb_width,
+                mb_height,
+                entries,
+                vop_rounding_type,
+                sample_mode,
+                bits_per_pixel,
+            )
+        })?;
         Ok(self.accept_anchor(frame))
     }
 
@@ -173,14 +202,16 @@ impl SequenceDecoder {
         vop_rounding_type: u8,
         bits_per_pixel: u32,
     ) -> Result<Vec<DecodedFrame>, FrameDecodeError> {
-        let frame = crate::frame_decode::assemble_p_vop_frame_obmc(
-            &self.store,
-            mb_width,
-            mb_height,
-            entries,
-            vop_rounding_type,
-            bits_per_pixel,
-        )?;
+        let frame = self.forward_chain(|chain| {
+            crate::frame_decode::assemble_p_vop_frame_obmc(
+                chain,
+                mb_width,
+                mb_height,
+                entries,
+                vop_rounding_type,
+                bits_per_pixel,
+            )
+        })?;
         Ok(self.accept_anchor(frame))
     }
 
@@ -197,16 +228,18 @@ impl SequenceDecoder {
         sample_mode: crate::bvop_prediction::BVopSampleMode,
         bits_per_pixel: u32,
     ) -> Result<Vec<DecodedFrame>, FrameDecodeError> {
-        let frame = assemble_s_gmc_vop_frame(
-            &self.store,
-            mb_width,
-            mb_height,
-            entries,
-            geometry,
-            vop_rounding_type,
-            sample_mode,
-            bits_per_pixel,
-        )?;
+        let frame = self.forward_chain(|chain| {
+            assemble_s_gmc_vop_frame(
+                chain,
+                mb_width,
+                mb_height,
+                entries,
+                geometry,
+                vop_rounding_type,
+                sample_mode,
+                bits_per_pixel,
+            )
+        })?;
         Ok(self.accept_anchor(frame))
     }
 

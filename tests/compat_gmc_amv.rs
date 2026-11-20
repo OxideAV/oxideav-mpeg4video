@@ -15,7 +15,7 @@ use oxideav_mpeg4video::compat::DecodeOptions;
 use oxideav_mpeg4video::decoder::Mpeg4VideoDecoder;
 use oxideav_mpeg4video::framestore::DecodedFrame;
 use oxideav_mpeg4video::ivop_encode::{
-    EncoderConfig, FrameView, encode_i_vop, write_configuration_headers,
+    EncoderConfig, FrameView, encode_i_vop_any, write_configuration_headers,
 };
 use oxideav_mpeg4video::svop_encode::write_s_vop_header;
 use oxideav_mpeg4video::vlc_encode::{put_cbpy, put_mcbpc_p, put_motion_vector};
@@ -70,7 +70,7 @@ fn craft_probe_stream(quarter_sample: bool, du: i32, dv: i32) -> Vec<u8> {
         width: w,
         height: h,
     };
-    let (i_unit, _recon) = encode_i_vop(&vol, &cfg, &view, 0, 0, 2);
+    let (i_unit, _recon) = encode_i_vop_any(&vol, &cfg, &view, 0, 0, 2);
     let mut stream = headers;
     stream.extend_from_slice(&i_unit);
     let mut bw = BitWriter::new();

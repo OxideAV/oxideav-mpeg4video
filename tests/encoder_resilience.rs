@@ -5,14 +5,14 @@
 //! crate's own decoder, and a corrupted RVLC texture partition still
 //! decodes through the §E.1.4.4 recovery path.
 
-use oxideav_mpeg4video::bvop_encode::encode_b_vop;
+use oxideav_mpeg4video::bvop_encode::encode_b_vop_any;
 use oxideav_mpeg4video::decoder::Mpeg4VideoDecoder;
 use oxideav_mpeg4video::framestore::{DecodedFrame, FrameStore};
 use oxideav_mpeg4video::ivop_encode::{
-    EncoderConfig, FrameView, encode_i_vop, write_configuration_headers,
+    EncoderConfig, FrameView, encode_i_vop_any, write_configuration_headers,
 };
 use oxideav_mpeg4video::packet_encode::ResilienceConfig;
-use oxideav_mpeg4video::pvop_encode::{encode_p_vop, reconstruct_own_p_vop_with_motion};
+use oxideav_mpeg4video::pvop_encode::{encode_p_vop_any, reconstruct_own_p_vop_with_motion};
 use oxideav_mpeg4video::vol::parse_video_object_layer;
 
 type Planes = (Vec<u8>, Vec<u8>, Vec<u8>);
@@ -91,13 +91,13 @@ fn encode_ip(cfg: &EncoderConfig, frames: usize, shift: (i64, i64), qp: u32) -> 
             height: h,
         };
         if k == 0 {
-            let (unit, recon) = encode_i_vop(&vol, cfg, &view, 0, 0, qp);
+            let (unit, recon) = encode_i_vop_any(&vol, cfg, &view, 0, 0, qp);
             out.stream.extend_from_slice(&unit);
             store.push_anchor(recon.clone());
             out.recons.push(recon);
         } else {
             let reference = store.backward().unwrap().clone();
-            let (unit, st) = encode_p_vop(&vol, cfg, &view, &reference, 0, k as u16, qp);
+            let (unit, st) = encode_p_vop_any(&vol, cfg, &view, &reference, 0, k as u16, qp);
             out.packets += st.packets;
             let (recon, _) = reconstruct_own_p_vop_with_motion(&vol, &unit, &mut store);
             out.stream.extend_from_slice(&unit);
@@ -239,15 +239,15 @@ fn b_vops_in_a_partitioned_vol_use_combined_packets() {
         width: w,
         height: h,
     };
-    let (i_unit, i_recon) = encode_i_vop(&vol, &cfg, &view(0), 0, 0, 8);
+    let (i_unit, i_recon) = encode_i_vop_any(&vol, &cfg, &view(0), 0, 0, 8);
     store.push_anchor(i_recon.clone());
     stream.extend_from_slice(&i_unit);
     let reference = store.backward().unwrap().clone();
-    let (p_unit, _) = encode_p_vop(&vol, &cfg, &view(2), &reference, 0, 2, 8);
+    let (p_unit, _) = encode_p_vop_any(&vol, &cfg, &view(2), &reference, 0, 2, 8);
     let (p_recon, motion) = reconstruct_own_p_vop_with_motion(&vol, &p_unit, &mut store);
     stream.extend_from_slice(&p_unit);
     let (b_unit, b_recon, stats) =
-        encode_b_vop(&vol, &cfg, &view(1), &store, Some(&motion), 1, 2, 0, 1, 8);
+        encode_b_vop_any(&vol, &cfg, &view(1), &store, Some(&motion), 1, 2, 0, 1, 8);
     stream.extend_from_slice(&b_unit);
     assert!(stats.packets > 0, "B-VOP must cut packets ({stats:?})");
     assert_exact(&decode_all(&stream), &[i_recon, b_recon, p_recon]);

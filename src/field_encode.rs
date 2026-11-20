@@ -37,7 +37,7 @@ use crate::field_motion::mc;
 use crate::half_sample::ReferenceVop;
 use crate::motion::MotionVector;
 use crate::pvop_encode::{SEARCH_RANGE, mv_range, search_window_pels};
-use crate::quarter_sample::interpolate_block_qpel_field_into;
+use crate::quarter_sample::interpolate_block_qpel_field_into_any;
 use crate::sample::Sample;
 
 /// The estimate for one output field.
@@ -111,7 +111,7 @@ pub(crate) fn field_luma_prediction<S: Sample>(
         BVopSampleMode::QuarterPel { bits_per_pixel } => {
             for sub in 0..2usize {
                 let mut sub_buf = [S::ZERO; 64];
-                interpolate_block_qpel_field_into(
+                interpolate_block_qpel_field_into_any(
                     reference,
                     mv.x,
                     mv.y,

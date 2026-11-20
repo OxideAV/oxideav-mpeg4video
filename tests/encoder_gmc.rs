@@ -7,7 +7,7 @@
 use oxideav_mpeg4video::decoder::Mpeg4VideoDecoder;
 use oxideav_mpeg4video::framestore::{DecodedFrame, FrameStore};
 use oxideav_mpeg4video::ivop_encode::{
-    EncoderConfig, FrameView, encode_i_vop, write_configuration_headers,
+    EncoderConfig, FrameView, encode_i_vop_any, write_configuration_headers,
 };
 use oxideav_mpeg4video::svop_encode::{encode_s_vop, reconstruct_own_s_vop_with_motion};
 use oxideav_mpeg4video::vol::parse_video_object_layer;
@@ -101,7 +101,7 @@ fn global_translation_lands_in_the_trajectory() {
             height: h,
         };
         if k == 0 {
-            let (unit, recon) = encode_i_vop(&vol, &cfg, &view, 0, 0, 5);
+            let (unit, recon) = encode_i_vop_any(&vol, &cfg, &view, 0, 0, 5);
             stream.extend_from_slice(&unit);
             store.push_anchor(recon.clone());
             recons.push(recon);
@@ -141,7 +141,7 @@ fn stationary_scene_collapses_to_gmc_copies() {
         height: h,
     };
     let mut store = FrameStore::new();
-    let (i_unit, i_recon) = encode_i_vop(&vol, &cfg, &view, 0, 0, 4);
+    let (i_unit, i_recon) = encode_i_vop_any(&vol, &cfg, &view, 0, 0, 4);
     store.push_anchor(i_recon.clone());
     let reference = store.backward().unwrap().clone();
     let (s_unit, stats) = encode_s_vop(&vol, &cfg, &view, &reference, 0, 1, 4);

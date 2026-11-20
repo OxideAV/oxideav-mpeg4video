@@ -39,7 +39,7 @@
 use crate::bitwriter::BitWriter;
 use crate::framestore::DecodedFrame;
 use crate::ivop_encode::{
-    EncoderConfig, FrameView, StaticSpriteVol, encode_i_vop, write_configuration_headers,
+    EncoderConfig, FrameView, StaticSpriteVol, encode_i_vop_any, write_configuration_headers,
 };
 use crate::static_sprite::{
     SpritePlanes, StaticSpriteParams, StaticWarp, static_sample, warp_static_sprite_vop,
@@ -147,7 +147,7 @@ impl StaticSpriteEncoder {
             ..*cfg
         };
         let plain_vol = vol_of(&plain);
-        let (unit, recon) = encode_i_vop(&plain_vol, &plain, sprite, 0, 0, qp);
+        let (unit, recon) = encode_i_vop_any(&plain_vol, &plain, sprite, 0, 0, qp);
         stream.extend_from_slice(&unit);
         let (mb_width, _) = plain.mb_dimensions();
         let planes = SpritePlanes::from_aligned(

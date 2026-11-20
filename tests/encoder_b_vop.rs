@@ -4,13 +4,13 @@
 //! reorder timing, and determinism.
 
 use oxideav_core::Encoder as _;
-use oxideav_mpeg4video::bvop_encode::{BVopEncodeStats, encode_b_vop};
+use oxideav_mpeg4video::bvop_encode::{BVopEncodeStats, encode_b_vop_any};
 use oxideav_mpeg4video::decoder::Mpeg4VideoDecoder;
 use oxideav_mpeg4video::framestore::{DecodedFrame, FrameStore};
 use oxideav_mpeg4video::ivop_encode::{
-    EncoderConfig, FrameView, encode_i_vop, write_configuration_headers,
+    EncoderConfig, FrameView, encode_i_vop_any, write_configuration_headers,
 };
-use oxideav_mpeg4video::pvop_encode::{encode_p_vop, reconstruct_own_p_vop_with_motion};
+use oxideav_mpeg4video::pvop_encode::{encode_p_vop_any, reconstruct_own_p_vop_with_motion};
 use oxideav_mpeg4video::vol::parse_video_object_layer;
 
 /// The translating scene of the P-VOP tests: a fixed textured
@@ -85,19 +85,19 @@ fn build_ibp(cfg: &EncoderConfig, qp: u32) -> (Vec<u8>, Vec<DecodedFrame>, BVopE
     let mut stream = headers;
 
     // I at ticks 0.
-    let (i_unit, i_recon) = encode_i_vop(&vol, cfg, &view(0), 0, 0, qp);
+    let (i_unit, i_recon) = encode_i_vop_any(&vol, cfg, &view(0), 0, 0, qp);
     store.push_anchor(i_recon.clone());
     stream.extend_from_slice(&i_unit);
 
     // P (display index 2) at ticks 2 — coded before the B.
     let reference = store.backward().unwrap().clone();
-    let (p_unit, _stats) = encode_p_vop(&vol, cfg, &view(2), &reference, 0, 2, qp);
+    let (p_unit, _stats) = encode_p_vop_any(&vol, cfg, &view(2), &reference, 0, 2, qp);
     let (p_recon, motion) = reconstruct_own_p_vop_with_motion(&vol, &p_unit, &mut store);
     stream.extend_from_slice(&p_unit);
 
     // B (display index 1) at ticks 1: TRB = 1, TRD = 2.
     let (b_unit, b_recon, b_stats) =
-        encode_b_vop(&vol, cfg, &view(1), &store, Some(&motion), 1, 2, 0, 1, qp);
+        encode_b_vop_any(&vol, cfg, &view(1), &store, Some(&motion), 1, 2, 0, 1, qp);
     stream.extend_from_slice(&b_unit);
 
     (stream, vec![i_recon, b_recon, p_recon], b_stats)
@@ -172,16 +172,16 @@ fn static_scene_b_vop_is_all_zero_bit() {
     };
     let mut store = FrameStore::new();
     let mut stream = headers;
-    let (i_unit, i_recon) = encode_i_vop(&vol, &cfg, &view, 0, 0, 4);
+    let (i_unit, i_recon) = encode_i_vop_any(&vol, &cfg, &view, 0, 0, 4);
     store.push_anchor(i_recon.clone());
     stream.extend_from_slice(&i_unit);
     let reference = store.backward().unwrap().clone();
-    let (p_unit, p_stats) = encode_p_vop(&vol, &cfg, &view, &reference, 0, 2, 4);
+    let (p_unit, p_stats) = encode_p_vop_any(&vol, &cfg, &view, &reference, 0, 2, 4);
     assert_eq!(p_stats.skipped, 9, "static P must be all-skip");
     let (p_recon, motion) = reconstruct_own_p_vop_with_motion(&vol, &p_unit, &mut store);
     stream.extend_from_slice(&p_unit);
     let (b_unit, b_recon, b_stats) =
-        encode_b_vop(&vol, &cfg, &view, &store, Some(&motion), 1, 2, 0, 1, 4);
+        encode_b_vop_any(&vol, &cfg, &view, &store, Some(&motion), 1, 2, 0, 1, 4);
     assert_eq!(b_stats.zero_bit, 9, "every co-located MB is skipped");
     // Header + stuffing only.
     assert!(

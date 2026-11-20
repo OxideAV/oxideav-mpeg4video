@@ -442,6 +442,129 @@ pub struct VbvParameters {
     pub vbv_occupancy: u32,
 }
 
+/// §6.2.3 `define_vop_complexity_estimation_header()`: which
+/// complexity statistics every VOP header of the layer carries (the
+/// §6.2.5 `read_vop_complexity_estimation_header()` body). The
+/// statistics describe the decoding effort a VOP needs; they do not
+/// affect the decoded samples, so a decoder only has to know how many
+/// bits to step over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct ComplexityEstimation {
+    /// `estimation_method` (2 bits): 0 = version 1, 1 = version 2.
+    /// Any other value defines no statistics at all.
+    pub estimation_method: u8,
+    /// Shape set: `dcecs_opaque` present.
+    pub opaque: bool,
+    /// Shape set: `dcecs_transparent` present.
+    pub transparent: bool,
+    /// Shape set: `dcecs_intra_cae` present.
+    pub intra_cae: bool,
+    /// Shape set: `dcecs_inter_cae` present.
+    pub inter_cae: bool,
+    /// Shape set: `dcecs_no_update` present.
+    pub no_update: bool,
+    /// Shape set: `dcecs_upsampling` present.
+    pub upsampling: bool,
+    /// Texture set 1: `dcecs_intra_blocks` present.
+    pub intra_blocks: bool,
+    /// Texture set 1: `dcecs_inter_blocks` present.
+    pub inter_blocks: bool,
+    /// Texture set 1: `dcecs_inter4v_blocks` present.
+    pub inter4v_blocks: bool,
+    /// Texture set 1: `dcecs_not_coded_blocks` present.
+    pub not_coded_blocks: bool,
+    /// Texture set 2: `dcecs_dct_coefs` present.
+    pub dct_coefs: bool,
+    /// Texture set 2: `dcecs_dct_lines` present.
+    pub dct_lines: bool,
+    /// Texture set 2: `dcecs_vlc_symbols` present.
+    pub vlc_symbols: bool,
+    /// Texture set 2: `dcecs_vlc_bits` present (a 4-bit field).
+    pub vlc_bits: bool,
+    /// Motion set: `dcecs_apm` present.
+    pub apm: bool,
+    /// Motion set: `dcecs_npm` present.
+    pub npm: bool,
+    /// Motion set: `dcecs_interpolate_mc_q` present.
+    pub interpolate_mc_q: bool,
+    /// Motion set: `dcecs_forw_back_mc_q` present.
+    pub forw_back_mc_q: bool,
+    /// Motion set: `dcecs_halfpel2` present.
+    pub halfpel2: bool,
+    /// Motion set: `dcecs_halfpel4` present.
+    pub halfpel4: bool,
+    /// Version-2 set: `dcecs_sadct` present.
+    pub sadct: bool,
+    /// Version-2 set: `dcecs_quarterpel` present.
+    pub quarterpel: bool,
+}
+
+impl ComplexityEstimation {
+    /// Length in bits of the §6.2.5
+    /// `read_vop_complexity_estimation_header()` body of a VOP of
+    /// `coding_type` (`sprite_static`: the VOL's `sprite_enable` is
+    /// "static", which gives an S-VOP its own list; an S(GMC)-VOP has
+    /// none).
+    pub fn vop_header_bits(
+        &self,
+        coding_type: crate::vop::VopCodingType,
+        sprite_static: bool,
+    ) -> u32 {
+        use crate::vop::VopCodingType;
+        if self.estimation_method > 1 {
+            return 0;
+        }
+        let n = |flags: &[bool]| -> u32 { flags.iter().map(|&f| u32::from(f)).sum() };
+        let shape = 8 * n(&[
+            self.opaque,
+            self.transparent,
+            self.intra_cae,
+            self.inter_cae,
+            self.no_update,
+            self.upsampling,
+        ]);
+        // intra_blocks .. vlc_symbols are bytes; vlc_bits is a nibble.
+        let texture = 8 * n(&[
+            self.intra_blocks,
+            self.not_coded_blocks,
+            self.dct_coefs,
+            self.dct_lines,
+            self.vlc_symbols,
+        ]) + 4 * u32::from(self.vlc_bits);
+        let inter = 8 * n(&[
+            self.inter_blocks,
+            self.inter4v_blocks,
+            self.apm,
+            self.npm,
+            self.forw_back_mc_q,
+            self.halfpel2,
+            self.halfpel4,
+        ]);
+        let version2 = 8 * n(&[self.sadct, self.quarterpel]);
+        let interpolate = 8 * u32::from(self.interpolate_mc_q);
+        match coding_type {
+            VopCodingType::I => shape + texture + 8 * u32::from(self.sadct),
+            VopCodingType::P => shape + texture + inter + version2,
+            VopCodingType::B => shape + texture + inter + interpolate + version2,
+            VopCodingType::S if sprite_static => texture + inter + interpolate,
+            VopCodingType::S => 0,
+        }
+    }
+}
+
+/// The §6.2.3 NEWPRED fields of a VOL (`newpred_enable == 1`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct NewpredConfig {
+    /// `requested_upstream_message_type` (2 bits): which upstream
+    /// messages the encoder asks the decoder to return.
+    pub requested_upstream_message_type: u8,
+    /// `newpred_segment_type`: `true` = the reference is selected per
+    /// VOP, `false` = per video packet.
+    pub segment_is_vop: bool,
+}
+
 /// Typed view of the bits that precede VOP data in a Video Object
 /// Layer header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -561,8 +684,10 @@ pub struct VolHeader {
     pub quarter_sample: bool,
     /// `complexity_estimation_disable` (§6.3.3). When `true`, the
     /// VOP header does NOT carry a complexity-estimation block.
-    /// Round 3 only accepts `true`.
     pub complexity_estimation_disable: bool,
+    /// The §6.2.3 `define_vop_complexity_estimation_header()` of a
+    /// VOL with `complexity_estimation_disable == 0`; `None` otherwise.
+    pub complexity_estimation: Option<ComplexityEstimation>,
     /// `resync_marker_disable` (§6.3.3). When `true`, no
     /// `resync_marker` bit pattern appears in the VOP payload.
     pub resync_marker_disable: bool,
@@ -577,6 +702,9 @@ pub struct VolHeader {
     /// `video_object_layer_verid != 1`; defaults to `false`
     /// otherwise.
     pub newpred_enable: bool,
+    /// The NEWPRED fields that follow `newpred_enable == 1`; `None`
+    /// otherwise.
+    pub newpred: Option<NewpredConfig>,
     /// `reduced_resolution_vop_enable` (§6.3.3). Defined only when
     /// `video_object_layer_verid != 1`; defaults to `false`
     /// otherwise.
@@ -940,11 +1068,11 @@ fn parse_video_object_layer_body(
         false
     };
     let complexity_estimation_disable = br.read_bool()?;
-    if !complexity_estimation_disable {
-        return Err(VolParseError::UnsupportedBranch(
-            "define_vop_complexity_estimation_header",
-        ));
-    }
+    let complexity_estimation = if complexity_estimation_disable {
+        None
+    } else {
+        Some(parse_complexity_estimation(br)?)
+    };
     let resync_marker_disable = br.read_bool()?;
     let data_partitioned = br.read_bool()?;
     let reversible_vlc = if data_partitioned {
@@ -952,22 +1080,25 @@ fn parse_video_object_layer_body(
     } else {
         false
     };
-    let (newpred_enable, reduced_resolution_vop_enable) = if video_object_layer_verid != 1 {
-        let np = br.read_bool()?;
-        if np {
-            // newpred_enable body: requested_upstream_message_type (2
-            // bits) + newpred_segment_type (1 bit). We consume those
-            // structurally to keep alignment if we ever continue past
-            // this point in a future round, but reject the branch
-            // immediately afterwards since the rest of the VOL syntax
-            // depends on it being false.
-            return Err(VolParseError::UnsupportedBranch("newpred_enable body"));
-        }
+    let (newpred, reduced_resolution_vop_enable) = if video_object_layer_verid != 1 {
+        let newpred = if br.read_bool()? {
+            // §6.2.3: requested_upstream_message_type (2 bits) and
+            // newpred_segment_type (1 bit) follow newpred_enable.
+            let requested_upstream_message_type = br.read_bits(2)? as u8;
+            let segment_is_vop = br.read_bool()?;
+            Some(NewpredConfig {
+                requested_upstream_message_type,
+                segment_is_vop,
+            })
+        } else {
+            None
+        };
         let rr = br.read_bool()?;
-        (np, rr)
+        (newpred, rr)
     } else {
-        (false, false)
+        (None, false)
     };
+    let newpred_enable = newpred.is_some();
     let scalability = br.read_bool()?;
 
     Ok(VolHeader {
@@ -1001,13 +1132,71 @@ fn parse_video_object_layer_body(
         nonintra_quant_mat,
         quarter_sample,
         complexity_estimation_disable,
+        complexity_estimation,
         resync_marker_disable,
         data_partitioned,
         reversible_vlc,
         newpred_enable,
+        newpred,
         reduced_resolution_vop_enable,
         scalability,
     })
+}
+
+/// §6.2.3 `define_vop_complexity_estimation_header()`.
+fn parse_complexity_estimation(
+    br: &mut BitReader<'_>,
+) -> Result<ComplexityEstimation, VolParseError> {
+    let mut ce = ComplexityEstimation {
+        estimation_method: br.read_bits(2)? as u8,
+        ..ComplexityEstimation::default()
+    };
+    if ce.estimation_method > 1 {
+        // Only methods '00' and '01' define a body.
+        return Ok(ce);
+    }
+    let shape_complexity_estimation_disable = br.read_bool()?;
+    if !shape_complexity_estimation_disable {
+        ce.opaque = br.read_bool()?;
+        ce.transparent = br.read_bool()?;
+        ce.intra_cae = br.read_bool()?;
+        ce.inter_cae = br.read_bool()?;
+        ce.no_update = br.read_bool()?;
+        ce.upsampling = br.read_bool()?;
+    }
+    let texture_complexity_estimation_set_1_disable = br.read_bool()?;
+    if !texture_complexity_estimation_set_1_disable {
+        ce.intra_blocks = br.read_bool()?;
+        ce.inter_blocks = br.read_bool()?;
+        ce.inter4v_blocks = br.read_bool()?;
+        ce.not_coded_blocks = br.read_bool()?;
+    }
+    read_marker_bit(br)?;
+    let texture_complexity_estimation_set_2_disable = br.read_bool()?;
+    if !texture_complexity_estimation_set_2_disable {
+        ce.dct_coefs = br.read_bool()?;
+        ce.dct_lines = br.read_bool()?;
+        ce.vlc_symbols = br.read_bool()?;
+        ce.vlc_bits = br.read_bool()?;
+    }
+    let motion_compensation_complexity_disable = br.read_bool()?;
+    if !motion_compensation_complexity_disable {
+        ce.apm = br.read_bool()?;
+        ce.npm = br.read_bool()?;
+        ce.interpolate_mc_q = br.read_bool()?;
+        ce.forw_back_mc_q = br.read_bool()?;
+        ce.halfpel2 = br.read_bool()?;
+        ce.halfpel4 = br.read_bool()?;
+    }
+    read_marker_bit(br)?;
+    if ce.estimation_method == 1 {
+        let version2_complexity_estimation_disable = br.read_bool()?;
+        if !version2_complexity_estimation_disable {
+            ce.sadct = br.read_bool()?;
+            ce.quarterpel = br.read_bool()?;
+        }
+    }
+    Ok(ce)
 }
 
 /// Parse a `VisualObjectSequence` start code followed by
@@ -1871,7 +2060,8 @@ mod tests {
     }
 
     #[test]
-    fn round3_complexity_estimation_header_branch_is_rejected() {
+    fn complexity_estimation_header_is_parsed() {
+        // Version-2 method with every set enabled and every flag on.
         let mut w = BitWriter::new();
         write_vol_header_up_to_trailing(&mut w, None, 0b00, false);
         w.write_bits(0, 1); // interlaced
@@ -1879,10 +2069,101 @@ mod tests {
         w.write_bits(0, 1); // sprite_enable
         w.write_bits(0, 1); // not_8_bit
         w.write_bits(0, 1); // quant_type
-        w.write_bits(0, 1); // complexity_estimation_disable = 0 → header expected
+        w.write_bits(0, 1); // complexity_estimation_disable = 0
+        w.write_bits(0b01, 2); // estimation_method
+        w.write_bits(0, 1); // shape_complexity_estimation_disable
+        w.write_bits(0b11_1111, 6); // opaque .. upsampling
+        w.write_bits(0, 1); // texture_complexity_estimation_set_1_disable
+        w.write_bits(0b1111, 4); // intra / inter / inter4v / not_coded
+        w.write_bits(1, 1); // marker_bit
+        w.write_bits(0, 1); // texture_complexity_estimation_set_2_disable
+        w.write_bits(0b1111, 4); // dct_coefs / dct_lines / vlc_symbols / vlc_bits
+        w.write_bits(0, 1); // motion_compensation_complexity_disable
+        w.write_bits(0b11_1111, 6); // apm .. halfpel4
+        w.write_bits(1, 1); // marker_bit
+        w.write_bits(0, 1); // version2_complexity_estimation_disable
+        w.write_bits(0b11, 2); // sadct, quarterpel
+        w.write_bits(1, 1); // resync_marker_disable
+        w.write_bits(0, 1); // data_partitioned
+        w.write_bits(0, 1); // scalability
         w.align();
-        let err = parse_video_object_layer(&w.buf, 0).unwrap_err();
-        assert!(matches!(err, VolParseError::UnsupportedBranch(_)));
+        let header = parse_video_object_layer(&w.buf, 0).unwrap();
+        assert!(!header.complexity_estimation_disable);
+        assert!(header.resync_marker_disable);
+        let ce = header.complexity_estimation.unwrap();
+        assert_eq!(ce.estimation_method, 1);
+        assert!(ce.opaque && ce.upsampling && ce.inter4v_blocks && ce.vlc_bits);
+        assert!(ce.apm && ce.halfpel4 && ce.sadct && ce.quarterpel);
+        use crate::vop::VopCodingType;
+        // I: six shape bytes, five texture bytes, the vlc_bits nibble
+        // and sadct.
+        assert_eq!(ce.vop_header_bits(VopCodingType::I, false), 8 * 12 + 4);
+        // P adds seven motion bytes and quarterpel.
+        assert_eq!(ce.vop_header_bits(VopCodingType::P, false), 8 * 20 + 4);
+        // B adds interpolate_mc_q.
+        assert_eq!(ce.vop_header_bits(VopCodingType::B, false), 8 * 21 + 4);
+        // A static-sprite S-VOP: texture, motion and interpolate; an
+        // S(GMC)-VOP carries none.
+        assert_eq!(ce.vop_header_bits(VopCodingType::S, true), 8 * 13 + 4);
+        assert_eq!(ce.vop_header_bits(VopCodingType::S, false), 0);
+    }
+
+    #[test]
+    fn complexity_estimation_version1_and_reserved_methods() {
+        // Version 1 with every set disabled: only the two markers.
+        let trailing = |w: &mut BitWriter| {
+            w.write_bits(1, 1); // resync_marker_disable
+            w.write_bits(0, 1); // data_partitioned
+            w.write_bits(0, 1); // scalability
+            w.align();
+        };
+        let lead = |w: &mut BitWriter| {
+            write_vol_header_up_to_trailing(w, None, 0b00, false);
+            w.write_bits(0, 1); // interlaced
+            w.write_bits(0, 1); // obmc_disable
+            w.write_bits(0, 1); // sprite_enable
+            w.write_bits(0, 1); // not_8_bit
+            w.write_bits(0, 1); // quant_type
+            w.write_bits(0, 1); // complexity_estimation_disable = 0
+        };
+        let mut w = BitWriter::new();
+        lead(&mut w);
+        w.write_bits(0b00, 2); // estimation_method (version 1)
+        w.write_bits(1, 1); // shape set disabled
+        w.write_bits(1, 1); // texture set 1 disabled
+        w.write_bits(1, 1); // marker_bit
+        w.write_bits(1, 1); // texture set 2 disabled
+        w.write_bits(1, 1); // motion set disabled
+        w.write_bits(1, 1); // marker_bit
+        trailing(&mut w);
+        let header = parse_video_object_layer(&w.buf, 0).unwrap();
+        let ce = header.complexity_estimation.unwrap();
+        assert_eq!(ce, ComplexityEstimation::default());
+        assert_eq!(ce.vop_header_bits(crate::vop::VopCodingType::B, false), 0);
+        assert!(header.resync_marker_disable);
+
+        // A method other than '00' / '01' defines no body at all.
+        let mut w = BitWriter::new();
+        lead(&mut w);
+        w.write_bits(0b10, 2); // estimation_method
+        trailing(&mut w);
+        let header = parse_video_object_layer(&w.buf, 0).unwrap();
+        assert_eq!(header.complexity_estimation.unwrap().estimation_method, 2);
+        assert!(header.resync_marker_disable);
+
+        // A cleared marker bit is an error, not a silent mis-parse.
+        let mut w = BitWriter::new();
+        lead(&mut w);
+        w.write_bits(0b00, 2);
+        w.write_bits(1, 1);
+        w.write_bits(1, 1);
+        w.write_bits(0, 1); // marker_bit cleared
+        w.write_bits(0xFF, 8);
+        w.align();
+        assert_eq!(
+            parse_video_object_layer(&w.buf, 0).unwrap_err(),
+            VolParseError::MarkerBitMissing
+        );
     }
 
     #[test]

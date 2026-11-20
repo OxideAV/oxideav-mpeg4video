@@ -85,7 +85,7 @@
 
 use crate::half_sample::ReferenceVop;
 use crate::motion::{FieldMvPair, MotionVector};
-use crate::quarter_sample::interpolate_block_qpel_field_into;
+use crate::quarter_sample::interpolate_block_qpel_field_into_any;
 use crate::reconstruct::{InterPredictionMacroblock, MACROBLOCK_CHROMA_SIDE, MACROBLOCK_LUMA_SIDE};
 use crate::sample::Sample;
 
@@ -584,7 +584,7 @@ pub fn field_motion_compensate_one_reference_qpel<S: Sample>(
         for sub in 0..2 {
             let x_off = sub * sub_w;
             let mut sub_buf = [S::ZERO; (MACROBLOCK_LUMA_SIDE / 2) * (MACROBLOCK_LUMA_SIDE / 2)];
-            interpolate_block_qpel_field_into(
+            interpolate_block_qpel_field_into_any(
                 luma_ref,
                 mv.x,
                 mv.y,

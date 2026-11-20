@@ -439,7 +439,7 @@ fn interpolate_luma_block_into<S: Sample>(
             );
         }
         crate::bvop_prediction::BVopSampleMode::QuarterPel { bits_per_pixel } => {
-            crate::quarter_sample::interpolate_block_qpel_into(
+            crate::quarter_sample::interpolate_block_qpel_into_any(
                 reference,
                 mv.x,
                 mv.y,

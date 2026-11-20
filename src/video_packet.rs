@@ -236,6 +236,12 @@ pub struct VideoPacketHeader {
     /// Re-stated `sprite_trajectory()` of an S(GMC)-VOP extension body
     /// (`sprite_enable == "GMC"`, `no_of_sprite_warping_points > 0`).
     pub sprite_trajectory: Option<crate::sprite::SpriteTrajectory>,
+    /// `vop_id` of a NEWPRED VOL (present in every video packet
+    /// header, extension code or not).
+    pub vop_id: Option<u16>,
+    /// `vop_id_for_prediction` when the packet's
+    /// `vop_id_for_prediction_indication` is set.
+    pub vop_id_for_prediction: Option<u16>,
 }
 
 /// Number of bits used to encode `macroblock_number` per Table 6-27.
@@ -510,6 +516,9 @@ pub fn parse_video_packet_header(
     let header_extension_code = br.read_bool()?;
 
     if !header_extension_code {
+        // §6.2.5: the NEWPRED block closes the header whether or not
+        // the extension body is present.
+        let (vop_id, vop_id_for_prediction) = parse_packet_newpred(br, ctx)?;
         return Ok(VideoPacketHeader {
             macroblock_number,
             quant_scale,
@@ -521,6 +530,8 @@ pub fn parse_video_packet_header(
             vop_fcode_forward: None,
             vop_fcode_backward: None,
             sprite_trajectory: None,
+            vop_id,
+            vop_id_for_prediction,
         });
     }
 
@@ -557,10 +568,15 @@ pub fn parse_video_packet_header(
         None
     };
 
-    // vop_reduced_resolution — also out of scope.
-    if ctx.reduced_resolution_vop_enable {
+    // vop_reduced_resolution is restated for I- and P-VOPs; a VOP
+    // that sets it is refused at its own header, so the copy is 0 on
+    // every stream this walk reaches.
+    if ctx.reduced_resolution_vop_enable
+        && matches!(vop_coding_type, VopCodingType::I | VopCodingType::P)
+        && br.read_bool()?
+    {
         return Err(VideoPacketParseError::UnsupportedBranch(
-            "reduced_resolution_vop_enable in video_packet_header extension",
+            "vop_reduced_resolution == 1 in video_packet_header extension",
         ));
     }
 
@@ -583,13 +599,7 @@ pub fn parse_video_packet_header(
         None
     };
 
-    // newpred_enable extension (vop_id / vop_id_for_prediction) —
-    // out of round-18 scope.
-    if ctx.newpred_enable {
-        return Err(VideoPacketParseError::UnsupportedBranch(
-            "newpred_enable in video_packet_header extension",
-        ));
-    }
+    let (vop_id, vop_id_for_prediction) = parse_packet_newpred(br, ctx)?;
 
     Ok(VideoPacketHeader {
         macroblock_number,
@@ -602,7 +612,22 @@ pub fn parse_video_packet_header(
         vop_fcode_forward,
         vop_fcode_backward,
         sprite_trajectory,
+        vop_id,
+        vop_id_for_prediction,
     })
+}
+
+/// The NEWPRED block that closes a video packet header of a
+/// `newpred_enable == 1` VOL.
+fn parse_packet_newpred(
+    br: &mut BitReader<'_>,
+    ctx: &VideoPacketContext,
+) -> Result<(Option<u16>, Option<u16>), VideoPacketParseError> {
+    if !ctx.newpred_enable {
+        return Ok((None, None));
+    }
+    let (id, for_prediction) = crate::vop::parse_newpred_ids(br, ctx.time_increment_resolution)?;
+    Ok((Some(id), for_prediction))
 }
 
 #[cfg(test)]
@@ -1148,9 +1173,9 @@ mod tests {
         assert_eq!(hdr.vop_fcode_forward, Some(1));
     }
 
-    #[test]
-    fn parser_rejects_newpred_extension() {
-        let mut w = BitWriter::new();
+    /// The packet header of the two tests below up to and including
+    /// `header_extension_code`, then the extension body of an I-VOP.
+    fn write_packet_with_extension(w: &mut BitWriter) {
         w.write_bool(false);
         for _ in 0..7 {
             w.write_bool(true);
@@ -1158,23 +1183,41 @@ mod tests {
         w.write_bits(1, 17);
         w.write_bits(0, 7);
         w.write_bits(5, 5);
-        w.write_bool(true);
-        w.write_bool(false);
-        w.write_bool(true);
-        w.write_bits(0, 5);
-        w.write_bool(true);
+        w.write_bool(true); // header_extension_code
+        w.write_bool(false); // modulo_time_base
+        w.write_bool(true); // marker
+        w.write_bits(0, 5); // vop_time_increment
+        w.write_bool(true); // marker
         w.write_bits(0b00, 2); // I
-        w.write_bits(0, 3);
-        let data = w.finish();
-        let mut ctx = default_ctx();
-        ctx.newpred_enable = true;
-        let mut br = BitReader::new(&data);
-        let err = parse_video_packet_header(&mut br, &ctx).unwrap_err();
-        assert!(matches!(err, VideoPacketParseError::UnsupportedBranch(_)));
+        w.write_bits(0, 3); // intra_dc_vlc_thr
     }
 
     #[test]
-    fn parser_rejects_reduced_resolution_extension() {
+    fn parser_reads_the_newpred_block_with_and_without_extension() {
+        // With the extension body: vop_id 9, predicted from vop_id 4.
+        // The context's resolution of 25 gives a 5-bit increment, so
+        // the ids are 8 bits wide.
+        let mut w = BitWriter::new();
+        write_packet_with_extension(&mut w);
+        w.write_bits(9, 8); // vop_id
+        w.write_bool(true); // vop_id_for_prediction_indication
+        w.write_bits(4, 8); // vop_id_for_prediction
+        w.write_bool(true); // marker
+        let data = w.finish();
+        let mut ctx = default_ctx();
+        ctx.newpred_enable = true;
+        assert_eq!(
+            crate::vop::vop_id_bits(ctx.time_increment_resolution),
+            8,
+            "test layout"
+        );
+        let mut br = BitReader::new(&data);
+        let header = parse_video_packet_header(&mut br, &ctx).unwrap();
+        assert!(header.header_extension_code);
+        assert_eq!(header.vop_id, Some(9));
+        assert_eq!(header.vop_id_for_prediction, Some(4));
+
+        // Without it, the block still closes the header.
         let mut w = BitWriter::new();
         w.write_bool(false);
         for _ in 0..7 {
@@ -1183,19 +1226,44 @@ mod tests {
         w.write_bits(1, 17);
         w.write_bits(0, 7);
         w.write_bits(5, 5);
-        w.write_bool(true);
-        w.write_bool(false);
-        w.write_bool(true);
-        w.write_bits(0, 5);
-        w.write_bool(true);
-        w.write_bits(0b00, 2); // I
-        w.write_bits(0, 3);
+        w.write_bool(false); // header_extension_code
+        w.write_bits(10, 8); // vop_id
+        w.write_bool(false); // no vop_id_for_prediction
+        w.write_bool(true); // marker
         let data = w.finish();
-        let mut ctx = default_ctx();
-        ctx.reduced_resolution_vop_enable = true;
         let mut br = BitReader::new(&data);
-        let err = parse_video_packet_header(&mut br, &ctx).unwrap_err();
-        assert!(matches!(err, VideoPacketParseError::UnsupportedBranch(_)));
+        let header = parse_video_packet_header(&mut br, &ctx).unwrap();
+        assert!(!header.header_extension_code);
+        assert_eq!(header.vop_id, Some(10));
+        assert_eq!(header.vop_id_for_prediction, None);
+        // A VOL without NEWPRED carries neither field.
+        let mut br = BitReader::new(&data);
+        let plain = parse_video_packet_header(&mut br, &default_ctx()).unwrap();
+        assert_eq!((plain.vop_id, plain.vop_id_for_prediction), (None, None));
+    }
+
+    #[test]
+    fn parser_reads_the_restated_reduced_resolution_bit() {
+        // vop_reduced_resolution == 0 is read and the header parses;
+        // == 1 names the reduced-resolution VOP it cannot decode.
+        for (bit, ok) in [(false, true), (true, false)] {
+            let mut w = BitWriter::new();
+            write_packet_with_extension(&mut w);
+            w.write_bool(bit); // vop_reduced_resolution
+            let data = w.finish();
+            let mut ctx = default_ctx();
+            ctx.reduced_resolution_vop_enable = true;
+            let mut br = BitReader::new(&data);
+            let parsed = parse_video_packet_header(&mut br, &ctx);
+            if ok {
+                assert!(parsed.unwrap().header_extension_code);
+            } else {
+                assert!(matches!(
+                    parsed.unwrap_err(),
+                    VideoPacketParseError::UnsupportedBranch(_)
+                ));
+            }
+        }
     }
 
     // ------- Error trait/display coverage -------

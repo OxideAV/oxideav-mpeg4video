@@ -10,11 +10,11 @@ use oxideav_mpeg4video::bitreader::BitReader;
 use oxideav_mpeg4video::decoder::Mpeg4VideoDecoder;
 use oxideav_mpeg4video::framestore::{DecodedFrame, FrameStore};
 use oxideav_mpeg4video::ivop_encode::{
-    EncoderConfig, FrameView, encode_i_vop, encode_i_vop_elect_thr, encode_i_vop_with_thr,
-    write_configuration_headers,
+    EncoderConfig, FrameView, encode_i_vop_any, encode_i_vop_elect_thr_any,
+    encode_i_vop_with_thr_any, write_configuration_headers,
 };
 use oxideav_mpeg4video::packet_encode::ResilienceConfig;
-use oxideav_mpeg4video::pvop_encode::{encode_p_vop, reconstruct_own_p_vop};
+use oxideav_mpeg4video::pvop_encode::{encode_p_vop_any, reconstruct_own_p_vop};
 use oxideav_mpeg4video::svop_encode::{encode_s_vop, reconstruct_own_s_vop_with_motion};
 use oxideav_mpeg4video::vol::parse_video_object_layer;
 use oxideav_mpeg4video::vop::{VopContext, parse_vop_header_body};
@@ -198,13 +198,14 @@ fn explicit_thresholds_round_trip_in_both_layouts() {
                 height: 64,
             };
             if k == 0 {
-                let (unit, recon) = encode_i_vop(&vol, &cfg, &view, 0, 0, qp);
+                let (unit, recon) = encode_i_vop_any(&vol, &cfg, &view, 0, 0, qp);
                 stream.extend_from_slice(&unit);
                 store.push_anchor(recon.clone());
                 recons.push(recon);
             } else {
                 let reference = store.backward().unwrap().clone();
-                let (unit, stats) = encode_p_vop(&vol, &cfg, &view, &reference, 0, k as u16, qp);
+                let (unit, stats) =
+                    encode_p_vop_any(&vol, &cfg, &view, &reference, 0, k as u16, qp);
                 assert!(
                     stats.intra > 0,
                     "thr {thr}: P-VOP {k} needs intra MBs ({stats:?})"
@@ -234,9 +235,9 @@ fn election_keeps_the_cheaper_variant() {
             width: 64,
             height: 48,
         };
-        let (dc, _) = encode_i_vop_with_thr(&vol, &cfg, &view, 0, 0, qp, 0);
-        let (ac, _) = encode_i_vop_with_thr(&vol, &cfg, &view, 0, 0, qp, 7);
-        let (elected, recon, thr) = encode_i_vop_elect_thr(&vol, &cfg, &view, 0, 0, qp);
+        let (dc, _) = encode_i_vop_with_thr_any(&vol, &cfg, &view, 0, 0, qp, 0);
+        let (ac, _) = encode_i_vop_with_thr_any(&vol, &cfg, &view, 0, 0, qp, 7);
+        let (elected, recon, thr) = encode_i_vop_elect_thr_any(&vol, &cfg, &view, 0, 0, qp);
         assert!(thr == 0 || thr == 7);
         assert_eq!(elected.len(), dc.len().min(ac.len()), "qp {qp}");
         assert_eq!(elected, if thr == 7 { ac } else { dc });
@@ -343,19 +344,19 @@ fn election_is_optimal_over_the_whole_table() {
     for qp in [6u32, 14, 16, 18, 20, 22, 28] {
         let sizes: Vec<usize> = (0u8..=7)
             .map(|thr| {
-                encode_i_vop_with_thr(&vol, &cfg, &view, 0, 0, qp, thr)
+                encode_i_vop_with_thr_any(&vol, &cfg, &view, 0, 0, qp, thr)
                     .0
                     .len()
             })
             .collect();
-        let (unit, _recon, thr) = encode_i_vop_elect_thr(&vol, &cfg, &view, 0, 0, qp);
+        let (unit, _recon, thr) = encode_i_vop_elect_thr_any(&vol, &cfg, &view, 0, 0, qp);
         let best = *sizes.iter().min().unwrap();
         let lowest_best = sizes.iter().position(|&s| s == best).unwrap() as u8;
         assert_eq!(unit.len(), best, "qp {qp}: elected {thr} {sizes:?}");
         assert_eq!(thr, lowest_best, "qp {qp}: {sizes:?}");
         assert_eq!(
             unit,
-            encode_i_vop_with_thr(&vol, &cfg, &view, 0, 0, qp, thr).0
+            encode_i_vop_with_thr_any(&vol, &cfg, &view, 0, 0, qp, thr).0
         );
         winners.push(thr);
     }
@@ -391,9 +392,12 @@ fn election_is_optimal_over_the_whole_table() {
                 14,
             )));
         let (_, vol) = vol_of(&cfg);
-        let (unit, _recon, thr) = encode_i_vop_elect_thr(&vol, &cfg, &view, 0, 0, 8);
-        let extremes =
-            [0u8, 7].map(|t| encode_i_vop_with_thr(&vol, &cfg, &view, 0, 0, 8, t).0.len());
+        let (unit, _recon, thr) = encode_i_vop_elect_thr_any(&vol, &cfg, &view, 0, 0, 8);
+        let extremes = [0u8, 7].map(|t| {
+            encode_i_vop_with_thr_any(&vol, &cfg, &view, 0, 0, 8, t)
+                .0
+                .len()
+        });
         println!(
             "budget {target_bits}: elected {thr} ({} bytes), extremes {extremes:?}",
             unit.len()
@@ -446,7 +450,7 @@ fn gmc_packets_carry_the_hec_trajectory() {
                 height: 64,
             };
             if k == 0 {
-                let (unit, recon) = encode_i_vop(&vol, &cfg, &view, 0, 0, 6);
+                let (unit, recon) = encode_i_vop_any(&vol, &cfg, &view, 0, 0, 6);
                 stream.extend_from_slice(&unit);
                 store.push_anchor(recon.clone());
                 recons.push(recon);

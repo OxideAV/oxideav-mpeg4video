@@ -3,13 +3,13 @@
 //! emission, the §6.3.7 running quantiser mirrored on both sides,
 //! sample-exact through the crate's own decoder.
 
-use oxideav_mpeg4video::bvop_encode::encode_b_vop;
+use oxideav_mpeg4video::bvop_encode::encode_b_vop_any;
 use oxideav_mpeg4video::decoder::Mpeg4VideoDecoder;
 use oxideav_mpeg4video::framestore::{DecodedFrame, FrameStore};
 use oxideav_mpeg4video::ivop_encode::{
-    EncoderConfig, FrameView, encode_i_vop, write_configuration_headers,
+    EncoderConfig, FrameView, encode_i_vop_any, write_configuration_headers,
 };
-use oxideav_mpeg4video::pvop_encode::{encode_p_vop, reconstruct_own_p_vop_with_motion};
+use oxideav_mpeg4video::pvop_encode::{encode_p_vop_any, reconstruct_own_p_vop_with_motion};
 use oxideav_mpeg4video::vol::parse_video_object_layer;
 
 type Planes = (Vec<u8>, Vec<u8>, Vec<u8>);
@@ -101,8 +101,8 @@ fn ip_dquant_round_trips_and_is_emitted() {
                 height: h,
             };
             if k == 0 {
-                let (unit, recon) = encode_i_vop(&vol, &cfg, &view, 0, 0, 8);
-                let (plain_unit, plain_recon) = encode_i_vop(&vol, &plain, &view, 0, 0, 8);
+                let (unit, recon) = encode_i_vop_any(&vol, &cfg, &view, 0, 0, 8);
+                let (plain_unit, plain_recon) = encode_i_vop_any(&vol, &plain, &view, 0, 0, 8);
                 assert_ne!(unit, plain_unit, "I-VOP dquant must change the stream");
                 store.push_anchor(recon.clone());
                 plain_store.push_anchor(plain_recon);
@@ -111,7 +111,7 @@ fn ip_dquant_round_trips_and_is_emitted() {
                 recons.push(recon);
             } else {
                 let reference = store.backward().unwrap().clone();
-                let (unit, stats) = encode_p_vop(&vol, &cfg, &view, &reference, 0, k as u16, 8);
+                let (unit, stats) = encode_p_vop_any(&vol, &cfg, &view, &reference, 0, k as u16, 8);
                 dquants += stats.dquant;
                 let (recon, _) = reconstruct_own_p_vop_with_motion(&vol, &unit, &mut store);
                 stream.extend_from_slice(&unit);
@@ -152,13 +152,13 @@ fn dquant_with_inter4v_and_qpel_round_trips() {
             height: h,
         };
         if k == 0 {
-            let (unit, recon) = encode_i_vop(&vol, &cfg, &view, 0, 0, 6);
+            let (unit, recon) = encode_i_vop_any(&vol, &cfg, &view, 0, 0, 6);
             store.push_anchor(recon.clone());
             stream.extend_from_slice(&unit);
             recons.push(recon);
         } else {
             let reference = store.backward().unwrap().clone();
-            let (unit, _stats) = encode_p_vop(&vol, &cfg, &view, &reference, 0, k as u16, 6);
+            let (unit, _stats) = encode_p_vop_any(&vol, &cfg, &view, &reference, 0, k as u16, 6);
             let (recon, _) = reconstruct_own_p_vop_with_motion(&vol, &unit, &mut store);
             stream.extend_from_slice(&unit);
             recons.push(recon);
@@ -188,15 +188,15 @@ fn b_vop_dbquant_round_trips_and_is_emitted() {
         width: w,
         height: h,
     };
-    let (i_unit, i_recon) = encode_i_vop(&vol, &cfg, &view(0), 0, 0, 8);
+    let (i_unit, i_recon) = encode_i_vop_any(&vol, &cfg, &view(0), 0, 0, 8);
     store.push_anchor(i_recon.clone());
     stream.extend_from_slice(&i_unit);
     let reference = store.backward().unwrap().clone();
-    let (p_unit, _) = encode_p_vop(&vol, &cfg, &view(2), &reference, 0, 2, 8);
+    let (p_unit, _) = encode_p_vop_any(&vol, &cfg, &view(2), &reference, 0, 2, 8);
     let (p_recon, motion) = reconstruct_own_p_vop_with_motion(&vol, &p_unit, &mut store);
     stream.extend_from_slice(&p_unit);
     let (b_unit, b_recon, stats) =
-        encode_b_vop(&vol, &cfg, &view(1), &store, Some(&motion), 1, 2, 0, 1, 8);
+        encode_b_vop_any(&vol, &cfg, &view(1), &store, Some(&motion), 1, 2, 0, 1, 8);
     stream.extend_from_slice(&b_unit);
     assert!(
         stats.dbquant > 0,

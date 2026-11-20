@@ -172,10 +172,12 @@ pub struct VopContext {
     /// Whether the VOL declared `reduced_resolution_vop_enable == 1`.
     /// Round 2 rejects.
     pub reduced_resolution_vop_enable: bool,
-    /// Whether `complexity_estimation_disable` is set in the VOL. Round
-    /// 2 only supports `complexity_estimation_disable == 1` (i.e. no
-    /// complexity-estimation header in the VOP).
+    /// Whether `complexity_estimation_disable` is set in the VOL.
     pub complexity_estimation_disable: bool,
+    /// The VOL's `define_vop_complexity_estimation_header()` (when
+    /// `complexity_estimation_disable == 0`): the statistics every
+    /// coded VOP header carries, which the parser steps over.
+    pub complexity_estimation: Option<crate::vol::ComplexityEstimation>,
 }
 
 impl Default for VopContext {
@@ -192,6 +194,7 @@ impl Default for VopContext {
             newpred_enable: false,
             reduced_resolution_vop_enable: false,
             complexity_estimation_disable: true,
+            complexity_estimation: None,
         }
     }
 }
@@ -214,6 +217,7 @@ impl VopContext {
             newpred_enable: vol.newpred_enable,
             reduced_resolution_vop_enable: vol.reduced_resolution_vop_enable,
             complexity_estimation_disable: vol.complexity_estimation_disable,
+            complexity_estimation: vol.complexity_estimation,
         }
     }
 }
@@ -293,6 +297,39 @@ pub struct VopHeader {
     /// alternate-vertical inverse scan for the VOP's blocks. Defaults
     /// to `false` for progressive VOLs.
     pub alternate_vertical_scan: bool,
+    /// §6.3.5 `vop_id` of a NEWPRED VOL (`newpred_enable == 1`):
+    /// incremented by one per coded VOP, never zero. `None` otherwise.
+    pub vop_id: Option<u16>,
+    /// §6.3.5 `vop_id_for_prediction`: the `vop_id` of the VOP this
+    /// one is predicted from instead of the previous one, when
+    /// `vop_id_for_prediction_indication == 1`. `None` otherwise.
+    pub vop_id_for_prediction: Option<u16>,
+}
+
+/// Width of `vop_id` / `vop_id_for_prediction` (§6.3.5): the smaller
+/// of the `vop_time_increment` length plus 3, and 15.
+pub fn vop_id_bits(resolution: u16) -> u8 {
+    (vop_time_increment_bits(resolution) + 3).min(15)
+}
+
+/// §6.2.5 NEWPRED block of a VOP or video packet header: `vop_id`,
+/// `vop_id_for_prediction_indication`, the optional
+/// `vop_id_for_prediction`, and the closing marker bit. Returns
+/// `(vop_id, vop_id_for_prediction)`.
+pub(crate) fn parse_newpred_ids(
+    br: &mut BitReader<'_>,
+    resolution: u16,
+) -> Result<(u16, Option<u16>), crate::bitreader::BitReaderError> {
+    let bits = usize::from(vop_id_bits(resolution));
+    let vop_id = br.read_bits(bits)? as u16;
+    let for_prediction = if br.read_bool()? {
+        Some(br.read_bits(bits)? as u16)
+    } else {
+        None
+    };
+    // marker_bit — its value does not change the parse.
+    br.read_bool()?;
+    Ok((vop_id, for_prediction))
 }
 
 /// Errors produced by the VOP / GOV header parsers. We reuse
@@ -565,21 +602,24 @@ fn parse_video_object_plane_body(
             static_sprite: None,
             top_field_first: false,
             alternate_vertical_scan: false,
+            vop_id: None,
+            vop_id_for_prediction: None,
         });
     }
 
-    // newpred_enable / reduced_resolution_vop_enable / non-rectangular
-    // shape branches are explicitly out of scope for round 2.
-    if ctx.newpred_enable {
-        return Err(VopParseError::UnsupportedBranch("newpred_enable"));
-    }
-    if ctx.reduced_resolution_vop_enable {
-        return Err(VopParseError::UnsupportedBranch(
-            "reduced_resolution_vop_enable",
-        ));
-    }
+    // §6.2.5: the NEWPRED block follows vop_coded.
+    let (vop_id, vop_id_for_prediction) = if ctx.newpred_enable {
+        let (id, for_prediction) = parse_newpred_ids(br, resolution)?;
+        (Some(id), for_prediction)
+    } else {
+        (None, None)
+    };
     if ctx.scalability {
-        return Err(VopParseError::UnsupportedBranch("scalability"));
+        // An enhancement layer's VOP header continues with
+        // ref_select_code and the scalability fields.
+        return Err(VopParseError::UnsupportedBranch(
+            "scalability (enhancement-layer VOP)",
+        ));
     }
 
     // vop_rounding_type: present only for P and S(GMC) coded VOPs in
@@ -593,10 +633,24 @@ fn parse_video_object_plane_body(
         rounding_type = br.read_bits(1)? as u8;
     }
 
-    if !ctx.complexity_estimation_disable {
+    // §6.2.5 vop_reduced_resolution: present on the I- and P-VOPs of
+    // a rectangular VOL with reduced_resolution_vop_enable. A VOP
+    // that sets it is coded at half resolution (§7.6.10: 32×32
+    // macroblocks, upsampled prediction error, block-boundary filter).
+    if ctx.reduced_resolution_vop_enable
+        && matches!(coding_type, VopCodingType::I | VopCodingType::P)
+        && br.read_bool()?
+    {
         return Err(VopParseError::UnsupportedBranch(
-            "complexity_estimation_header",
+            "vop_reduced_resolution == 1 (reduced-resolution VOP, subclause 7.6.10)",
         ));
+    }
+
+    // §6.2.5 read_vop_complexity_estimation_header(): decoding-effort
+    // statistics; the decoded samples do not depend on them.
+    if let Some(ce) = ctx.complexity_estimation {
+        let bits = ce.vop_header_bits(coding_type, ctx.sprite_static);
+        br.skip_bits(bits as usize)?;
     }
 
     // intra_dc_vlc_thr (Table 6-25). 3 bits, 0..=7.
@@ -647,6 +701,8 @@ fn parse_video_object_plane_body(
             }),
             top_field_first,
             alternate_vertical_scan,
+            vop_id,
+            vop_id_for_prediction,
         });
     }
 
@@ -720,6 +776,8 @@ fn parse_video_object_plane_body(
         static_sprite: None,
         top_field_first,
         alternate_vertical_scan,
+        vop_id,
+        vop_id_for_prediction,
     })
 }
 
@@ -1160,24 +1218,121 @@ mod tests {
             ..VopContext::default()
         };
         let err = parse_video_object_plane_header(&data, 30_000, ctx).unwrap_err();
-        assert!(matches!(
-            err,
-            VopParseError::UnsupportedBranch("scalability")
-        ));
+        assert!(matches!(err, VopParseError::UnsupportedBranch(_)));
+    }
+
+    /// An I- or P-VOP header with the optional NEWPRED block, the
+    /// `vop_reduced_resolution` bit and `stat_bits` of complexity
+    /// statistics ahead of `intra_dc_vlc_thr`.
+    fn make_extended_vop(
+        p_vop: bool,
+        newpred: Option<(u32, Option<u32>)>,
+        reduced_resolution: Option<bool>,
+        stat_bits: usize,
+    ) -> Vec<u8> {
+        let mut w = BitWriter::new();
+        w.write_bits(VOP_START_CODE, 32);
+        w.write_bits(u32::from(p_vop), 2); // I = 00, P = 01
+        w.write_bits(0, 1); // modulo_time_base
+        w.write_marker();
+        w.write_bits(7, vop_time_increment_bits(25) as usize);
+        w.write_marker();
+        w.write_bits(1, 1); // vop_coded
+        if let Some((id, for_prediction)) = newpred {
+            let bits = usize::from(vop_id_bits(25));
+            w.write_bits(id, bits);
+            w.write_bits(u32::from(for_prediction.is_some()), 1);
+            if let Some(reference) = for_prediction {
+                w.write_bits(reference, bits);
+            }
+            w.write_marker();
+        }
+        if p_vop {
+            w.write_bits(1, 1); // vop_rounding_type
+        }
+        if let Some(rr) = reduced_resolution {
+            w.write_bits(u32::from(rr), 1);
+        }
+        for _ in 0..stat_bits {
+            w.write_bits(1, 1);
+        }
+        w.write_bits(5, 3); // intra_dc_vlc_thr
+        w.write_bits(13, 5); // vop_quant
+        if p_vop {
+            w.write_bits(2, 3); // vop_fcode_forward
+        }
+        w.align();
+        w.buf
     }
 
     #[test]
-    fn unsupported_newpred_is_rejected() {
-        let data = make_i_vop(30_000, 0, 0, 1, 0);
+    fn newpred_ids_are_read_from_the_vop_header() {
+        // resolution 25 → 5-bit increment → 8-bit ids.
+        assert_eq!(vop_id_bits(25), 8);
+        assert_eq!(vop_id_bits(1), 4);
+        assert_eq!(vop_id_bits(65_535), 15);
         let ctx = VopContext {
             newpred_enable: true,
             ..VopContext::default()
         };
-        let err = parse_video_object_plane_header(&data, 30_000, ctx).unwrap_err();
-        assert!(matches!(
-            err,
-            VopParseError::UnsupportedBranch("newpred_enable")
-        ));
+        let data = make_extended_vop(true, Some((200, Some(197))), None, 0);
+        let header = parse_video_object_plane_header(&data, 25, ctx).unwrap();
+        assert_eq!(header.vop_id, Some(200));
+        assert_eq!(header.vop_id_for_prediction, Some(197));
+        assert_eq!(header.rounding_type, 1);
+        assert_eq!(header.intra_dc_vlc_thr, 5);
+        assert_eq!(header.quant, 13);
+        assert_eq!(header.fcode_fwd, 2);
+
+        let data = make_extended_vop(false, Some((3, None)), None, 0);
+        let header = parse_video_object_plane_header(&data, 25, ctx).unwrap();
+        assert_eq!(header.vop_id, Some(3));
+        assert_eq!(header.vop_id_for_prediction, None);
+        assert_eq!(header.quant, 13);
+    }
+
+    #[test]
+    fn reduced_resolution_bit_is_read_and_a_set_bit_is_named() {
+        let ctx = VopContext {
+            reduced_resolution_vop_enable: true,
+            ..VopContext::default()
+        };
+        for p_vop in [false, true] {
+            let data = make_extended_vop(p_vop, None, Some(false), 0);
+            let header = parse_video_object_plane_header(&data, 25, ctx).unwrap();
+            assert_eq!(header.quant, 13);
+            assert_eq!(header.intra_dc_vlc_thr, 5);
+            let data = make_extended_vop(p_vop, None, Some(true), 0);
+            let err = parse_video_object_plane_header(&data, 25, ctx).unwrap_err();
+            assert!(
+                matches!(err, VopParseError::UnsupportedBranch(what) if what.contains("7.6.10"))
+            );
+        }
+    }
+
+    #[test]
+    fn complexity_statistics_are_stepped_over() {
+        let ce = crate::vol::ComplexityEstimation {
+            intra_blocks: true,
+            vlc_bits: true,
+            inter_blocks: true,
+            quarterpel: true,
+            estimation_method: 1,
+            ..Default::default()
+        };
+        let ctx = VopContext {
+            complexity_estimation_disable: false,
+            complexity_estimation: Some(ce),
+            ..VopContext::default()
+        };
+        // I: intra_blocks + vlc_bits = 12 bits; P adds inter_blocks
+        // and quarterpel = 28 bits.
+        for (p_vop, bits) in [(false, 12usize), (true, 28)] {
+            let data = make_extended_vop(p_vop, None, None, bits);
+            let header = parse_video_object_plane_header(&data, 25, ctx).unwrap();
+            assert_eq!(header.intra_dc_vlc_thr, 5, "p_vop {p_vop}");
+            assert_eq!(header.quant, 13);
+        }
     }
 
     #[test]

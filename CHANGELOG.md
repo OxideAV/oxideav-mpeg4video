@@ -8,6 +8,52 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Visual object layer syntax sweep** — header blocks the decoder
+  used to decline, now read as §6.2.3 / §6.2.5 define them.
+  - `define_vop_complexity_estimation_header()` (VOL) and
+    `read_vop_complexity_estimation_header()` (every coded VOP):
+    `vol::ComplexityEstimation` records which statistics are sent and
+    `vop_header_bits()` gives the length of the per-VOP block for I-,
+    P-, B- and static-sprite S-VOPs (an S(GMC)-VOP has none); the VOP
+    parser steps over it. The statistics describe decoding effort and
+    do not enter the reconstruction.
+  - **NEWPRED** (§7.14, `newpred_enable`): `vol::NewpredConfig`
+    (`requested_upstream_message_type`, `newpred_segment_type`),
+    `vop_id` / `vop_id_for_prediction` in the VOP header and in every
+    video packet header (after the extension body, present or not;
+    width `min(vop_time_increment bits + 3, 15)`). With the VOP
+    segment type the stream decoder keeps the anchors decoded since
+    the last I-VOP (`decoder::NEWPRED_MEMORY_VOPS` = 16) and predicts
+    a P- or S(GMC)-VOP from the one it names; the anchor chain B-VOPs
+    use is untouched. A reference outside the memory is
+    `StreamDecodeError::MissingNewpredReference`. Per-packet reference
+    selection (`newpred_segment_type == 0`) and a selection on a B-VOP
+    are declined with typed errors.
+  - `vop_reduced_resolution` is read (VOP header and packet extension
+    body): a `reduced_resolution_vop_enable` VOL whose VOPs are all
+    full resolution decodes; a VOP that sets the bit is declined by
+    name (§7.6.10) instead of the whole VOL.
+  - **Several layers in one stream**: every `(video_object_id,
+    video_object_layer_id)` has its own configuration, reference
+    chain, clock, sprite and NEWPRED memory (the current layer plus
+    `decoder::MAX_PARKED_LAYERS` = 4 others); frames carry
+    `DecodedFrame::layer()`, `Mpeg4VideoDecoder::current_layer()`
+    names the layer in effect and `flush()` releases every layer's
+    held anchor. VOPs of a scalability enhancement layer
+    (`scalability == 1`) are stepped over and counted
+    (`enhancement_vops_skipped()`), so the layers such a stream builds
+    on decode.
+- **Opt-in error concealment** (§E.1.4.2) —
+  `DecodeOptions::with_error_concealment(true)` / registry key
+  `error-concealment`: a VOP that fails to decode is replaced by the
+  copy of its forward reference (the `vop_coded == 0` reconstruction),
+  an anchor still enters the chain and moves the clock, and
+  `Mpeg4VideoDecoder::concealment()` /
+  `DecodedFrame::concealed_macroblocks()` report what was concealed. A
+  VOP with an unreadable header or no reference is dropped and
+  counted; a VOP declined for a tool the decoder does not implement
+  stays an error. Default off: a damaged VOP is an error.
+
 - **N-bit video** (§6.3.3 `not_8_bit`, `bits_per_pixel` 4..=12,
   `quant_precision` 3..=9), decode and encode.
   - Picture store: `DecodedFrame` holds one byte per sample up to 8
@@ -37,7 +83,10 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   - Encoder: `EncoderConfig::with_bit_depth(bits_per_pixel,
     quant_precision)` writes `not_8_bit` + both fields and signals the
     N-bit object type (`0x05`) and profile (`0x42`); `FrameView<'_, S>`
-    carries 16-bit sources. I-/P-/B-VOPs with AC/DC prediction, 4MV,
+    carries 16-bit sources into `encode_i_vop_any` / `encode_p_vop_any`
+    / `encode_b_vop_any` (the unsuffixed entry points keep their 8-bit
+    signatures, as do the `quarter_sample` functions beside their
+    `_any` forms). I-/P-/B-VOPs with AC/DC prediction, 4MV,
     both quantisation methods, per-macroblock quantiser modulation and
     the error-resilience tools — the Table 9-1 tool set of that object
     type; quarter-sample, GMC, sprites, interlace and the short header

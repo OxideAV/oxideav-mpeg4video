@@ -23,14 +23,14 @@ use oxideav_core::{
     CodecId, CodecParameters, Error, Frame, Packet, PixelFormat, Rational, Result, TimeBase,
 };
 
-use crate::bvop_encode::encode_b_vop;
+use crate::bvop_encode::encode_b_vop_any;
 use crate::framestore::FrameStore;
 use crate::ivop_encode::{
-    EncoderConfig, FrameView, encode_i_vop_elect_thr_full, encode_i_vop_full,
+    EncoderConfig, FrameView, encode_i_vop_elect_thr_full_any, encode_i_vop_full_any,
     write_configuration_headers,
 };
 use crate::mb_quant::MbBudget;
-use crate::pvop_encode::{encode_p_vop, reconstruct_own_p_vop_with_anchor_motion};
+use crate::pvop_encode::{encode_p_vop_any, reconstruct_own_p_vop_with_anchor_motion};
 use crate::rate_control::{BudgetPlanner, FirstPassStats, FrameStat, RateController, VopClass};
 use crate::vol::{VolHeader, parse_video_object_layer};
 
@@ -1400,12 +1400,12 @@ impl Mpeg4VideoEncoder {
                     // Elect intra_dc_vlc_thr by measured cost and carry
                     // it to the following P/S-VOP headers.
                     let (unit, recon, thr, stats) = with_picture_view!(frame, w, h, |v| {
-                        encode_i_vop_elect_thr_full(&vol, &self.cfg, &v, modulo, increment, qp)
+                        encode_i_vop_elect_thr_full_any(&vol, &self.cfg, &v, modulo, increment, qp)
                     });
                     self.cfg.intra_dc_vlc_thr = thr;
                     (unit, recon, stats)
                 } else {
-                    with_picture_view!(frame, w, h, |v| encode_i_vop_full(
+                    with_picture_view!(frame, w, h, |v| encode_i_vop_full_any(
                         &vol,
                         &self.cfg,
                         &v,
@@ -1470,7 +1470,7 @@ impl Mpeg4VideoEncoder {
             let mut qp = self.plan_vop(VopClass::P);
             let unit = loop {
                 let (unit, stats) = with_picture_view!(frame, w, h, |v| {
-                    encode_p_vop(&vol, &self.cfg, &v, &reference, modulo, increment, qp)
+                    encode_p_vop_any(&vol, &self.cfg, &v, &reference, modulo, increment, qp)
                 });
                 let mean_qp = stats.mean_qp_or(qp);
                 if let Some(q) = self.calibrate_vop(VopClass::P, unit.len(), mean_qp) {
@@ -1559,7 +1559,7 @@ impl Mpeg4VideoEncoder {
                         );
                     (unit, stats.mean_qp_or(qp))
                 } else {
-                    let (unit, _recon, stats) = with_picture_view!(b, w, h, |v| encode_b_vop(
+                    let (unit, _recon, stats) = with_picture_view!(b, w, h, |v| encode_b_vop_any(
                         &vol,
                         &self.cfg,
                         &v,

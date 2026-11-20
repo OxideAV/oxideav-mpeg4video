@@ -8,9 +8,9 @@
 use oxideav_mpeg4video::decoder::Mpeg4VideoDecoder;
 use oxideav_mpeg4video::framestore::{DecodedFrame, FrameStore};
 use oxideav_mpeg4video::ivop_encode::{
-    EncoderConfig, FrameView, encode_i_vop, write_configuration_headers,
+    EncoderConfig, FrameView, encode_i_vop_any, write_configuration_headers,
 };
-use oxideav_mpeg4video::pvop_encode::{encode_p_vop, reconstruct_own_p_vop};
+use oxideav_mpeg4video::pvop_encode::{encode_p_vop_any, reconstruct_own_p_vop};
 use oxideav_mpeg4video::vol::parse_video_object_layer;
 
 fn lcg(state: &mut u32) -> u32 {
@@ -99,13 +99,13 @@ fn roundtrip(kind: Kind, w: u16, h: u16, qp: u32, quant_type: bool) {
             height: usize::from(h),
         };
         if k % 2 == 0 {
-            let (unit, recon) = encode_i_vop(&vol, &cfg, &view, 0, k as u16, qp);
+            let (unit, recon) = encode_i_vop_any(&vol, &cfg, &view, 0, k as u16, qp);
             store.push_anchor(recon.clone());
             stream.extend_from_slice(&unit);
             recons.push(recon);
         } else {
             let reference = store.backward().expect("anchor present").clone();
-            let (unit, _stats) = encode_p_vop(&vol, &cfg, &view, &reference, 0, k as u16, qp);
+            let (unit, _stats) = encode_p_vop_any(&vol, &cfg, &view, &reference, 0, k as u16, qp);
             let recon = reconstruct_own_p_vop(&vol, &unit, &mut store);
             stream.extend_from_slice(&unit);
             recons.push(recon);
@@ -207,7 +207,7 @@ fn roundtrip_ibp_resilient(kind: Kind, w: u16, h: u16, qp: u32, quant_type: bool
 }
 
 fn roundtrip_ibp_cfg(kind: Kind, cfg: &EncoderConfig, qp: u32) {
-    use oxideav_mpeg4video::bvop_encode::encode_b_vop;
+    use oxideav_mpeg4video::bvop_encode::encode_b_vop_any;
     use oxideav_mpeg4video::pvop_encode::reconstruct_own_p_vop_with_motion;
     let cfg = *cfg;
     let (w, h) = (cfg.width, cfg.height);
@@ -239,15 +239,15 @@ fn roundtrip_ibp_cfg(kind: Kind, cfg: &EncoderConfig, qp: u32) {
 
     let mut store = FrameStore::new();
     let mut stream = headers;
-    let (i_unit, i_recon) = encode_i_vop(&vol, &cfg, &view(0), 0, 0, qp);
+    let (i_unit, i_recon) = encode_i_vop_any(&vol, &cfg, &view(0), 0, 0, qp);
     store.push_anchor(i_recon.clone());
     stream.extend_from_slice(&i_unit);
     let reference = store.backward().unwrap().clone();
-    let (p_unit, _stats) = encode_p_vop(&vol, &cfg, &view(2), &reference, 0, 2, qp);
+    let (p_unit, _stats) = encode_p_vop_any(&vol, &cfg, &view(2), &reference, 0, 2, qp);
     let (p_recon, motion) = reconstruct_own_p_vop_with_motion(&vol, &p_unit, &mut store);
     stream.extend_from_slice(&p_unit);
     let (b_unit, b_recon, _bstats) =
-        encode_b_vop(&vol, &cfg, &view(1), &store, Some(&motion), 1, 2, 0, 1, qp);
+        encode_b_vop_any(&vol, &cfg, &view(1), &store, Some(&motion), 1, 2, 0, 1, qp);
     stream.extend_from_slice(&b_unit);
 
     let mut dec = Mpeg4VideoDecoder::new();

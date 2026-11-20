@@ -52,12 +52,6 @@ pub enum FrameStoreError {
         /// Requested luma height in samples.
         height: usize,
     },
-    /// A sample depth outside the §6.3.3 `bits_per_pixel` range 4..=12
-    /// was requested.
-    InvalidBitDepth {
-        /// Requested bits per sample.
-        bits_per_pixel: u32,
-    },
     /// A macroblock blit addressed a column/row outside the frame's
     /// macroblock grid.
     MacroblockOutOfBounds {
@@ -69,6 +63,12 @@ pub enum FrameStoreError {
         mb_width: usize,
         /// Frame height in macroblocks.
         mb_height: usize,
+    },
+    /// A sample depth outside the §6.3.3 `bits_per_pixel` range 4..=12
+    /// was requested.
+    InvalidBitDepth {
+        /// Requested bits per sample.
+        bits_per_pixel: u32,
     },
 }
 
@@ -115,6 +115,11 @@ pub struct DecodedFrame {
     /// [`DecodedFrame::pts`] / [`DecodedFrame::pts_ticks`].
     pts: Option<i64>,
     pts_ticks: Option<i64>,
+    /// `(video_object_id, video_object_layer_id)` — see
+    /// [`DecodedFrame::layer`].
+    layer: (u8, u8),
+    /// See [`DecodedFrame::concealed_macroblocks`].
+    concealed_macroblocks: u32,
 }
 
 impl DecodedFrame {
@@ -180,6 +185,8 @@ impl DecodedFrame {
             coding_type,
             pts: None,
             pts_ticks: None,
+            layer: (0, 0),
+            concealed_macroblocks: 0,
         })
     }
 
@@ -221,6 +228,38 @@ impl DecodedFrame {
     #[inline]
     pub const fn pts_ticks(&self) -> Option<i64> {
         self.pts_ticks
+    }
+
+    /// The video object and layer this picture belongs to:
+    /// `(video_object_id, video_object_layer_id)` from the §6.2.1
+    /// start codes that preceded its VOP (`(0, 0)` for a stream that
+    /// carries a single layer, a short-header stream, or a frame not
+    /// produced by the stream decoder).
+    #[inline]
+    pub const fn layer(&self) -> (u8, u8) {
+        self.layer
+    }
+
+    /// Number of macroblocks of this picture that were not decoded
+    /// from the stream but concealed (copied from the reference
+    /// picture) by the opt-in error concealment; 0 for a picture
+    /// decoded as coded.
+    #[inline]
+    pub const fn concealed_macroblocks(&self) -> u32 {
+        self.concealed_macroblocks
+    }
+
+    /// Record the concealed-macroblock count (see
+    /// [`DecodedFrame::concealed_macroblocks`]).
+    #[inline]
+    pub fn set_concealed_macroblocks(&mut self, count: u32) {
+        self.concealed_macroblocks = count;
+    }
+
+    /// Attach the layer identity (see [`DecodedFrame::layer`]).
+    #[inline]
+    pub fn set_layer(&mut self, layer: (u8, u8)) {
+        self.layer = layer;
     }
 
     /// Attach the container presentation timestamp (see

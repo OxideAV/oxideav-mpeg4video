@@ -7,10 +7,10 @@
 use oxideav_mpeg4video::decoder::Mpeg4VideoDecoder;
 use oxideav_mpeg4video::framestore::{DecodedFrame, FrameStore};
 use oxideav_mpeg4video::ivop_encode::{
-    EncoderConfig, FrameView, encode_i_vop, write_configuration_headers,
+    EncoderConfig, FrameView, encode_i_vop_any, write_configuration_headers,
 };
 use oxideav_mpeg4video::pvop_encode::{
-    PVopEncodeStats, encode_p_vop, reconstruct_own_p_vop_with_motion,
+    PVopEncodeStats, encode_p_vop_any, reconstruct_own_p_vop_with_motion,
 };
 use oxideav_mpeg4video::pvop_mv::PvopMbMotion;
 use oxideav_mpeg4video::vol::parse_video_object_layer;
@@ -74,13 +74,13 @@ fn encode_ip(cfg: &EncoderConfig, frames: usize, shift: (i64, i64), qp: u32) -> 
             height: h,
         };
         if k == 0 {
-            let (unit, recon) = encode_i_vop(&vol, cfg, &view, 0, 0, qp);
+            let (unit, recon) = encode_i_vop_any(&vol, cfg, &view, 0, 0, qp);
             out.stream.extend_from_slice(&unit);
             store.push_anchor(recon.clone());
             out.recons.push(recon);
         } else {
             let reference = store.backward().expect("anchor present").clone();
-            let (unit, st) = encode_p_vop(&vol, cfg, &view, &reference, 0, k as u16, qp);
+            let (unit, st) = encode_p_vop_any(&vol, cfg, &view, &reference, 0, k as u16, qp);
             let (recon, motion) = reconstruct_own_p_vop_with_motion(&vol, &unit, &mut store);
             out.stream.extend_from_slice(&unit);
             out.recons.push(recon);

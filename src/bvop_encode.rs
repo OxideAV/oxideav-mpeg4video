@@ -340,7 +340,7 @@ pub(crate) fn candidate_sad<S: Sample>(
 /// crate's own decode of the freshly emitted bits), and the mode
 /// statistics.
 #[allow(clippy::too_many_arguments)]
-pub fn encode_b_vop<S: Sample>(
+pub fn encode_b_vop_any<S: Sample>(
     vol: &crate::vol::VolHeader,
     cfg: &EncoderConfig,
     frame: &FrameView<'_, S>,
@@ -704,6 +704,35 @@ pub fn reconstruct_own_b_vop(
         u32::from(vol.bits_per_pixel),
     )
     .expect("own B-VOP must assemble")
+}
+
+/// [`encode_b_vop_any`] over 8-bit samples (the store of every VOL that is not
+/// N-bit with more than 8 bits per pixel).
+#[allow(clippy::too_many_arguments)]
+pub fn encode_b_vop(
+    vol: &crate::vol::VolHeader,
+    cfg: &EncoderConfig,
+    frame: &FrameView<'_>,
+    store: &FrameStore,
+    anchor_motion: Option<&[PvopMbMotion]>,
+    trb: i32,
+    trd: i32,
+    modulo_time_base: u32,
+    time_increment: u16,
+    qp: u32,
+) -> (Vec<u8>, DecodedFrame, BVopEncodeStats) {
+    encode_b_vop_any(
+        vol,
+        cfg,
+        frame,
+        store,
+        anchor_motion,
+        trb,
+        trd,
+        modulo_time_base,
+        time_increment,
+        qp,
+    )
 }
 
 #[cfg(test)]

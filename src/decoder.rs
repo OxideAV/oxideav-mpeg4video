@@ -121,6 +121,14 @@ pub enum StreamDecodeError {
         /// Computed `TRD` (future anchor minus past anchor, ticks).
         trd: i64,
     },
+    /// §7.14 NEWPRED: a VOP names, in `vop_id_for_prediction`, a
+    /// reference VOP that is not in the reference memory (never
+    /// decoded, decoded before the last I-VOP, or pushed out of the
+    /// memory by newer VOPs).
+    MissingNewpredReference {
+        /// The `vop_id` the VOP asked to be predicted from.
+        vop_id: u16,
+    },
 }
 
 impl core::fmt::Display for StreamDecodeError {
@@ -140,6 +148,10 @@ impl core::fmt::Display for StreamDecodeError {
             StreamDecodeError::BadTemporalReference { trb, trd } => write!(
                 f,
                 "stream decode: inconsistent B-VOP temporal references (TRB {trb}, TRD {trd})"
+            ),
+            StreamDecodeError::MissingNewpredReference { vop_id } => write!(
+                f,
+                "stream decode: NEWPRED reference vop_id {vop_id} is not in the reference memory"
             ),
         }
     }
@@ -220,11 +232,70 @@ pub struct Mpeg4VideoDecoder {
     /// §7.8.2 sprite memory of a basic static-sprite VOL: the
     /// reconstructed initial I-VOP (never displayed).
     sprite: Option<crate::static_sprite::SpritePlanes>,
+    /// §7.14 NEWPRED reference memory: the anchors decoded since the
+    /// last I-VOP, by `vop_id`, newest last (at most
+    /// [`NEWPRED_MEMORY_VOPS`]).
+    newpred_memory: std::collections::VecDeque<(u16, DecodedFrame)>,
+    /// `video_object_id` of the most recent `video_object_start_code`
+    /// (0 when the stream carried none).
+    video_object_id: u8,
+    /// The layer the fields above describe: `(video_object_id,
+    /// video_object_layer_id)` of the most recent
+    /// `video_object_layer_start_code`. `None` before the first VOL.
+    layer: Option<(u8, u8)>,
+    /// The decoding state of the other layers met so far (at most
+    /// [`MAX_PARKED_LAYERS`], oldest first).
+    parked: Vec<((u8, u8), LayerState)>,
+    /// VOPs of scalability enhancement layers stepped over.
+    enhancement_vops_skipped: u64,
+    /// What the opt-in error concealment did so far.
+    concealment: ConcealmentStats,
     /// The build number of the most recent user-data unit carrying the
     /// encoder signature ([`encoder_build_of`]). Once set it is never
     /// cleared.
     encoder_build: Option<u32>,
 }
+
+/// What the opt-in error concealment
+/// ([`DecodeOptions::error_concealment`]) did to a stream.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ConcealmentStats {
+    /// Damaged VOPs replaced by a copy of their forward reference.
+    pub concealed_vops: u64,
+    /// Damaged VOPs that produced no picture: their header could not
+    /// be read, or there was no reference to copy.
+    pub dropped_vops: u64,
+}
+
+/// The decoding state that belongs to one video object layer: its
+/// configuration, reference chain, time bases and memories.
+#[derive(Debug, Default)]
+struct LayerState {
+    vol: Option<VolHeader>,
+    sequence: SequenceDecoder,
+    anchor_motion: Option<Vec<AnchorMbMotion>>,
+    sync_sec: u64,
+    b_base_sec: u64,
+    prev_anchor_ticks: Option<i64>,
+    last_anchor_ticks: Option<i64>,
+    sprite: Option<crate::static_sprite::SpritePlanes>,
+    newpred_memory: std::collections::VecDeque<(u16, DecodedFrame)>,
+}
+
+/// Number of layers, besides the one being decoded, whose decoding
+/// state (reference pictures included) is kept while the stream moves
+/// between layers. A stream that visits more layers than this loses
+/// the state of the least recently visited one: its next VOPs need a
+/// fresh I-VOP.
+pub const MAX_PARKED_LAYERS: usize = 4;
+
+/// Number of decoded anchors the §7.14 NEWPRED reference memory keeps
+/// (the specification leaves the size of the "additional reference
+/// VOP memory" to the decoder; a selection older than this, or older
+/// than the last I-VOP, is reported as
+/// [`StreamDecodeError::MissingNewpredReference`]).
+pub const NEWPRED_MEMORY_VOPS: usize = 16;
 
 /// The short-header picture clock (see
 /// [`Mpeg4VideoDecoder::decode_with_pts`]).
@@ -393,9 +464,78 @@ impl Mpeg4VideoDecoder {
         Ok(out)
     }
 
-    /// Release the final held anchor at end-of-stream (§6.1.3.8).
+    /// Release the final held anchor at end-of-stream (§6.1.3.8) —
+    /// of the current layer first, then of every other layer the
+    /// stream visited.
     pub fn flush(&mut self) -> Vec<DecodedFrame> {
-        self.sequence.flush()
+        let current = self.layer.unwrap_or((0, 0));
+        let mut out = self.sequence.flush();
+        for frame in out.iter_mut() {
+            frame.set_layer(current);
+        }
+        for (id, state) in self.parked.iter_mut() {
+            for mut frame in state.sequence.flush() {
+                frame.set_layer(*id);
+                out.push(frame);
+            }
+        }
+        out
+    }
+
+    /// The layer the next VOP belongs to: `(video_object_id,
+    /// video_object_layer_id)` of the most recent
+    /// `video_object_layer_start_code`; `None` before the first one.
+    pub fn current_layer(&self) -> Option<(u8, u8)> {
+        self.layer
+    }
+
+    /// Number of VOPs stepped over because their layer is a
+    /// scalability enhancement layer (`scalability == 1`): the base
+    /// layer of such a stream decodes, the enhancement does not.
+    pub fn enhancement_vops_skipped(&self) -> u64 {
+        self.enhancement_vops_skipped
+    }
+
+    /// Make `id` the current layer: park the state of the layer being
+    /// left and bring back (or start) the state of the one entered.
+    fn enter_layer(&mut self, id: (u8, u8)) {
+        if self.layer == Some(id) {
+            return;
+        }
+        let Some(leaving) = self.layer.replace(id) else {
+            // The first layer of the stream: nothing to park.
+            return;
+        };
+        let coded_order = self.sequence.coded_order();
+        let entering = match self.parked.iter().position(|(held, _)| *held == id) {
+            Some(index) => self.parked.remove(index).1,
+            None => {
+                let mut fresh = LayerState::default();
+                fresh.sequence.set_coded_order(coded_order);
+                fresh
+            }
+        };
+        let left = LayerState {
+            vol: std::mem::replace(&mut self.vol, entering.vol),
+            sequence: std::mem::replace(&mut self.sequence, entering.sequence),
+            anchor_motion: std::mem::replace(&mut self.anchor_motion, entering.anchor_motion),
+            sync_sec: std::mem::replace(&mut self.sync_sec, entering.sync_sec),
+            b_base_sec: std::mem::replace(&mut self.b_base_sec, entering.b_base_sec),
+            prev_anchor_ticks: std::mem::replace(
+                &mut self.prev_anchor_ticks,
+                entering.prev_anchor_ticks,
+            ),
+            last_anchor_ticks: std::mem::replace(
+                &mut self.last_anchor_ticks,
+                entering.last_anchor_ticks,
+            ),
+            sprite: std::mem::replace(&mut self.sprite, entering.sprite),
+            newpred_memory: std::mem::replace(&mut self.newpred_memory, entering.newpred_memory),
+        };
+        if self.parked.len() == MAX_PARKED_LAYERS {
+            self.parked.remove(0);
+        }
+        self.parked.push((leaving, left));
     }
 
     /// Decode one `video_plane_with_short_header()` picture
@@ -476,9 +616,15 @@ impl Mpeg4VideoDecoder {
                 let _ = parse_visual_object_header(unit)?;
             }
             VIDEO_OBJECT_START_CODE_MIN..=VIDEO_OBJECT_START_CODE_MAX => {
-                // A bare video_object_start_code carries only its id.
+                // A bare video_object_start_code carries only its id:
+                // the object the following layers belong to.
+                self.video_object_id = (code - VIDEO_OBJECT_START_CODE_MIN) as u8;
             }
             VIDEO_OBJECT_LAYER_START_CODE_MIN..=VIDEO_OBJECT_LAYER_START_CODE_MAX => {
+                // §6.2.1: the VOPs that follow belong to this layer.
+                // Each layer has its own reference chain and clock.
+                let layer_id = (code - VIDEO_OBJECT_LAYER_START_CODE_MIN) as u8;
+                self.enter_layer((self.video_object_id, layer_id));
                 let vol = parse_video_object_layer(unit, self.profile_level)?;
                 if self.vol != Some(vol) {
                     // A different layer configuration: its sprite (if
@@ -498,7 +644,26 @@ impl Mpeg4VideoDecoder {
                 self.b_base_sec = secs;
             }
             VOP_START_CODE => {
-                self.decode_vop_unit(unit, container_pts, out)?;
+                if self.vol.is_some_and(|vol| vol.scalability) {
+                    // A scalability enhancement layer: its VOPs refine
+                    // another layer's pictures (ref_select_code,
+                    // §7.9). The layers it builds on decode without
+                    // it; its own VOPs are stepped over.
+                    self.enhancement_vops_skipped += 1;
+                    return Ok(());
+                }
+                let first = out.len();
+                match self.decode_vop_unit(unit, container_pts, out, false) {
+                    Ok(()) => {}
+                    Err(error) if self.options.error_concealment && is_stream_damage(&error) => {
+                        self.conceal_vop(unit, container_pts, out);
+                    }
+                    Err(error) => return Err(error),
+                }
+                let layer = self.layer.unwrap_or((0, 0));
+                for frame in &mut out[first..] {
+                    frame.set_layer(layer);
+                }
             }
             _ => {
                 // Unknown / reserved start code: skip. (Stuffing and
@@ -508,12 +673,46 @@ impl Mpeg4VideoDecoder {
         Ok(())
     }
 
+    /// [`DecodeOptions::error_concealment`]: stand in for a VOP that
+    /// failed to decode. With a readable header and a reference, the
+    /// VOP becomes the §6.3.5 `vop_coded == 0` copy of its forward
+    /// reference (an anchor still enters the chain and moves the
+    /// clock); otherwise it is dropped.
+    fn conceal_vop(
+        &mut self,
+        unit: &[u8],
+        container_pts: Option<i64>,
+        out: &mut Vec<DecodedFrame>,
+    ) {
+        let first = out.len();
+        self.sequence.set_reference_override(None);
+        if self
+            .decode_vop_unit(unit, container_pts, out, true)
+            .is_err()
+        {
+            out.truncate(first);
+            self.concealment.dropped_vops += 1;
+            return;
+        }
+        self.concealment.concealed_vops += 1;
+    }
+
+    /// What the opt-in error concealment did so far (all zero while
+    /// [`DecodeOptions::error_concealment`] is off).
+    pub fn concealment(&self) -> ConcealmentStats {
+        self.concealment
+    }
+
     /// Decode one `video_object_plane` unit end-to-end.
+    /// `as_uncoded` reconstructs it as the §6.3.5 `vop_coded == 0`
+    /// copy of its forward reference whatever its body says (the
+    /// concealment of a damaged VOP).
     fn decode_vop_unit(
         &mut self,
         unit: &[u8],
         container_pts: Option<i64>,
         out: &mut Vec<DecodedFrame>,
+        as_uncoded: bool,
     ) -> Result<(), StreamDecodeError> {
         let vol = self.vol.ok_or(StreamDecodeError::MissingVol)?;
         if !(4..=12).contains(&vol.bits_per_pixel) {
@@ -553,6 +752,10 @@ impl Mpeg4VideoDecoder {
             + i64::from(vop.time_increment);
 
         if matches!(vol.sprite_enable, SpriteEnable::Static) {
+            if as_uncoded {
+                // A sprite VOP is not a copy of a previous picture.
+                return Err(StreamDecodeError::MissingAnchor);
+            }
             return self.decode_static_sprite_vop(
                 &vol,
                 &vop,
@@ -563,16 +766,53 @@ impl Mpeg4VideoDecoder {
             );
         }
 
-        if !vop.coded {
+        if !vop.coded || as_uncoded {
             return self.decode_uncoded_vop(
                 &vop,
-                mb_count,
+                (mb_count, as_uncoded),
                 mb_width,
                 mb_height,
                 res,
                 (container_pts, vop_ticks),
                 out,
             );
+        }
+
+        // §7.14 NEWPRED: select the reference this VOP names.
+        self.sequence.set_reference_override(None);
+        if let Some(newpred) = vol.newpred {
+            if !newpred.segment_is_vop {
+                // Per-packet reference selection restricts motion
+                // compensation to each packet's own area of its own
+                // reference picture.
+                return Err(StreamDecodeError::Vop(VopParseError::UnsupportedBranch(
+                    "newpred_segment_type == Video Packet (per-packet reference selection, \
+                     subclause 7.14.1)",
+                )));
+            }
+            if let Some(id) = vop.vop_id_for_prediction {
+                match vop.coding_type {
+                    // An I-VOP predicts from nothing.
+                    VopCodingType::I => {}
+                    VopCodingType::P | VopCodingType::S => {
+                        let reference = self
+                            .newpred_memory
+                            .iter()
+                            .rev()
+                            .find(|(held, _)| *held == id)
+                            .map(|(_, frame)| frame.clone())
+                            .ok_or(StreamDecodeError::MissingNewpredReference { vop_id: id })?;
+                        self.sequence.set_reference_override(Some(reference));
+                    }
+                    VopCodingType::B => {
+                        // §7.14.1 replaces "the reference VOP"; a
+                        // B-VOP has two.
+                        return Err(StreamDecodeError::Vop(VopParseError::UnsupportedBranch(
+                            "vop_id_for_prediction on a B-VOP",
+                        )));
+                    }
+                }
+            }
         }
 
         match vop.coding_type {
@@ -723,6 +963,20 @@ impl Mpeg4VideoDecoder {
                 pending.set_pts_ticks(Some(vop_ticks));
             }
             self.advance_anchor_time(&vop, res);
+            // §7.14 / §E.1.6.4: a correctly decoded anchor joins the
+            // NEWPRED reference memory; nothing before the last I-VOP
+            // may be referred to.
+            if let Some(id) = vop.vop_id {
+                if matches!(vop.coding_type, VopCodingType::I) {
+                    self.newpred_memory.clear();
+                }
+                if let Some(frame) = self.sequence.store().backward() {
+                    if self.newpred_memory.len() == NEWPRED_MEMORY_VOPS {
+                        self.newpred_memory.pop_front();
+                    }
+                    self.newpred_memory.push_back((id, frame.clone()));
+                }
+            }
         } else if let Some(frame) = out.last_mut() {
             frame.set_pts(container_pts);
             frame.set_pts_ticks(Some(vop_ticks));
@@ -870,7 +1124,7 @@ impl Mpeg4VideoDecoder {
     fn decode_uncoded_vop(
         &mut self,
         vop: &VopHeader,
-        mb_count: usize,
+        (mb_count, concealed): (usize, bool),
         mb_width: usize,
         mb_height: usize,
         res: i64,
@@ -898,6 +1152,9 @@ impl Mpeg4VideoDecoder {
                 if let Some(frame) = out.last_mut() {
                     frame.set_pts(container_pts);
                     frame.set_pts_ticks(Some(vop_ticks));
+                    if concealed {
+                        frame.set_concealed_macroblocks(mb_count as u32);
+                    }
                 }
             }
             _ => {
@@ -925,6 +1182,9 @@ impl Mpeg4VideoDecoder {
                 if let Some(pending) = produced_anchor(&mut self.sequence, out) {
                     pending.set_pts(container_pts);
                     pending.set_pts_ticks(Some(vop_ticks));
+                    if concealed {
+                        pending.set_concealed_macroblocks(mb_count as u32);
+                    }
                 }
                 self.advance_anchor_time(vop, res);
             }
@@ -1045,6 +1305,26 @@ fn motion_of_s_entries(entries: &[SGmcMbContent]) -> Vec<AnchorMbMotion> {
 /// The frame the anchor VOP just pushed produced: the §6.1.3.8 held
 /// anchor in display order, or the frame appended to `out` in coded
 /// order ([`Mpeg4VideoDecoder::set_coded_order_output`]).
+/// Whether a VOP decode error points at damaged stream data (which
+/// [`DecodeOptions::error_concealment`] conceals) rather than at a
+/// tool this decoder declines or a stream that never had the anchors
+/// the VOP needs (which stay errors).
+fn is_stream_damage(error: &StreamDecodeError) -> bool {
+    match error {
+        StreamDecodeError::Vop(VopParseError::UnsupportedBranch(_))
+        | StreamDecodeError::VopDecode(VopDecodeError::Unsupported(_))
+        | StreamDecodeError::Vol(_)
+        | StreamDecodeError::MissingVol
+        | StreamDecodeError::MissingAnchor
+        | StreamDecodeError::MissingNewpredReference { .. }
+        | StreamDecodeError::ShortHeader(_) => false,
+        StreamDecodeError::Vop(_)
+        | StreamDecodeError::VopDecode(_)
+        | StreamDecodeError::Frame(_)
+        | StreamDecodeError::BadTemporalReference { .. } => true,
+    }
+}
+
 fn produced_anchor<'a>(
     sequence: &'a mut SequenceDecoder,
     out: &'a mut [DecodedFrame],
@@ -1340,6 +1620,9 @@ pub struct Mpeg4DecoderOptions {
     /// Explicit inverse-transform selection (`None` follows the mode;
     /// see [`DecodeOptions::inverse_transform`]).
     pub inverse_transform: Option<InverseTransformSelection>,
+    /// The opt-in error concealment
+    /// ([`DecodeOptions::error_concealment`]).
+    pub error_concealment: bool,
 }
 
 impl Mpeg4DecoderOptions {
@@ -1365,6 +1648,7 @@ impl From<Mpeg4DecoderOptions> for DecodeOptions {
         DecodeOptions::spec()
             .with_ecosystem_compat(o.ecosystem_compat)
             .with_inverse_transform(o.inverse_transform)
+            .with_error_concealment(o.error_concealment)
     }
 }
 
@@ -1382,6 +1666,13 @@ impl oxideav_core::CodecOptionsStruct for Mpeg4DecoderOptions {
                    inverse-transform is set",
         },
         oxideav_core::OptionField {
+            name: "error-concealment",
+            kind: oxideav_core::OptionKind::Bool,
+            default: oxideav_core::OptionValue::Bool(false),
+            help: "replace a VOP that fails to decode by a copy of its forward reference \
+                   instead of reporting an error (ISO/IEC 14496-2 E.1.4.2)",
+        },
+        oxideav_core::OptionField {
             name: "inverse-transform",
             kind: oxideav_core::OptionKind::Enum(&["exact", "variant-rc", "from-stream"]),
             default: oxideav_core::OptionValue::String(String::new()),
@@ -1396,6 +1687,7 @@ impl oxideav_core::CodecOptionsStruct for Mpeg4DecoderOptions {
     fn apply(&mut self, key: &str, value: &oxideav_core::OptionValue) -> oxideav_core::Result<()> {
         match key {
             "ecosystem-compat" => self.ecosystem_compat = value.as_bool()?,
+            "error-concealment" => self.error_concealment = value.as_bool()?,
             "inverse-transform" => {
                 self.inverse_transform = Some(match value.as_str()? {
                     "exact" => InverseTransformSelection::Exact,
@@ -1470,7 +1762,7 @@ mod tests {
     use super::*;
 
     /// MSB-first bit writer for synthesising elementary streams.
-    #[derive(Default)]
+    #[derive(Default, Clone)]
     pub(crate) struct BitWriter {
         bytes: Vec<u8>,
         bit: u8,
@@ -2054,6 +2346,590 @@ mod tests {
             0x00, 0x00, 0x01, 0xB1, // VOS end
         ];
         assert_eq!(scan_start_codes(&data), vec![0, 5, 10]);
+    }
+
+    // ---- §6.2.3 / §6.2.5 optional header blocks ---------------------
+
+    /// What the extended test VOL declares beyond the plain one.
+    #[derive(Clone, Copy, Default)]
+    struct VolExtras {
+        /// `define_vop_complexity_estimation_header()` with the
+        /// intra_blocks, vlc_bits, inter_blocks, interpolate_mc_q and
+        /// quarterpel statistics.
+        complexity: bool,
+        /// `newpred_enable` with this `newpred_segment_type`.
+        newpred_segment_is_vop: Option<bool>,
+        /// `reduced_resolution_vop_enable`.
+        reduced_resolution: bool,
+    }
+
+    /// A verid-2 rectangular VOL (resolution 30, method-2 quant).
+    fn write_extended_vol(w: &mut BitWriter, width: u32, height: u32, x: VolExtras) {
+        w.write_bits(0x0000_0120, 32);
+        w.write_bits(0, 1); // random_accessible_vol
+        w.write_bits(1, 8); // video_object_type_indication
+        w.write_bits(1, 1); // is_object_layer_identifier
+        w.write_bits(2, 4); // video_object_layer_verid
+        w.write_bits(1, 3); // video_object_layer_priority
+        w.write_bits(1, 4); // aspect_ratio_info 1:1
+        w.write_bits(0, 1); // vol_control_parameters
+        w.write_bits(0, 2); // shape rectangular
+        w.write_bits(1, 1); // marker
+        w.write_bits(30, 16); // vop_time_increment_resolution
+        w.write_bits(1, 1); // marker
+        w.write_bits(0, 1); // fixed_vop_rate
+        w.write_bits(1, 1); // marker
+        w.write_bits(width, 13);
+        w.write_bits(1, 1); // marker
+        w.write_bits(height, 13);
+        w.write_bits(1, 1); // marker
+        w.write_bits(0, 1); // interlaced
+        w.write_bits(1, 1); // obmc_disable
+        w.write_bits(0, 2); // sprite_enable (two bits under verid 2)
+        w.write_bits(0, 1); // not_8_bit
+        w.write_bits(0, 1); // quant_type
+        w.write_bits(0, 1); // quarter_sample
+        if x.complexity {
+            w.write_bits(0, 1); // complexity_estimation_disable = 0
+            w.write_bits(0b01, 2); // estimation_method (version 2)
+            w.write_bits(1, 1); // shape set disabled
+            w.write_bits(0, 1); // texture set 1 enabled
+            w.write_bits(0b1100, 4); // intra_blocks, inter_blocks
+            w.write_bits(1, 1); // marker
+            w.write_bits(0, 1); // texture set 2 enabled
+            w.write_bits(0b0001, 4); // vlc_bits
+            w.write_bits(0, 1); // motion set enabled
+            w.write_bits(0b001000, 6); // interpolate_mc_q
+            w.write_bits(1, 1); // marker
+            w.write_bits(0, 1); // version-2 set enabled
+            w.write_bits(0b01, 2); // quarterpel
+        } else {
+            w.write_bits(1, 1); // complexity_estimation_disable
+        }
+        w.write_bits(1, 1); // resync_marker_disable
+        w.write_bits(0, 1); // data_partitioned
+        match x.newpred_segment_is_vop {
+            Some(segment_is_vop) => {
+                w.write_bits(1, 1); // newpred_enable
+                w.write_bits(0b01, 2); // requested_upstream_message_type
+                w.write_bits(u32::from(segment_is_vop), 1); // newpred_segment_type
+            }
+            None => w.write_bits(0, 1),
+        }
+        w.write_bits(u32::from(x.reduced_resolution), 1);
+        w.write_bits(0, 1); // scalability
+        w.align();
+    }
+
+    /// The per-VOP side of [`VolExtras`].
+    #[derive(Clone, Copy, Default)]
+    struct VopExtras {
+        vol: VolExtras,
+        /// `(vop_id, vop_id_for_prediction)` of a NEWPRED VOL.
+        ids: Option<(u32, Option<u32>)>,
+        /// `vop_reduced_resolution` (I- and P-VOPs of an RRV VOL).
+        reduced: bool,
+    }
+
+    /// The macroblock layer of a test VOP.
+    #[derive(Clone, Copy)]
+    enum Body {
+        /// I-VOP: DC-only intra macroblocks at the default DC (grey 128).
+        IntraGrey,
+        /// P-VOP: every macroblock `not_coded`.
+        Skipped,
+        /// P-VOP: intra macroblocks whose first luminance block is one
+        /// DC level above its prediction (at quant 8 the luminance DC
+        /// scaler is 16: 130 in the first macroblock, 132 in the
+        /// second, ...).
+        IntraBrighter,
+        /// B-VOP: every macroblock `modb == "1"` (direct, no residual).
+        Direct,
+    }
+
+    /// One VOP of the extended VOL (quant 8, `tinc` ticks).
+    fn write_extended_vop(w: &mut BitWriter, body: Body, mbs: usize, tinc: u32, x: VopExtras) {
+        let coding = match body {
+            Body::IntraGrey => 0b00,
+            Body::Skipped | Body::IntraBrighter => 0b01,
+            Body::Direct => 0b10,
+        };
+        w.write_bits(0x0000_01B6, 32);
+        w.write_bits(coding, 2);
+        w.write_bits(0, 1); // modulo_time_base
+        w.write_bits(1, 1); // marker
+        w.write_bits(tinc, 5);
+        w.write_bits(1, 1); // marker
+        w.write_bits(1, 1); // vop_coded
+        if let Some((id, for_prediction)) = x.ids {
+            w.write_bits(id, 8); // vop_id (5-bit increment + 3)
+            w.write_bits(u32::from(for_prediction.is_some()), 1);
+            if let Some(reference) = for_prediction {
+                w.write_bits(reference, 8);
+            }
+            w.write_bits(1, 1); // marker
+        }
+        if coding == 0b01 {
+            w.write_bits(0, 1); // vop_rounding_type
+        }
+        if x.vol.reduced_resolution && coding != 0b10 {
+            w.write_bits(u32::from(x.reduced), 1); // vop_reduced_resolution
+        }
+        if x.vol.complexity {
+            // intra_blocks (8) + vlc_bits (4) on every type; P and B
+            // add inter_blocks and quarterpel, B interpolate_mc_q.
+            let bytes = match coding {
+                0b00 => 1,
+                0b01 => 3,
+                _ => 4,
+            };
+            w.write_bits(0x55, 8); // dcecs_intra_blocks
+            w.write_bits(0b1010, 4); // dcecs_vlc_bits
+            for k in 1..bytes {
+                w.write_bits(0x30 + k, 8);
+            }
+        }
+        w.write_bits(0, 3); // intra_dc_vlc_thr
+        w.write_bits(8, 5); // vop_quant
+        if coding != 0b00 {
+            w.write_bits(1, 3); // vop_fcode_forward
+        }
+        if coding == 0b10 {
+            w.write_bits(1, 3); // vop_fcode_backward
+        }
+        for _ in 0..mbs {
+            match body {
+                Body::IntraGrey => write_dc_only_intra_mb(w),
+                Body::Skipped | Body::Direct => w.write_bits(1, 1),
+                Body::IntraBrighter => {
+                    w.write_bits(0, 1); // not_coded
+                    w.write_bits(0b0_0011, 5); // mcbpc: intra, cbpc 00
+                    w.write_bits(0, 1); // ac_pred_flag
+                    w.write_bits(0b0011, 4); // cbpy intra 0
+                    w.write_bits(0b11, 2); // luma DC size 1
+                    w.write_bits(1, 1); // differential +1
+                    for _ in 0..3 {
+                        w.write_bits(0b011, 3); // luma DC size 0
+                    }
+                    for _ in 0..2 {
+                        w.write_bits(0b11, 2); // chroma DC size 0
+                    }
+                }
+            }
+        }
+        w.align();
+    }
+
+    fn decode_all(stream: &[u8]) -> Result<Vec<DecodedFrame>, StreamDecodeError> {
+        let mut dec = Mpeg4VideoDecoder::new();
+        let mut frames = dec.decode(stream)?;
+        frames.extend(dec.flush());
+        Ok(frames)
+    }
+
+    #[test]
+    fn complexity_estimation_statistics_do_not_change_the_pictures() {
+        // The same I / P(intra) / B / P VOPs with and without the
+        // complexity-estimation blocks in the VOL and every VOP header.
+        let build = |complexity: bool| {
+            let vol = VolExtras {
+                complexity,
+                ..VolExtras::default()
+            };
+            let x = VopExtras {
+                vol,
+                ..VopExtras::default()
+            };
+            let mut w = BitWriter::default();
+            write_vos(&mut w);
+            write_extended_vol(&mut w, 32, 16, vol);
+            write_extended_vop(&mut w, Body::IntraGrey, 2, 0, x);
+            write_extended_vop(&mut w, Body::IntraBrighter, 2, 2, x);
+            write_extended_vop(&mut w, Body::Direct, 2, 1, x);
+            write_extended_vop(&mut w, Body::Skipped, 2, 3, x);
+            w.finish()
+        };
+        let plain = decode_all(&build(false)).unwrap();
+        let with_statistics = decode_all(&build(true)).unwrap();
+        assert_eq!(plain.len(), 4);
+        assert_eq!(plain, with_statistics);
+        // The pictures are what the macroblock layers say.
+        assert_eq!(plain[0].luma_at(5, 5), Some(128));
+        assert_eq!(plain[2].luma_at(5, 5), Some(130));
+        assert_eq!(plain[3].luma_at(31, 15), Some(132));
+
+        let mut dec = Mpeg4VideoDecoder::new();
+        dec.decode(&build(true)).unwrap();
+        let ce = dec.vol().unwrap().complexity_estimation.unwrap();
+        assert!(ce.intra_blocks && ce.inter_blocks && ce.vlc_bits);
+        assert!(ce.interpolate_mc_q && ce.quarterpel && !ce.sadct);
+    }
+
+    #[test]
+    fn newpred_selects_the_named_reference_vop() {
+        let vol = VolExtras {
+            newpred_segment_is_vop: Some(true),
+            ..VolExtras::default()
+        };
+        let ids = |id: u32, reference: Option<u32>| VopExtras {
+            vol,
+            ids: Some((id, reference)),
+            ..VopExtras::default()
+        };
+        let mut w = BitWriter::default();
+        write_vos(&mut w);
+        write_extended_vol(&mut w, 16, 16, vol);
+        write_extended_vop(&mut w, Body::IntraGrey, 1, 0, ids(1, None)); // 128
+        write_extended_vop(&mut w, Body::IntraBrighter, 1, 1, ids(2, None)); // 130
+        // Copies of their reference: the I-VOP, then the brighter P.
+        write_extended_vop(&mut w, Body::Skipped, 1, 2, ids(3, Some(1)));
+        write_extended_vop(&mut w, Body::Skipped, 1, 3, ids(4, Some(2)));
+        // No selection: the previous VOP.
+        write_extended_vop(&mut w, Body::Skipped, 1, 4, ids(5, None));
+        // The previous VOP named explicitly, then one two back.
+        write_extended_vop(&mut w, Body::Skipped, 1, 5, ids(6, Some(5)));
+        write_extended_vop(&mut w, Body::Skipped, 1, 6, ids(7, Some(3)));
+        let frames = decode_all(&w.finish()).unwrap();
+        let luma: Vec<u8> = frames.iter().map(|f| f.luma_at(7, 9).unwrap()).collect();
+        assert_eq!(luma, [128, 130, 128, 130, 130, 130, 128]);
+
+        let mut dec = Mpeg4VideoDecoder::new();
+        let mut w = BitWriter::default();
+        write_vos(&mut w);
+        write_extended_vol(&mut w, 16, 16, vol);
+        dec.decode(&w.finish()).unwrap();
+        let config = dec.vol().unwrap().newpred.unwrap();
+        assert!(config.segment_is_vop);
+        assert_eq!(config.requested_upstream_message_type, 1);
+    }
+
+    #[test]
+    fn newpred_b_vops_keep_their_display_order_anchors() {
+        // I(1) P(2, brighter) then P(3) predicted from the I-VOP, with
+        // a B-VOP between P(2) and P(3). Its co-located macroblock in
+        // P(3) is not_coded, so it is the copy of its forward anchor
+        // (§6.3.6 co_located_not_coded) — P(2), the previous anchor in
+        // display order, not the reference P(3) selected.
+        let vol = VolExtras {
+            newpred_segment_is_vop: Some(true),
+            ..VolExtras::default()
+        };
+        let ids = |id: u32, reference: Option<u32>| VopExtras {
+            vol,
+            ids: Some((id, reference)),
+            ..VopExtras::default()
+        };
+        let mut w = BitWriter::default();
+        write_vos(&mut w);
+        write_extended_vol(&mut w, 16, 16, vol);
+        write_extended_vop(&mut w, Body::IntraGrey, 1, 0, ids(1, None));
+        write_extended_vop(&mut w, Body::IntraBrighter, 1, 1, ids(2, None));
+        write_extended_vop(&mut w, Body::Skipped, 1, 3, ids(3, Some(1)));
+        write_extended_vop(&mut w, Body::Direct, 1, 2, ids(4, None));
+        let frames = decode_all(&w.finish()).unwrap();
+        let luma: Vec<u8> = frames.iter().map(|f| f.luma_at(3, 3).unwrap()).collect();
+        // Display order: I, P(2), B, P(3).
+        assert_eq!(luma, [128, 130, 130, 128]);
+        assert_eq!(frames[2].coding_type(), VopCodingType::B);
+    }
+
+    #[test]
+    fn newpred_references_outside_the_memory_are_reported() {
+        let vol = VolExtras {
+            newpred_segment_is_vop: Some(true),
+            ..VolExtras::default()
+        };
+        let ids = |id: u32, reference: Option<u32>| VopExtras {
+            vol,
+            ids: Some((id, reference)),
+            ..VopExtras::default()
+        };
+        // A vop_id that was never decoded.
+        let mut w = BitWriter::default();
+        write_vos(&mut w);
+        write_extended_vol(&mut w, 16, 16, vol);
+        write_extended_vop(&mut w, Body::IntraGrey, 1, 0, ids(1, None));
+        write_extended_vop(&mut w, Body::Skipped, 1, 1, ids(2, Some(77)));
+        assert_eq!(
+            decode_all(&w.finish()).unwrap_err(),
+            StreamDecodeError::MissingNewpredReference { vop_id: 77 }
+        );
+        // §E.1.6.4: nothing decoded before the last I-VOP is referred to.
+        let mut w = BitWriter::default();
+        write_vos(&mut w);
+        write_extended_vol(&mut w, 16, 16, vol);
+        write_extended_vop(&mut w, Body::IntraGrey, 1, 0, ids(1, None));
+        write_extended_vop(&mut w, Body::IntraBrighter, 1, 1, ids(2, None));
+        write_extended_vop(&mut w, Body::IntraGrey, 1, 2, ids(3, None));
+        write_extended_vop(&mut w, Body::Skipped, 1, 3, ids(4, Some(2)));
+        assert_eq!(
+            decode_all(&w.finish()).unwrap_err(),
+            StreamDecodeError::MissingNewpredReference { vop_id: 2 }
+        );
+        // A selection older than the memory holds.
+        let mut w = BitWriter::default();
+        write_vos(&mut w);
+        write_extended_vol(&mut w, 16, 16, vol);
+        write_extended_vop(&mut w, Body::IntraGrey, 1, 0, ids(1, None));
+        for k in 0..NEWPRED_MEMORY_VOPS as u32 {
+            write_extended_vop(&mut w, Body::Skipped, 1, (k + 1) % 30, ids(k + 2, None));
+        }
+        let within = {
+            let mut w2 = BitWriter::default();
+            write_extended_vop(&mut w2, Body::Skipped, 1, 20, ids(200, Some(2)));
+            w2.finish()
+        };
+        let beyond = {
+            let mut w2 = BitWriter::default();
+            write_extended_vop(&mut w2, Body::Skipped, 1, 20, ids(200, Some(1)));
+            w2.finish()
+        };
+        let head = w.finish();
+        assert!(decode_all(&[head.clone(), within].concat()).is_ok());
+        assert_eq!(
+            decode_all(&[head, beyond].concat()).unwrap_err(),
+            StreamDecodeError::MissingNewpredReference { vop_id: 1 }
+        );
+    }
+
+    #[test]
+    fn newpred_forms_outside_the_defined_decode_are_named() {
+        // Per-packet reference selection.
+        let vol = VolExtras {
+            newpred_segment_is_vop: Some(false),
+            ..VolExtras::default()
+        };
+        let x = VopExtras {
+            vol,
+            ids: Some((1, None)),
+            ..VopExtras::default()
+        };
+        let mut w = BitWriter::default();
+        write_vos(&mut w);
+        write_extended_vol(&mut w, 16, 16, vol);
+        write_extended_vop(&mut w, Body::IntraGrey, 1, 0, x);
+        let err = decode_all(&w.finish()).unwrap_err();
+        assert!(matches!(
+            err,
+            StreamDecodeError::Vop(VopParseError::UnsupportedBranch(what)) if what.contains("Video Packet")
+        ));
+        // A reference selection on a B-VOP.
+        let vol = VolExtras {
+            newpred_segment_is_vop: Some(true),
+            ..VolExtras::default()
+        };
+        let ids = |id: u32, reference: Option<u32>| VopExtras {
+            vol,
+            ids: Some((id, reference)),
+            ..VopExtras::default()
+        };
+        let mut w = BitWriter::default();
+        write_vos(&mut w);
+        write_extended_vol(&mut w, 16, 16, vol);
+        write_extended_vop(&mut w, Body::IntraGrey, 1, 0, ids(1, None));
+        write_extended_vop(&mut w, Body::Skipped, 1, 2, ids(2, None));
+        write_extended_vop(&mut w, Body::Direct, 1, 1, ids(3, Some(1)));
+        let err = decode_all(&w.finish()).unwrap_err();
+        assert!(matches!(
+            err,
+            StreamDecodeError::Vop(VopParseError::UnsupportedBranch(what)) if what.contains("B-VOP")
+        ));
+    }
+
+    #[test]
+    fn reduced_resolution_vol_decodes_its_full_resolution_vops() {
+        let vol = VolExtras {
+            reduced_resolution: true,
+            ..VolExtras::default()
+        };
+        let x = VopExtras {
+            vol,
+            ..VopExtras::default()
+        };
+        let mut w = BitWriter::default();
+        write_vos(&mut w);
+        write_extended_vol(&mut w, 32, 16, vol);
+        write_extended_vop(&mut w, Body::IntraGrey, 2, 0, x);
+        write_extended_vop(&mut w, Body::IntraBrighter, 2, 2, x);
+        write_extended_vop(&mut w, Body::Direct, 2, 1, x);
+        let frames = decode_all(&w.finish()).unwrap();
+        let luma: Vec<u8> = frames.iter().map(|f| f.luma_at(20, 4).unwrap()).collect();
+        // Display order I, B, P; the second macroblock of the P-VOP is
+        // 132 and the direct B-VOP averages its anchors.
+        assert_eq!(luma, [128, 130, 132]);
+
+        // A VOP that sets vop_reduced_resolution is named, not
+        // mis-decoded at full resolution.
+        let mut w = BitWriter::default();
+        write_vos(&mut w);
+        write_extended_vol(&mut w, 32, 16, vol);
+        write_extended_vop(
+            &mut w,
+            Body::IntraGrey,
+            2,
+            0,
+            VopExtras { reduced: true, ..x },
+        );
+        let err = decode_all(&w.finish()).unwrap_err();
+        assert!(matches!(
+            err,
+            StreamDecodeError::Vop(VopParseError::UnsupportedBranch(what)) if what.contains("7.6.10")
+        ));
+    }
+
+    // ---- several layers in one stream ------------------------------
+
+    /// [`write_vol`] with a `video_object_layer_id` and the
+    /// `scalability` flag.
+    fn write_vol_of_layer(w: &mut BitWriter, id: u32, width: u32, height: u32, scalable: bool) {
+        w.write_bits(0x0000_0120 + id, 32);
+        w.write_bits(0, 1); // random_accessible_vol
+        w.write_bits(1, 8); // video_object_type_indication
+        w.write_bits(0, 1); // is_object_layer_identifier
+        w.write_bits(1, 4); // aspect_ratio_info 1:1
+        w.write_bits(0, 1); // vol_control_parameters
+        w.write_bits(0, 2); // shape rectangular
+        w.write_bits(1, 1); // marker
+        w.write_bits(30, 16); // vop_time_increment_resolution
+        w.write_bits(1, 1); // marker
+        w.write_bits(0, 1); // fixed_vop_rate
+        w.write_bits(1, 1); // marker
+        w.write_bits(width, 13);
+        w.write_bits(1, 1); // marker
+        w.write_bits(height, 13);
+        w.write_bits(1, 1); // marker
+        w.write_bits(0, 1); // interlaced
+        w.write_bits(1, 1); // obmc_disable
+        w.write_bits(0, 1); // sprite_enable
+        w.write_bits(0, 1); // not_8_bit
+        w.write_bits(0, 1); // quant_type
+        w.write_bits(1, 1); // complexity_estimation_disable
+        w.write_bits(1, 1); // resync_marker_disable
+        w.write_bits(0, 1); // data_partitioned
+        w.write_bits(u32::from(scalable), 1); // scalability
+        w.align();
+    }
+
+    #[test]
+    fn each_layer_keeps_its_own_reference_chain() {
+        let plain = VopExtras::default();
+        let mut w = BitWriter::default();
+        write_vos(&mut w);
+        // Layer 0: 16×16, a grey I-VOP.
+        write_vol_of_layer(&mut w, 0, 16, 16, false);
+        write_extended_vop(&mut w, Body::IntraGrey, 1, 0, plain);
+        // Layer 1: 32×16, an I-VOP and a brighter P-VOP.
+        write_vol_of_layer(&mut w, 1, 32, 16, false);
+        write_extended_vop(&mut w, Body::IntraGrey, 2, 0, plain);
+        write_extended_vop(&mut w, Body::IntraBrighter, 2, 1, plain);
+        // Back to layer 0: a P-VOP that copies *its* I-VOP.
+        write_vol_of_layer(&mut w, 0, 16, 16, false);
+        write_extended_vop(&mut w, Body::Skipped, 1, 1, plain);
+        // And to layer 1: a copy of its brighter P-VOP.
+        write_vol_of_layer(&mut w, 1, 32, 16, false);
+        write_extended_vop(&mut w, Body::Skipped, 2, 2, plain);
+        let stream = w.finish();
+
+        let mut dec = Mpeg4VideoDecoder::new();
+        let mut frames = dec.decode(&stream).unwrap();
+        assert_eq!(dec.current_layer(), Some((0, 1)));
+        assert_eq!(dec.vol().unwrap().width, 32);
+        frames.extend(dec.flush());
+        let of = |layer: (u8, u8)| -> Vec<&DecodedFrame> {
+            frames.iter().filter(|f| f.layer() == layer).collect()
+        };
+        let layer0 = of((0, 0));
+        let layer1 = of((0, 1));
+        assert_eq!(layer0.len(), 2);
+        assert_eq!(layer1.len(), 3);
+        assert!(layer0.iter().all(|f| f.width() == 16));
+        assert!(layer1.iter().all(|f| f.width() == 32));
+        let luma = |fs: &[&DecodedFrame]| -> Vec<u8> {
+            fs.iter().map(|f| f.luma_at(2, 2).unwrap()).collect()
+        };
+        assert_eq!(luma(&layer0), [128, 128]);
+        assert_eq!(luma(&layer1), [128, 130, 130]);
+        // Each layer runs its own clock.
+        let ticks = |fs: &[&DecodedFrame]| -> Vec<i64> {
+            fs.iter().map(|f| f.pts_ticks().unwrap()).collect()
+        };
+        assert_eq!(ticks(&layer0), [0, 1]);
+        assert_eq!(ticks(&layer1), [0, 1, 2]);
+    }
+
+    #[test]
+    fn video_objects_are_separate_layers_too() {
+        let plain = VopExtras::default();
+        let mut w = BitWriter::default();
+        write_vos(&mut w);
+        w.write_bits(VIDEO_OBJECT_START_CODE_MIN, 32);
+        write_vol_of_layer(&mut w, 0, 16, 16, false);
+        write_extended_vop(&mut w, Body::IntraGrey, 1, 0, plain);
+        w.write_bits(VIDEO_OBJECT_START_CODE_MIN + 3, 32);
+        write_vol_of_layer(&mut w, 0, 16, 16, false);
+        // No anchor yet in object 3's layer 0.
+        write_extended_vop(&mut w, Body::Skipped, 1, 1, plain);
+        let stream = w.finish();
+        let mut dec = Mpeg4VideoDecoder::new();
+        assert_eq!(
+            dec.decode(&stream).unwrap_err(),
+            StreamDecodeError::MissingAnchor
+        );
+        assert_eq!(dec.current_layer(), Some((3, 0)));
+        // The first object's picture is still released.
+        let frames = dec.flush();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].layer(), (0, 0));
+    }
+
+    #[test]
+    fn enhancement_layer_vops_are_stepped_over() {
+        let plain = VopExtras::default();
+        let mut w = BitWriter::default();
+        write_vos(&mut w);
+        write_vol_of_layer(&mut w, 0, 16, 16, false);
+        write_extended_vop(&mut w, Body::IntraGrey, 1, 0, plain);
+        // An enhancement layer with two VOPs of its own syntax.
+        write_vol_of_layer(&mut w, 1, 16, 16, true);
+        for _ in 0..2 {
+            w.write_bits(0x0000_01B6, 32);
+            w.write_bits(0xDEAD_BEEF, 32);
+            w.align();
+        }
+        write_vol_of_layer(&mut w, 0, 16, 16, false);
+        write_extended_vop(&mut w, Body::IntraBrighter, 1, 1, plain);
+        let stream = w.finish();
+        let mut dec = Mpeg4VideoDecoder::new();
+        let mut frames = dec.decode(&stream).unwrap();
+        frames.extend(dec.flush());
+        assert_eq!(dec.enhancement_vops_skipped(), 2);
+        assert_eq!(frames.len(), 2);
+        assert!(frames.iter().all(|f| f.layer() == (0, 0)));
+        assert_eq!(frames[1].luma_at(0, 0), Some(130));
+    }
+
+    #[test]
+    fn a_stream_visiting_many_layers_keeps_a_bounded_number_of_them() {
+        let plain = VopExtras::default();
+        let layers = MAX_PARKED_LAYERS as u32 + 3;
+        let mut w = BitWriter::default();
+        write_vos(&mut w);
+        for id in 0..layers {
+            write_vol_of_layer(&mut w, id, 16, 16, false);
+            write_extended_vop(&mut w, Body::IntraGrey, 1, 0, plain);
+        }
+        // Layer 0 was visited first: its state is gone, so a P-VOP
+        // there has no anchor; the most recent layers still have theirs.
+        let mut recent = w.clone();
+        write_vol_of_layer(&mut recent, layers - 2, 16, 16, false);
+        write_extended_vop(&mut recent, Body::Skipped, 1, 1, plain);
+        assert!(decode_all(&recent.finish()).is_ok());
+        write_vol_of_layer(&mut w, 0, 16, 16, false);
+        write_extended_vop(&mut w, Body::Skipped, 1, 1, plain);
+        assert_eq!(
+            decode_all(&w.finish()).unwrap_err(),
+            StreamDecodeError::MissingAnchor
+        );
     }
 }
 

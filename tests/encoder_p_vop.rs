@@ -6,9 +6,9 @@
 use oxideav_mpeg4video::decoder::Mpeg4VideoDecoder;
 use oxideav_mpeg4video::framestore::{DecodedFrame, FrameStore};
 use oxideav_mpeg4video::ivop_encode::{
-    EncoderConfig, FrameView, encode_i_vop, write_configuration_headers,
+    EncoderConfig, FrameView, encode_i_vop_any, write_configuration_headers,
 };
-use oxideav_mpeg4video::pvop_encode::{PVopEncodeStats, encode_p_vop, reconstruct_own_p_vop};
+use oxideav_mpeg4video::pvop_encode::{PVopEncodeStats, encode_p_vop_any, reconstruct_own_p_vop};
 use oxideav_mpeg4video::vol::parse_video_object_layer;
 
 /// A translating scene: a fixed textured background sampled at a
@@ -87,14 +87,14 @@ fn encode_ip_stream(cfg: &EncoderConfig, qp: u32, frames: usize, scene: &Scene) 
             height: scene.height,
         };
         if k == 0 {
-            let (unit, recon) = encode_i_vop(&vol, cfg, &view, 0, 0, qp);
+            let (unit, recon) = encode_i_vop_any(&vol, cfg, &view, 0, 0, qp);
             unit_sizes.push(unit.len());
             stream.extend_from_slice(&unit);
             store.push_anchor(recon.clone());
             recons.push(recon);
         } else {
             let reference = store.backward().expect("anchor present").clone();
-            let (unit, st) = encode_p_vop(&vol, cfg, &view, &reference, 0, k as u16, qp);
+            let (unit, st) = encode_p_vop_any(&vol, cfg, &view, &reference, 0, k as u16, qp);
             unit_sizes.push(unit.len());
             let recon = reconstruct_own_p_vop(&vol, &unit, &mut store);
             stream.extend_from_slice(&unit);
@@ -200,11 +200,11 @@ fn static_scene_collapses_to_skips() {
     };
     let mut store = FrameStore::new();
     let mut stream = headers;
-    let (unit, recon) = encode_i_vop(&vol, &cfg, &view, 0, 0, 4);
+    let (unit, recon) = encode_i_vop_any(&vol, &cfg, &view, 0, 0, 4);
     stream.extend_from_slice(&unit);
     store.push_anchor(recon.clone());
     let reference = store.backward().unwrap().clone();
-    let (p_unit, stats) = encode_p_vop(&vol, &cfg, &view, &reference, 0, 1, 4);
+    let (p_unit, stats) = encode_p_vop_any(&vol, &cfg, &view, &reference, 0, 1, 4);
     // Every macroblock of an unchanged frame must be skipped: 3×3 MBs.
     assert_eq!(stats, {
         let mut want = PVopEncodeStats::default();
@@ -279,13 +279,13 @@ fn divergent_block_motion_selects_inter4v_and_self_decodes() {
             height: h,
         };
         if k == 0 {
-            let (unit, recon) = encode_i_vop(&vol, &cfg, &view, 0, 0, 4);
+            let (unit, recon) = encode_i_vop_any(&vol, &cfg, &view, 0, 0, 4);
             stream.extend_from_slice(&unit);
             store.push_anchor(recon.clone());
             recons.push(recon);
         } else {
             let reference = store.backward().unwrap().clone();
-            let (unit, stats) = encode_p_vop(&vol, &cfg, &view, &reference, 0, k as u16, 4);
+            let (unit, stats) = encode_p_vop_any(&vol, &cfg, &view, &reference, 0, k as u16, 4);
             four_mv_total += stats.inter4v;
             let recon = reconstruct_own_p_vop(&vol, &unit, &mut store);
             stream.extend_from_slice(&unit);
@@ -315,13 +315,13 @@ fn divergent_block_motion_selects_inter4v_and_self_decodes() {
             height: h,
         };
         if k == 0 {
-            let (unit, recon) = encode_i_vop(&vol, &cfg_off, &view, 0, 0, 4);
+            let (unit, recon) = encode_i_vop_any(&vol, &cfg_off, &view, 0, 0, 4);
             stream.extend_from_slice(&unit);
             store.push_anchor(recon.clone());
             recons.push(recon);
         } else {
             let reference = store.backward().unwrap().clone();
-            let (unit, stats) = encode_p_vop(&vol, &cfg_off, &view, &reference, 0, k as u16, 4);
+            let (unit, stats) = encode_p_vop_any(&vol, &cfg_off, &view, &reference, 0, k as u16, 4);
             assert_eq!(stats.inter4v, 0, "four_mv off must never emit inter4v");
             let recon = reconstruct_own_p_vop(&vol, &unit, &mut store);
             stream.extend_from_slice(&unit);
@@ -406,13 +406,13 @@ fn qpel_four_mv_divergent_motion_self_decodes() {
             height: h,
         };
         if k == 0 {
-            let (unit, recon) = encode_i_vop(&vol, &cfg, &view, 0, 0, 4);
+            let (unit, recon) = encode_i_vop_any(&vol, &cfg, &view, 0, 0, 4);
             stream.extend_from_slice(&unit);
             store.push_anchor(recon.clone());
             recons.push(recon);
         } else {
             let reference = store.backward().unwrap().clone();
-            let (unit, stats) = encode_p_vop(&vol, &cfg, &view, &reference, 0, k as u16, 4);
+            let (unit, stats) = encode_p_vop_any(&vol, &cfg, &view, &reference, 0, k as u16, 4);
             four_mv_total += stats.inter4v;
             let recon = reconstruct_own_p_vop(&vol, &unit, &mut store);
             stream.extend_from_slice(&unit);

@@ -19,9 +19,9 @@
 use oxideav_mpeg4video::decoder::Mpeg4VideoDecoder;
 use oxideav_mpeg4video::framestore::FrameStore;
 use oxideav_mpeg4video::ivop_encode::{
-    EncoderConfig, FrameView, encode_i_vop, write_configuration_headers,
+    EncoderConfig, FrameView, encode_i_vop_any, write_configuration_headers,
 };
-use oxideav_mpeg4video::pvop_encode::{encode_p_vop, reconstruct_own_p_vop};
+use oxideav_mpeg4video::pvop_encode::{encode_p_vop_any, reconstruct_own_p_vop};
 use oxideav_mpeg4video::vol::parse_video_object_layer;
 
 fn fixture(name: &str) -> Vec<u8> {
@@ -103,7 +103,7 @@ fn build_stream(quant_type: bool) -> Vec<u8> {
             width: 64,
             height: 64,
         };
-        let (unit, _recon) = encode_i_vop(&vol, &cfg, &view, 0, k as u16, 4);
+        let (unit, _recon) = encode_i_vop_any(&vol, &cfg, &view, 0, k as u16, 4);
         stream.extend_from_slice(&unit);
     }
     stream
@@ -164,12 +164,12 @@ fn build_ip_stream() -> Vec<u8> {
             height: 64,
         };
         if k == 0 {
-            let (unit, recon) = encode_i_vop(&vol, &cfg, &view, 0, 0, 4);
+            let (unit, recon) = encode_i_vop_any(&vol, &cfg, &view, 0, 0, 4);
             store.push_anchor(recon);
             stream.extend_from_slice(&unit);
         } else {
             let reference = store.backward().expect("anchor present").clone();
-            let (unit, _stats) = encode_p_vop(&vol, &cfg, &view, &reference, 0, k as u16, 4);
+            let (unit, _stats) = encode_p_vop_any(&vol, &cfg, &view, &reference, 0, k as u16, 4);
             let _ = reconstruct_own_p_vop(&vol, &unit, &mut store);
             stream.extend_from_slice(&unit);
         }
@@ -317,12 +317,12 @@ fn build_tooled_ip_stream(cfg: &EncoderConfig, picture: fn(usize) -> Planes) -> 
             height: 64,
         };
         if k == 0 {
-            let (unit, recon) = encode_i_vop(&vol, cfg, &view, 0, 0, 4);
+            let (unit, recon) = encode_i_vop_any(&vol, cfg, &view, 0, 0, 4);
             store.push_anchor(recon);
             stream.extend_from_slice(&unit);
         } else {
             let reference = store.backward().expect("anchor present").clone();
-            let (unit, _stats) = encode_p_vop(&vol, cfg, &view, &reference, 0, k as u16, 4);
+            let (unit, _stats) = encode_p_vop_any(&vol, cfg, &view, &reference, 0, k as u16, 4);
             let _ = reconstruct_own_p_vop(&vol, &unit, &mut store);
             stream.extend_from_slice(&unit);
         }

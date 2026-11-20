@@ -535,7 +535,7 @@ fn sad_subpel_block8<S: Sample>(
             );
         }
         BVopSampleMode::QuarterPel { bits_per_pixel } => {
-            crate::quarter_sample::interpolate_block_qpel_into(
+            crate::quarter_sample::interpolate_block_qpel_into_any(
                 reference,
                 mv.x,
                 mv.y,
@@ -779,7 +779,7 @@ pub(crate) fn inter_cbp(events: &[Vec<AcEvent>]) -> (u8, u8) {
 /// emitted unit (start-code delimited, stuffed) and the mode
 /// statistics.
 #[allow(clippy::too_many_arguments)]
-pub fn encode_p_vop<S: Sample>(
+pub fn encode_p_vop_any<S: Sample>(
     vol: &crate::vol::VolHeader,
     cfg: &EncoderConfig,
     frame: &FrameView<'_, S>,
@@ -1359,6 +1359,29 @@ pub fn push_i_vop_anchor(store: &mut FrameStore, recon: DecodedFrame) {
 }
 
 /// One inter residual block for spot checks in tests.
+/// [`encode_p_vop_any`] over 8-bit samples (the store of every VOL that is not
+/// N-bit with more than 8 bits per pixel).
+#[allow(clippy::too_many_arguments)]
+pub fn encode_p_vop(
+    vol: &crate::vol::VolHeader,
+    cfg: &EncoderConfig,
+    frame: &FrameView<'_>,
+    reference: &DecodedFrame,
+    modulo_time_base: u32,
+    time_increment: u16,
+    qp: u32,
+) -> (Vec<u8>, PVopEncodeStats) {
+    encode_p_vop_any(
+        vol,
+        cfg,
+        frame,
+        reference,
+        modulo_time_base,
+        time_increment,
+        qp,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

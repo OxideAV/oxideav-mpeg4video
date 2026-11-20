@@ -8,7 +8,7 @@
 use oxideav_mpeg4video::decoder::Mpeg4VideoDecoder;
 use oxideav_mpeg4video::framestore::DecodedFrame;
 use oxideav_mpeg4video::ivop_encode::{
-    EncoderConfig, FrameView, encode_i_vop, write_configuration_headers,
+    EncoderConfig, FrameView, encode_i_vop_any, write_configuration_headers,
 };
 use oxideav_mpeg4video::vol::parse_video_object_layer;
 
@@ -130,7 +130,7 @@ fn encode_stream(
         } else {
             (ticks - 1) / u32::from(res)
         };
-        let (unit, recon) = encode_i_vop(
+        let (unit, recon) = encode_i_vop_any(
             &vol,
             cfg,
             &pic.view(),

@@ -355,15 +355,15 @@ pub const fn reduce_qpel_to_half_pel_chroma(c: i32) -> i32 {
 /// # Examples
 ///
 /// ```
-/// use oxideav_mpeg4video::quarter_sample::fir_8tap_clip;
+/// use oxideav_mpeg4video::quarter_sample::fir_8tap_clip_any;
 /// // Flat input → output equals the constant (the FIR coefficients
 /// // sum to 256 — symmetric pair sums: 160+160 - 48-48 + 24+24 - 8-8
 /// // = 320 - 96 + 48 - 16 = 256).
-/// assert_eq!(fir_8tap_clip(&[100u8; 8], 0, 8), 100);
-/// assert_eq!(fir_8tap_clip(&[100u8; 8], 1, 8), 100);
+/// assert_eq!(fir_8tap_clip_any(&[100u8; 8], 0, 8), 100);
+/// assert_eq!(fir_8tap_clip_any(&[100u8; 8], 1, 8), 100);
 /// ```
 #[inline]
-pub fn fir_8tap_clip<P: Sample>(s: &[P; 8], rounding_control: u8, bits_per_pixel: u32) -> P {
+pub fn fir_8tap_clip_any<P: Sample>(s: &[P; 8], rounding_control: u8, bits_per_pixel: u32) -> P {
     let rc = (rounding_control & 1) as i32;
     let c = QPEL_FIR_C;
     let acc: i32 = c[0] * (s[3].working() + s[4].working())
@@ -411,7 +411,7 @@ fn vert_taps<S: QpelSource>(vop: &S, int_x: i32, int_y: i32) -> [S::Px; 8] {
 /// int_y)`. Equivalent to `(Σ C[j] * (A_{-j, 0} + A_{+j, 0}) + 128 -
 /// rc) / 256`, then clipped to `[0, 2^bpp - 1]`.
 #[inline]
-pub fn half_pel_b<P: Sample>(
+pub fn half_pel_b_any<P: Sample>(
     vop: &ReferenceVop<'_, P>,
     int_x: i32,
     int_y: i32,
@@ -430,7 +430,7 @@ fn half_pel_b_src<S: QpelSource>(
     bits_per_pixel: u32,
 ) -> S::Px {
     let taps = horiz_taps(vop, int_x, int_y);
-    fir_8tap_clip(&taps, rounding_control, bits_per_pixel)
+    fir_8tap_clip_any(&taps, rounding_control, bits_per_pixel)
 }
 
 /// §7.6.2.2.1 vertical half-pel `c` at integer `(int_x, int_y)`.
@@ -439,7 +439,7 @@ fn half_pel_b_src<S: QpelSource>(
 /// + 1)`. Equivalent to `(Σ C[j] * (A_{0, -j} + A_{0, +j}) + 128 -
 ///   rc) / 256`, then clipped.
 #[inline]
-pub fn half_pel_c<P: Sample>(
+pub fn half_pel_c_any<P: Sample>(
     vop: &ReferenceVop<'_, P>,
     int_x: i32,
     int_y: i32,
@@ -458,7 +458,7 @@ fn half_pel_c_src<S: QpelSource>(
     bits_per_pixel: u32,
 ) -> S::Px {
     let taps = vert_taps(vop, int_x, int_y);
-    fir_8tap_clip(&taps, rounding_control, bits_per_pixel)
+    fir_8tap_clip_any(&taps, rounding_control, bits_per_pixel)
 }
 
 /// §7.6.2.2.1 diagonal half-pel `d` at integer `(int_x, int_y)`.
@@ -467,7 +467,7 @@ fn half_pel_c_src<S: QpelSource>(
 /// `b` values `b_{-3} .. b_4`. Each `b_i` is independently computed
 /// and clipped before entering the second-stage FIR.
 #[inline]
-pub fn half_pel_d<P: Sample>(
+pub fn half_pel_d_any<P: Sample>(
     vop: &ReferenceVop<'_, P>,
     int_x: i32,
     int_y: i32,
@@ -489,7 +489,7 @@ fn half_pel_d_src<S: QpelSource>(
     for (k, dy) in (-3i32..=4).enumerate() {
         col[k] = half_pel_b_src(vop, int_x, int_y + dy, rounding_control, bits_per_pixel);
     }
-    fir_8tap_clip(&col, rounding_control, bits_per_pixel)
+    fir_8tap_clip_any(&col, rounding_control, bits_per_pixel)
 }
 
 /// One bilinear blend `(x + y + 1 - rc) / 2`, clipped to `[0, 2^bpp -
@@ -521,7 +521,7 @@ fn bilinear<P: Sample>(x: P, y: P, rounding_control: u8, bits_per_pixel: u32) ->
 /// fetch via [`ReferenceVop::fetch_clamped`].
 #[inline]
 #[allow(clippy::too_many_arguments)]
-pub fn interpolate_quarter_pixel<P: Sample>(
+pub fn interpolate_quarter_pixel_any<P: Sample>(
     vop: &ReferenceVop<'_, P>,
     int_x: i32,
     int_y: i32,
@@ -676,7 +676,7 @@ fn compute_k<S: QpelSource>(vop: &S, int_x: i32, int_y: i32, rc: u8, bpp: u32) -
         let b = half_pel_b_src(vop, int_x, int_y + dy, rc, bpp);
         col[k] = bilinear(a, b, rc, bpp);
     }
-    fir_8tap_clip(&col, rc, bpp)
+    fir_8tap_clip_any(&col, rc, bpp)
 }
 
 /// §7.6.2.2.2 quarter-sample `l` at integer-anchor `(int_x, int_y)`.
@@ -691,7 +691,7 @@ fn compute_l<S: QpelSource>(vop: &S, int_x: i32, int_y: i32, rc: u8, bpp: u32) -
         let a = vop.fetch(int_x + 1, int_y + dy);
         col[k] = bilinear(b, a, rc, bpp);
     }
-    fir_8tap_clip(&col, rc, bpp)
+    fir_8tap_clip_any(&col, rc, bpp)
 }
 
 /// §7.6.2.2 / Figure 7-30 mirrored reference block.
@@ -932,7 +932,7 @@ fn cascade_block<S: QpelSource>(
 // The signature reflects the §7.6.2.2 inputs one-for-one (motion
 // vector x/y, block origin x/y, block w/h, rounding control, bpp).
 #[allow(clippy::too_many_arguments)]
-pub fn interpolate_block_qpel<P: Sample>(
+pub fn interpolate_block_qpel_any<P: Sample>(
     vop: &ReferenceVop<'_, P>,
     mv_x: i32,
     mv_y: i32,
@@ -944,7 +944,7 @@ pub fn interpolate_block_qpel<P: Sample>(
     bits_per_pixel: u32,
 ) -> Vec<P> {
     let mut out = vec![P::ZERO; block_w * block_h];
-    interpolate_block_qpel_into(
+    interpolate_block_qpel_into_any(
         vop,
         mv_x,
         mv_y,
@@ -969,7 +969,7 @@ pub fn interpolate_block_qpel<P: Sample>(
 ///
 /// Panics if `out.len() < block_w * block_h`.
 #[allow(clippy::too_many_arguments)]
-pub fn interpolate_block_qpel_into<P: Sample>(
+pub fn interpolate_block_qpel_into_any<P: Sample>(
     vop: &ReferenceVop<'_, P>,
     mv_x: i32,
     mv_y: i32,
@@ -1062,7 +1062,7 @@ pub fn interpolate_block_qpel_into<P: Sample>(
 ///
 /// Panics if `out.len() < block_w * block_h`.
 #[allow(clippy::too_many_arguments)]
-pub fn interpolate_block_qpel_field_into<P: Sample>(
+pub fn interpolate_block_qpel_field_into_any<P: Sample>(
     vop: &ReferenceVop<'_, P>,
     mv_x: i32,
     mv_y: i32,
@@ -1139,7 +1139,7 @@ pub fn interpolate_block_qpel_field_into<P: Sample>(
 /// allocated `Vec`. See [`interpolate_block_qpel_field_into`] for
 /// parameter semantics.
 #[allow(clippy::too_many_arguments)]
-pub fn interpolate_block_qpel_field<P: Sample>(
+pub fn interpolate_block_qpel_field_any<P: Sample>(
     vop: &ReferenceVop<'_, P>,
     mv_x: i32,
     mv_y: i32,
@@ -1152,7 +1152,7 @@ pub fn interpolate_block_qpel_field<P: Sample>(
     bits_per_pixel: u32,
 ) -> Vec<P> {
     let mut out = vec![P::ZERO; block_w * block_h];
-    interpolate_block_qpel_field_into(
+    interpolate_block_qpel_field_into_any(
         vop,
         mv_x,
         mv_y,
@@ -1166,6 +1166,192 @@ pub fn interpolate_block_qpel_field<P: Sample>(
         &mut out,
     );
     out
+}
+
+/// [`fir_8tap_clip_any`] over 8-bit samples (the store of every VOL that is not
+/// N-bit with more than 8 bits per pixel).
+#[inline]
+pub fn fir_8tap_clip(s: &[u8; 8], rounding_control: u8, bits_per_pixel: u32) -> u8 {
+    fir_8tap_clip_any(s, rounding_control, bits_per_pixel)
+}
+
+/// [`half_pel_b_any`] over 8-bit samples (the store of every VOL that is not
+/// N-bit with more than 8 bits per pixel).
+#[inline]
+pub fn half_pel_b(
+    vop: &ReferenceVop<'_>,
+    int_x: i32,
+    int_y: i32,
+    rounding_control: u8,
+    bits_per_pixel: u32,
+) -> u8 {
+    half_pel_b_any(vop, int_x, int_y, rounding_control, bits_per_pixel)
+}
+
+/// [`half_pel_c_any`] over 8-bit samples (the store of every VOL that is not
+/// N-bit with more than 8 bits per pixel).
+#[inline]
+pub fn half_pel_c(
+    vop: &ReferenceVop<'_>,
+    int_x: i32,
+    int_y: i32,
+    rounding_control: u8,
+    bits_per_pixel: u32,
+) -> u8 {
+    half_pel_c_any(vop, int_x, int_y, rounding_control, bits_per_pixel)
+}
+
+/// [`half_pel_d_any`] over 8-bit samples (the store of every VOL that is not
+/// N-bit with more than 8 bits per pixel).
+#[inline]
+pub fn half_pel_d(
+    vop: &ReferenceVop<'_>,
+    int_x: i32,
+    int_y: i32,
+    rounding_control: u8,
+    bits_per_pixel: u32,
+) -> u8 {
+    half_pel_d_any(vop, int_x, int_y, rounding_control, bits_per_pixel)
+}
+
+/// [`interpolate_quarter_pixel_any`] over 8-bit samples (the store of every VOL that is not
+/// N-bit with more than 8 bits per pixel).
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub fn interpolate_quarter_pixel(
+    vop: &ReferenceVop<'_>,
+    int_x: i32,
+    int_y: i32,
+    qfrac_x: u8,
+    qfrac_y: u8,
+    rounding_control: u8,
+    bits_per_pixel: u32,
+) -> u8 {
+    interpolate_quarter_pixel_any(
+        vop,
+        int_x,
+        int_y,
+        qfrac_x,
+        qfrac_y,
+        rounding_control,
+        bits_per_pixel,
+    )
+}
+
+/// [`interpolate_block_qpel_any`] over 8-bit samples (the store of every VOL that is not
+/// N-bit with more than 8 bits per pixel).
+#[allow(clippy::too_many_arguments)]
+pub fn interpolate_block_qpel(
+    vop: &ReferenceVop<'_>,
+    mv_x: i32,
+    mv_y: i32,
+    origin_x: i32,
+    origin_y: i32,
+    block_w: usize,
+    block_h: usize,
+    vop_rounding_type: u8,
+    bits_per_pixel: u32,
+) -> Vec<u8> {
+    interpolate_block_qpel_any(
+        vop,
+        mv_x,
+        mv_y,
+        origin_x,
+        origin_y,
+        block_w,
+        block_h,
+        vop_rounding_type,
+        bits_per_pixel,
+    )
+}
+
+/// [`interpolate_block_qpel_into_any`] over 8-bit samples (the store of every VOL that is not
+/// N-bit with more than 8 bits per pixel).
+#[allow(clippy::too_many_arguments)]
+pub fn interpolate_block_qpel_into(
+    vop: &ReferenceVop<'_>,
+    mv_x: i32,
+    mv_y: i32,
+    origin_x: i32,
+    origin_y: i32,
+    block_w: usize,
+    block_h: usize,
+    vop_rounding_type: u8,
+    bits_per_pixel: u32,
+    out: &mut [u8],
+) {
+    interpolate_block_qpel_into_any(
+        vop,
+        mv_x,
+        mv_y,
+        origin_x,
+        origin_y,
+        block_w,
+        block_h,
+        vop_rounding_type,
+        bits_per_pixel,
+        out,
+    )
+}
+
+/// [`interpolate_block_qpel_field_any`] over 8-bit samples (the store of every VOL that is not
+/// N-bit with more than 8 bits per pixel).
+#[allow(clippy::too_many_arguments)]
+pub fn interpolate_block_qpel_field(
+    vop: &ReferenceVop<'_>,
+    mv_x: i32,
+    mv_y: i32,
+    origin_x: i32,
+    origin_y: i32,
+    block_w: usize,
+    block_h: usize,
+    ref_field_y0: i32,
+    vop_rounding_type: u8,
+    bits_per_pixel: u32,
+) -> Vec<u8> {
+    interpolate_block_qpel_field_any(
+        vop,
+        mv_x,
+        mv_y,
+        origin_x,
+        origin_y,
+        block_w,
+        block_h,
+        ref_field_y0,
+        vop_rounding_type,
+        bits_per_pixel,
+    )
+}
+
+/// [`interpolate_block_qpel_field_into_any`] over 8-bit samples (the store of every VOL that is not
+/// N-bit with more than 8 bits per pixel).
+#[allow(clippy::too_many_arguments)]
+pub fn interpolate_block_qpel_field_into(
+    vop: &ReferenceVop<'_>,
+    mv_x: i32,
+    mv_y: i32,
+    origin_x: i32,
+    origin_y: i32,
+    block_w: usize,
+    block_h: usize,
+    ref_field_y0: i32,
+    vop_rounding_type: u8,
+    bits_per_pixel: u32,
+    out: &mut [u8],
+) {
+    interpolate_block_qpel_field_into_any(
+        vop,
+        mv_x,
+        mv_y,
+        origin_x,
+        origin_y,
+        block_w,
+        block_h,
+        ref_field_y0,
+        vop_rounding_type,
+        bits_per_pixel,
+        out,
+    )
 }
 
 #[cfg(test)]
@@ -1222,7 +1408,7 @@ mod tests {
                             let (xi, qx) = split_quarter_pel(mv_x);
                             let (yi, qy) = split_quarter_pel(mv_y);
                             let got =
-                                interpolate_block_qpel(&vop, mv_x, mv_y, ox, oy, bw, bh, rc, 8);
+                                interpolate_block_qpel_any(&vop, mv_x, mv_y, ox, oy, bw, bh, rc, 8);
                             let want = per_sample_block(&vop, ox + xi, oy + yi, bw, bh, qx, qy, rc);
                             assert_eq!(
                                 got, want,
@@ -1231,7 +1417,7 @@ mod tests {
                             // Field variant: both reference parities.
                             for parity in 0..2 {
                                 let mvy_frame = 2 * mv_y;
-                                let got = interpolate_block_qpel_field(
+                                let got = interpolate_block_qpel_field_any(
                                     &vop, mv_x, mvy_frame, ox, oy, bw, bh, parity, rc, 8,
                                 );
                                 let field = FieldRefView::new(&vop, parity);
@@ -1328,8 +1514,8 @@ mod tests {
     #[test]
     fn fir_8tap_clip_flat_reproduces_constant() {
         for &v in &[0u8, 1, 100, 200, 255] {
-            assert_eq!(fir_8tap_clip(&[v; 8], 0, 8), v);
-            assert_eq!(fir_8tap_clip(&[v; 8], 1, 8), v);
+            assert_eq!(fir_8tap_clip_any(&[v; 8], 0, 8), v);
+            assert_eq!(fir_8tap_clip_any(&[v; 8], 1, 8), v);
         }
     }
 
@@ -1352,8 +1538,8 @@ mod tests {
         //   (32640 + 128 - 0)/256 = 32768/256 = 128.
         //   (32640 + 128 - 1)/256 = 32767/256 = 127.99... → 127.
         let s = [0u8, 0, 0, 0, 255, 255, 255, 255];
-        assert_eq!(fir_8tap_clip(&s, 0, 8), 128);
-        assert_eq!(fir_8tap_clip(&s, 1, 8), 127);
+        assert_eq!(fir_8tap_clip_any(&s, 0, 8), 128);
+        assert_eq!(fir_8tap_clip_any(&s, 1, 8), 127);
     }
 
     #[test]
@@ -1368,7 +1554,7 @@ mod tests {
         let s = [255u8, 0, 0, 0, 0, 0, 0, 255];
         let pre_clip = (-4080_i32 + 128) / 256;
         assert!(pre_clip < 0, "expected negative pre-clip, got {pre_clip}");
-        assert_eq!(fir_8tap_clip(&s, 0, 8), 0);
+        assert_eq!(fir_8tap_clip_any(&s, 0, 8), 0);
     }
 
     #[test]
@@ -1379,7 +1565,7 @@ mod tests {
         let s = [0u8, 0, 0, 255, 255, 0, 0, 0];
         let pre_clip = (81_600_i32 + 128) / 256;
         assert!(pre_clip > 255, "expected > 255 pre-clip, got {pre_clip}");
-        assert_eq!(fir_8tap_clip(&s, 0, 8), 255);
+        assert_eq!(fir_8tap_clip_any(&s, 0, 8), 255);
     }
 
     // ─────────────────── half_pel_b / c / d ──────────────────────────
@@ -1390,8 +1576,8 @@ mod tests {
         let vop = ReferenceVop::new(&buf, 8, 8).unwrap();
         for x in 0..8 {
             for y in 0..8 {
-                assert_eq!(half_pel_b(&vop, x, y, 0, 8), 77);
-                assert_eq!(half_pel_b(&vop, x, y, 1, 8), 77);
+                assert_eq!(half_pel_b_any(&vop, x, y, 0, 8), 77);
+                assert_eq!(half_pel_b_any(&vop, x, y, 1, 8), 77);
             }
         }
     }
@@ -1400,15 +1586,15 @@ mod tests {
     fn half_pel_c_flat_plane_is_constant() {
         let buf = [33u8; 8 * 8];
         let vop = ReferenceVop::new(&buf, 8, 8).unwrap();
-        assert_eq!(half_pel_c(&vop, 4, 4, 0, 8), 33);
+        assert_eq!(half_pel_c_any(&vop, 4, 4, 0, 8), 33);
     }
 
     #[test]
     fn half_pel_d_flat_plane_is_constant() {
         let buf = [200u8; 8 * 8];
         let vop = ReferenceVop::new(&buf, 8, 8).unwrap();
-        assert_eq!(half_pel_d(&vop, 4, 4, 0, 8), 200);
-        assert_eq!(half_pel_d(&vop, 4, 4, 1, 8), 200);
+        assert_eq!(half_pel_d_any(&vop, 4, 4, 0, 8), 200);
+        assert_eq!(half_pel_d_any(&vop, 4, 4, 1, 8), 200);
     }
 
     #[test]
@@ -1423,8 +1609,8 @@ mod tests {
         // half-pel b at int_x = 3, int_y = 0: half between row[3]
         // and row[4]; taps are row[0..8] which matches the
         // step-edge case.
-        assert_eq!(half_pel_b(&vop, 3, 0, 0, 8), 128);
-        assert_eq!(half_pel_b(&vop, 3, 0, 1, 8), 127);
+        assert_eq!(half_pel_b_any(&vop, 3, 0, 0, 8), 128);
+        assert_eq!(half_pel_b_any(&vop, 3, 0, 1, 8), 127);
     }
 
     // ───────────── interpolate_quarter_pixel ────────────────────────
@@ -1443,7 +1629,7 @@ mod tests {
         for j in 0i32..8 {
             for i in 0i32..8 {
                 assert_eq!(
-                    interpolate_quarter_pixel(&vop, i, j, 0, 0, 0, 8),
+                    interpolate_quarter_pixel_any(&vop, i, j, 0, 0, 0, 8),
                     buf[(j as usize) * 8 + (i as usize)],
                 );
             }
@@ -1458,8 +1644,8 @@ mod tests {
         for j in 0i32..8 {
             for i in 0i32..7 {
                 assert_eq!(
-                    interpolate_quarter_pixel(&vop, i, j, 2, 0, 0, 8),
-                    half_pel_b(&vop, i, j, 0, 8),
+                    interpolate_quarter_pixel_any(&vop, i, j, 2, 0, 0, 8),
+                    half_pel_b_any(&vop, i, j, 0, 8),
                 );
             }
         }
@@ -1471,8 +1657,8 @@ mod tests {
         let buf = [42u8; 8 * 8];
         let vop = ReferenceVop::new(&buf, 8, 8).unwrap();
         assert_eq!(
-            interpolate_quarter_pixel(&vop, 3, 3, 0, 2, 0, 8),
-            half_pel_c(&vop, 3, 3, 0, 8),
+            interpolate_quarter_pixel_any(&vop, 3, 3, 0, 2, 0, 8),
+            half_pel_c_any(&vop, 3, 3, 0, 8),
         );
     }
 
@@ -1482,8 +1668,8 @@ mod tests {
         let buf = [42u8; 8 * 8];
         let vop = ReferenceVop::new(&buf, 8, 8).unwrap();
         assert_eq!(
-            interpolate_quarter_pixel(&vop, 3, 3, 2, 2, 0, 8),
-            half_pel_d(&vop, 3, 3, 0, 8),
+            interpolate_quarter_pixel_any(&vop, 3, 3, 2, 2, 0, 8),
+            half_pel_d_any(&vop, 3, 3, 0, 8),
         );
     }
 
@@ -1499,7 +1685,7 @@ mod tests {
         for qy in 0u8..=3 {
             for qx in 0u8..=3 {
                 for &rc in &[0u8, 1] {
-                    let v = interpolate_quarter_pixel(&vop, 5, 5, qx, qy, rc, 8);
+                    let v = interpolate_quarter_pixel_any(&vop, 5, 5, qx, qy, rc, 8);
                     assert_eq!(v, 100, "qx={qx} qy={qy} rc={rc}");
                 }
             }
@@ -1514,7 +1700,7 @@ mod tests {
         let vop = ReferenceVop::new(&buf, 8, 8).unwrap();
         for qx in 0u8..=3 {
             for qy in 0u8..=3 {
-                let v = interpolate_quarter_pixel(&vop, -10, -10, qx, qy, 0, 8);
+                let v = interpolate_quarter_pixel_any(&vop, -10, -10, qx, qy, 0, 8);
                 assert_eq!(v, 77, "qx={qx} qy={qy}");
             }
         }
@@ -1536,8 +1722,8 @@ mod tests {
         //     + (-8)*(100+101) = 201 * 128 = 25728
         // (25728 + 128 - 0)/256 = 25856/256 = 101
         // (25728 + 128 - 1)/256 = 25855/256 = 100.99... → 100.
-        let rc0 = interpolate_quarter_pixel(&vop, 0, 0, 2, 0, 0, 8);
-        let rc1 = interpolate_quarter_pixel(&vop, 0, 0, 2, 0, 1, 8);
+        let rc0 = interpolate_quarter_pixel_any(&vop, 0, 0, 2, 0, 0, 8);
+        let rc1 = interpolate_quarter_pixel_any(&vop, 0, 0, 2, 0, 1, 8);
         assert_eq!(rc0, 101);
         assert_eq!(rc1, 100);
     }
@@ -1556,7 +1742,7 @@ mod tests {
             }
         }
         let vop = ReferenceVop::new(&buf, 8, 8).unwrap();
-        let block = interpolate_block_qpel(&vop, 4, 4, 0, 0, 4, 4, 0, 8);
+        let block = interpolate_block_qpel_any(&vop, 4, 4, 0, 0, 4, 4, 0, 8);
         for j in 0..4 {
             for i in 0..4 {
                 // The pixel at (i, j) in the predicted block reads
@@ -1577,7 +1763,7 @@ mod tests {
             }
         }
         let vop = ReferenceVop::new(&buf, 8, 8).unwrap();
-        let block = interpolate_block_qpel(&vop, 0, 0, 0, 0, 4, 4, 0, 8);
+        let block = interpolate_block_qpel_any(&vop, 0, 0, 0, 0, 4, 4, 0, 8);
         for j in 0..4 {
             for i in 0..4 {
                 assert_eq!(block[j * 4 + i], buf[j * 8 + i]);
@@ -1591,7 +1777,7 @@ mod tests {
         let vop = ReferenceVop::new(&buf, 2, 2).unwrap();
         let mut out = [0u8; 3];
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            interpolate_block_qpel_into(&vop, 0, 0, 0, 0, 2, 2, 0, 8, &mut out);
+            interpolate_block_qpel_into_any(&vop, 0, 0, 0, 0, 2, 2, 0, 8, &mut out);
         }));
         assert!(r.is_err());
     }
@@ -1603,7 +1789,7 @@ mod tests {
         for &rc in &[0u8, 1] {
             for &mvx in &[0i32, 1, 2, 3, -1, -2] {
                 for &mvy in &[0i32, 1, 2, 3, -1, -2] {
-                    let out = interpolate_block_qpel(&vop, mvx, mvy, 0, 0, 4, 4, rc, 8);
+                    let out = interpolate_block_qpel_any(&vop, mvx, mvy, 0, 0, 4, 4, rc, 8);
                     assert!(out.iter().all(|&v| v == 55), "mv=({mvx},{mvy}) rc={rc}");
                 }
             }
@@ -1617,7 +1803,7 @@ mod tests {
         // result on a flat reference is still flat.
         let buf = [123u8; 16 * 16];
         let vop = ReferenceVop::new(&buf, 16, 16).unwrap();
-        let block = interpolate_block_qpel(&vop, 1, 1, 4, 4, 8, 8, 0, 8);
+        let block = interpolate_block_qpel_any(&vop, 1, 1, 4, 4, 8, 8, 0, 8);
         assert!(block.iter().all(|&v| v == 123));
     }
 
@@ -1637,10 +1823,10 @@ mod tests {
         let vop = ReferenceVop::new(&buf, 8, 8).unwrap();
         let int_x = 3;
         let int_y = 3;
-        let integer = interpolate_quarter_pixel(&vop, int_x, int_y, 0, 0, 0, 8);
-        let q1 = interpolate_quarter_pixel(&vop, int_x, int_y, 1, 0, 0, 8);
-        let q2 = interpolate_quarter_pixel(&vop, int_x, int_y, 2, 0, 0, 8);
-        let q3 = interpolate_quarter_pixel(&vop, int_x, int_y, 3, 0, 0, 8);
+        let integer = interpolate_quarter_pixel_any(&vop, int_x, int_y, 0, 0, 0, 8);
+        let q1 = interpolate_quarter_pixel_any(&vop, int_x, int_y, 1, 0, 0, 8);
+        let q2 = interpolate_quarter_pixel_any(&vop, int_x, int_y, 2, 0, 0, 8);
+        let q3 = interpolate_quarter_pixel_any(&vop, int_x, int_y, 3, 0, 0, 8);
         // Monotonic on a monotone-increasing horizontal ramp.
         assert!(
             integer <= q1 && q1 <= q2 && q2 <= q3,
@@ -1740,7 +1926,7 @@ mod tests {
         let side = 16;
         let plane = striped_plane(side);
         let vop = ReferenceVop::new(&plane, side, side).unwrap();
-        let block = interpolate_block_qpel_field(&vop, 0, 0, 0, 0, 16, 8, 0, 0, 8);
+        let block = interpolate_block_qpel_field_any(&vop, 0, 0, 0, 0, 16, 8, 0, 0, 8);
         for j in 0..8 {
             for i in 0..16 {
                 // Field-line j of the top field → frame line 2j.
@@ -1755,7 +1941,7 @@ mod tests {
         let plane = striped_plane(side);
         let vop = ReferenceVop::new(&plane, side, side).unwrap();
         // ref_field_y0 = 1 → bottom reference field.
-        let block = interpolate_block_qpel_field(&vop, 0, 0, 0, 0, 16, 8, 1, 0, 8);
+        let block = interpolate_block_qpel_field_any(&vop, 0, 0, 0, 0, 16, 8, 1, 0, 8);
         for j in 0..8 {
             for i in 0..16 {
                 assert_eq!(block[j * 16 + i], (2 * j + 1) as u8, "j={j} i={i}");
@@ -1772,7 +1958,8 @@ mod tests {
         for &rc in &[0u8, 1] {
             for &mvx in &[0i32, 1, 2, 3, -1, -5] {
                 for &mvy in &[0i32, 2, 4, 6, 8, -2, -8] {
-                    let block = interpolate_block_qpel_field(&vop, mvx, mvy, 8, 8, 16, 8, 0, rc, 8);
+                    let block =
+                        interpolate_block_qpel_field_any(&vop, mvx, mvy, 8, 8, 16, 8, 0, rc, 8);
                     assert!(block.iter().all(|&v| v == 88), "mv=({mvx},{mvy}) rc={rc}",);
                 }
             }
@@ -1787,7 +1974,7 @@ mod tests {
         let plane = striped_plane(side);
         let vop = ReferenceVop::new(&plane, side, side).unwrap();
         // Top reference, MVy = 8 → field-grid integer step +1 line.
-        let block = interpolate_block_qpel_field(&vop, 0, 8, 0, 0, 16, 8, 0, 0, 8);
+        let block = interpolate_block_qpel_field_any(&vop, 0, 8, 0, 0, 16, 8, 0, 0, 8);
         for j in 0..7 {
             for i in 0..16 {
                 // Field-line (j + 1) of the top field → frame 2(j+1).
@@ -1817,12 +2004,12 @@ mod tests {
         // read away from the plane edges (the §7.6.4 edge clamp lands
         // on the frame's edge line whatever its parity, so only an
         // interior block isolates the same-field FIR rule).
-        let block = interpolate_block_qpel_field(&vop, 0, 4, 0, 8, 16, 8, 0, 0, 8);
+        let block = interpolate_block_qpel_field_any(&vop, 0, 4, 0, 8, 16, 8, 0, 0, 8);
         for v in &block {
             assert_eq!(*v, 100, "bottom-field value 200 must not leak in");
         }
         // Bottom reference (ref_field_y0 = 1) → all 200, symmetrically.
-        let block_bot = interpolate_block_qpel_field(&vop, 0, 4, 0, 8, 16, 8, 1, 0, 8);
+        let block_bot = interpolate_block_qpel_field_any(&vop, 0, 4, 0, 8, 16, 8, 1, 0, 8);
         for v in &block_bot {
             assert_eq!(*v, 200, "top-field value 100 must not leak in");
         }
@@ -1858,7 +2045,7 @@ mod tests {
         // inside it for j ∈ {3, 4} only; nearer the block boundary the
         // Figure 7-30 mirror kicks in and the values legitimately
         // differ from the plane-clamped helper.
-        let block = interpolate_block_qpel_field(&vop, 0, 4, 0, 24, 16, 8, 0, 0, 8);
+        let block = interpolate_block_qpel_field_any(&vop, 0, 4, 0, 24, 16, 8, 0, 0, 8);
         for j in 3..=4 {
             let expected = half_pel_c_src(&top, 5, 12 + j as i32, 0, 8);
             for i in 0..16 {
@@ -1873,7 +2060,7 @@ mod tests {
         let vop = ReferenceVop::new(&buf, 4, 4).unwrap();
         let mut out = [0u8; 3];
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            interpolate_block_qpel_field_into(&vop, 0, 0, 0, 0, 2, 2, 0, 0, 8, &mut out);
+            interpolate_block_qpel_field_into_any(&vop, 0, 0, 0, 0, 2, 2, 0, 0, 8, &mut out);
         }));
         assert!(r.is_err());
     }
@@ -1898,7 +2085,8 @@ mod tests {
         // Single-line progressive reference holding the same ramp.
         let one_line = ReferenceVop::new(&row, side, 1).unwrap();
         for qfx in 0u8..=3 {
-            let field = interpolate_block_qpel_field(&vop, qfx as i32, 0, 0, 0, side, 8, 0, 0, 8);
+            let field =
+                interpolate_block_qpel_field_any(&vop, qfx as i32, 0, 0, 0, side, 8, 0, 0, 8);
             // Only block-interior columns are comparable to the
             // plane-clamped per-pixel cascade: the §7.6.2.2 mirrored
             // block spans columns 0..=16 (M+1 = 17), so the eight
@@ -1908,7 +2096,7 @@ mod tests {
             for i in 3..=12 {
                 // Progressive single-line fetch at the same x sub-pel,
                 // qfy = 0 (no vertical interp).
-                let prog = interpolate_quarter_pixel(&one_line, i as i32, 0, qfx, 0, 0, 8);
+                let prog = interpolate_quarter_pixel_any(&one_line, i as i32, 0, qfx, 0, 0, 8);
                 // Every output field line equals the single-line value
                 // (top field lines are all the same ramp).
                 for j in 0..8 {
@@ -1945,7 +2133,7 @@ mod tests {
             *px = (idx * 7 % 251) as u8;
         }
         let vop = ReferenceVop::new(&plane, side, side).unwrap();
-        let block = interpolate_block_qpel(&vop, 4, -8, 8, 8, 8, 8, 0, 8);
+        let block = interpolate_block_qpel_any(&vop, 4, -8, 8, 8, 8, 8, 0, 8);
         for j in 0..8 {
             for i in 0..8 {
                 assert_eq!(
@@ -1970,7 +2158,7 @@ mod tests {
             *px = (idx * 13 % 239) as u8;
         }
         let vop = ReferenceVop::new(&plane, side, side).unwrap();
-        let block = interpolate_block_qpel(&vop, 2, 0, 8, 8, 8, 8, 0, 8);
+        let block = interpolate_block_qpel_any(&vop, 2, 0, 8, 8, 8, 8, 0, 8);
         // Interior row 0 of the block reads plane row 8, columns 8..=16.
         let interior: Vec<u8> = (0..9).map(|i| plane[8 * side + 8 + i]).collect();
         // Mirrored taps for the half-pel between interior cols 0 and 1:
@@ -1986,7 +2174,7 @@ mod tests {
             interior[3],
             interior[4],
         ];
-        let expected = fir_8tap_clip(&taps, 0, 8);
+        let expected = fir_8tap_clip_any(&taps, 0, 8);
         assert_eq!(block[0], expected);
     }
 
@@ -2002,13 +2190,13 @@ mod tests {
         }
         let vop = ReferenceVop::new(&plane, side, side).unwrap();
         let mv = (2, 2); // half-pel `d` position — full FIR cascade.
-        let whole = interpolate_block_qpel(&vop, mv.0, mv.1, 12, 12, 16, 16, 0, 8);
+        let whole = interpolate_block_qpel_any(&vop, mv.0, mv.1, 12, 12, 16, 16, 0, 8);
         let mut tiled = vec![0u8; 256];
         let mut any_diff = false;
         for b in 0..4 {
             let bx = 12 + 8 * (b & 1) as i32;
             let by = 12 + 8 * (b >> 1) as i32;
-            let tile = interpolate_block_qpel(&vop, mv.0, mv.1, bx, by, 8, 8, 0, 8);
+            let tile = interpolate_block_qpel_any(&vop, mv.0, mv.1, bx, by, 8, 8, 0, 8);
             for j in 0..8 {
                 for i in 0..8 {
                     tiled[(8 * (b >> 1) + j) * 16 + 8 * (b & 1) + i] = tile[j * 8 + i];

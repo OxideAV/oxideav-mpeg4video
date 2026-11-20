@@ -183,9 +183,27 @@ pub struct DecodeOptions {
     /// either mode. See
     /// [`DecodeOptions::inverse_transform_selection`].
     pub inverse_transform: Option<InverseTransformSelection>,
+    /// Opt-in error concealment (§E.1.4.2). When `false` (the
+    /// default) a VOP that fails to decode is reported as an error
+    /// and produces no picture. When `true` the stream decoder
+    /// replaces a damaged VOP by a copy of its forward reference —
+    /// "missing blocks may be replaced with the same block from the
+    /// previous frame" — keeps the reference chain and the clock
+    /// moving, and counts what it concealed
+    /// ([`Mpeg4VideoDecoder::concealment`](crate::decoder::Mpeg4VideoDecoder::concealment),
+    /// [`DecodedFrame::concealed_macroblocks`](crate::framestore::DecodedFrame::concealed_macroblocks)).
+    /// A VOP the decoder declines for a tool it does not implement is
+    /// still an error: that is not stream damage.
+    pub error_concealment: bool,
 }
 
 impl DecodeOptions {
+    /// Set `error_concealment`.
+    pub fn with_error_concealment(mut self, v: bool) -> Self {
+        self.error_concealment = v;
+        self
+    }
+
     /// Set `ecosystem_compat`.
     pub fn with_ecosystem_compat(mut self, v: bool) -> Self {
         self.ecosystem_compat = v;
@@ -210,6 +228,7 @@ impl DecodeOptions {
         Self {
             ecosystem_compat: false,
             inverse_transform: None,
+            error_concealment: false,
         }
     }
 
@@ -218,6 +237,7 @@ impl DecodeOptions {
         Self {
             ecosystem_compat: true,
             inverse_transform: None,
+            error_concealment: false,
         }
     }
 

@@ -79,6 +79,13 @@ const PREFIX: &[u8] = &[
 
 /// The decode options one input runs with, from its first byte.
 fn options_of(select: u8) -> DecodeOptions {
+    // The high bit turns the opt-in error concealment on, so damaged
+    // VOPs take the copy-of-reference path in half of the runs.
+    let conceal = select & 0x80 != 0;
+    options_base(select & 0x7F).with_error_concealment(conceal)
+}
+
+fn options_base(select: u8) -> DecodeOptions {
     match select % 6 {
         0 => DecodeOptions::spec(),
         1 => DecodeOptions::ecosystem(),

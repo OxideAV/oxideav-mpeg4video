@@ -1951,10 +1951,12 @@ mod tests {
             nonintra_quant_mat: None,
             quarter_sample: false,
             complexity_estimation_disable: true,
+            complexity_estimation: None,
             resync_marker_disable: true,
             data_partitioned: false,
             reversible_vlc: false,
             newpred_enable: false,
+            newpred: None,
             reduced_resolution_vop_enable: false,
             scalability: false,
         }

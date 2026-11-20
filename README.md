@@ -298,6 +298,40 @@ decodes sample-exact against the encoder's closed loop
 only: the black-box decoder used elsewhere reads the VOL as a static
 sprite and then declines it, so no independent decode exists yet.
 
+## Layers, optional header blocks, damaged streams
+
+- **Several layers.** A stream may carry more than one video object
+  and more than one layer per object. Each `(video_object_id,
+  video_object_layer_id)` pair decodes with its own configuration,
+  reference chain and clock; `DecodedFrame::layer()` says which one a
+  picture belongs to, and `flush()` releases the last picture of every
+  layer. The decoder keeps the state of the current layer and four
+  others. VOPs of a scalability enhancement layer are stepped over
+  (`enhancement_vops_skipped()`).
+- **Complexity estimation.** A VOL with
+  `complexity_estimation_disable == 0` announces decoding-effort
+  statistics that every VOP header then carries; they are parsed in
+  the VOL and stepped over in the VOPs (they do not affect the
+  pictures).
+- **NEWPRED** (§7.14). `vop_id` / `vop_id_for_prediction` are read
+  from VOP and video-packet headers. With the VOP segment type a P- or
+  S(GMC)-VOP is predicted from the VOP it names, out of a memory of
+  the 16 most recent anchors since the last I-VOP; B-VOPs keep their
+  display-order anchors. The upstream messages of §7.14.2 are the
+  application's business — the decoder exposes what it decoded, it
+  does not talk back.
+- **Error concealment** — opt-in (`DecodeOptions::with_error_concealment`,
+  registry key `error-concealment`). By default a VOP that fails to
+  decode is an error. With concealment on it becomes the copy of its
+  forward reference, as §E.1.4.2 suggests for missing blocks; anchors
+  still enter the chain and the clock keeps moving, so the stream
+  recovers at the next intra data. `Mpeg4VideoDecoder::concealment()`
+  counts concealed and dropped VOPs and
+  `DecodedFrame::concealed_macroblocks()` marks the pictures.
+  Concealment works on whole VOPs: a damaged video packet takes its
+  VOP with it (resynchronising inside the VOP at the next
+  `resync_marker` is not implemented).
+
 ## N-bit video
 
 `not_8_bit` VOLs (§6.3.3: `bits_per_pixel` 4..=12, `quant_precision`
@@ -322,7 +356,8 @@ ceiling, and DC sizes up to 12 with their marker bit.
 
 The encoder (`bits-per-pixel`, `quant-precision`; input `Yuv420P`,
 `Yuv420P10Le` or `Yuv420P12Le`; direct API
-`EncoderConfig::with_bit_depth` + `FrameView` over `u16`) codes the
+`EncoderConfig::with_bit_depth` + `FrameView` over `u16` into the
+`encode_*_vop_any` entry points) codes the
 N-bit object type's tool set (Table 9-1): I-/P-/B-VOPs, AC/DC
 prediction, 4MV, both quantisation methods, per-macroblock quantiser
 modulation, rate control, video packets, data partitioning and
@@ -729,8 +764,18 @@ both modes' envelopes are pinned).
   decoding each piece's `sprite_shape_texture()` macroblock body into
   sprite memory (the object-piece I-VOP / update-piece P-VOP
   macroblock texture subset).
-- Scalability enhancement layers, Studio Profile, and non-rectangular
-  shapes (rejected with typed errors). GMC global-motion warping *is*
+- Reduced-resolution VOPs (`vop_reduced_resolution == 1`, §7.6.10):
+  the VOL flag and the per-VOP bit are read, a VOL whose VOPs are all
+  full resolution decodes, and a reduced-resolution VOP is declined by
+  name.
+- NEWPRED with per-packet reference selection
+  (`newpred_segment_type == 0`: each packet is compensated inside its
+  own area of its own reference) and a reference selection on a B-VOP
+  (§7.14.1 replaces "the reference VOP"; a B-VOP has two) — typed
+  errors. NEWPRED with the VOP segment type decodes (see below).
+- Scalability enhancement layers: their VOPs are stepped over and
+  counted, the layers they build on decode. Studio Profile and
+  non-rectangular shapes are rejected with typed errors. GMC global-motion warping *is*
   supported; the §6.3.6 `mcsel` flag is now routed into the §7.3 recon
   loop (`s_gmc_recon::s_gmc_prediction_macroblock` selects warped vs.
   translational per-MB), and the §7.8.7.3 averaged MV predictor and the

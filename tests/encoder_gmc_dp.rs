@@ -11,7 +11,7 @@
 use oxideav_mpeg4video::decoder::Mpeg4VideoDecoder;
 use oxideav_mpeg4video::framestore::{DecodedFrame, FrameStore};
 use oxideav_mpeg4video::ivop_encode::{
-    EncoderConfig, FrameView, encode_i_vop, write_configuration_headers,
+    EncoderConfig, FrameView, encode_i_vop_any, write_configuration_headers,
 };
 use oxideav_mpeg4video::packet_encode::ResilienceConfig;
 use oxideav_mpeg4video::svop_encode::{encode_s_vop, reconstruct_own_s_vop_with_motion};
@@ -171,7 +171,7 @@ fn gmc_data_partitioned_round_trips() {
                 height: 64,
             };
             if k == 0 {
-                let (unit, recon) = encode_i_vop(&vol, &cfg, &view, 0, 0, 9);
+                let (unit, recon) = encode_i_vop_any(&vol, &cfg, &view, 0, 0, 9);
                 stream.extend_from_slice(&unit);
                 store.push_anchor(recon.clone());
                 recons.push(recon);
@@ -291,7 +291,7 @@ fn truncated_rvlc_texture_on_a_gmc_packet_recovers() {
         width: 96,
         height: 64,
     };
-    let (_, recon) = encode_i_vop(&vol, &cfg, &view, 0, 0, 9);
+    let (_, recon) = encode_i_vop_any(&vol, &cfg, &view, 0, 0, 9);
     store.push_anchor(recon);
     let (y, cb, cr) = picture(96, 64, 1, (2, 1));
     let view = FrameView {

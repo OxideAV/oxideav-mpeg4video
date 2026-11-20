@@ -18,7 +18,11 @@
 //! forces the inverse-transform selection (default: the mode's own).
 //! `MPEG4VIDEO_BENCH_ENCODE` names a raw `yuv420p` file with its
 //! dimensions and optional encoder options; the hash covers the
-//! emitted bytes.
+//! emitted bytes. `MPEG4VIDEO_BENCH_ENCODE_OUT=dir` additionally
+//! writes each encode's elementary stream to
+//! `dir/<source stem>.<options>.m4v` (for rate–distortion
+//! measurements with an external decoder), and
+//! `MPEG4VIDEO_BENCH_FPS=n` sets the frame rate (default 25).
 
 use std::time::Instant;
 
@@ -114,6 +118,12 @@ fn bench_encode(spec: &str) {
     let mut params = CodecParameters::video(CodecId::new("mpeg4video"));
     params.width = Some(w as u32);
     params.height = Some(h as u32);
+    if let Some(fps) = std::env::var("MPEG4VIDEO_BENCH_FPS")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+    {
+        params.frame_rate = Some(oxideav_core::Rational::new(fps, 1));
+    }
     let mut bag = CodecOptions::default();
     for kv in options.split(',').filter(|s| !s.is_empty()) {
         if let Some((k, v)) = kv.split_once('=') {
@@ -124,7 +134,9 @@ fn bench_encode(spec: &str) {
     let mut best = f64::INFINITY;
     let mut hash = 0u64;
     let mut bytes = 0usize;
+    let mut stream = Vec::new();
     for _ in 0..repeats() {
+        stream.clear();
         let mut enc = match oxideav_mpeg4video::encoder::make_encoder(&params) {
             Ok(e) => e,
             Err(e) => {
@@ -140,6 +152,7 @@ fn bench_encode(spec: &str) {
                 Ok(p) => {
                     bytes += p.data.len();
                     fnv1a(&mut hash, &p.data);
+                    stream.extend_from_slice(&p.data);
                 }
                 Err(Error::NeedMore) | Err(Error::Eof) => break,
                 Err(e) => panic!("receive_packet: {e}"),
@@ -170,6 +183,26 @@ fn bench_encode(spec: &str) {
         enc.flush().expect("flush");
         drain(&mut enc);
         best = best.min(start.elapsed().as_secs_f64());
+    }
+    if let Ok(dir) = std::env::var("MPEG4VIDEO_BENCH_ENCODE_OUT") {
+        let stem = std::path::Path::new(path)
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let tag: String = options
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let out = std::path::Path::new(&dir).join(format!("{stem}.{tag}.m4v"));
+        if let Err(e) = std::fs::write(&out, &stream) {
+            println!("encode {spec}: cannot write {}: {e}", out.display());
+        }
     }
     println!(
         "encode {dims} {path} [{options}]: {count} frames, {:.2} fps ({:.1} ms/frame), {bytes} bytes, hash {hash:016x}",

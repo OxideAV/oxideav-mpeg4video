@@ -13,10 +13,10 @@ use oxideav_mpeg4video::bvop_interlaced_encode::{
 use oxideav_mpeg4video::decoder::Mpeg4VideoDecoder;
 use oxideav_mpeg4video::framestore::{DecodedFrame, FrameStore};
 use oxideav_mpeg4video::ivop_encode::{
-    EncoderConfig, FrameView, encode_i_vop, write_configuration_headers,
+    EncoderConfig, FrameView, encode_i_vop_any, write_configuration_headers,
 };
 use oxideav_mpeg4video::pvop_encode::{
-    PVopEncodeStats, encode_p_vop, reconstruct_own_p_vop_with_anchor_motion,
+    PVopEncodeStats, encode_p_vop_any, reconstruct_own_p_vop_with_anchor_motion,
 };
 use oxideav_mpeg4video::svop_encode::{
     SVopEncodeStats, encode_s_vop, reconstruct_own_s_vop_with_anchor_motion,
@@ -221,13 +221,13 @@ fn encode_ip_scene(
             height: h,
         };
         if k == 0 {
-            let (unit, recon) = encode_i_vop(&vol, cfg, &view, 0, 0, qp);
+            let (unit, recon) = encode_i_vop_any(&vol, cfg, &view, 0, 0, qp);
             stream.extend_from_slice(&unit);
             store.push_anchor(recon.clone());
             recons.push(recon);
         } else {
             let reference = store.backward().unwrap().clone();
-            let (unit, st) = encode_p_vop(&vol, cfg, &view, &reference, 0, k as u16, qp);
+            let (unit, st) = encode_p_vop_any(&vol, cfg, &view, &reference, 0, k as u16, qp);
             let (recon, motion) = reconstruct_own_p_vop_with_anchor_motion(&vol, &unit, &mut store);
             stream.extend_from_slice(&unit);
             recons.push(recon);
@@ -336,7 +336,7 @@ fn encode_ipbb_scene(
     let mut store = FrameStore::new();
     // Display order 0..7, coding order: I0 P3 B1 B2 P6 B4 B5.
     let (y, cb, cr) = view_of(0);
-    let (unit, recon) = encode_i_vop(
+    let (unit, recon) = encode_i_vop_any(
         &vol,
         cfg,
         &FrameView {
@@ -356,7 +356,7 @@ fn encode_ipbb_scene(
     for (anchor, bs) in [(3usize, [1usize, 2usize]), (6, [4, 5])] {
         let (y, cb, cr) = view_of(anchor);
         let reference = store.backward().unwrap().clone();
-        let (unit, _) = encode_p_vop(
+        let (unit, _) = encode_p_vop_any(
             &vol,
             cfg,
             &FrameView {
@@ -695,7 +695,7 @@ fn encode_isbb(
     let mut store = FrameStore::new();
     let view_of = |k: usize| picture_split(w, h, k, motion.0, motion.1);
     let (y, cb, cr) = view_of(0);
-    let (unit, recon) = encode_i_vop(
+    let (unit, recon) = encode_i_vop_any(
         &vol,
         cfg,
         &FrameView {
