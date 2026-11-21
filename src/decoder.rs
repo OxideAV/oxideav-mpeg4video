@@ -1742,19 +1742,40 @@ impl oxideav_core::CodecOptionsStruct for Mpeg4DecoderOptions {
     }
 }
 
+/// The options of `params` that belong to schema `T`.
+///
+/// A stream's parameter set also carries what its container recorded
+/// about the track (edit lists, bit-rate boxes, handler names, …) and
+/// may carry the options of the encoder that produced it; none of that
+/// configures this decoder, so only its own keys are parsed (a
+/// malformed value of one of them is still an error).
+fn own_options<T: oxideav_core::CodecOptionsStruct>(
+    options: &oxideav_core::CodecOptions,
+) -> oxideav_core::CodecOptions {
+    let mut own = oxideav_core::CodecOptions::default();
+    for (key, value) in options.iter() {
+        if T::SCHEMA.iter().any(|f| f.name == key) {
+            own.insert(key, value);
+        }
+    }
+    own
+}
+
 /// Direct factory endpoint: build a boxed registry-compatible decoder
 /// from [`oxideav_core::CodecParameters`].
 ///
 /// `params.extradata` (the VOS/VO/VOL configuration run, when the
 /// container carries one) is decoded immediately; data packets follow
 /// via [`oxideav_core::Decoder::send_packet`]. `params.options` is
-/// parsed against the [`Mpeg4DecoderOptions`] schema (unknown keys and
-/// malformed values are rejected with
-/// [`Error::InvalidData`](oxideav_core::Error::InvalidData)).
+/// parsed against the [`Mpeg4DecoderOptions`] schema: keys outside it
+/// (container track records, encoder options) are left alone, and a
+/// malformed value of one of its own keys is rejected with
+/// [`Error::InvalidData`](oxideav_core::Error::InvalidData).
 pub fn make_decoder(
     params: &oxideav_core::CodecParameters,
 ) -> oxideav_core::Result<Box<dyn oxideav_core::Decoder>> {
-    let options: Mpeg4DecoderOptions = oxideav_core::parse_options(&params.options)?;
+    let options: Mpeg4DecoderOptions =
+        oxideav_core::parse_options(&own_options::<Mpeg4DecoderOptions>(&params.options))?;
     let mut dec = Mpeg4PacketDecoder {
         codec_id: params.codec_id.clone(),
         inner: Mpeg4VideoDecoder::with_options(options.into()),
@@ -3142,13 +3163,14 @@ mod registry_tests {
     }
 
     #[test]
-    fn make_decoder_rejects_unknown_or_malformed_options() {
+    fn make_decoder_ignores_foreign_keys_and_rejects_malformed_options() {
+        // What an MP4 demuxer records about the track rides in the same
+        // bag; it must not stop the decoder from being built.
         let mut params = CodecParameters::video(CodecId::new("mpeg4video"));
-        params.options = oxideav_core::CodecOptions::new().set("no-such-option", "1");
-        assert!(matches!(
-            make_decoder(&params),
-            Err(oxideav_core::Error::InvalidData(_))
-        ));
+        params.options = oxideav_core::CodecOptions::new()
+            .set("elst_entry_count", "1")
+            .set("elst_0", "0:0:1:0");
+        assert!(make_decoder(&params).is_ok());
         let mut params = CodecParameters::video(CodecId::new("mpeg4video"));
         params.options = oxideav_core::CodecOptions::new().set("ecosystem-compat", "maybe");
         assert!(matches!(
