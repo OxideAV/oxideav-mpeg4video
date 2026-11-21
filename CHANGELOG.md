@@ -6,6 +6,19 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.11](https://github.com/OxideAV/oxideav-mpeg4video/compare/v0.1.10...v0.1.11) - 2026-11-21
+
+### Other
+
+- parse only this decoder's own option keys
+- encoder motion search and decisions, decoder thread budget
+- VOL syntax sweep — complexity estimation, NEWPRED, layers, opt-in concealment
+- N-bit video — 4..=12 bits per sample, decode and encode
+- crate-level needless_range_loop allowance (clippy 1.100 extends the lint to nested spec-indexed loops)
+- inverse-transform selection — fuzz coverage, bench switches, README / fixture notes
+- inverse-transform selection — exact by default, from stream evidence under ecosystem-compat, forceable either way
+- integer row-column inverse transform (variant RC) — 64/64 staged vectors, worked examples, empty-row rule
+
 ### Fixed
 
 - decoder: option keys this decoder does not define (a container's track records such as the MP4 edit-list entries, or the producing encoder's options) no longer fail the decoder factory; only its own keys are parsed, and a malformed value of one of them is still an error. Such streams could not be opened through the registry at all.
